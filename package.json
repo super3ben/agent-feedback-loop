@@ -1,0 +1,40 @@
+{
+  "name": "agent-feedback-loop",
+  "version": "0.1.0",
+  "description": "Prompt-first feedback reflection hooks for Codex and Claude Code.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/super3ben/agent-feedback-loop.git"
+  },
+  "homepage": "https://github.com/super3ben/agent-feedback-loop#readme",
+  "bugs": {
+    "url": "https://github.com/super3ben/agent-feedback-loop/issues"
+  },
+  "bin": {
+    "agent-feedback-loop": "./bin/agent-feedback-loop.mjs"
+  },
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node ./bin/agent-feedback-loop.mjs doctor"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "agent",
+    "codex",
+    "claude-code",
+    "hooks",
+    "prompt",
+    "reflection"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
