@@ -1,0 +1,21 @@
+<svg width="1200" height="520" viewBox="0 0 1200 520" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Terminal quick start</title>
+  <desc id="desc">Install, configure, and diagnose Agent Feedback Loop from the terminal.</desc>
+  <rect width="1200" height="520" rx="24" fill="#0D1117"/>
+  <rect x="52" y="52" width="1096" height="416" rx="18" fill="#161B22" stroke="#30363D"/>
+  <circle cx="84" cy="82" r="8" fill="#FF5F56"/>
+  <circle cx="112" cy="82" r="8" fill="#FFBD2E"/>
+  <circle cx="140" cy="82" r="8" fill="#27C93F"/>
+  <text x="172" y="88" fill="#8B949E" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">agent-feedback-loop quick start</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20">
+    <text x="82" y="142" fill="#7EE787">$ npm install -g agent-feedback-loop</text>
+    <text x="82" y="184" fill="#7EE787">$ agent-feedback-loop install</text>
+    <text x="82" y="226" fill="#C9D1D9">agent-feedback-loop installed</text>
+    <text x="116" y="264" fill="#8B949E">- copy templates -&gt; ~/.agent/feedback-loop</text>
+    <text x="116" y="302" fill="#8B949E">- connect Codex hook -&gt; codex-hook.sh</text>
+    <text x="116" y="340" fill="#8B949E">- connect Claude Code hook -&gt; claude-hook.sh</text>
+    <text x="82" y="392" fill="#7EE787">$ agent-feedback-loop doctor</text>
+    <text x="82" y="434" fill="#3FB950">agent-feedback-loop healthy</text>
+  </g>
+</svg>

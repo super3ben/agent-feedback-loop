@@ -22,7 +22,9 @@
     "bin",
     "src",
     "templates",
+    "assets",
     "README.md",
+    "README-zh.md",
     "LICENSE"
   ],
   "keywords": [
