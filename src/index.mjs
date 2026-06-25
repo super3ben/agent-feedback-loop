@@ -30,6 +30,7 @@ export function pathsFor(home = os.homedir()) {
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
     codexHook: path.join(packRoot, "hooks", "codex-hook.sh"),
     claudeHook: path.join(packRoot, "hooks", "claude-hook.sh"),
+    triggerRules: path.join(packRoot, "hooks", "trigger-rules.sh"),
     codexConfig: path.join(home, ".codex", "config.toml"),
     claudeSettings: path.join(home, ".claude", "settings.json")
   };
@@ -241,6 +242,7 @@ export async function doctor(options = {}) {
     rule: await exists(paths.ruleFile),
     codexHook: await exists(paths.codexHook),
     claudeHook: await exists(paths.claudeHook),
+    triggerRules: await exists(paths.triggerRules),
     codexHookExecutable: await isExecutable(paths.codexHook),
     claudeHookExecutable: await isExecutable(paths.claudeHook)
   };

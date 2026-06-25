@@ -4,11 +4,13 @@ Use this rule when the user expresses strong dissatisfaction, anger, repeated er
 
 Do not assume user anger means the agent was wrong.
 
-## Trigger Signals
+## Trigger Model
 
-- Repeated error language: "每次", "反复", "重复", "又一次", "总是", "again", "repeated", "recurring".
-- Strong dissatisfaction: "非常不满意", "生气", "严重问题", "大问题", "blocker", "critical".
-- Context or process failure: "漏了", "没理解", "理解错", "没有按规则", "没有真机测试".
+- Every hook invocation injects a short semantic gate.
+- The active model must inspect the latest user message in any language.
+- Run reflection when the message expresses dissatisfaction, correction, repeated failure, process criticism, or a future prevention rule/preference.
+- Ignore the gate for normal requests.
+- Shell hooks keep only a small force-reflection fallback for unmistakable blocker-level language such as "critical", "blocker", "非常不满意", "严重问题", and similar high-severity wording.
 
 ## Required Response
 

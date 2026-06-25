@@ -171,6 +171,10 @@ Backups are created before config changes:
 
 ## Reflection Contract
 
+Hooks inject a short semantic feedback gate on every prompt. The gate asks the active model to inspect the latest user message in any language and only run reflection when it expresses dissatisfaction, correction, repeated failure, process criticism, or a future prevention rule/preference.
+
+The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language such as `critical`, `blocker`, `非常不满意`, or `严重问题`. It does not try to enumerate every Chinese or English dissatisfaction phrase.
+
 When triggered, the prompt requires the agent to classify responsibility as exactly one:
 
 - `agent_fault`
@@ -227,14 +231,16 @@ node ./bin/agent-feedback-loop.mjs install --home /tmp/afl-home
 
 Agent Feedback Loop 是一套面向 Codex 和 Claude Code 的“提示词优先”自动反思机制。
 
-当用户表达强烈不满、指出重复错误、说 agent 漏上下文或没有按流程执行时，它会通过 CLI hook 注入反思提示，让 agent 在继续执行前先复盘。
+每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
+
+hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`。它不再维护大规模中英文触发词表。
 
 核心原则：
 
 - 不启动后台服务。
 - 不用 JavaScript 调大模型。
 - 不把反思逻辑写死在代码里。
-- hook 只负责触发，Markdown prompt 负责流程。
+- hook 只负责注入短 gate 和极强信号兜底，Markdown prompt 负责完整反思流程。
 - 非程序员也可以直接维护 `reflection-agent.md` 和 `feedback-loop.md`。
 - 子 agent 分析完必须关闭/释放，并记录 `released_agent_ids` 或说明 CLI 不支持释放。
 - 项目规则写到 `.agent/rules/feedback-loop.md`，避免 `AGENTS.md` / `CLAUDE.md` 无限膨胀。
@@ -264,12 +270,13 @@ agent-feedback-loop uninstall    # 移除 hook 配置，保留 prompt 文件
 ~/.agent/feedback-loop/rules/feedback-loop.md
 ```
 
-如果要调整触发词，再改：
+如果要调整短 gate 文案或极强兜底词，再改共享规则文件：
 
 ```text
-~/.agent/feedback-loop/hooks/codex-hook.sh
-~/.agent/feedback-loop/hooks/claude-hook.sh
+~/.agent/feedback-loop/hooks/trigger-rules.sh
 ```
+
+`codex-hook.sh` 和 `claude-hook.sh` 只负责输出各自 CLI 需要的 JSON。
 
 ## License
 

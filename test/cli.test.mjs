@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -107,6 +107,79 @@ describe("agent-feedback-loop package", () => {
     const claudeJson = JSON.parse(claude.stdout);
     assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(claudeJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
+  });
+
+  it("shell hooks inject a semantic gate for normal prompts", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
+    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
+    const payload = JSON.stringify({ prompt: "Please summarize the README in two bullets." });
+
+    const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
+    const codexJson = JSON.parse(codex.stdout);
+    assert.equal(codexJson.continue, true);
+    assert.match(codexJson.systemMessage, /Feedback gate/);
+    assert.doesNotMatch(codexJson.systemMessage, /Feedback reflection triggered/);
+
+    const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
+    const claudeJson = JSON.parse(claude.stdout);
+    assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(claudeJson.hookSpecificOutput.additionalContext, /Feedback gate/);
+    assert.doesNotMatch(claudeJson.hookSpecificOutput.additionalContext, /Feedback reflection triggered/);
+  });
+
+  it("shell hooks inject a semantic gate for implicit dissatisfaction in multiple languages", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
+    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
+    const prompts = [
+      "这里显示也是呀只显示数字不明显，就不能有点设计性？让这些东西显示明显点，以后这种页面的这种都要调用设计性的skill类似front-desgin等等",
+      "为什么当时做文档的时候没考虑要用术语呢，mode AB让别人怎么理解，这种问题以后不要再出现",
+      "This is not clear enough. Why did you not use a design skill for this kind of visible page? These pages should use a design skill in the future."
+    ];
+
+    for (const prompt of prompts) {
+      const payload = JSON.stringify({ prompt });
+
+      const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
+      assert.match(codex.stdout, /Feedback gate/);
+
+      const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
+      assert.match(claude.stdout, /Feedback gate/);
+    }
+  });
+
+  it("shell hooks fail open when shared trigger rules are missing", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const hookDir = path.join(home, ".agent", "feedback-loop", "hooks");
+    const codexHook = path.join(hookDir, "codex-hook.sh");
+    const claudeHook = path.join(hookDir, "claude-hook.sh");
+    await rm(path.join(hookDir, "trigger-rules.sh"));
+
+    const payload = JSON.stringify({ prompt: "这里显示太差了，重做" });
+
+    const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
+    assert.equal(JSON.parse(codex.stdout).continue, true);
+
+    const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
+    assert.deepEqual(JSON.parse(claude.stdout), {});
+  });
+
+  it("doctor reports unhealthy when shared trigger rules are missing", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    await rm(path.join(home, ".agent", "feedback-loop", "hooks", "trigger-rules.sh"));
+
+    const health = await doctor({ home });
+    assert.equal(health.healthy, false);
+    assert.equal(health.files.triggerRules, false);
   });
 
   it("CLI doctor exits successfully after install", async () => {
