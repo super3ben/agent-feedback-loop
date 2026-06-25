@@ -101,19 +101,6 @@ function codexHookBlock(paths) {
   ].join("\n");
 }
 
-function reflectionAgentPrompt(paths) {
-  return [
-    "A feedback reflection event may have been triggered.",
-    `Follow ${paths.promptFile}.`,
-    "Classify responsibility as agent_fault, user_misunderstanding, shared_ambiguity, external_limit, or insufficient_evidence.",
-    "Do not assume the user is correct.",
-    "If reflection subagents are used, close/release completed ones after consuming their reports and record released_agent_ids or the explicit CLI limitation.",
-    "Project-specific rules go to .agent/rules/feedback-loop.md.",
-    "Global promotion requires Blocker + agent_fault + generalizable + cross-project evidence.",
-    "Input: $ARGUMENTS"
-  ].join(" ");
-}
-
 function removeClaudeEntries(settings, paths) {
   const hooks = settings.hooks?.UserPromptSubmit;
   if (!Array.isArray(hooks)) return settings;
@@ -175,10 +162,6 @@ async function installClaude(paths, dryRun, actions) {
         type: "command",
         command: paths.claudeHook,
         timeout: 2
-      },
-      {
-        type: "agent",
-        prompt: reflectionAgentPrompt(paths)
       }
     ]
   });
@@ -271,8 +254,7 @@ export async function doctor(options = {}) {
   };
   const healthy = Object.values(files).every(Boolean)
     && codex.connected
-    && claudeStatus.commandHookConnected
-    && claudeStatus.agentPromptConnected;
+    && claudeStatus.commandHookConnected;
   return { healthy, home, files, codex, claude: claudeStatus };
 }
 

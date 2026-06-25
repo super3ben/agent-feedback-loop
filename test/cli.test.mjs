@@ -66,12 +66,13 @@ describe("agent-feedback-loop package", () => {
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
     assert.ok(userPromptHooks.some((hook) => hook.command?.includes("claude-hook.sh")));
-    assert.ok(userPromptHooks.some((hook) => hook.type === "agent" && hook.prompt.includes("reflection-agent.md")));
+    assert.equal(userPromptHooks.some((hook) => hook.type === "agent"), false);
 
     const health = await doctor({ home });
     assert.equal(health.healthy, true);
     assert.equal(health.codex.connected, true);
     assert.equal(health.claude.commandHookConnected, true);
+    assert.equal(health.claude.agentPromptConnected, false);
 
     await uninstall({ home, dryRun: false, removeFiles: false });
 
