@@ -21,19 +21,63 @@ const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
 
+// Declarative CLI registry. Adding a new model-visible CLI = adding one entry.
+// configKey/configPath are resolved against home in pathsFor.
+const CLIS = [
+  {
+    id: "codex",
+    label: "Codex",
+    format: "toml",
+    configKey: "codexConfig",
+    configPath: [".codex", "config.toml"],
+    hookEvent: "UserPromptSubmit",
+    hookArgs: ["--event", "UserPromptSubmit", "--continue"]
+  },
+  {
+    id: "claude",
+    label: "Claude Code",
+    format: "json",
+    configKey: "claudeSettings",
+    configPath: [".claude", "settings.json"],
+    hookEvent: "UserPromptSubmit",
+    hookArgs: ["--event", "UserPromptSubmit"]
+  },
+  {
+    id: "gemini",
+    label: "Gemini CLI",
+    format: "json",
+    configKey: "geminiSettings",
+    configPath: [".gemini", "settings.json"],
+    hookEvent: "BeforeAgent",
+    hookArgs: ["--event", "BeforeAgent"]
+  }
+];
+
 export function pathsFor(home = os.homedir()) {
   const packRoot = path.join(home, ".agent", "feedback-loop");
-  return {
+  const paths = {
     home,
     packRoot,
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
-    codexHook: path.join(packRoot, "hooks", "codex-hook.sh"),
-    claudeHook: path.join(packRoot, "hooks", "claude-hook.sh"),
+    coreHook: path.join(packRoot, "hooks", "core-hook.sh"),
     triggerRules: path.join(packRoot, "hooks", "trigger-rules.sh"),
-    codexConfig: path.join(home, ".codex", "config.toml"),
-    claudeSettings: path.join(home, ".claude", "settings.json")
+    // Per-CLI hooks from <=0.1.x, replaced by the single core-hook.sh.
+    // Deleted on install/uninstall so stale copies can't confuse the model.
+    legacyHooks: [
+      path.join(packRoot, "hooks", "codex-hook.sh"),
+      path.join(packRoot, "hooks", "claude-hook.sh")
+    ]
   };
+  for (const cli of CLIS) {
+    paths[cli.configKey] = path.join(home, ...cli.configPath);
+  }
+  return paths;
+}
+
+// Full shell command a CLI config should invoke for this hook.
+function hookCommand(paths, cli) {
+  return [paths.coreHook, ...cli.hookArgs].join(" ");
 }
 
 async function exists(file) {
@@ -88,24 +132,28 @@ function removeMarkedCodexBlock(text) {
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
-function codexHookBlock(paths) {
+function codexHookBlock(paths, cli) {
   return [
     CODEX_MARKER_START,
     "[[hooks.UserPromptSubmit]]",
     "",
     "[[hooks.UserPromptSubmit.hooks]]",
     'type = "command"',
-    `command = ${tomlString(paths.codexHook)}`,
+    `command = ${tomlString(hookCommand(paths, cli))}`,
     "timeout = 2",
     'statusMessage = "Injecting feedback reflection prompt"',
     CODEX_MARKER_END
   ].join("\n");
 }
 
-function removeClaudeEntries(settings, paths) {
-  const hooks = settings.hooks?.UserPromptSubmit;
+// Remove our managed entries for a given JSON-config CLI (Claude/Gemini).
+// Matches by event key + the core-hook path appearing in command, so it cleans
+// both the current core-hook wiring and any legacy per-CLI hook commands.
+function removeJsonHookEntries(settings, paths, cli) {
+  const event = cli.hookEvent;
+  const hooks = settings.hooks?.[event];
   if (!Array.isArray(hooks)) return settings;
-  settings.hooks.UserPromptSubmit = hooks
+  settings.hooks[event] = hooks
     .map((entry) => {
       if (!entry || !Array.isArray(entry.hooks)) return entry;
       return {
@@ -113,7 +161,10 @@ function removeClaudeEntries(settings, paths) {
         hooks: entry.hooks.filter((hook) => {
           const command = typeof hook.command === "string" ? hook.command : "";
           const prompt = typeof hook.prompt === "string" ? hook.prompt : "";
-          return !command.includes(paths.claudeHook) && !prompt.includes(paths.promptFile);
+          return !command.includes(paths.coreHook)
+            && !command.includes("codex-hook.sh")
+            && !command.includes("claude-hook.sh")
+            && !prompt.includes(paths.promptFile);
         })
       };
     })
@@ -121,55 +172,77 @@ function removeClaudeEntries(settings, paths) {
   return settings;
 }
 
-async function readClaudeSettings(file) {
+async function readJsonSettings(file) {
   if (!(await exists(file))) return {};
   const text = await readFile(file, "utf8");
   if (!text.trim()) return {};
   return JSON.parse(text);
 }
 
-async function writePromptPack(paths, dryRun, actions) {
-  actions.push(`copy templates -> ${paths.packRoot}`);
-  if (dryRun) return;
-  await mkdir(path.dirname(paths.packRoot), { recursive: true });
-  await cp(TEMPLATE_ROOT, paths.packRoot, { recursive: true });
-  await chmod(paths.codexHook, 0o755);
-  await chmod(paths.claudeHook, 0o755);
-}
-
-async function installCodex(paths, dryRun, actions) {
-  await backup(paths.codexConfig, dryRun, actions);
-  const current = (await exists(paths.codexConfig)) ? await readFile(paths.codexConfig, "utf8") : "";
-  const cleaned = removeMarkedCodexBlock(current);
-  const next = cleaned.includes(paths.codexHook)
-    ? `${cleaned.trimEnd()}\n`
-    : `${cleaned.trimEnd()}${cleaned.trim() ? "\n\n" : ""}${codexHookBlock(paths)}\n`;
-  actions.push(`connect Codex hook -> ${paths.codexHook}`);
-  if (!dryRun) {
-    await mkdir(path.dirname(paths.codexConfig), { recursive: true });
-    await writeFile(paths.codexConfig, next, "utf8");
+async function removeLegacyHooks(paths, dryRun, actions) {
+  for (const file of paths.legacyHooks) {
+    if (!(await exists(file))) continue;
+    actions.push(`remove legacy hook ${file}`);
+    if (!dryRun) await rm(file, { force: true });
   }
 }
 
-async function installClaude(paths, dryRun, actions) {
-  await backup(paths.claudeSettings, dryRun, actions);
-  const settings = removeClaudeEntries(await readClaudeSettings(paths.claudeSettings), paths);
+async function writePromptPack(paths, dryRun, actions) {
+  actions.push(`copy templates -> ${paths.packRoot}`);
+  if (dryRun) {
+    await removeLegacyHooks(paths, dryRun, actions);
+    return;
+  }
+  await mkdir(path.dirname(paths.packRoot), { recursive: true });
+  await cp(TEMPLATE_ROOT, paths.packRoot, { recursive: true });
+  await chmod(paths.coreHook, 0o755);
+  // cp does not delete files absent from templates, so pre-0.2 per-CLI hooks
+  // linger after an upgrade. Remove them explicitly.
+  await removeLegacyHooks(paths, dryRun, actions);
+}
+
+async function installTomlBlock(paths, cli, dryRun, actions) {
+  const configFile = paths[cli.configKey];
+  await backup(configFile, dryRun, actions);
+  const current = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
+  const cleaned = removeMarkedCodexBlock(current);
+  const block = codexHookBlock(paths, cli);
+  const next = `${cleaned.trimEnd()}${cleaned.trim() ? "\n\n" : ""}${block}\n`;
+  actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
+  if (!dryRun) {
+    await mkdir(path.dirname(configFile), { recursive: true });
+    await writeFile(configFile, next, "utf8");
+  }
+}
+
+async function installJsonHooks(paths, cli, dryRun, actions) {
+  const configFile = paths[cli.configKey];
+  await backup(configFile, dryRun, actions);
+  const settings = removeJsonHookEntries(await readJsonSettings(configFile), paths, cli);
   settings.hooks = settings.hooks || {};
-  settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
-  settings.hooks.UserPromptSubmit.push({
+  settings.hooks[cli.hookEvent] = settings.hooks[cli.hookEvent] || [];
+  settings.hooks[cli.hookEvent].push({
     matcher: "",
     hooks: [
       {
         type: "command",
-        command: paths.claudeHook,
+        command: hookCommand(paths, cli),
         timeout: 2
       }
     ]
   });
-  actions.push(`connect Claude Code hook -> ${paths.claudeHook}`);
+  actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
   if (!dryRun) {
-    await mkdir(path.dirname(paths.claudeSettings), { recursive: true });
-    await writeFile(paths.claudeSettings, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+    await mkdir(path.dirname(configFile), { recursive: true });
+    await writeFile(configFile, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  }
+}
+
+async function installCli(paths, cli, dryRun, actions) {
+  if (cli.format === "toml") {
+    await installTomlBlock(paths, cli, dryRun, actions);
+  } else {
+    await installJsonHooks(paths, cli, dryRun, actions);
   }
 }
 
@@ -179,9 +252,26 @@ export async function install(options = {}) {
   const paths = pathsFor(home);
   const actions = [];
   await writePromptPack(paths, dryRun, actions);
-  await installCodex(paths, dryRun, actions);
-  await installClaude(paths, dryRun, actions);
+  for (const cli of CLIS) {
+    await installCli(paths, cli, dryRun, actions);
+  }
   return { dryRun, paths, actions };
+}
+
+async function uninstallCli(paths, cli, dryRun, actions) {
+  const configFile = paths[cli.configKey];
+  if (!(await exists(configFile))) return;
+  await backup(configFile, dryRun, actions);
+  if (cli.format === "toml") {
+    const current = await readFile(configFile, "utf8");
+    const next = `${removeMarkedCodexBlock(current)}\n`;
+    actions.push(`disconnect ${cli.label} hook`);
+    if (!dryRun) await writeFile(configFile, next, "utf8");
+  } else {
+    const settings = removeJsonHookEntries(await readJsonSettings(configFile), paths, cli);
+    actions.push(`disconnect ${cli.label} hook`);
+    if (!dryRun) await writeFile(configFile, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  }
 }
 
 export async function uninstall(options = {}) {
@@ -191,24 +281,15 @@ export async function uninstall(options = {}) {
   const paths = pathsFor(home);
   const actions = [];
 
-  if (await exists(paths.codexConfig)) {
-    await backup(paths.codexConfig, dryRun, actions);
-    const current = await readFile(paths.codexConfig, "utf8");
-    const next = `${removeMarkedCodexBlock(current)}\n`;
-    actions.push("disconnect Codex hook");
-    if (!dryRun) await writeFile(paths.codexConfig, next, "utf8");
-  }
-
-  if (await exists(paths.claudeSettings)) {
-    await backup(paths.claudeSettings, dryRun, actions);
-    const settings = removeClaudeEntries(await readClaudeSettings(paths.claudeSettings), paths);
-    actions.push("disconnect Claude Code hook");
-    if (!dryRun) await writeFile(paths.claudeSettings, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  for (const cli of CLIS) {
+    await uninstallCli(paths, cli, dryRun, actions);
   }
 
   if (removeFiles) {
     actions.push(`remove ${paths.packRoot}`);
     if (!dryRun) await rm(paths.packRoot, { recursive: true, force: true });
+  } else {
+    await removeLegacyHooks(paths, dryRun, actions);
   }
 
   return { dryRun, paths, actions };
@@ -226,38 +307,43 @@ async function isExecutable(file) {
 export async function doctor(options = {}) {
   const home = options.home || os.homedir();
   const paths = pathsFor(home);
-  const codexText = (await exists(paths.codexConfig)) ? await readFile(paths.codexConfig, "utf8") : "";
-  let claude = {};
-  try {
-    claude = await readClaudeSettings(paths.claudeSettings);
-  } catch {
-    claude = {};
-  }
-  const claudeHooks = Array.isArray(claude.hooks?.UserPromptSubmit)
-    ? claude.hooks.UserPromptSubmit.flatMap((entry) => (Array.isArray(entry.hooks) ? entry.hooks : []))
-    : [];
 
   const files = {
     prompt: await exists(paths.promptFile),
     rule: await exists(paths.ruleFile),
-    codexHook: await exists(paths.codexHook),
-    claudeHook: await exists(paths.claudeHook),
+    coreHook: await exists(paths.coreHook),
     triggerRules: await exists(paths.triggerRules),
-    codexHookExecutable: await isExecutable(paths.codexHook),
-    claudeHookExecutable: await isExecutable(paths.claudeHook)
+    coreHookExecutable: await isExecutable(paths.coreHook)
   };
-  const codex = {
-    connected: codexText.includes(paths.codexHook),
-    managedBlock: codexText.includes(CODEX_MARKER_START)
-  };
-  const claudeStatus = {
-    commandHookConnected: claudeHooks.some((hook) => hook.command === paths.claudeHook),
-    agentPromptConnected: claudeHooks.some((hook) => typeof hook.prompt === "string" && hook.prompt.includes(paths.promptFile))
-  };
+
+  const clis = {};
+  for (const cli of CLIS) {
+    const configFile = paths[cli.configKey];
+    if (cli.format === "toml") {
+      const text = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
+      clis[cli.id] = {
+        connected: text.includes(paths.coreHook),
+        managedBlock: text.includes(CODEX_MARKER_START)
+      };
+    } else {
+      let settings = {};
+      try {
+        settings = await readJsonSettings(configFile);
+      } catch {
+        settings = {};
+      }
+      const entries = Array.isArray(settings.hooks?.[cli.hookEvent])
+        ? settings.hooks[cli.hookEvent].flatMap((entry) => (Array.isArray(entry.hooks) ? entry.hooks : []))
+        : [];
+      clis[cli.id] = {
+        connected: entries.some((hook) => typeof hook.command === "string" && hook.command.includes(paths.coreHook))
+      };
+    }
+  }
+
   const healthy = Object.values(files).every(Boolean)
-    && codex.connected
-    && claudeStatus.commandHookConnected;
-  return { healthy, home, files, codex, claude: claudeStatus };
+    && CLIS.every((cli) => clis[cli.id].connected);
+  return { healthy, home, files, clis };
 }
 
 export async function assertTemplateTree() {

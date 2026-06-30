@@ -1,7 +1,7 @@
 {
   "name": "agent-feedback-loop",
-  "version": "0.1.2",
-  "description": "Prompt-first feedback reflection hooks for Codex and Claude Code.",
+  "version": "0.2.0",
+  "description": "Prompt-first feedback reflection hooks for Codex, Claude Code, and Gemini CLI.",
   "type": "module",
   "repository": {
     "type": "git",
@@ -31,6 +31,7 @@
     "agent",
     "codex",
     "claude-code",
+    "gemini-cli",
     "hooks",
     "prompt",
     "reflection"

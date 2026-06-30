@@ -20,9 +20,9 @@ async function readText(file) {
   return readFile(file, "utf8");
 }
 
-function runWithInput(file, input, env) {
+function runWithInput(file, input, env, args = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(file, [], { env });
+    const child = spawn(file, args, { env });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -52,34 +52,45 @@ describe("agent-feedback-loop package", () => {
     await install({ home, dryRun: false });
 
     const promptFile = path.join(home, ".agent", "feedback-loop", "prompts", "reflection-agent.md");
-    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
-    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
     const codexConfig = path.join(home, ".codex", "config.toml");
     const claudeSettings = path.join(home, ".claude", "settings.json");
+    const geminiSettings = path.join(home, ".gemini", "settings.json");
 
     assert.match(await readText(promptFile), /user_misunderstanding/);
-    assert.equal((await stat(codexHook)).mode & 0o111, 0o111);
-    assert.equal((await stat(claudeHook)).mode & 0o111, 0o111);
+    assert.match(await readText(promptFile), /默认使用中文/);
+    assert.match(await readText(promptFile), /用户明确选择的语言/);
+    assert.match(await readText(promptFile), /background reflection subagent/);
+    assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
-    assert.match(await readText(codexConfig), /codex-hook\.sh/);
+    assert.match(await readText(codexConfig), /core-hook\.sh/);
+    assert.match(await readText(codexConfig), /--continue/);
 
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
-    assert.ok(userPromptHooks.some((hook) => hook.command?.includes("claude-hook.sh")));
+    assert.ok(userPromptHooks.some((hook) => hook.command?.includes("core-hook.sh")));
     assert.equal(userPromptHooks.some((hook) => hook.type === "agent"), false);
+
+    const gemini = JSON.parse(await readText(geminiSettings));
+    const beforeAgentHooks = gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks);
+    assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("core-hook.sh")));
+    assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("--event BeforeAgent")));
 
     const health = await doctor({ home });
     assert.equal(health.healthy, true);
-    assert.equal(health.codex.connected, true);
-    assert.equal(health.claude.commandHookConnected, true);
-    assert.equal(health.claude.agentPromptConnected, false);
+    assert.equal(health.clis.codex.connected, true);
+    assert.equal(health.clis.claude.connected, true);
+    assert.equal(health.clis.gemini.connected, true);
 
     await uninstall({ home, dryRun: false, removeFiles: false });
 
     assert.doesNotMatch(await readText(codexConfig), /agent-feedback-loop:start/);
     const settingsAfter = JSON.parse(await readText(claudeSettings));
-    const hooksAfter = settingsAfter.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
-    assert.equal(hooksAfter.some((hook) => hook.command?.includes("claude-hook.sh")), false);
+    const hooksAfter = (settingsAfter.hooks.UserPromptSubmit || []).flatMap((entry) => entry.hooks);
+    assert.equal(hooksAfter.some((hook) => hook.command?.includes("core-hook.sh")), false);
+    const geminiAfter = JSON.parse(await readText(geminiSettings));
+    const beforeAfter = (geminiAfter.hooks.BeforeAgent || []).flatMap((entry) => entry.hooks);
+    assert.equal(beforeAfter.some((hook) => hook.command?.includes("core-hook.sh")), false);
   });
 
   it("dry-run install reports actions without writing files", async () => {
@@ -91,51 +102,97 @@ describe("agent-feedback-loop package", () => {
     await assert.rejects(stat(path.join(home, ".agent", "feedback-loop")));
   });
 
-  it("shell hooks emit non-blocking CLI-specific JSON", async () => {
+  it("install removes legacy per-CLI hooks left over from older versions", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
 
-    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
-    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
+    const hookDir = path.join(home, ".agent", "feedback-loop", "hooks");
+    const legacyCodex = path.join(hookDir, "codex-hook.sh");
+    const legacyClaude = path.join(hookDir, "claude-hook.sh");
+    // Simulate an upgrade from <=0.1.x where these still sit on disk.
+    await writeFile(legacyCodex, "#!/bin/sh\n", "utf8");
+    await writeFile(legacyClaude, "#!/bin/sh\n", "utf8");
+
+    const result = await install({ home, dryRun: false });
+
+    await assert.rejects(stat(legacyCodex));
+    await assert.rejects(stat(legacyClaude));
+    assert.ok(result.actions.some((a) => a.includes("remove legacy hook") && a.includes("codex-hook.sh")));
+    // core hook must survive the cleanup
+    assert.equal((await stat(path.join(hookDir, "core-hook.sh"))).mode & 0o111, 0o111);
+  });
+
+  it("core hook emits non-blocking CLI-specific JSON", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
     const payload = JSON.stringify({ prompt: "严重问题，每次你都漏上下文" });
 
-    const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
-    assert.equal(JSON.parse(codex.stdout).continue, true);
-    assert.match(codex.stdout, /released_agent_ids/);
-
-    const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
-    const claudeJson = JSON.parse(claude.stdout);
-    assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-    assert.match(claudeJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
-  });
-
-  it("shell hooks inject a semantic gate for normal prompts", async () => {
-    const home = await tempHome();
-    await install({ home, dryRun: false });
-
-    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
-    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
-    const payload = JSON.stringify({ prompt: "Please summarize the README in two bullets." });
-
-    const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
+    const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
     const codexJson = JSON.parse(codex.stdout);
     assert.equal(codexJson.continue, true);
-    assert.match(codexJson.systemMessage, /Feedback gate/);
-    assert.doesNotMatch(codexJson.systemMessage, /Feedback reflection triggered/);
+    assert.equal(codexJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /released_agent_ids/);
 
-    const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
+    const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
     const claudeJson = JSON.parse(claude.stdout);
+    assert.equal(claudeJson.continue, undefined);
     assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-    assert.match(claudeJson.hookSpecificOutput.additionalContext, /Feedback gate/);
-    assert.doesNotMatch(claudeJson.hookSpecificOutput.additionalContext, /Feedback reflection triggered/);
+    assert.match(claudeJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
+
+    const gemini = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "BeforeAgent"]);
+    const geminiJson = JSON.parse(gemini.stdout);
+    assert.equal(geminiJson.continue, undefined);
+    assert.equal(geminiJson.hookSpecificOutput.hookEventName, "BeforeAgent");
+    assert.match(geminiJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
   });
 
-  it("shell hooks inject a semantic gate for implicit dissatisfaction in multiple languages", async () => {
+  it("core hook forces reflection for live incident and explicit self-reflection wording", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
 
-    const codexHook = path.join(home, ".agent", "feedback-loop", "hooks", "codex-hook.sh");
-    const claudeHook = path.join(home, ".agent", "feedback-loop", "hooks", "claude-hook.sh");
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const prompts = [
+      "这次是很严重的现场事故，为什么没有触发自我反思？",
+      "你调用agent-feedback-loop去反思了吗，这次是这么严重的现场事故",
+      "为什么不触发自我反思"
+    ];
+
+    for (const prompt of prompts) {
+      const codex = await runWithInput(coreHook, JSON.stringify({ prompt }), { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
+      const codexContext = JSON.parse(codex.stdout).hookSpecificOutput.additionalContext;
+      assert.match(codexContext, /反馈反思已触发/);
+      assert.match(codexContext, /background reflection subagent/);
+      assert.match(codexContext, /后台模式，不要暂停当前工作/);
+    }
+  });
+
+  it("core hook injects a semantic gate for normal prompts", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const payload = JSON.stringify({ prompt: "Please summarize the README in two bullets." });
+
+    const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
+    const codexJson = JSON.parse(codex.stdout);
+    assert.equal(codexJson.continue, true);
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /反馈检查/);
+    assert.doesNotMatch(codexJson.hookSpecificOutput.additionalContext, /反馈反思已触发/);
+
+    const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
+    const claudeJson = JSON.parse(claude.stdout);
+    assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(claudeJson.hookSpecificOutput.additionalContext, /反馈检查/);
+    assert.doesNotMatch(claudeJson.hookSpecificOutput.additionalContext, /反馈反思已触发/);
+  });
+
+  it("core hook injects a semantic gate for implicit dissatisfaction in multiple languages", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
     const prompts = [
       "这里显示也是呀只显示数字不明显，就不能有点设计性？让这些东西显示明显点，以后这种页面的这种都要调用设计性的skill类似front-desgin等等",
       "为什么当时做文档的时候没考虑要用术语呢，mode AB让别人怎么理解，这种问题以后不要再出现",
@@ -145,29 +202,28 @@ describe("agent-feedback-loop package", () => {
     for (const prompt of prompts) {
       const payload = JSON.stringify({ prompt });
 
-      const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
-      assert.match(codex.stdout, /Feedback gate/);
+      const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
+      assert.match(codex.stdout, /反馈检查/);
 
-      const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
-      assert.match(claude.stdout, /Feedback gate/);
+      const gemini = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "BeforeAgent"]);
+      assert.match(gemini.stdout, /反馈检查/);
     }
   });
 
-  it("shell hooks fail open when shared trigger rules are missing", async () => {
+  it("core hook fails open when shared trigger rules are missing", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
 
     const hookDir = path.join(home, ".agent", "feedback-loop", "hooks");
-    const codexHook = path.join(hookDir, "codex-hook.sh");
-    const claudeHook = path.join(hookDir, "claude-hook.sh");
+    const coreHook = path.join(hookDir, "core-hook.sh");
     await rm(path.join(hookDir, "trigger-rules.sh"));
 
     const payload = JSON.stringify({ prompt: "这里显示太差了，重做" });
 
-    const codex = await runWithInput(codexHook, payload, { ...process.env, HOME: home });
+    const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
     assert.equal(JSON.parse(codex.stdout).continue, true);
 
-    const claude = await runWithInput(claudeHook, payload, { ...process.env, HOME: home });
+    const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
     assert.deepEqual(JSON.parse(claude.stdout), {});
   });
 
