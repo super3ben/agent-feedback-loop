@@ -31,7 +31,9 @@ const CLIS = [
     configKey: "codexConfig",
     configPath: [".codex", "config.toml"],
     hookEvent: "UserPromptSubmit",
-    hookArgs: ["--event", "UserPromptSubmit", "--continue"]
+    hookArgs: ["--event", "UserPromptSubmit", "--continue"],
+    stopEvent: "Stop",
+    stopArgs: ["--mode", "codex"]
   },
   {
     id: "claude",
@@ -40,7 +42,9 @@ const CLIS = [
     configKey: "claudeSettings",
     configPath: [".claude", "settings.json"],
     hookEvent: "UserPromptSubmit",
-    hookArgs: ["--event", "UserPromptSubmit"]
+    hookArgs: ["--event", "UserPromptSubmit"],
+    stopEvent: "Stop",
+    stopArgs: ["--mode", "claude"]
   },
   {
     id: "gemini",
@@ -49,7 +53,9 @@ const CLIS = [
     configKey: "geminiSettings",
     configPath: [".gemini", "settings.json"],
     hookEvent: "BeforeAgent",
-    hookArgs: ["--event", "BeforeAgent"]
+    hookArgs: ["--event", "BeforeAgent"],
+    stopEvent: "AfterAgent",
+    stopArgs: ["--mode", "gemini"]
   }
 ];
 
@@ -61,6 +67,7 @@ export function pathsFor(home = os.homedir()) {
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
     coreHook: path.join(packRoot, "hooks", "core-hook.sh"),
+    stopHook: path.join(packRoot, "hooks", "stop-hook.sh"),
     triggerRules: path.join(packRoot, "hooks", "trigger-rules.sh"),
     // Per-CLI hooks from <=0.1.x, replaced by the single core-hook.sh.
     // Deleted on install/uninstall so stale copies can't confuse the model.
@@ -75,9 +82,14 @@ export function pathsFor(home = os.homedir()) {
   return paths;
 }
 
-// Full shell command a CLI config should invoke for this hook.
+// Full shell command a CLI config should invoke for the prompt-time hook.
 function hookCommand(paths, cli) {
   return [paths.coreHook, ...cli.hookArgs].join(" ");
+}
+
+// Full shell command for the post-turn backstop hook.
+function stopCommand(paths, cli) {
+  return [paths.stopHook, ...cli.stopArgs].join(" ");
 }
 
 async function exists(file) {
@@ -135,40 +147,48 @@ function removeMarkedCodexBlock(text) {
 function codexHookBlock(paths, cli) {
   return [
     CODEX_MARKER_START,
-    "[[hooks.UserPromptSubmit]]",
+    `[[hooks.${cli.hookEvent}]]`,
     "",
-    "[[hooks.UserPromptSubmit.hooks]]",
+    `[[hooks.${cli.hookEvent}.hooks]]`,
     'type = "command"',
     `command = ${tomlString(hookCommand(paths, cli))}`,
     "timeout = 2",
     'statusMessage = "Injecting feedback reflection prompt"',
+    "",
+    `[[hooks.${cli.stopEvent}]]`,
+    "",
+    `[[hooks.${cli.stopEvent}.hooks]]`,
+    'type = "command"',
+    `command = ${tomlString(stopCommand(paths, cli))}`,
+    "timeout = 5",
+    'statusMessage = "Checking feedback reflection backstop"',
     CODEX_MARKER_END
   ].join("\n");
 }
 
 // Remove our managed entries for a given JSON-config CLI (Claude/Gemini).
-// Matches by event key + the core-hook path appearing in command, so it cleans
-// both the current core-hook wiring and any legacy per-CLI hook commands.
+// Cleans both the prompt-time hook (hookEvent) and the backstop (stopEvent),
+// matching our hook paths plus legacy per-CLI hook commands.
 function removeJsonHookEntries(settings, paths, cli) {
-  const event = cli.hookEvent;
-  const hooks = settings.hooks?.[event];
-  if (!Array.isArray(hooks)) return settings;
-  settings.hooks[event] = hooks
-    .map((entry) => {
-      if (!entry || !Array.isArray(entry.hooks)) return entry;
-      return {
-        ...entry,
-        hooks: entry.hooks.filter((hook) => {
-          const command = typeof hook.command === "string" ? hook.command : "";
-          const prompt = typeof hook.prompt === "string" ? hook.prompt : "";
-          return !command.includes(paths.coreHook)
-            && !command.includes("codex-hook.sh")
-            && !command.includes("claude-hook.sh")
-            && !prompt.includes(paths.promptFile);
-        })
-      };
-    })
-    .filter((entry) => !entry || !Array.isArray(entry.hooks) || entry.hooks.length > 0);
+  const isOurs = (hook) => {
+    const command = typeof hook.command === "string" ? hook.command : "";
+    const prompt = typeof hook.prompt === "string" ? hook.prompt : "";
+    return command.includes(paths.coreHook)
+      || command.includes(paths.stopHook)
+      || command.includes("codex-hook.sh")
+      || command.includes("claude-hook.sh")
+      || prompt.includes(paths.promptFile);
+  };
+  for (const event of [cli.hookEvent, cli.stopEvent]) {
+    const hooks = settings.hooks?.[event];
+    if (!Array.isArray(hooks)) continue;
+    settings.hooks[event] = hooks
+      .map((entry) => {
+        if (!entry || !Array.isArray(entry.hooks)) return entry;
+        return { ...entry, hooks: entry.hooks.filter((hook) => !isOurs(hook)) };
+      })
+      .filter((entry) => !entry || !Array.isArray(entry.hooks) || entry.hooks.length > 0);
+  }
   return settings;
 }
 
@@ -196,6 +216,7 @@ async function writePromptPack(paths, dryRun, actions) {
   await mkdir(path.dirname(paths.packRoot), { recursive: true });
   await cp(TEMPLATE_ROOT, paths.packRoot, { recursive: true });
   await chmod(paths.coreHook, 0o755);
+  await chmod(paths.stopHook, 0o755);
   // cp does not delete files absent from templates, so pre-0.2 per-CLI hooks
   // linger after an upgrade. Remove them explicitly.
   await removeLegacyHooks(paths, dryRun, actions);
@@ -223,15 +244,15 @@ async function installJsonHooks(paths, cli, dryRun, actions) {
   settings.hooks[cli.hookEvent] = settings.hooks[cli.hookEvent] || [];
   settings.hooks[cli.hookEvent].push({
     matcher: "",
-    hooks: [
-      {
-        type: "command",
-        command: hookCommand(paths, cli),
-        timeout: 2
-      }
-    ]
+    hooks: [{ type: "command", command: hookCommand(paths, cli), timeout: 2 }]
+  });
+  settings.hooks[cli.stopEvent] = settings.hooks[cli.stopEvent] || [];
+  settings.hooks[cli.stopEvent].push({
+    matcher: "",
+    hooks: [{ type: "command", command: stopCommand(paths, cli), timeout: 5 }]
   });
   actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
+  actions.push(`connect ${cli.label} backstop -> ${paths.stopHook}`);
   if (!dryRun) {
     await mkdir(path.dirname(configFile), { recursive: true });
     await writeFile(configFile, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
@@ -312,8 +333,10 @@ export async function doctor(options = {}) {
     prompt: await exists(paths.promptFile),
     rule: await exists(paths.ruleFile),
     coreHook: await exists(paths.coreHook),
+    stopHook: await exists(paths.stopHook),
     triggerRules: await exists(paths.triggerRules),
-    coreHookExecutable: await isExecutable(paths.coreHook)
+    coreHookExecutable: await isExecutable(paths.coreHook),
+    stopHookExecutable: await isExecutable(paths.stopHook)
   };
 
   const clis = {};
@@ -321,8 +344,12 @@ export async function doctor(options = {}) {
     const configFile = paths[cli.configKey];
     if (cli.format === "toml") {
       const text = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
+      const promptConnected = text.includes(paths.coreHook);
+      const backstopConnected = text.includes(paths.stopHook);
       clis[cli.id] = {
-        connected: text.includes(paths.coreHook),
+        connected: promptConnected && backstopConnected,
+        promptConnected,
+        backstopConnected,
         managedBlock: text.includes(CODEX_MARKER_START)
       };
     } else {
@@ -332,11 +359,15 @@ export async function doctor(options = {}) {
       } catch {
         settings = {};
       }
-      const entries = Array.isArray(settings.hooks?.[cli.hookEvent])
-        ? settings.hooks[cli.hookEvent].flatMap((entry) => (Array.isArray(entry.hooks) ? entry.hooks : []))
-        : [];
+      const cmds = (event) => (Array.isArray(settings.hooks?.[event])
+        ? settings.hooks[event].flatMap((entry) => (Array.isArray(entry.hooks) ? entry.hooks : []))
+        : []).map((hook) => (typeof hook.command === "string" ? hook.command : ""));
+      const promptConnected = cmds(cli.hookEvent).some((c) => c.includes(paths.coreHook));
+      const backstopConnected = cmds(cli.stopEvent).some((c) => c.includes(paths.stopHook));
       clis[cli.id] = {
-        connected: entries.some((hook) => typeof hook.command === "string" && hook.command.includes(paths.coreHook))
+        connected: promptConnected && backstopConnected,
+        promptConnected,
+        backstopConnected
       };
     }
   }

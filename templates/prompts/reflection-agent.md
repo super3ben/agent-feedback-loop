@@ -42,6 +42,16 @@ Return a concise report with:
 - confidence: low, medium, or high;
 - released_agent_ids.
 
+## Completion Marker (required)
+
+After the report, the main agent must output one line in its turn reply:
+
+```
+<!--afl-reflection:done responsibility=<the chosen responsibility>-->
+```
+
+This is a machine-verifiable receipt. A post-turn backstop hook (`Stop` / `AfterAgent`) greps for it; if reflection was required this turn but the marker is missing, the backstop forces one more turn. Do not omit it, and do not emit it unless reflection was actually performed.
+
 ## Rule Boundaries
 
 Only `agent_fault` may produce a strong rule.

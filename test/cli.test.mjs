@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -65,16 +65,23 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
     assert.match(await readText(codexConfig), /core-hook\.sh/);
     assert.match(await readText(codexConfig), /--continue/);
+    // backstop: Codex Stop hook wired to stop-hook.sh
+    assert.match(await readText(codexConfig), /\[\[hooks\.Stop\]\]/);
+    assert.match(await readText(codexConfig), /stop-hook\.sh --mode codex/);
 
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
     assert.ok(userPromptHooks.some((hook) => hook.command?.includes("core-hook.sh")));
     assert.equal(userPromptHooks.some((hook) => hook.type === "agent"), false);
+    const claudeStop = settings.hooks.Stop.flatMap((entry) => entry.hooks);
+    assert.ok(claudeStop.some((hook) => hook.command?.includes("stop-hook.sh --mode claude")));
 
     const gemini = JSON.parse(await readText(geminiSettings));
     const beforeAgentHooks = gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks);
     assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("core-hook.sh")));
     assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("--event BeforeAgent")));
+    const geminiAfterAgent = gemini.hooks.AfterAgent.flatMap((entry) => entry.hooks);
+    assert.ok(geminiAfterAgent.some((hook) => hook.command?.includes("stop-hook.sh --mode gemini")));
 
     const health = await doctor({ home });
     assert.equal(health.healthy, true);
@@ -91,6 +98,87 @@ describe("agent-feedback-loop package", () => {
     const geminiAfter = JSON.parse(await readText(geminiSettings));
     const beforeAfter = (geminiAfter.hooks.BeforeAgent || []).flatMap((entry) => entry.hooks);
     assert.equal(beforeAfter.some((hook) => hook.command?.includes("core-hook.sh")), false);
+    // backstop cleaned too
+    assert.doesNotMatch(await readText(codexConfig), /stop-hook\.sh/);
+    const stopAfter = (settingsAfter.hooks.Stop || []).flatMap((entry) => entry.hooks);
+    assert.equal(stopAfter.some((hook) => hook.command?.includes("stop-hook.sh")), false);
+    const afterAgentAfter = (geminiAfter.hooks.AfterAgent || []).flatMap((entry) => entry.hooks);
+    assert.equal(afterAgentAfter.some((hook) => hook.command?.includes("stop-hook.sh")), false);
+  });
+
+  it("core hook writes a per-turn marker on forced reflection, gate defers to the model", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-mk-"));
+    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+
+    // forced (shell word match) -> shell touches the marker file
+    await runWithInput(coreHook, JSON.stringify({ session_id: "s1", turn_id: 1, prompt: "严重问题" }), env, ["--event", "UserPromptSubmit", "--continue"]);
+    await stat(path.join(tmp, "afl-reflect", "s1.1.required"));
+
+    // gate (normal-but-maybe-unhappy) -> shell does NOT touch; injects touch instruction for the model
+    const gate = await runWithInput(coreHook, JSON.stringify({ session_id: "s1", turn_id: 2, prompt: "summarize" }), env, ["--event", "UserPromptSubmit"]);
+    const ctx = JSON.parse(gate.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /touch/);
+    assert.match(ctx, /s1\.2\.required/);
+    assert.match(ctx, /afl-reflection:done/);
+    await assert.rejects(stat(path.join(tmp, "afl-reflect", "s1.2.required")));
+  });
+
+  it("stop hook backstop: blocks when required-but-not-done, passes otherwise, guards loops", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const stopHook = path.join(home, ".agent", "feedback-loop", "hooks", "stop-hook.sh");
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-stop-"));
+    const mdir = path.join(tmp, "afl-reflect");
+    await mkdir(mdir, { recursive: true });
+    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+    const marker = path.join(mdir, "s1.1.required");
+
+    // no marker -> pass
+    const noMark = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1 }), env, ["--mode", "codex"]);
+    assert.equal(JSON.parse(noMark.stdout).continue, true);
+
+    // required + no done marker -> block (Codex strict: no hookSpecificOutput)
+    await writeFile(marker, "");
+    const blocked = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "我把bug修了" }), env, ["--mode", "codex"]);
+    const blockedJson = JSON.parse(blocked.stdout);
+    assert.equal(blockedJson.decision, "block");
+    assert.ok(blockedJson.reason && blockedJson.reason.length > 0);
+    assert.equal(blockedJson.hookSpecificOutput, undefined);
+
+    // required + done marker present in reply -> pass and clean up marker
+    await writeFile(marker, "");
+    const done = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault-->" }), env, ["--mode", "codex"]);
+    assert.equal(JSON.parse(done.stdout).continue, true);
+    await assert.rejects(stat(marker));
+
+    // loop guard: stop_hook_active=true -> pass even if required and not done
+    await writeFile(marker, "");
+    const guarded = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, stop_hook_active: true, last_assistant_message: "still nothing" }), env, ["--mode", "codex"]);
+    assert.equal(JSON.parse(guarded.stdout).continue, true);
+  });
+
+  it("stop hook gemini mode denies once then passes via file counter (0.30.0 loop-guard bug workaround)", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const stopHook = path.join(home, ".agent", "feedback-loop", "hooks", "stop-hook.sh");
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-gem-"));
+    const mdir = path.join(tmp, "afl-reflect");
+    await mkdir(mdir, { recursive: true });
+    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+    const marker = path.join(mdir, "g1.1.required");
+    const payload = JSON.stringify({ session_id: "g1", turn_id: 1 });
+
+    await writeFile(marker, "");
+    const first = await runWithInput(stopHook, payload, env, ["--mode", "gemini"]);
+    assert.equal(JSON.parse(first.stdout).decision, "deny");
+
+    // second time: retries file exists -> pass (no infinite loop)
+    await writeFile(marker, "");
+    const second = await runWithInput(stopHook, payload, env, ["--mode", "gemini"]);
+    assert.deepEqual(JSON.parse(second.stdout), {});
   });
 
   it("dry-run install reports actions without writing files", async () => {

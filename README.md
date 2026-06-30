@@ -94,11 +94,11 @@ agent-feedback-loop doctor
 
 1. Copy the prompt pack to `~/.agent/feedback-loop`.
 2. Back up `~/.codex/config.toml`, `~/.claude/settings.json`, and `~/.gemini/settings.json` if they exist.
-3. Connect a Codex `UserPromptSubmit` hook.
-4. Connect a Claude Code `UserPromptSubmit` hook.
-5. Connect a Gemini CLI `BeforeAgent` hook.
+3. Connect a Codex `UserPromptSubmit` hook + a `Stop` backstop.
+4. Connect a Claude Code `UserPromptSubmit` hook + a `Stop` backstop.
+5. Connect a Gemini CLI `BeforeAgent` hook + an `AfterAgent` backstop.
 
-All three CLIs are wired to one shared `core-hook.sh`; each entry just passes the flags that CLI needs.
+The prompt-time hooks share one `core-hook.sh`; the backstops share one `stop-hook.sh`. Each entry just passes the flags that CLI needs.
 
 ## Screenshots
 
@@ -150,6 +150,7 @@ agent-feedback-loop paths
 ~/.agent/feedback-loop/
   hooks/
     core-hook.sh
+    stop-hook.sh
     trigger-rules.sh
   prompts/
     reflection-agent.md
@@ -173,11 +174,26 @@ Backups are created before config changes:
 ~/.gemini/settings.json.backup-YYYYMMDDHHMMSS
 ```
 
+## Two Layers: Soft Gate + Hard Backstop
+
+Deciding "does this turn warrant reflection?" can never be 100% reliable up front — a semantic gate can misjudge, and a keyword list can never be exhaustive (you can always phrase dissatisfaction a new way). So coverage does not rely on getting that one judgment perfect. There are two layers:
+
+**Layer 1 — soft gate (prompt time, `core-hook.sh`).** Every prompt gets a short semantic gate asking the model to reflect when the message shows dissatisfaction, correction, repeated failure, or process criticism (`怎么又…` / "why again" phrasing counts). When reflection is warranted, the marker for "this turn requires reflection" is written two ways: the model writes it (semantic long tail, no word list), and the shell writes it on an unmistakable keyword match (`critical`, `blocker`, `现场事故`, …). The keyword list is intentionally tiny — it is a hard-trigger floor, not a coverage mechanism.
+
+**Layer 2 — hard backstop (turn end, `stop-hook.sh`).** After the model replies, a `Stop` (Codex/Claude) or `AfterAgent` (Gemini) hook checks two deterministic things — never re-doing the semantic judgment in shell:
+
+- **Was reflection required?** → the per-turn marker file from Layer 1 exists.
+- **Did the model reflect?** → the reply contains the receipt line `<!--afl-reflection:done responsibility=...-->`.
+
+If required but the receipt is missing, the backstop forces exactly one continuation turn telling the model to reflect. A loop guard (`stop_hook_active`, or a file counter on Gemini where that flag is broken in 0.30.0) ensures it blocks at most once.
+
+**Honest boundary:** the guarantee is only as good as "did Layer 1 mark the turn." The shell-keyword path is a hard guarantee; the model-written marker is still soft (the model might miss it). The backstop turns "reflection silently skipped" from undetectable into mostly-caught — it does not make detection perfect.
+
 ## Reflection Contract
 
 Hooks inject a short semantic feedback gate on every prompt. The gate asks the active model to inspect the latest user message in any language and only run reflection when it expresses dissatisfaction, correction, repeated failure, process criticism, or a future prevention rule/preference.
 
-The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language such as `critical`, `blocker`, `非常不满意`, `严重问题`, `现场事故`, or `自我反思`. It does not try to enumerate every Chinese or English dissatisfaction phrase.
+The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language such as `critical`, `blocker`, `非常不满意`, `严重问题`, `现场事故`, or `自我反思`. It does not try to enumerate every Chinese or English dissatisfaction phrase — the backstop, not a bigger word list, is what catches the long tail.
 
 Reflection reports default to Chinese unless the user explicitly selected another language in the current request or setup.
 
@@ -265,6 +281,15 @@ Agent Feedback Loop 是一套面向 Codex、Claude Code 和 Gemini CLI 的“提
 当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会在**后台**反思:先给用户一句“已识别到重大问题、反思已在后台启动”的可见提示,然后**继续处理当前的修复**——反思不打断用户的补救。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
 
 hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`。它不再维护大规模中英文触发词表。
+
+### 两层防护:软 gate + 硬兜底
+
+"这轮该不该反思"这个判断永远做不到 100% 准——语义 gate 会误判,词表也永远列不全(不满总能有新说法)。所以覆盖**不依赖把这个判断做到完美**,而是分两层:
+
+- **第一层 软 gate(提示时,`core-hook.sh`)**:每轮注入语义 gate,让模型在不满/纠错/重复出错/流程质疑("怎么又…"也算)时反思。判定要反思时,"本轮要反思"的标记**双写**:模型写(覆盖语义长尾,无需词表)+ shell 命中极小硬词表时写(`critical`/`现场事故` 等)。词表只是无歧义硬触发的地板,不再用来追求覆盖。
+- **第二层 硬兜底(回合结束,`stop-hook.sh`)**:模型答完后,`Stop`(Codex/Claude)/`AfterAgent`(Gemini)hook 做两个**确定性**检查(绝不在 shell 里重做语义判断):① 本轮该反思吗 → 第一层的标记文件在不在;② 模型反思了吗 → 回复里有没有凭据行 `<!--afl-reflection:done responsibility=...-->`。**该反思却没凭据 → 强制重来一轮**,防死循环保证只打回一次。
+
+**诚实边界**:保证强度 = 第一层有没有标记上。shell 硬词那条是硬保证,模型自己写标记那条仍是软的(可能漏)。兜底把"反思被悄悄跳过"从不可察变成大部分能抓——但不等于 100%。
 
 反思报告默认使用中文；如果用户在接入或当前请求里明确指定其他语言，则按用户选择的语言输出。
 

@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# Marker needle the Stop/AfterAgent backstop greps for in the model reply.
+# Reflection must end its report with: <!--afl-reflection:done responsibility=...-->
+AFL_DONE_MARKER='<!--afl-reflection:done'
+
 agent_feedback_contains() {
   printf '%s' "$1" | grep -Eiq "$2"
 }
@@ -16,12 +20,35 @@ agent_feedback_should_force_reflect() {
   return 1
 }
 
+# Directory holding per-turn reflection markers.
+agent_feedback_marker_dir() {
+  printf '%s/afl-reflect' "${TMPDIR:-/tmp}"
+}
+
+# Path of the "this turn requires reflection" marker for a session+turn.
+# Both args are sanitized to a safe filename; empty values degrade to "_".
+agent_feedback_marker_path() {
+  session="$(printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_')"
+  turn="$(printf '%s' "${2:-}" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -n "$session" ] || session="_"
+  [ -n "$turn" ] || turn="_"
+  printf '%s/%s.%s.required' "$(agent_feedback_marker_dir)" "$session" "$turn"
+}
+
 agent_feedback_gate_message() {
   prompt_file="$1"
-  printf '反馈检查：请语义检查最新用户消息。如果消息表达不满、纠错、重复失败、流程质疑，或要求未来防复发规则，请遵循 %s；否则忽略本检查并正常回答。反思报告默认使用中文，除非用户明确选择其他语言。' "$prompt_file"
+  marker_path="$2"
+  printf '反馈检查：请语义检查最新用户消息。如果消息表达不满、纠错、重复失败、流程质疑，或要求未来防复发规则（例如“怎么又/为什么还/又…了/不要再”这类重复出错或不满的口吻也算），你必须：(a) 先执行 `touch %s` 标记本轮需要反思；(b) 遵循 %s 完成反思；(c) 在本轮回复结尾输出一行 `%s responsibility=<分类>-->` 作为机器可校验的完成凭据。否则忽略本检查并正常回答。反思报告默认使用中文，除非用户明确选择其他语言。' "$marker_path" "$prompt_file" "$AFL_DONE_MARKER"
 }
 
 agent_feedback_reflection_message() {
   prompt_file="$1"
-  printf '反馈反思已触发（后台模式，不要暂停当前工作）。请按顺序：(1) 先给用户一行可见提示，说明已识别到本次重大问题、反思已在后台启动，你会继续处理当前任务；(2) 立即启动一个独立的 background reflection subagent，把 %s 和当前上下文交给它；(3) 不要等待该 subagent，继续推进用户当前的修复/补救或其他请求；(4) 当 subagent 报告就绪后，再异步把结论摘要补充给用户，主会话不要用自己未经支撑的反思替代该报告。反思报告默认使用中文，除非用户明确选择其他语言。必须分类责任为 agent_fault、user_misunderstanding、shared_ambiguity、external_limit 或 insufficient_evidence。消费报告后关闭/释放已完成的反思 subagent，并记录 released_agent_ids。项目规则写入 .agent/rules/feedback-loop.md；只有 Blocker + agent_fault + 跨项目证据才可提升为全局规则。' "$prompt_file"
+  printf '反馈反思已触发（后台模式，不要暂停当前工作）。请按顺序：(1) 先给用户一行可见提示，说明已识别到本次重大问题、反思已在后台启动，你会继续处理当前任务；(2) 立即启动一个独立的 background reflection subagent，把 %s 和当前上下文交给它；(3) 不要等待该 subagent，继续推进用户当前的修复/补救或其他请求；(4) 当 subagent 报告就绪后，再异步把结论摘要补充给用户，主会话不要用自己未经支撑的反思替代该报告。反思报告默认使用中文，除非用户明确选择其他语言。必须分类责任为 agent_fault、user_misunderstanding、shared_ambiguity、external_limit 或 insufficient_evidence。完成反思后必须在回复结尾输出一行 `%s responsibility=<分类>-->` 作为机器可校验凭据。消费报告后关闭/释放已完成的反思 subagent，并记录 released_agent_ids。项目规则写入 .agent/rules/feedback-loop.md；只有 Blocker + agent_fault + 跨项目证据才可提升为全局规则。' "$prompt_file" "$AFL_DONE_MARKER"
+}
+
+# Continuation prompt the Stop/AfterAgent backstop sends when reflection was
+# required this turn but the done-marker is missing.
+agent_feedback_stop_reason() {
+  prompt_file="$1"
+  printf '检测到本轮要求反思但未见反思完成标记。请立即遵循 %s 完成反思（分类责任为 agent_fault/user_misunderstanding/shared_ambiguity/external_limit/insufficient_evidence），并在回复结尾输出一行 `%s responsibility=<分类>-->`。' "$prompt_file" "$AFL_DONE_MARKER"
 }

@@ -35,10 +35,24 @@ fi
 
 . "$HOOK_DIR/trigger-rules.sh"
 
+# Extract a top-level field from the JSON payload without jq.
+# Handles both "name":"value" and "name":123 forms.
+afl_json_field() {
+  printf '%s' "$payload" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\).*/\1/p' | head -n1
+}
+
+session_id="$(afl_json_field session_id)"
+turn_id="$(afl_json_field turn_id)"
+marker_path="$(agent_feedback_marker_path "$session_id" "$turn_id")"
+
 if agent_feedback_should_force_reflect "$payload"; then
+  # Judgment 1 (shell write): unambiguous strong feedback -> mark this turn.
+  mkdir -p "$(agent_feedback_marker_dir)" 2>/dev/null || true
+  : > "$marker_path" 2>/dev/null || true
   message="$(agent_feedback_reflection_message "$PROMPT_FILE")"
 else
-  message="$(agent_feedback_gate_message "$PROMPT_FILE")"
+  # Semantic gate: model self-judges and writes the marker itself if needed.
+  message="$(agent_feedback_gate_message "$PROMPT_FILE" "$marker_path")"
 fi
 
 cat <<JSON
