@@ -10,11 +10,18 @@ Do not assume user anger means the agent was wrong.
 
 If the user explicitly chose another language for reflection reports during setup or in the current request, use the 用户明确选择的语言 instead.
 
-## Role Boundary
+## Delivery (default: write to a file, keep the turn short)
 
-You are the background reflection subagent, not the main working agent.
+Reflection must not flood the main conversation. The full report is an artifact, not turn output.
 
-Reflection is non-blocking. The main agent starts you, then keeps working on the user's current remediation or other request without waiting for you. Once your report is ready, the main agent folds a short conclusion back to the user asynchronously, closes/releases you when the CLI supports it, and decides whether rules need changes. The main agent should not replace this report with its own unsupported reflection while a background reflection subagent can run.
+Default on every platform:
+
+1. Write the full report to `.agent/reflections/<YYYYMMDD-HHMMSS>-<short-slug>.md` in the project (create the `.agent/reflections/` directory if missing).
+2. In the turn reply, output **only**: one short line stating the issue was caught and where the reflection was saved, then the completion marker. Do **not** paste the full report into the conversation.
+
+Optional enhancement — only where the platform exposes a true background subagent (e.g. Claude Code's Task tool): the main agent may delegate the reflection to a background subagent so it runs without occupying the main thread. Even then, the report goes to the file and the turn reply stays to one line. Do not rely on backgrounding on platforms that lack it; the file-write default already keeps the main session clear.
+
+The main agent should not paste an unsupported inline reflection in place of writing the file.
 
 ## Responsibility
 

@@ -25,7 +25,7 @@ Agent Feedback Loop
 
 Prompt-first feedback reflection hooks for **Codex**, **Claude Code**, and **Gemini CLI**.
 
-Agent Feedback Loop makes an AI coding agent reflect in the **background** when the user says it repeatedly made mistakes, missed context, skipped required process, or caused strong dissatisfaction. The agent tells the user it noticed the major issue and started reflecting, but **keeps working on the fix** — reflection never blocks the user's remediation. It installs lightweight hooks that inject this reflection instruction into the model's context.
+Agent Feedback Loop makes an AI coding agent reflect when the user says it repeatedly made mistakes, missed context, skipped required process, or caused strong dissatisfaction. The full reflection is written to a file (`.agent/reflections/`) and the agent leaves only a one-line acknowledgement in the conversation, then **keeps working on the fix** — reflection never blocks the user's remediation and never floods the main session. It installs lightweight hooks that inject this reflection instruction into the model's context.
 
 The key design choice: **the reflection logic lives in Markdown, not in JavaScript or Python.**
 
@@ -208,9 +208,9 @@ When triggered, the prompt requires the agent to classify responsibility as exac
 It also requires:
 
 - evidence before rule changes;
-- when the platform exposes subagents, the main conversation must start one independent background reflection subagent before writing the full reflection itself;
-- if subagents are unavailable from the current surface, the agent must record that limitation before using main-conversation fallback reflection;
-- subagent close/release after reflection reports are consumed;
+- the full reflection written to `.agent/reflections/<timestamp>.md`, with only a one-line summary plus the completion marker left in the turn — the report is never pasted inline;
+- a true background subagent only as an optional enhancement where the platform exposes one (e.g. Claude Code's Task tool); the file-write default already keeps the main session clear everywhere else;
+- subagent close/release after reflection reports are consumed, when one was used;
 - `released_agent_ids` or an explicit CLI limitation note;
 - project-specific rules in `.agent/rules/feedback-loop.md`;
 - global promotion only for `Blocker + agent_fault + generalizable + cross-project evidence`.
@@ -278,7 +278,7 @@ node ./bin/agent-feedback-loop.mjs install --home /tmp/afl-home
 
 Agent Feedback Loop 是一套面向 Codex、Claude Code 和 Gemini CLI 的“提示词优先”自动反思机制。
 
-当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会在**后台**反思:先给用户一句“已识别到重大问题、反思已在后台启动”的可见提示,然后**继续处理当前的修复**——反思不打断用户的补救。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
+当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task)时可选择委托后台跑,但这只是增强,不是必需。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
 
 hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`。它不再维护大规模中英文触发词表。
 
@@ -297,7 +297,7 @@ hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常
 
 - 不启动后台服务。
 - 不用 JavaScript 调大模型。
-- shell hook 不能自己创建 Codex/Claude/Gemini 内部 subagent；它只注入硬性要求，当前 agent 必须在平台支持时启动后台反思 subagent。
+- shell hook 不能自己创建 Codex/Claude/Gemini 内部 subagent；它只注入硬性要求，当前 agent 默认把完整反思写进文件、回合只留一行，平台支持时才可选地用后台 subagent。
 - 不把反思逻辑写死在代码里。
 - hook 只负责注入短 gate 和极强信号兜底，Markdown prompt 负责完整反思流程。
 - 非程序员也可以直接维护 `reflection-agent.md` 和 `feedback-loop.md`。

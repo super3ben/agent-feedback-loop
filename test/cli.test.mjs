@@ -60,7 +60,7 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(promptFile), /user_misunderstanding/);
     assert.match(await readText(promptFile), /默认使用中文/);
     assert.match(await readText(promptFile), /用户明确选择的语言/);
-    assert.match(await readText(promptFile), /background reflection subagent/);
+    assert.match(await readText(promptFile), /\.agent\/reflections/);
     assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
     assert.match(await readText(codexConfig), /core-hook\.sh/);
@@ -251,8 +251,8 @@ describe("agent-feedback-loop package", () => {
       const codex = await runWithInput(coreHook, JSON.stringify({ prompt }), { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
       const codexContext = JSON.parse(codex.stdout).hookSpecificOutput.additionalContext;
       assert.match(codexContext, /反馈反思已触发/);
-      assert.match(codexContext, /background reflection subagent/);
-      assert.match(codexContext, /后台模式，不要暂停当前工作/);
+      assert.match(codexContext, /\.agent\/reflections/);
+      assert.match(codexContext, /不要暂停当前工作/);
     }
   });
 
