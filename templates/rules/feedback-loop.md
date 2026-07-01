@@ -22,9 +22,10 @@ Reflection must never block the user, and its full report must never flood the c
 3. Optional, only where the platform exposes a true background subagent (e.g. Claude Code's Task tool): delegate the reflection to a background subagent so it runs off the main thread. Even then, the report goes to the file and the turn stays to one line. Do not depend on backgrounding where it is unavailable — the file-write default already keeps the session clear.
 4. Classify responsibility as `agent_fault`, `user_misunderstanding`, `shared_ambiguity`, `external_limit`, or `insufficient_evidence`.
 5. If a background subagent was used, close/release it after consuming the report and record `released_agent_ids`.
-6. Only write a project rule when the finding is an `agent_fault` with evidence and a concrete future constraint.
+6. When the finding is an `agent_fault` with evidence, medium/high confidence, and a concrete future constraint, default directly write the project rule to `.agent/rules/feedback-loop.md`. Do not ask the user whether to write it. 中文会话也按同一规则：默认直接写入项目规则。
 7. Write project-specific rules to `.agent/rules/feedback-loop.md`, not to `AGENTS.md` or `CLAUDE.md`.
-8. Only promote to global personal rules for Blocker-level, generalizable, cross-project agent faults.
+8. Do not auto-write low-confidence, insufficient-evidence, or global personal rules; record the reason in the reflection report instead.
+9. Only promote to global personal rules for Blocker-level, generalizable, cross-project agent faults.
 
 ## Severity Policy
 

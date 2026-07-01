@@ -193,7 +193,7 @@ If required but the receipt is missing, the backstop forces exactly one continua
 
 Hooks inject a short semantic feedback gate on every prompt. The gate asks the active model to inspect the latest user message in any language and only run reflection when it expresses dissatisfaction, correction, repeated failure, process criticism, or a future prevention rule/preference.
 
-The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language such as `critical`, `blocker`, `非常不满意`, `严重问题`, `现场事故`, or `自我反思`. It does not try to enumerate every Chinese or English dissatisfaction phrase — the backstop, not a bigger word list, is what catches the long tail.
+The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language or explicit future-prevention preferences such as `critical`, `blocker`, `非常不满意`, `严重问题`, `现场事故`, `自我反思`, or `不要询问要不要/默认就要`. It does not try to enumerate every Chinese or English dissatisfaction phrase — the backstop, not a bigger word list, is what catches the long tail.
 
 Reflection reports default to Chinese unless the user explicitly selected another language in the current request or setup.
 
@@ -213,6 +213,7 @@ It also requires:
 - subagent close/release after reflection reports are consumed, when one was used;
 - `released_agent_ids` or an explicit CLI limitation note;
 - project-specific rules in `.agent/rules/feedback-loop.md`;
+- project rules are written by default, without asking again, when the finding is `agent_fault` with evidence, medium/high confidence, and a concrete future prevention constraint;
 - global promotion only for `Blocker + agent_fault + generalizable + cross-project evidence`.
 
 ## What It Does Not Do
@@ -280,7 +281,7 @@ Agent Feedback Loop 是一套面向 Codex、Claude Code 和 Gemini CLI 的“提
 
 当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task)时可选择委托后台跑,但这只是增强,不是必需。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
 
-hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`。它不再维护大规模中英文触发词表。
+hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`、`不要询问要不要/默认就要`。它不再维护大规模中英文触发词表。
 
 ### 两层防护:软 gate + 硬兜底
 
@@ -303,6 +304,7 @@ hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常
 - 非程序员也可以直接维护 `reflection-agent.md` 和 `feedback-loop.md`。
 - 子 agent 分析完必须关闭/释放，并记录 `released_agent_ids` 或说明 CLI 不支持释放。
 - 项目规则写到 `.agent/rules/feedback-loop.md`，避免 `AGENTS.md` / `CLAUDE.md` 无限膨胀。
+- 当结论是 `agent_fault` 且有证据、中高置信度、具备具体防复发约束时，项目规则默认直接写入，不再询问用户“要不要写”。
 
 ### 安装
 

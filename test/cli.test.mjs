@@ -61,6 +61,8 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(promptFile), /默认使用中文/);
     assert.match(await readText(promptFile), /用户明确选择的语言/);
     assert.match(await readText(promptFile), /\.agent\/reflections/);
+    assert.match(await readText(promptFile), /无需再询问用户是否写入/);
+    assert.match(await readText(path.join(home, ".agent", "feedback-loop", "rules", "feedback-loop.md")), /默认直接写入项目规则/);
     assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
     assert.match(await readText(codexConfig), /core-hook\.sh/);
@@ -124,6 +126,25 @@ describe("agent-feedback-loop package", () => {
     assert.match(ctx, /s1\.2\.required/);
     assert.match(ctx, /afl-reflection:done/);
     await assert.rejects(stat(path.join(tmp, "afl-reflect", "s1.2.required")));
+  });
+
+  it("core hook debug logs decisions without logging prompt content", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const env = { ...process.env, HOME: home, AGENT_FEEDBACK_LOOP_DEBUG: "1" };
+
+    const forced = await runWithInput(
+      coreHook,
+      JSON.stringify({ session_id: "s-debug", turn_id: 7, prompt: "严重问题：不要把这句完整写进日志" }),
+      env,
+      ["--event", "UserPromptSubmit", "--continue"]
+    );
+
+    assert.match(forced.stderr, /agent-feedback-loop: event=UserPromptSubmit decision=force/);
+    assert.match(forced.stderr, /session=s-debug/);
+    assert.match(forced.stderr, /turn=7/);
+    assert.doesNotMatch(forced.stderr, /不要把这句完整写进日志/);
   });
 
   it("stop hook backstop: blocks when required-but-not-done, passes otherwise, guards loops", async () => {
@@ -210,6 +231,20 @@ describe("agent-feedback-loop package", () => {
     assert.equal((await stat(path.join(hookDir, "core-hook.sh"))).mode & 0o111, 0o111);
   });
 
+  it("install removes stale prompt-pack tests left over from older versions", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const staleTests = path.join(home, ".agent", "feedback-loop", "tests");
+    await mkdir(staleTests, { recursive: true });
+    await writeFile(path.join(staleTests, "test_prompt_first_hooks.py"), "# stale legacy tests\n", "utf8");
+
+    const result = await install({ home, dryRun: false });
+
+    await assert.rejects(stat(staleTests));
+    assert.ok(result.actions.some((a) => a.includes("remove stale tests")));
+  });
+
   it("core hook emits non-blocking CLI-specific JSON", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
@@ -244,7 +279,8 @@ describe("agent-feedback-loop package", () => {
     const prompts = [
       "这次是很严重的现场事故，为什么没有触发自我反思？",
       "你调用agent-feedback-loop去反思了吗，这次是这么严重的现场事故",
-      "为什么不触发自我反思"
+      "为什么不触发自我反思",
+      "这种情况不要询问要不要，默认就要"
     ];
 
     for (const prompt of prompts) {

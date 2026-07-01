@@ -45,13 +45,22 @@ session_id="$(afl_json_field session_id)"
 turn_id="$(afl_json_field turn_id)"
 marker_path="$(agent_feedback_marker_path "$session_id" "$turn_id")"
 
+afl_debug_log() {
+  [ "${AGENT_FEEDBACK_LOOP_DEBUG:-}" = "1" ] || return 0
+  decision="$1"
+  printf 'agent-feedback-loop: event=%s decision=%s session=%s turn=%s marker=%s\n' \
+    "$EVENT" "$decision" "${session_id:-_}" "${turn_id:-_}" "$marker_path" >&2
+}
+
 if agent_feedback_should_force_reflect "$payload"; then
   # Judgment 1 (shell write): unambiguous strong feedback -> mark this turn.
   mkdir -p "$(agent_feedback_marker_dir)" 2>/dev/null || true
   : > "$marker_path" 2>/dev/null || true
+  afl_debug_log "force"
   message="$(agent_feedback_reflection_message "$PROMPT_FILE")"
 else
   # Semantic gate: model self-judges and writes the marker itself if needed.
+  afl_debug_log "gate"
   message="$(agent_feedback_gate_message "$PROMPT_FILE" "$marker_path")"
 fi
 
