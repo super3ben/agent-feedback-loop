@@ -56,10 +56,10 @@ afl_cleanup() {
 
 # Judgment 2: did the model reflect? grep the reply/transcript for the marker.
 done=1
-if printf '%s' "$payload" | grep -qF "$AFL_DONE_MARKER"; then
+if agent_feedback_has_done_marker "$payload"; then
   done=0
 elif [ -n "$transcript_path" ] && [ -r "$transcript_path" ] \
-     && grep -qF "$AFL_DONE_MARKER" "$transcript_path" 2>/dev/null; then
+     && grep -Eq "$AFL_DONE_PATTERN" "$transcript_path" 2>/dev/null; then
   done=0
 fi
 if [ "$done" -eq 0 ]; then

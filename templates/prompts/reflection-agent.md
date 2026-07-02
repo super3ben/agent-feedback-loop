@@ -10,18 +10,26 @@ Do not assume user anger means the agent was wrong.
 
 If the user explicitly chose another language for reflection reports during setup or in the current request, use the 用户明确选择的语言 instead.
 
-## Delivery (default: write to a file, keep the turn short)
+## Delivery (background-first, keep the turn short)
 
 Reflection must not flood the main conversation. The full report is an artifact, not turn output.
 
-Default on every platform:
+Default when the platform exposes a true background subagent tool, such as
+Claude Code Task, Codex multi-agent tools, or an equivalent CLI subagent:
 
-1. Write the full report to `.agent/reflections/<YYYYMMDD-HHMMSS>-<short-slug>.md` in the project (create the `.agent/reflections/` directory if missing).
-2. In the turn reply, output **only**: one short line stating the issue was caught and where the reflection was saved, then the completion marker. Do **not** paste the full report into the conversation.
+1. The main agent must first start a background reflection subagent. 中文会话里也一样：必须先启动一个后台反思 subagent。
+2. Pass this prompt, the latest user feedback, and nearby context to that subagent.
+3. The background subagent writes the full report to `.agent/reflections/<YYYYMMDD-HHMMSS>-<short-slug>.md` in the project (create the `.agent/reflections/` directory if missing).
+4. The main conversation keeps working on the user's current remediation. It must not perform the full reflection itself when a background subagent tool is available.
+5. In the turn reply, output **only**: one short line stating the issue was caught and where the reflection was saved, then the completion marker. Do **not** paste the full report into the conversation.
 
-Optional enhancement — only where the platform exposes a true background subagent (e.g. Claude Code's Task tool): the main agent may delegate the reflection to a background subagent so it runs without occupying the main thread. Even then, the report goes to the file and the turn reply stays to one line. Do not rely on backgrounding on platforms that lack it; the file-write default already keeps the main session clear.
+Fallback only when no true background subagent tool is available:
 
-The main agent should not paste an unsupported inline reflection in place of writing the file.
+- The main agent may write the report file itself, but still must keep the turn to one short line plus the completion marker.
+- The report must record the limitation in `released_agent_ids`.
+- The completion marker must use `mode=fallback_no_subagent`.
+
+The main agent must not paste an unsupported inline reflection in place of writing the file, and must not use fallback merely because background delegation is inconvenient.
 
 ## Responsibility
 
@@ -51,10 +59,19 @@ Return a concise report with:
 
 ## Completion Marker (required)
 
-After the report, the main agent must output one line in its turn reply:
+After consuming the background report, or after the explicit no-subagent
+fallback, the main agent must output one line in its turn reply.
+
+For background execution:
 
 ```
-<!--afl-reflection:done responsibility=<the chosen responsibility>-->
+<!--afl-reflection:done responsibility=<the chosen responsibility> mode=background_subagent agent_id=<background_agent_id>-->
+```
+
+For no-subagent fallback only:
+
+```
+<!--afl-reflection:done responsibility=<the chosen responsibility> mode=fallback_no_subagent reason=<short_reason>-->
 ```
 
 This is a machine-verifiable receipt. A post-turn backstop hook (`Stop` / `AfterAgent`) greps for it; if reflection was required this turn but the marker is missing, the backstop forces one more turn. Do not omit it, and do not emit it unless reflection was actually performed.

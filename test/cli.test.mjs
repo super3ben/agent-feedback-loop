@@ -61,6 +61,8 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(promptFile), /默认使用中文/);
     assert.match(await readText(promptFile), /用户明确选择的语言/);
     assert.match(await readText(promptFile), /\.agent\/reflections/);
+    assert.match(await readText(promptFile), /必须先启动一个后台反思 subagent/);
+    assert.match(await readText(promptFile), /mode=background_subagent/);
     assert.match(await readText(promptFile), /无需再询问用户是否写入/);
     assert.match(await readText(path.join(home, ".agent", "feedback-loop", "rules", "feedback-loop.md")), /默认直接写入项目规则/);
     assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
@@ -74,6 +76,9 @@ describe("agent-feedback-loop package", () => {
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
     assert.ok(userPromptHooks.some((hook) => hook.command?.includes("core-hook.sh")));
+    // Claude's type:"agent" hook starts a subagent, but it blocks the hook.
+    // Keep the hook itself command-based; the injected contract forces the
+    // active agent to start the platform's background subagent tool.
     assert.equal(userPromptHooks.some((hook) => hook.type === "agent"), false);
     const claudeStop = settings.hooks.Stop.flatMap((entry) => entry.hooks);
     assert.ok(claudeStop.some((hook) => hook.command?.includes("stop-hook.sh --mode claude")));
@@ -171,7 +176,12 @@ describe("agent-feedback-loop package", () => {
 
     // required + done marker present in reply -> pass and clean up marker
     await writeFile(marker, "");
-    const done = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault-->" }), env, ["--mode", "codex"]);
+    const oldMarkerOnly = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault-->" }), env, ["--mode", "codex"]);
+    assert.equal(JSON.parse(oldMarkerOnly.stdout).decision, "block");
+
+    // required + done marker with background/fallback mode -> pass and clean up marker
+    await writeFile(marker, "");
+    const done = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault mode=background_subagent agent_id=abc-->" }), env, ["--mode", "codex"]);
     assert.equal(JSON.parse(done.stdout).continue, true);
     await assert.rejects(stat(marker));
 
@@ -257,6 +267,8 @@ describe("agent-feedback-loop package", () => {
     assert.equal(codexJson.continue, true);
     assert.equal(codexJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(codexJson.hookSpecificOutput.additionalContext, /released_agent_ids/);
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /必须先启动一个后台反思 subagent/);
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /mode=background_subagent/);
 
     const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
     const claudeJson = JSON.parse(claude.stdout);
@@ -280,7 +292,9 @@ describe("agent-feedback-loop package", () => {
       "这次是很严重的现场事故，为什么没有触发自我反思？",
       "你调用agent-feedback-loop去反思了吗，这次是这么严重的现场事故",
       "为什么不触发自我反思",
-      "这种情况不要询问要不要，默认就要"
+      "这种情况不要询问要不要，默认就要",
+      "现在反思还是没用到子subagent还是触发在用户的主会话",
+      "反思不要占用主会话，要后台 subagent 无感执行"
     ];
 
     for (const prompt of prompts) {
@@ -289,6 +303,7 @@ describe("agent-feedback-loop package", () => {
       assert.match(codexContext, /反馈反思已触发/);
       assert.match(codexContext, /\.agent\/reflections/);
       assert.match(codexContext, /不要暂停当前工作/);
+      assert.match(codexContext, /不得由主会话自己完成完整反思/);
     }
   });
 

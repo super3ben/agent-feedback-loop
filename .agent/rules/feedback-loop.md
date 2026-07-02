@@ -52,3 +52,23 @@
 
 反例(避免过度收窄):对**无法查证**的事项(如用户私有意图、外部不可见状态),
 可在显式标注「假设」的前提下给出有条件的答复,不要求停下来反复确认。
+
+## Background Reflection First（反馈反思优先后台执行）
+
+修改 hook / feedback-loop / 自动反思机制时,必须把目标层级先判定清楚:
+个人用户级、项目模板级、还是单一项目级。涉及“每个项目”“project 级别”
+或“个人用户级别”的表达,默认做可复用机制。
+
+当 feedback-loop 识别到需要反思的用户反馈时:
+
+1. 若目标平台提供真正后台 subagent 能力(例如 Claude Code Task、Codex multi-agent),
+   必须自动委托后台 subagent 生成反思报告,主会话只输出短提示和完成标记。
+2. 主会话不得粘贴完整反思报告,不得把“是否要启动后台反思”交回用户确认。
+3. 报告仍必须落到 `.agent/reflections/`,符合条件的项目规则仍必须写入
+   `.agent/rules/feedback-loop.md`。
+4. 若当前平台没有真正后台 subagent / 显式释放 API,必须在报告的
+   `released_agent_ids` 中记录该限制,并采用 `mode=fallback_no_subagent`
+   的“文件报告 + 一行回执”最小打扰 fallback。
+
+反例(避免过度收窄):在不提供后台 subagent 的运行时中,不得伪造后台执行;
+此时可以由当前 agent 写入文件,但仍不得把完整报告贴进主会话。

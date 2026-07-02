@@ -183,7 +183,7 @@ Deciding "does this turn warrant reflection?" can never be 100% reliable up fron
 **Layer 2 — hard backstop (turn end, `stop-hook.sh`).** After the model replies, a `Stop` (Codex/Claude) or `AfterAgent` (Gemini) hook checks two deterministic things — never re-doing the semantic judgment in shell:
 
 - **Was reflection required?** → the per-turn marker file from Layer 1 exists.
-- **Did the model reflect?** → the reply contains the receipt line `<!--afl-reflection:done responsibility=...-->`.
+- **Did the model reflect through the right path?** → the reply contains a receipt line with either `mode=background_subagent` or, only when no subagent tool exists, `mode=fallback_no_subagent`.
 
 If required but the receipt is missing, the backstop forces exactly one continuation turn telling the model to reflect. A loop guard (`stop_hook_active`, or a file counter on Gemini where that flag is broken in 0.30.0) ensures it blocks at most once.
 
@@ -209,8 +209,9 @@ It also requires:
 
 - evidence before rule changes;
 - the full reflection written to `.agent/reflections/<timestamp>.md`, with only a one-line summary plus the completion marker left in the turn — the report is never pasted inline;
-- a true background subagent only as an optional enhancement where the platform exposes one (e.g. Claude Code's Task tool); the file-write default already keeps the main session clear everywhere else;
-- subagent close/release after reflection reports are consumed, when one was used;
+- a true background subagent as the default path wherever the active agent exposes one (for example Claude Code Task or Codex multi-agent tools); the main session must not perform the full reflection itself when that tool is available;
+- no-subagent fallback only when the runtime exposes no true background subagent tool, recorded with `mode=fallback_no_subagent`;
+- subagent close/release after reflection reports are consumed, when the runtime exposes a close/release operation;
 - `released_agent_ids` or an explicit CLI limitation note;
 - project-specific rules in `.agent/rules/feedback-loop.md`;
 - project rules are written by default, without asking again, when the finding is `agent_fault` with evidence, medium/high confidence, and a concrete future prevention constraint;
@@ -220,7 +221,7 @@ It also requires:
 
 - It does not start a background service.
 - It does not call an LLM from JavaScript.
-- It cannot create a Codex/Claude/Gemini subagent from shell by itself; it injects the requirement, and the active agent must use platform subagent tools when available.
+- It cannot create a Codex/Claude/Gemini subagent from shell by itself; it injects a hard requirement, and the active agent must use platform subagent tools when available. Codex command hooks currently do not run `agent` handlers, Claude `type:"agent"` hooks are blocking rather than no-impact background work, and Gemini hooks currently support command hooks only, so the portable path is command-hook injection plus a Stop/AfterAgent backstop.
 - It does not upload conversation content.
 - It does not force every correction into a rule.
 - It does not edit `AGENTS.md` or `CLAUDE.md` by default.
@@ -279,7 +280,7 @@ node ./bin/agent-feedback-loop.mjs install --home /tmp/afl-home
 
 Agent Feedback Loop 是一套面向 Codex、Claude Code 和 Gemini CLI 的“提示词优先”自动反思机制。
 
-当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task)时可选择委托后台跑,但这只是增强,不是必需。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
+当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task 或 Codex multi-agent 工具)时,必须先委托后台跑,不能由主会话自己做完整反思；只有运行时没有真正后台 subagent 工具时,才允许文件报告 fallback。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
 
 hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`、`不要询问要不要/默认就要`。它不再维护大规模中英文触发词表。
 
@@ -298,7 +299,7 @@ hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常
 
 - 不启动后台服务。
 - 不用 JavaScript 调大模型。
-- shell hook 不能自己创建 Codex/Claude/Gemini 内部 subagent；它只注入硬性要求，当前 agent 默认把完整反思写进文件、回合只留一行，平台支持时才可选地用后台 subagent。
+- shell hook 不能自己创建 Codex/Claude/Gemini 内部 subagent；它只注入硬性要求，当前 agent 必须优先调用平台提供的后台 subagent 工具。没有后台 subagent 能力时才允许 `mode=fallback_no_subagent`。
 - 不把反思逻辑写死在代码里。
 - hook 只负责注入短 gate 和极强信号兜底，Markdown prompt 负责完整反思流程。
 - 非程序员也可以直接维护 `reflection-agent.md` 和 `feedback-loop.md`。
