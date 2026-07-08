@@ -113,43 +113,96 @@ describe("agent-feedback-loop package", () => {
     assert.equal(afterAgentAfter.some((hook) => hook.command?.includes("stop-hook.sh")), false);
   });
 
-  it("core hook writes a per-turn marker on forced reflection, gate defers to the model", async () => {
+  it("core hook queues normal prompts silently and injects a batch review when due", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
     const tmp = await mkdtemp(path.join(tmpdir(), "afl-mk-"));
-    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+    const queueDir = path.join(tmp, "queue");
+    const env = {
+      ...process.env,
+      HOME: home,
+      TMPDIR: tmp,
+      AGENT_FEEDBACK_LOOP_QUEUE_DIR: queueDir,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "3",
+      AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "0"
+    };
+    const payload = (turn, prompt) => JSON.stringify({ session_id: "s1", turn_id: turn, cwd: "/tmp/proj-a", prompt });
 
-    // forced (shell word match) -> shell touches the marker file
-    await runWithInput(coreHook, JSON.stringify({ session_id: "s1", turn_id: 1, prompt: "严重问题" }), env, ["--event", "UserPromptSubmit", "--continue"]);
-    await stat(path.join(tmp, "afl-reflect", "s1.1.required"));
+    // turns below the threshold: nothing injected, prompt recorded to the queue
+    const first = await runWithInput(coreHook, payload(1, "summarize the README"), env, ["--event", "UserPromptSubmit", "--continue"]);
+    assert.deepEqual(JSON.parse(first.stdout), { continue: true });
+    const second = await runWithInput(coreHook, payload(2, "按照这个格式总结，记得一定要有事件依据"), env, ["--event", "UserPromptSubmit"]);
+    assert.deepEqual(JSON.parse(second.stdout), {});
+    const queueFile = path.join(queueDir, "_tmp_proj-a.jsonl");
+    assert.equal((await readText(queueFile)).trim().split("\n").length, 2);
+    await assert.rejects(stat(path.join(tmp, "afl-reflect", "s1.1.required")));
 
-    // gate (normal-but-maybe-unhappy) -> shell does NOT touch; injects touch instruction for the model
-    const gate = await runWithInput(coreHook, JSON.stringify({ session_id: "s1", turn_id: 2, prompt: "summarize" }), env, ["--event", "UserPromptSubmit"]);
-    const ctx = JSON.parse(gate.stdout).hookSpecificOutput.additionalContext;
-    assert.match(ctx, /touch/);
-    assert.match(ctx, /s1\.2\.required/);
+    // threshold reached: batch review injected, per-turn marker written for the backstop
+    const third = await runWithInput(coreHook, payload(3, "third message"), env, ["--event", "UserPromptSubmit"]);
+    const ctx = JSON.parse(third.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /反馈评审到期/);
+    assert.match(ctx, /_tmp_proj-a\.jsonl/);
+    assert.match(ctx, /回顾性反馈/);
+    assert.match(ctx, /宁漏报不误报/);
+    assert.match(ctx, /逐字引用用户原话/);
+    assert.match(ctx, /5 Why/);
+    assert.match(ctx, /run_in_background/);
     assert.match(ctx, /afl-reflection:done/);
-    await assert.rejects(stat(path.join(tmp, "afl-reflect", "s1.2.required")));
+    await stat(path.join(tmp, "afl-reflect", "s1.3.required"));
+
+    // queue is only cleared by the reviewer; the review stamp suppresses re-fire under cooldown
+    const cooldownEnv = { ...env, AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "3600" };
+    const fourth = await runWithInput(coreHook, payload(4, "fourth message"), cooldownEnv, ["--event", "UserPromptSubmit"]);
+    assert.deepEqual(JSON.parse(fourth.stdout), {});
+  });
+
+  it("core hook dedups repeated hook firings for the same user message", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-dd-"));
+    const queueDir = path.join(tmp, "queue");
+    const env = { ...process.env, HOME: home, TMPDIR: tmp, AGENT_FEEDBACK_LOOP_QUEUE_DIR: queueDir };
+    const queueFile = path.join(queueDir, "_tmp_proj-dd.jsonl");
+
+    // same session + same prompt text but a fresh prompt_id -> one queue line
+    const dup = (pid) => JSON.stringify({ session_id: "sd", prompt_id: pid, cwd: "/tmp/proj-dd", prompt: "检查一下部署" });
+    await runWithInput(coreHook, dup("p1"), env, ["--event", "UserPromptSubmit"]);
+    await runWithInput(coreHook, dup("p2"), env, ["--event", "UserPromptSubmit"]);
+    assert.equal((await readText(queueFile)).trim().split("\n").length, 1);
+
+    // a different message afterwards is appended normally
+    await runWithInput(coreHook, JSON.stringify({ session_id: "sd", prompt_id: "p3", cwd: "/tmp/proj-dd", prompt: "继续" }), env, ["--event", "UserPromptSubmit"]);
+    // and the same text again later (not back-to-back) is a fresh entry
+    await runWithInput(coreHook, dup("p4"), env, ["--event", "UserPromptSubmit"]);
+    assert.equal((await readText(queueFile)).trim().split("\n").length, 3);
   });
 
   it("core hook debug logs decisions without logging prompt content", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
-    const env = { ...process.env, HOME: home, AGENT_FEEDBACK_LOOP_DEBUG: "1" };
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-dbg-"));
+    const env = {
+      ...process.env,
+      HOME: home,
+      TMPDIR: tmp,
+      AGENT_FEEDBACK_LOOP_QUEUE_DIR: path.join(tmp, "queue"),
+      AGENT_FEEDBACK_LOOP_DEBUG: "1"
+    };
 
-    const forced = await runWithInput(
+    const queued = await runWithInput(
       coreHook,
       JSON.stringify({ session_id: "s-debug", turn_id: 7, prompt: "严重问题：不要把这句完整写进日志" }),
       env,
       ["--event", "UserPromptSubmit", "--continue"]
     );
 
-    assert.match(forced.stderr, /agent-feedback-loop: event=UserPromptSubmit decision=force/);
-    assert.match(forced.stderr, /session=s-debug/);
-    assert.match(forced.stderr, /turn=7/);
-    assert.doesNotMatch(forced.stderr, /不要把这句完整写进日志/);
+    assert.match(queued.stderr, /agent-feedback-loop: event=UserPromptSubmit decision=queue/);
+    assert.match(queued.stderr, /session=s-debug/);
+    assert.match(queued.stderr, /turn=7/);
+    assert.doesNotMatch(queued.stderr, /不要把这句完整写进日志/);
   });
 
   it("stop hook backstop: blocks when required-but-not-done, passes otherwise, guards loops", async () => {
@@ -255,98 +308,58 @@ describe("agent-feedback-loop package", () => {
     assert.ok(result.actions.some((a) => a.includes("remove stale tests")));
   });
 
-  it("core hook emits non-blocking CLI-specific JSON", async () => {
+  it("core hook emits CLI-specific fail-open JSON on quiet queue turns", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
 
     const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
-    const payload = JSON.stringify({ prompt: "严重问题，每次你都漏上下文" });
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-quiet-"));
+    const env = { ...process.env, HOME: home, AGENT_FEEDBACK_LOOP_QUEUE_DIR: path.join(tmp, "queue") };
+    const payload = JSON.stringify({ prompt: "严重问题，每次你都漏上下文", cwd: "/tmp/proj-b" });
 
-    const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
+    // even blocker-sounding wording is just queued — no per-turn injection at all
+    const codex = await runWithInput(coreHook, payload, env, ["--event", "UserPromptSubmit", "--continue"]);
+    assert.deepEqual(JSON.parse(codex.stdout), { continue: true });
+
+    const claude = await runWithInput(coreHook, payload, env, ["--event", "UserPromptSubmit"]);
+    assert.deepEqual(JSON.parse(claude.stdout), {});
+
+    const gemini = await runWithInput(coreHook, payload, env, ["--event", "BeforeAgent"]);
+    assert.deepEqual(JSON.parse(gemini.stdout), {});
+
+    // identical session+text fired three times -> deduped to one queue entry
+    const queueFile = path.join(tmp, "queue", "_tmp_proj-b.jsonl");
+    assert.equal((await readText(queueFile)).trim().split("\n").length, 1);
+  });
+
+  it("core hook review instruction targets the correct event name per CLI", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const tmp = await mkdtemp(path.join(tmpdir(), "afl-due-"));
+    const env = {
+      ...process.env,
+      HOME: home,
+      TMPDIR: tmp,
+      AGENT_FEEDBACK_LOOP_QUEUE_DIR: path.join(tmp, "queue"),
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "1",
+      AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "0"
+    };
+    const payload = (turn) => JSON.stringify({ session_id: "s2", turn_id: turn, cwd: "/tmp/proj-c", prompt: "hello" });
+
+    const codex = await runWithInput(coreHook, payload(1), env, ["--event", "UserPromptSubmit", "--continue"]);
     const codexJson = JSON.parse(codex.stdout);
     assert.equal(codexJson.continue, true);
     assert.equal(codexJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-    assert.match(codexJson.hookSpecificOutput.additionalContext, /released_agent_ids/);
-    assert.match(codexJson.hookSpecificOutput.additionalContext, /必须先启动一个后台反思 subagent/);
-    assert.match(codexJson.hookSpecificOutput.additionalContext, /mode=background_subagent/);
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /后台评审 subagent/);
+    assert.match(codexJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
 
-    const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
-    const claudeJson = JSON.parse(claude.stdout);
-    assert.equal(claudeJson.continue, undefined);
-    assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-    assert.match(claudeJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
-
-    const gemini = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "BeforeAgent"]);
+    const gemini = await runWithInput(coreHook, payload(2), env, ["--event", "BeforeAgent"]);
     const geminiJson = JSON.parse(gemini.stdout);
     assert.equal(geminiJson.continue, undefined);
     assert.equal(geminiJson.hookSpecificOutput.hookEventName, "BeforeAgent");
-    assert.match(geminiJson.hookSpecificOutput.additionalContext, /reflection-agent\.md/);
-  });
-
-  it("core hook forces reflection for live incident and explicit self-reflection wording", async () => {
-    const home = await tempHome();
-    await install({ home, dryRun: false });
-
-    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
-    const prompts = [
-      "这次是很严重的现场事故，为什么没有触发自我反思？",
-      "你调用agent-feedback-loop去反思了吗，这次是这么严重的现场事故",
-      "为什么不触发自我反思",
-      "这种情况不要询问要不要，默认就要",
-      "现在反思还是没用到子subagent还是触发在用户的主会话",
-      "反思不要占用主会话，要后台 subagent 无感执行"
-    ];
-
-    for (const prompt of prompts) {
-      const codex = await runWithInput(coreHook, JSON.stringify({ prompt }), { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
-      const codexContext = JSON.parse(codex.stdout).hookSpecificOutput.additionalContext;
-      assert.match(codexContext, /反馈反思已触发/);
-      assert.match(codexContext, /\.agent\/reflections/);
-      assert.match(codexContext, /不要暂停当前工作/);
-      assert.match(codexContext, /不得由主会话自己完成完整反思/);
-    }
-  });
-
-  it("core hook injects a semantic gate for normal prompts", async () => {
-    const home = await tempHome();
-    await install({ home, dryRun: false });
-
-    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
-    const payload = JSON.stringify({ prompt: "Please summarize the README in two bullets." });
-
-    const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
-    const codexJson = JSON.parse(codex.stdout);
-    assert.equal(codexJson.continue, true);
-    assert.match(codexJson.hookSpecificOutput.additionalContext, /反馈检查/);
-    assert.doesNotMatch(codexJson.hookSpecificOutput.additionalContext, /反馈反思已触发/);
-
-    const claude = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit"]);
-    const claudeJson = JSON.parse(claude.stdout);
-    assert.equal(claudeJson.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-    assert.match(claudeJson.hookSpecificOutput.additionalContext, /反馈检查/);
-    assert.doesNotMatch(claudeJson.hookSpecificOutput.additionalContext, /反馈反思已触发/);
-  });
-
-  it("core hook injects a semantic gate for implicit dissatisfaction in multiple languages", async () => {
-    const home = await tempHome();
-    await install({ home, dryRun: false });
-
-    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
-    const prompts = [
-      "这里显示也是呀只显示数字不明显，就不能有点设计性？让这些东西显示明显点，以后这种页面的这种都要调用设计性的skill类似front-desgin等等",
-      "为什么当时做文档的时候没考虑要用术语呢，mode AB让别人怎么理解，这种问题以后不要再出现",
-      "This is not clear enough. Why did you not use a design skill for this kind of visible page? These pages should use a design skill in the future."
-    ];
-
-    for (const prompt of prompts) {
-      const payload = JSON.stringify({ prompt });
-
-      const codex = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "UserPromptSubmit", "--continue"]);
-      assert.match(codex.stdout, /反馈检查/);
-
-      const gemini = await runWithInput(coreHook, payload, { ...process.env, HOME: home }, ["--event", "BeforeAgent"]);
-      assert.match(gemini.stdout, /反馈检查/);
-    }
+    assert.match(geminiJson.hookSpecificOutput.additionalContext, /mode=background_subagent/);
   });
 
   it("core hook fails open when shared trigger rules are missing", async () => {

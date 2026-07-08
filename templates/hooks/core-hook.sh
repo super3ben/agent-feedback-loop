@@ -2,6 +2,12 @@
 set -eu
 
 # Parameterized feedback-loop hook shared by all model-visible CLIs.
+#
+# Deferred-review model: every user prompt is appended to a persistent
+# per-project queue (zero tokens injected). Only when the queue is due for
+# review does the hook inject a single batch-review instruction, so most
+# turns cost nothing and reflection still cannot be forgotten.
+#
 # Flags:
 #   --event <name>   value for hookEventName (default: UserPromptSubmit)
 #   --continue       include "continue":true in output (Codex needs it)
@@ -43,27 +49,39 @@ afl_json_field() {
 
 session_id="$(afl_json_field session_id)"
 turn_id="$(afl_json_field turn_id)"
+project_dir="$(afl_json_field cwd)"
+[ -n "$project_dir" ] || project_dir="$(pwd)"
 marker_path="$(agent_feedback_marker_path "$session_id" "$turn_id")"
+queue_path="$(agent_feedback_queue_path "$project_dir")"
 
 afl_debug_log() {
   [ "${AGENT_FEEDBACK_LOOP_DEBUG:-}" = "1" ] || return 0
   decision="$1"
-  printf 'agent-feedback-loop: event=%s decision=%s session=%s turn=%s marker=%s\n' \
-    "$EVENT" "$decision" "${session_id:-_}" "${turn_id:-_}" "$marker_path" >&2
+  printf 'agent-feedback-loop: event=%s decision=%s session=%s turn=%s queue=%s\n' \
+    "$EVENT" "$decision" "${session_id:-_}" "${turn_id:-_}" "$queue_path" >&2
 }
 
-if agent_feedback_should_force_reflect "$payload"; then
-  # Judgment 1 (shell write): unambiguous strong feedback -> mark this turn.
+# Record this prompt for the deferred batch review. Never blocks the turn.
+# Dedup key = session + prompt text (NOT the raw payload: duplicate hook
+# firings for one user message carry a fresh prompt_id, so raw lines differ).
+prompt_text="$(afl_json_field prompt)"
+agent_feedback_queue_append "$queue_path" "$payload" "${session_id}:${prompt_text}"
+
+if agent_feedback_review_due "$queue_path"; then
+  # Review due -> mark this turn (backstop enforces completion) and inject
+  # the single batch-review instruction.
   mkdir -p "$(agent_feedback_marker_dir)" 2>/dev/null || true
   : > "$marker_path" 2>/dev/null || true
-  afl_debug_log "force"
-  message="$(agent_feedback_reflection_message "$PROMPT_FILE")"
-else
-  # Semantic gate: model self-judges and writes the marker itself if needed.
-  afl_debug_log "gate"
-  message="$(agent_feedback_gate_message "$PROMPT_FILE" "$marker_path")"
-fi
-
-cat <<JSON
+  agent_feedback_mark_review_started "$queue_path"
+  afl_debug_log "review"
+  message="$(agent_feedback_review_message "$PROMPT_FILE" "$queue_path" "$(agent_feedback_queue_count "$queue_path")")"
+  cat <<JSON
 {${continue_field}"hookSpecificOutput":{"hookEventName":"${EVENT}","additionalContext":"${message}"}}
 JSON
+  exit 0
+fi
+
+# Not due: zero tokens injected, the turn proceeds untouched.
+afl_debug_log "queue"
+printf '%s\n' "$fail_open"
+exit 0

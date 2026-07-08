@@ -25,7 +25,7 @@ Agent Feedback Loop
 
 Prompt-first feedback reflection hooks for **Codex**, **Claude Code**, and **Gemini CLI**.
 
-Agent Feedback Loop makes an AI coding agent reflect when the user says it repeatedly made mistakes, missed context, skipped required process, or caused strong dissatisfaction. The full reflection is written to a file (`.agent/reflections/`) and the agent leaves only a one-line acknowledgement in the conversation, then **keeps working on the fix** — reflection never blocks the user's remediation and never floods the main session. It installs lightweight hooks that inject this reflection instruction into the model's context.
+Agent Feedback Loop makes an AI coding agent reflect when the user's messages show it repeatedly made mistakes, missed context, skipped required process, or caused dissatisfaction. Instead of judging every keystroke, hooks silently record each prompt to a per-project queue and periodically hand the backlog to a background reviewer — so normal turns cost zero tokens and real feedback is reviewed with hindsight, delayed but never forgotten. The full reflection is written to a file (`.agent/reflections/`) and the agent leaves only a one-line acknowledgement in the conversation, then **keeps working on the fix** — reflection never blocks the user's remediation and never floods the main session.
 
 The key design choice: **the reflection logic lives in Markdown, not in JavaScript or Python.**
 
@@ -47,7 +47,7 @@ Most teams solve this by adding more rules to `AGENTS.md` or `CLAUDE.md`. That w
 
 Agent Feedback Loop separates the concern:
 
-- **Hooks** detect strong feedback and inject a reflection prompt.
+- **Hooks** record every prompt to a per-project queue and inject one batch-review instruction when it comes due.
 - **Markdown prompts** define the reflection process.
 - **The agent** classifies responsibility and decides whether a rule is justified.
 - **Project rules** stay in `.agent/rules/feedback-loop.md`.
@@ -156,6 +156,7 @@ agent-feedback-loop paths
     reflection-agent.md
   rules/
     feedback-loop.md
+  queue/            # created at runtime: one <project>.jsonl per project
 ```
 
 The installer patches:
@@ -174,26 +175,26 @@ Backups are created before config changes:
 ~/.gemini/settings.json.backup-YYYYMMDDHHMMSS
 ```
 
-## Two Layers: Soft Gate + Hard Backstop
+## Deferred Review: Queue + Hard Backstop
 
-Deciding "does this turn warrant reflection?" can never be 100% reliable up front — a semantic gate can misjudge, and a keyword list can never be exhaustive (you can always phrase dissatisfaction a new way). So coverage does not rely on getting that one judgment perfect. There are two layers:
+Judging "is this single message feedback?" per turn can never be reliable — a semantic gate misjudges prospective task constraints as corrections, and a keyword list can never be exhaustive (you can always phrase dissatisfaction a new way). Per-turn judging also costs tokens on every prompt. So the design defers the judgment instead of trying to perfect it:
 
-**Layer 1 — soft gate (prompt time, `core-hook.sh`).** Every prompt gets a short semantic gate asking the model to reflect when the message shows dissatisfaction, correction, repeated failure, or process criticism (`怎么又…` / "why again" phrasing counts). When reflection is warranted, the marker for "this turn requires reflection" is written two ways: the model writes it (semantic long tail, no word list), and the shell writes it on an unmistakable keyword match (`critical`, `blocker`, `现场事故`, …). The keyword list is intentionally tiny — it is a hard-trigger floor, not a coverage mechanism.
+**Layer 1 — silent queue (prompt time, `core-hook.sh`).** Every user prompt is appended to a persistent per-project queue at `~/.agent/feedback-loop/queue/<project>.jsonl`. Nothing is injected into the model's context on normal turns — zero token cost, zero false positives. There is no keyword matching and no per-turn semantic gate at all.
 
-**Layer 2 — hard backstop (turn end, `stop-hook.sh`).** After the model replies, a `Stop` (Codex/Claude) or `AfterAgent` (Gemini) hook checks two deterministic things — never re-doing the semantic judgment in shell:
+**Layer 2 — due batch review (prompt time, same hook).** When the queue is due — enough entries accumulated (`AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES`, default 5), or the oldest pending entry is older than `AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE` (default 4h), and the review cooldown (`AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN`, default 15min) has passed — the hook injects one batch-review instruction. The model hands the queue file to a background reviewer subagent, which reads all pending messages **with hindsight**: it can see whether a requirement was later repeated, whether the user pushed back on an output, whether a complaint recurred. Feedback is defined retrospectively (points at existing output, or repeats an earlier requirement); prospective task constraints are explicitly not feedback. The reviewer reflects only on real feedback, then clears the queue. The queue lives on disk and survives sessions — reflection is delayed, never forgotten.
 
-- **Was reflection required?** → the per-turn marker file from Layer 1 exists.
-- **Did the model reflect through the right path?** → the reply contains a receipt line with either `mode=background_subagent` or, only when no subagent tool exists, `mode=fallback_no_subagent`.
+**Layer 3 — hard backstop (turn end, `stop-hook.sh`).** On a review-due turn the hook writes a per-turn marker file. After the model replies, a `Stop` (Codex/Claude) or `AfterAgent` (Gemini) hook checks two deterministic things — never re-doing any semantic judgment in shell:
 
-If required but the receipt is missing, the backstop forces exactly one continuation turn telling the model to reflect. A loop guard (`stop_hook_active`, or a file counter on Gemini where that flag is broken in 0.30.0) ensures it blocks at most once.
+- **Was a review required?** → the per-turn marker file exists.
+- **Did the model run it through the right path?** → the reply contains a receipt line with either `mode=background_subagent` or, only when no subagent tool exists, `mode=fallback_no_subagent`.
 
-**Honest boundary:** the guarantee is only as good as "did Layer 1 mark the turn." The shell-keyword path is a hard guarantee; the model-written marker is still soft (the model might miss it). The backstop turns "reflection silently skipped" from undetectable into mostly-caught — it does not make detection perfect.
+If required but the receipt is missing, the backstop forces exactly one continuation turn. A loop guard (`stop_hook_active`, or a file counter on Gemini where that flag is broken in 0.30.0) ensures it blocks at most once. And because the queue is only cleared by a successful review, a review that silently dies simply re-fires after the cooldown.
+
+**Honest boundary:** whether the reviewer classifies each queued message correctly is still a model judgment — but it now happens once per batch with full hindsight, instead of once per keystroke with none, and a wrong "skip" costs nothing (the message stays reviewable in history) while a wrong "reflect" no longer interrupts your work.
 
 ## Reflection Contract
 
-Hooks inject a short semantic feedback gate on every prompt. The gate asks the active model to inspect the latest user message in any language and only run reflection when it expresses dissatisfaction, correction, repeated failure, process criticism, or a future prevention rule/preference.
-
-The shell hook keeps only a small force-reflection fallback for unmistakable blocker-level language or explicit future-prevention preferences such as `critical`, `blocker`, `非常不满意`, `严重问题`, `现场事故`, `自我反思`, or `不要询问要不要/默认就要`. It does not try to enumerate every Chinese or English dissatisfaction phrase — the backstop, not a bigger word list, is what catches the long tail.
+Nothing is injected on normal turns. When a batch review comes due, the injected instruction requires the active model to start a background reviewer subagent, which inspects the queued messages in any language and reflects only on those that are retrospective feedback: dissatisfaction with, or correction of, something the agent already produced, or a requirement repeated because it was previously ignored. Prospective constraints on new tasks (“must include…”, “记得一定要…”) are normal instructions, never feedback; when uncertain the reviewer must prefer skipping. A review that finds zero real feedback is the expected healthy outcome and produces no report and no rule.
 
 Reflection reports default to Chinese unless the user explicitly selected another language in the current request or setup.
 
@@ -230,7 +231,7 @@ It also requires:
 
 ### How it works in one sentence
 
-The moment you press enter, this tool slips a short instruction ("check if the user is unhappy — if so, reflect") into the message **before it reaches the model**. The model reads that instruction and reflects. The whole thing lives or dies on one thing: **can we get text in front of the model?**
+The moment you press enter, the hook silently records your message to the queue. When a batch review comes due, it slips a short instruction ("review the queued messages for real feedback — reflect on what you find") into the message **before it reaches the model**. The model reads that instruction and delegates the review. The whole thing lives or dies on one thing: **can we get text in front of the model?**
 
 ```
 your input ──▶ [hook slips in the reflection instruction] ──▶ model sees "your message + instruction"
@@ -280,18 +281,19 @@ node ./bin/agent-feedback-loop.mjs install --home /tmp/afl-home
 
 Agent Feedback Loop 是一套面向 Codex、Claude Code 和 Gemini CLI 的“提示词优先”自动反思机制。
 
-当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task 或 Codex multi-agent 工具)时,必须先委托后台跑,不能由主会话自己做完整反思；只有运行时没有真正后台 subagent 工具时,才允许文件报告 fallback。每次用户提交时，CLI hook 都只注入一条很短的语义 gate，让当前模型判断最新消息是否表达了不满、纠错、重复失败、流程质疑，或要求未来防复发规则。普通请求会忽略这条 gate 正常回答。
+当用户表达重复出错、漏上下文、跳过流程或强烈不满时，agent 会反思:**完整反思写进文件**(`.agent/reflections/`),回合里**只留一行**“已识别问题、反思已存到某文件”的摘要,然后**继续处理当前的修复**——反思既不打断用户的补救,也不会用一墙报告淹没主会话。平台有真正的后台 subagent(如 Claude Code 的 Task 或 Codex multi-agent 工具)时,必须先委托后台跑,不能由主会话自己做完整反思；只有运行时没有真正后台 subagent 工具时,才允许文件报告 fallback。
 
-hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常不满意`、`严重问题`、`现场事故`、`自我反思`、`不要询问要不要/默认就要`。它不再维护大规模中英文触发词表。
+触发方式是**延迟批量评审**,不是逐条判断:hook 不判断任何消息内容,只把每条用户消息静默记录到 `~/.agent/feedback-loop/queue/<项目>.jsonl`(零 token 成本)。只有队列到期时(默认攒够 5 条、或最早一条超过 4 小时,且距上次评审超过 15 分钟)才注入一条批量评审指令,由后台 subagent 带着"事后视角"通读积压消息,只对**回顾性反馈**反思——即针对 agent 既有产出的不满/纠正,或被重复提出的要求;对新任务的前置要求("记得一定要…"、"不要…")一律不算反馈,拿不准就跳过。评审完成后清空队列。队列落在磁盘上、跨会话存活:反思会延迟,但不会被忘记。
 
-### 两层防护:软 gate + 硬兜底
+### 三层结构:静默队列 + 到期评审 + 硬兜底
 
-"这轮该不该反思"这个判断永远做不到 100% 准——语义 gate 会误判,词表也永远列不全(不满总能有新说法)。所以覆盖**不依赖把这个判断做到完美**,而是分两层:
+"这条消息是不是反馈"逐条判永远判不准——词表列不全,语义 gate 又会把前置约束误判成纠错,而且每轮都烧 token。所以干脆不逐条判:
 
-- **第一层 软 gate(提示时,`core-hook.sh`)**:每轮注入语义 gate,让模型在不满/纠错/重复出错/流程质疑("怎么又…"也算)时反思。判定要反思时,"本轮要反思"的标记**双写**:模型写(覆盖语义长尾,无需词表)+ shell 命中极小硬词表时写(`critical`/`现场事故` 等)。词表只是无歧义硬触发的地板,不再用来追求覆盖。
-- **第二层 硬兜底(回合结束,`stop-hook.sh`)**:模型答完后,`Stop`(Codex/Claude)/`AfterAgent`(Gemini)hook 做两个**确定性**检查(绝不在 shell 里重做语义判断):① 本轮该反思吗 → 第一层的标记文件在不在;② 模型反思了吗 → 回复里有没有凭据行 `<!--afl-reflection:done responsibility=...-->`。**该反思却没凭据 → 强制重来一轮**,防死循环保证只打回一次。
+- **第一层 静默队列(提示时,`core-hook.sh`)**:每条消息追加进项目队列,普通回合**什么都不注入**。没有词表,没有语义 gate,没有误报。
+- **第二层 到期评审(提示时,同一个 hook)**:队列到期才注入一条批量评审指令,并写下"本轮要评审"的标记文件。评审 subagent 看的是一段时间内的全部消息,能看到"要求有没有被重复提"、"用户有没有对产出提出不满",判断天然比单条准。阈值可用 `AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES` / `AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE` / `AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN` 调。
+- **第三层 硬兜底(回合结束,`stop-hook.sh`)**:模型答完后,`Stop`(Codex/Claude)/`AfterAgent`(Gemini)hook 做两个**确定性**检查(绝不在 shell 里做语义判断):① 本轮要评审吗 → 标记文件在不在;② 评审跑了吗 → 回复里有没有凭据行 `<!--afl-reflection:done responsibility=...-->`。**该评审却没凭据 → 强制重来一轮**,防死循环保证只打回一次。队列只由评审成功后清空,评审悄悄失败的话冷却期过后会自动重新触发。
 
-**诚实边界**:保证强度 = 第一层有没有标记上。shell 硬词那条是硬保证,模型自己写标记那条仍是软的(可能漏)。兜底把"反思被悄悄跳过"从不可察变成大部分能抓——但不等于 100%。
+**诚实边界**:评审 subagent 对每条消息的分类仍是模型判断——但它从"每次按键都无上下文地判一次"变成了"每批带完整前后文判一次";判成"跳过"错了没有任何代价(消息还留在历史里),判成"反思"错了也不再打断你的工作。
 
 反思报告默认使用中文；如果用户在接入或当前请求里明确指定其他语言，则按用户选择的语言输出。
 
@@ -301,7 +303,7 @@ hook 只保留极少数强触发兜底，例如 `critical`、`blocker`、`非常
 - 不用 JavaScript 调大模型。
 - shell hook 不能自己创建 Codex/Claude/Gemini 内部 subagent；它只注入硬性要求，当前 agent 必须优先调用平台提供的后台 subagent 工具。没有后台 subagent 能力时才允许 `mode=fallback_no_subagent`。
 - 不把反思逻辑写死在代码里。
-- hook 只负责注入短 gate 和极强信号兜底，Markdown prompt 负责完整反思流程。
+- hook 只负责记录队列和注入到期评审指令，Markdown prompt 负责完整反思流程。
 - 非程序员也可以直接维护 `reflection-agent.md` 和 `feedback-loop.md`。
 - 子 agent 分析完必须关闭/释放，并记录 `released_agent_ids` 或说明 CLI 不支持释放。
 - 项目规则写到 `.agent/rules/feedback-loop.md`，避免 `AGENTS.md` / `CLAUDE.md` 无限膨胀。
@@ -332,7 +334,7 @@ agent-feedback-loop uninstall    # 移除 hook 配置，保留 prompt 文件
 ~/.agent/feedback-loop/rules/feedback-loop.md
 ```
 
-如果要调整短 gate 文案或极强兜底词，再改共享规则文件：
+如果要调整评审阈值文案或到期评审指令，再改共享规则文件：
 
 ```text
 ~/.agent/feedback-loop/hooks/trigger-rules.sh
@@ -342,7 +344,7 @@ agent-feedback-loop uninstall    # 移除 hook 配置，保留 prompt 文件
 
 ### 支持哪些 CLI（大白话）
 
-**这套机制的命根子:能不能往「模型的上下文」里塞字。** 你按下回车那一刻,在消息送进模型之前,这个工具偷偷塞进一段指令(「检查用户是不是在表达不满,是的话就反思」)。模型读到这段字,才会去反思。
+**这套机制的命根子:能不能往「模型的上下文」里塞字。** 你按下回车那一刻,hook 先把消息静默记进队列;等评审到期,它在消息送进模型之前偷偷塞进一段指令(「把积压的消息交给后台评审,发现真反馈就反思」)。模型读到这段字,评审才会发生。
 
 ```
 用户输入 ──▶ [hook 塞入反思指令] ──▶ 模型看到「你的消息 + 反思指令」

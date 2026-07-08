@@ -1,25 +1,21 @@
 #!/bin/sh
 
 # Marker needle the Stop/AfterAgent backstop greps for in the model reply.
-# Reflection must end its report with: <!--afl-reflection:done responsibility=...-->
+# A review turn must end its reply with: <!--afl-reflection:done responsibility=...-->
 AFL_DONE_MARKER='<!--afl-reflection:done'
 AFL_DONE_PATTERN='<!--afl-reflection:done[[:space:]][^>]*responsibility=[^[:space:]>]+[^>]*mode=(background_subagent|fallback_no_subagent)'
 
-agent_feedback_contains() {
-  printf '%s' "$1" | grep -Eiq "$2"
-}
-
-agent_feedback_should_force_reflect() {
-  payload="$1"
-
-  force_pattern='非常不满意|生气|严重问题|严重.*现场事故|现场事故|自我反思|反思了吗|触发.*反思|没用到.*subagent|没有用到.*subagent|反思.*subagent|subagent.*反思|反思.*主会话|主会话.*反思|反思.*后台|后台.*反思|占用.*主会话|不要询问.*要不要|不要问.*要不要|别问.*要不要|默认就要|大问题|太差|重做|重来|没有按规则|没按规则|没有真机测试|没真机测试|critical|blocker|very dissatisfied|angry|furious|unacceptable|serious issue|major issue|production incident|site incident'
-
-  if agent_feedback_contains "$payload" "$force_pattern"; then
-    return 0
-  fi
-
-  return 1
-}
+# Deferred-review model: no keyword matching and no per-turn semantic gate.
+# Every user prompt is appended to a persistent per-project queue at zero
+# token cost. A single batch review is injected only when the queue is due:
+#   due = queue non-empty
+#         AND seconds since last review >= cooldown
+#         AND (entries >= min-entries OR seconds since last review >= max-age)
+# The queue lives on disk and survives sessions, so deferred feedback is
+# reviewed eventually even if the session that produced it already ended.
+AFL_REVIEW_MIN_ENTRIES="${AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES:-5}"
+AFL_REVIEW_MAX_AGE="${AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE:-14400}"
+AFL_REVIEW_COOLDOWN="${AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN:-900}"
 
 agent_feedback_has_done_marker() {
   printf '%s' "$1" | grep -Eq "$AFL_DONE_PATTERN"
@@ -30,7 +26,7 @@ agent_feedback_marker_dir() {
   printf '%s/afl-reflect' "${TMPDIR:-/tmp}"
 }
 
-# Path of the "this turn requires reflection" marker for a session+turn.
+# Path of the "this turn requires review" marker for a session+turn.
 # Both args are sanitized to a safe filename; empty values degrade to "_".
 agent_feedback_marker_path() {
   session="$(printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_')"
@@ -40,20 +36,91 @@ agent_feedback_marker_path() {
   printf '%s/%s.%s.required' "$(agent_feedback_marker_dir)" "$session" "$turn"
 }
 
-agent_feedback_gate_message() {
-  prompt_file="$1"
-  marker_path="$2"
-  printf '反馈检查：请语义检查最新用户消息。如果消息表达不满、纠错、重复失败、流程质疑，或要求未来防复发规则（例如“怎么又/为什么还/又…了/不要再”这类重复出错或不满的口吻也算），你必须：(a) 先执行 `touch %s` 标记本轮需要反思；(b) 必须先启动一个后台反思 subagent，并把 %s 和当前反馈上下文交给它，主会话继续处理用户当前问题；不得由主会话自己完成完整反思；(c) 若当前平台确实没有后台 subagent 工具，才允许主会话按文件报告 fallback 执行，并在报告中记录限制；(d) 若结论是 agent_fault 且有证据、中高置信度、具备具体防复发约束，默认直接写入 .agent/rules/feedback-loop.md，无需再询问用户是否写入；(e) 在本轮回复结尾输出一行 `%s responsibility=<分类> mode=background_subagent agent_id=<后台agent_id>-->`。无后台能力时输出 `%s responsibility=<分类> mode=fallback_no_subagent reason=<原因>-->`。否则忽略本检查并正常回答。反思报告默认使用中文，除非用户明确选择其他语言。' "$marker_path" "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+# Persistent queue of raw hook payloads, one JSON line per user prompt.
+agent_feedback_queue_dir() {
+  printf '%s' "${AGENT_FEEDBACK_LOOP_QUEUE_DIR:-$HOME/.agent/feedback-loop/queue}"
 }
 
-agent_feedback_reflection_message() {
-  prompt_file="$1"
-  printf '反馈反思已触发（不要暂停当前工作，也不要把整篇反思贴进对话）。请：(1) 必须先启动一个后台反思 subagent，并把 %s 和当前反馈上下文交给它；主会话继续处理用户当前的修复/补救或其他请求，不得由主会话自己完成完整反思；(2) 后台 subagent 遵循该提示完成反思（分类责任为 agent_fault/user_misunderstanding/shared_ambiguity/external_limit/insufficient_evidence），把完整报告写入项目内 .agent/reflections/<时间戳>-<短标题>.md（目录不存在就创建）；(3) 回合里只输出一行：已识别本次问题、完整反思已存到该文件；(4) 完成后在回复结尾输出一行 `%s responsibility=<分类> mode=background_subagent agent_id=<后台agent_id>-->` 作为机器可校验凭据。若当前平台确实没有后台 subagent 工具，才允许主会话按文件报告 fallback 执行，并输出 `%s responsibility=<分类> mode=fallback_no_subagent reason=<原因>-->`。反思报告默认使用中文，除非用户明确选择其他语言。消费报告后释放后台 subagent 并记录 released_agent_ids。agent_fault 且有证据、中高置信度、具备具体防复发约束时，项目规则默认直接写入 .agent/rules/feedback-loop.md，无需再询问用户是否写入；只有低置信/证据不足或 Blocker + agent_fault + 跨项目证据的全局个人规则才提案。' "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+# One queue per project (sanitized cwd) so reviews and reports stay
+# project-local even when several projects share the queue directory.
+agent_feedback_queue_path() {
+  project="$(printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -n "$project" ] || project="_"
+  printf '%s/%s.jsonl' "$(agent_feedback_queue_dir)" "$project"
 }
 
-# Continuation prompt the Stop/AfterAgent backstop sends when reflection was
-# required this turn but the done-marker is missing.
+# Epoch-seconds stamp of the last review start for a queue file.
+agent_feedback_stamp_path() {
+  printf '%s.last-review' "${1%.jsonl}"
+}
+
+agent_feedback_queue_append() {
+  queue="$1"
+  entry="$(printf '%s' "$2" | tr '\n' ' ')"
+  dedup_key="${3:-}"
+  mkdir -p "$(agent_feedback_queue_dir)" 2>/dev/null || return 0
+  # Dedup: some CLIs fire the prompt hook more than once for the same user
+  # message (same session/text, new prompt_id), so compare the prompt text —
+  # not the raw payload line — against the previous append and skip repeats.
+  # Genuine repeats of the same short message later on are one queue entry;
+  # the reviewer sees repetition from context, so nothing meaningful is lost.
+  last_key_file="${queue%.jsonl}.last-prompt"
+  if [ -n "$dedup_key" ] && [ -s "$queue" ] \
+     && [ "$dedup_key" = "$(cat "$last_key_file" 2>/dev/null)" ]; then
+    return 0
+  fi
+  printf '%s\n' "$entry" >> "$queue" 2>/dev/null || return 0
+  [ -n "$dedup_key" ] && printf '%s' "$dedup_key" > "$last_key_file" 2>/dev/null
+  stamp="$(agent_feedback_stamp_path "$queue")"
+  # First activity starts the age clock so max-age is measured from the
+  # oldest pending entry, not from the epoch.
+  [ -f "$stamp" ] || date +%s > "$stamp" 2>/dev/null || true
+  return 0
+}
+
+agent_feedback_queue_count() {
+  count="$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')"
+  printf '%s' "${count:-0}"
+}
+
+agent_feedback_review_due() {
+  queue="$1"
+  [ -s "$queue" ] || return 1
+  stamp="$(agent_feedback_stamp_path "$queue")"
+  now="$(date +%s)"
+  last="$(cat "$stamp" 2>/dev/null || printf '0')"
+  case "$last" in
+    ''|*[!0-9]*) last=0 ;;
+  esac
+  elapsed=$((now - last))
+  [ "$elapsed" -ge "$AFL_REVIEW_COOLDOWN" ] || return 1
+  count="$(agent_feedback_queue_count "$queue")"
+  case "$count" in
+    ''|*[!0-9]*) count=0 ;;
+  esac
+  [ "$count" -ge "$AFL_REVIEW_MIN_ENTRIES" ] && return 0
+  [ "$elapsed" -ge "$AFL_REVIEW_MAX_AGE" ] && return 0
+  return 1
+}
+
+# Refresh the stamp when a review is injected so the cooldown suppresses
+# duplicate injections while the background reviewer is still working. The
+# queue itself is only cleared by the reviewer, so a failed review re-fires
+# after the cooldown instead of being forgotten.
+agent_feedback_mark_review_started() {
+  date +%s > "$(agent_feedback_stamp_path "$1")" 2>/dev/null || true
+}
+
+agent_feedback_review_message() {
+  prompt_file="$1"
+  queue="$2"
+  count="$3"
+  printf '反馈评审到期：队列文件 %s 已积累 %s 条用户消息记录。请立即启动一个后台评审 subagent（不得由主会话自己完成评审），把 %s 和该队列文件路径交给它：由它读取队列，按「回顾性反馈」标准筛选——仅当消息针对 agent 既有产出表达不满/纠正，或同一要求被重复提出时才算反馈；对新任务的前置要求、约束、偏好一律不算，宁漏报不误报；判为反馈必须能逐字引用用户原话并指明所指的既有产出，引用不出就不算；结论为「无新过错/预防性提醒」时严禁写规则或改既有规则、也不归档报告。忽略普通消息；仅对真实反馈按该提示完成反思。反思必须有深度：对每条真实反馈做 5 Why 逐层追因到「过程/默认假设」层的系统性根因，抽象成可复用的方法论类别，并给出「以后要这样做」的方法改进（不是单条「不要再犯 X」）；浅层复述或只加一条窄规则视为不合格。评审是分析不是跑测试：严禁启动后台或长驻进程（不得用 run_in_background、测试 watch、tail -f、dev server），确需取证只能同步、有超时、非交互地跑一次，结束前必须确保没有遗留运行中的子进程或 shell。报告写入对应项目 .agent/reflections/<时间戳>-<短标题>.md；agent_fault 且有证据、中高置信度、具备具体防复发约束时默认直接写入该项目 .agent/rules/feedback-loop.md，无需询问用户。评审完成后清空该队列文件。主会话继续处理用户当前请求，仅在回复结尾输出一行 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。若当前平台确实没有后台 subagent 工具，才允许主会话自行快速评审并输出 `%s responsibility=<分类或none> mode=fallback_no_subagent reason=<原因>-->`。反思报告默认使用中文，除非用户明确选择其他语言。' "$queue" "$count" "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+}
+
+# Continuation prompt the Stop/AfterAgent backstop sends when a review was
+# due this turn but the done-marker is missing.
 agent_feedback_stop_reason() {
   prompt_file="$1"
-  printf '检测到本轮要求反思但未见合格完成标记。请立即先启动一个后台反思 subagent，遵循 %s 完成反思；不得由主会话自己完成完整反思。完成后输出 `%s responsibility=<分类> mode=background_subagent agent_id=<后台agent_id>-->`。若当前平台确实没有后台 subagent 工具，才允许文件报告 fallback，并输出 `%s responsibility=<分类> mode=fallback_no_subagent reason=<原因>-->`。若结论是 agent_fault 且有证据、中高置信度、具备具体防复发约束，默认直接写入 .agent/rules/feedback-loop.md，无需再询问用户是否写入。' "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+  printf '检测到本轮反馈评审到期但未见合格完成标记。请立即启动一个后台评审 subagent，遵循 %s 处理积压反馈队列；不得由主会话自己完成完整评审。完成后输出 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。若当前平台确实没有后台 subagent 工具，才允许主会话 fallback 并输出 `%s responsibility=<分类或none> mode=fallback_no_subagent reason=<原因>-->`。agent_fault 且有证据、中高置信度、具备具体防复发约束时，默认直接写入项目 .agent/rules/feedback-loop.md，无需再询问用户。' "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
 }
