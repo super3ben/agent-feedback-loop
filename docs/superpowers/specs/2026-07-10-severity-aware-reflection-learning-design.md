@@ -60,6 +60,11 @@
 - 能给出明确适用范围和反例/例外;
 - 不是单纯预防性提醒或低证据猜测。
 
+发现同类 Markdown 规则或 active lesson 时, reviewer 只禁止创建重复规则, 不能因此停止处理。
+真实反馈一旦属于复发, 必须追加 recurrence event, 审计旧教训为什么没有产生约束效果,
+并对原 lesson 做激活、升级、修订或进入待复审状态。`existing rule found` 不是
+`rule_action: none` 的充分条件。
+
 ### 4.2 Store: 项目级 lesson 事件日志与活动快照
 
 项目数据使用两个文件:
@@ -69,11 +74,14 @@
 <project>/.agent/feedback-loop/active-lessons.json
 ~/.agent/feedback-loop/lessons/global.jsonl
 ~/.agent/feedback-loop/lessons/active-global.json
+~/.agent/feedback-loop/review-receipts/<review-event-id>.json
 ```
 
 - `lessons.jsonl` 是追加式事件日志, 保存创建、复发、升级、降级、合并、归档事件。
 - `active-lessons.json` 是原子生成的活动快照, 供 prompt hook 快速只读选择。
 - 完整证据和因果链仍保存在 `.agent/reflections/<timestamp>-<slug>.md`。
+- review receipt 是后台评审事务的机器校验结果, 记录 report/event/snapshot 的最终 revision;
+  它和「本会话加载过哪些 lesson」的 session receipt 是两种不同凭证。
 - 个人全局 lesson 只有满足现有 Blocker + 跨项目证据门时才写入 global event log;
   selector 会把 global active snapshot 与当前项目 snapshot 合并后选择。
 
@@ -146,6 +154,36 @@ lesson context 与批量评审 instruction 同时到期时, `additionalContext` 
 
 Stop/AfterAgent backstop 仍只约束到期评审完成标记, 不因为普通 lesson 注入阻断回合。
 
+### 4.5 Effectiveness auditor: 复发时审计控制链
+
+后台 reviewer 对同类首次反馈只分析「本次任务为什么做错」。对同类复发必须再分析一条独立的
+「学习控制链为什么失效」, 不能把两条因果链合并成一句「规则没有吃进」:
+
+1. 找到匹配的旧规则、lesson id 和当时应生效的 revision;
+2. 读取当前 CLI/session 的 lesson receipt, 证明该 revision 是否被编译、选择和注入;
+3. 对照用户请求、行动卡 `when` 和 agent 行为, 判断是否适用、是否执行;
+4. 归类唯一的主失败模式, 并写出可验证的纠正动作;
+5. 追加 effectiveness event, 更新 lesson revision/snapshot 后才允许给出完成 receipt。
+
+失败模式和默认动作如下:
+
+| failure_mode | 证据 | 必须动作 |
+| --- | --- | --- |
+| `not_materialized` | Markdown 规则存在, 但没有对应 active lesson | 编译并激活原规则, 不复制近义规则 |
+| `not_selected` | active lesson 存在, session receipt 没有该 revision | 修正 scope/signals/load_policy, 复发严重度至少提升一级 |
+| `loaded_not_applied` | receipt 证明已注入, 但 agent 没执行行动卡 | 严重度至少提升一级, 把 `do` 改成带前置检查和验收证据的强动作 |
+| `contract_incomplete` | 已加载且部分执行, 但行动卡无法覆盖该场景 | 修订 when/do/exception, 生成新 revision |
+| `external_limit` | 控制链已执行, 失败来自可证明的宿主限制 | 保留证据和 fallback, 不把限制伪装成 agent 已学会 |
+| `unknown` | receipt/上下文不足, 无法证明在哪一层失效 | 标记 `review_due`, 保留队列证据, 不允许静默归档为已处理 |
+
+这项审计只在识别到真实复发反馈时运行, 不在普通会话增加 LLM 调用。session receipt 和
+snapshot 查询是本地结构化读取, 不消耗模型 token。
+
+后台 subagent 完成后写 `review-receipts/<review-event-id>.json`; 主会话的隐藏完成标记只引用
+`receipt=<review-event-id>`, 不再把一段不可验证的 HTML 注释本身当作完成证据。Stop/AfterAgent
+backstop 必须校验 receipt 状态为 `acknowledged`, 且其中引用的 report、lesson event 和 snapshot
+revision 均存在。这样「写了报告并清队列, 但学习状态没有变化」不能伪装成反思成功。
+
 ## 5. Lesson 数据模型
 
 ```json
@@ -175,6 +213,18 @@ Stop/AfterAgent backstop 仍只约束到期评审完成标记, 不因为普通 l
     "source": ".agent/reflections/...md"
   },
   "recurrence_count": 2,
+  "effectiveness": {
+    "previous_lesson_id": "afl-lesson-...",
+    "expected_revision": 2,
+    "was_materialized": true,
+    "was_loaded": false,
+    "was_applicable": true,
+    "was_followed": false,
+    "failure_mode": "not_selected",
+    "control_owner": "selector",
+    "corrective_action": "expand task_types and activate project-session loading",
+    "audit_source": "~/.agent/feedback-loop/session-context/<session>.json"
+  },
   "evidence": ["..."],
   "created_at": "...",
   "last_seen_at": "...",
@@ -191,6 +241,10 @@ Stop/AfterAgent backstop 仍只约束到期评审完成标记, 不因为普通 l
 
 `signals` 由 reviewer 针对具体 lesson 生成, 可同时包含中英文别名。它不是全局写死的
 「不满词表」, 只用于判断某项方法教训是否与当前任务有关。
+
+`effectiveness` 只在复发事件上必填。`control_owner` 使用
+`reviewer | compiler | selector | agent_execution | lesson_contract | external | unknown`,
+用于把「任务执行过错」和「插件控制链失效」分开归责。
 
 ## 6. 严重度判定与加载策略
 
@@ -216,6 +270,24 @@ Stop/AfterAgent backstop 仍只约束到期评审完成标记, 不因为普通 l
 - 数据破坏、凭据泄漏、安全风险、不可逆 live 操作 -> 至少 `Blocker`;
 - 已有活动 lesson 仍发生同类过错 -> 至少升级一级;
 - 跨会话重复并造成真实环境/用户流程影响 -> 至少 `Critical`。
+
+如果 reviewer 已引用既有规则或 lesson 作为 repeated-pattern evidence, 却仍输出 `Major`
+且没有可证明的 `external_limit`, schema validator 必须拒绝该事件。严重度规则不能只写在 prompt
+里由模型自行选择。
+
+### 6.1 反思深度随严重度变化
+
+反思深度由必须回答的问题决定, 不使用固定字数或固定 token 截断:
+
+| 严重度 | 完整报告最低要求 |
+| --- | --- |
+| Minor | 事实、直接原因、一个可执行局部改进; 不生成活动 lesson |
+| Major | 完整 5 Why 到过程/默认假设层、遗漏信号、方法分类、行动卡 |
+| Critical | Major 全部内容 + 决策时间线 + 独立的学习控制链 5 Why + effectiveness audit + 反事实检查点 |
+| Blocker | Critical 全部内容 + 影响面/不可逆性 + 停止条件 + 回滚/隔离方案 + 是否提升为全局 lesson 的证据 |
+
+报告完成度按字段和证据校验, 不是按篇幅校验。完整报告保存在磁盘; 普通会话仍只加载行动卡,
+因此加深 Critical/Blocker 反思不会让每个后续会话携带整份 5 Why。
 
 加载策略:
 
@@ -340,6 +412,17 @@ candidate -> active -> review_due -> active / conditional / archived / supersede
 Minor 同 class_id 在复审窗口内累计三次时提升为 Major。已有 active lesson 再复发时至少升级一级,
 并要求反思「为什么已有教训没有被加载或没有被执行」, 不能只追加同义规则。
 
+对真实复发反馈, 以下四项全部持久化后才算处理成功:
+
+1. 完整反思报告;
+2. recurrence + effectiveness event;
+3. 与 failure_mode 对应的 lesson revision/status/snapshot 变更;
+4. 指向上述 event 的 review receipt。
+
+后台 reviewer 可以在这些写入成功后清空已消费的队列项。只写报告、只清空队列、或仅返回
+`rule_action: none` 都不能生成成功 receipt。为了避免失败时重复处理整个队列, queue entry 使用
+event id 标记 `claimed -> reflected -> compiled -> acknowledged`, 最后一步完成后再压缩已确认项。
+
 ## 11. 插件安装与升级
 
 `agent-feedback-loop install` 继续完成 prompt pack 和三 CLI hook 接线, 并新增:
@@ -396,10 +479,15 @@ estimated_tokens=N soft_budget=S reserve_budget=R absolute_budget=A snapshot_rev
 6. 无关 snapshot revision 更新不得让已注入 lesson 重复进入同一会话。
 7. 严重卡超过 reserve/absolute 时分别触发合并和 severe-index degraded mode。
 8. 同 class_id 归并、复发升级、superseded/archived 排除测试。
-9. malformed snapshot、缺 session_id、counter 不可用的 fail-open 测试。
-10. queue review 与 lesson context 同时注入时的组合顺序测试。
-11. debug 日志包含选择理由和预算, 但不包含 prompt/card 正文。
-12. install/uninstall/doctor 对 Codex、Claude、Gemini 配置的回归测试。
+9. 复发 effectiveness audit 六种 failure_mode 的状态迁移测试。
+10. 「旧 Markdown 规则存在但没有 session receipt」必须归类 `not_materialized`, 不得
+    `rule_action: none` 后只写报告。
+11. repeated-pattern evidence + Major 的事件必须被 schema validator 拒绝。
+12. 报告已写但 event/snapshot 未完成时不得清队列或签发成功 receipt。
+13. malformed snapshot、缺 session_id、counter 不可用的 fail-open 测试。
+14. queue review 与 lesson context 同时注入时的组合顺序测试。
+15. debug 日志包含选择理由和预算, 但不包含 prompt/card 正文。
+16. install/uninstall/doctor 对 Codex、Claude、Gemini 配置的回归测试。
 
 ### 14.2 Token 校准测试
 
@@ -422,6 +510,10 @@ estimated_tokens=N soft_budget=S reserve_budget=R absolute_budget=A snapshot_rev
 7. 新会话没有额外 token-count/semantic-retrieval LLM 请求。
 8. 队列、后台反思、Stop/AfterAgent backstop 仍正常工作。
 9. 使用 Computer Use 检查真实 CLI 可见行为, 并把机制层与端到端层结果分开报告。
+10. 复现「既有规则存在但本轮未注入」场景, 后台报告必须产出 `not_materialized` 或
+    `not_selected` audit、升级原 lesson, 下一新会话能看到修订后的行动卡。
+11. 复现「行动卡已注入但 agent 仍偏离」场景, 必须产出 `loaded_not_applied`, 不能用
+    「已有同类规则所以不新增」结束评审。
 
 ## 15. 成功标准
 
@@ -432,7 +524,8 @@ estimated_tokens=N soft_budget=S reserve_budget=R absolute_budget=A snapshot_rev
 - 偶发 Minor 不会永久占用上下文;
 - 严重 lesson 不会因预算被截断或静默丢失;
 - 所有注入都可解释「为什么选中/为什么跳过/消耗多少」;
-- 反思完整报告、行动卡、加载 receipt 和复发事件形成可追踪闭环;
+- 反思完整报告、行动卡、加载 receipt、effectiveness audit 和复发事件形成可追踪闭环;
+- 同类复发不会以「规则已存在」为由只生成报告; 每次复发都能看到控制链失败分类和状态变更;
 - 三个平台至少各完成一次真实新会话验收, 不能只凭 doctor/单测宣称生效。
 
 ## 16. 实施边界
@@ -441,9 +534,10 @@ estimated_tokens=N soft_budget=S reserve_budget=R absolute_budget=A snapshot_rev
 
 1. lesson schema/event store/snapshot;
 2. reviewer 产出完整行动卡;
-3. Node selector + session receipt;
-4. 严重度/相关性/预算选择;
-5. core hook 组合注入;
-6. doctor/日志/测试/三 CLI 真机验收。
+3. recurrence effectiveness audit + review receipt;
+4. Node selector + session receipt;
+5. 严重度/相关性/预算选择;
+6. core hook 组合注入;
+7. doctor/日志/测试/三 CLI 真机验收。
 
 不在第一版加入 embeddings、向量数据库、后台守护进程、Web UI 或每会话 LLM router。
