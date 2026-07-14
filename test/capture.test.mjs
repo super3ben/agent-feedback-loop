@@ -5,7 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { captureSession, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
+import { captureObservedSession, captureSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { openStore } from "../src/store.mjs";
 
@@ -37,6 +37,100 @@ test("redacts secrets while preserving a deterministic content hash", () => {
   assert.ok(first.manifest.length >= 2);
 });
 
+test("redacts natural-language credential assignments without language-specific values leaking", () => {
+  const chinese = redactText("服务器密码是 SyntheticOnly-123+ 请直接连接");
+  const english = redactText("The password is SyntheticOnly-456+ for this test");
+  assert.doesNotMatch(chinese.text, /SyntheticOnly-123/);
+  assert.doesNotMatch(english.text, /SyntheticOnly-456/);
+  assert.match(chinese.text, /\[REDACTED\]/);
+  assert.match(english.text, /\[REDACTED\]/);
+});
+
+test("redacts credential-like values from reminder-style credential context", () => {
+  const chinese = redactText("密码之前已经提供，账号 operator SyntheticReminder-731+");
+  const english = redactText("The password was already shared for operator SyntheticReminder-842+");
+  assert.doesNotMatch(chinese.text, /SyntheticReminder-731/);
+  assert.doesNotMatch(english.text, /SyntheticReminder-842/);
+  assert.ok(chinese.manifest.some((item) => item.type === "credential_context"));
+  assert.ok(english.manifest.some((item) => item.type === "credential_context"));
+});
+
+test("detects an immediately preceding interrupted turn without matching prompt wording", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-2" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "turn-2", reason: "interrupted" } }),
+    JSON.stringify({ type: "response_item", payload: { role: "user", content: "neutral text with no feedback keywords" } })
+  ].join("\n"), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-3" });
+  assert.deepEqual(signal, { immediateReview: true, reason: "prior_turn_interrupted" });
+});
+
+test("does not reuse an older interruption when the latest prior turn completed", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-control-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "turn-1", reason: "interrupted" } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-2" } })
+  ].join("\n"), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-3" });
+  assert.deepEqual(signal, { immediateReview: false, reason: "none" });
+});
+
+test("does not fast-track a stale interruption after a long idle resume", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-stale-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, JSON.stringify({
+    timestamp: "2026-07-14T00:00:00.000Z",
+    type: "event_msg",
+    payload: { type: "turn_aborted", turn_id: "turn-1", reason: "interrupted" }
+  }), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal(
+    { transcript_path: transcript, turn_id: "turn-2" },
+    { now: () => Date.parse("2026-07-14T01:00:00.000Z"), maxSignalAgeMs: 15 * 60 * 1000 }
+  );
+  assert.deepEqual(signal, { immediateReview: false, reason: "stale_interruption" });
+});
+
+test("detects same-turn user steering after assistant output without matching wording", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-steering-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-active" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "initial request" }] } }),
+    JSON.stringify({ timestamp: "2026-07-14T12:00:10.000Z", type: "response_item", payload: { id: "msg-assistant-active", type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "working" }] } })
+  ].join("\n"), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-active" });
+  assert.deepEqual(signal, {
+    immediateReview: true,
+    reason: "active_turn_steering",
+    referent: {
+      id: "msg-assistant-active",
+      turnId: "turn-active",
+      timestamp: "2026-07-14T12:00:10.000Z",
+      text: "working"
+    }
+  });
+});
+
+test("same-turn requirement additions before assistant output stay on the batch path", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-addition-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-active" } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "initial request" }] } })
+  ].join("\n"), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-active" });
+  assert.deepEqual(signal, { immediateReview: false, reason: "none" });
+});
+
 test("capture stores index data and encrypted raw evidence with restrictive modes", async () => {
   const { paths, store, blobs } = await fixture();
   const event = normalizeHookEvent({
@@ -52,6 +146,75 @@ test("capture stores index data and encrypted raw evidence with restrictive mode
   assert.doesNotMatch(await readFile(result.blobPath, "utf8"), /sk-live-secret/);
   assert.equal((await stat(result.blobPath)).mode & 0o777, 0o600);
   assert.equal((await stat(paths.keyRoot)).mode & 0o777, 0o700);
+  store.close();
+});
+
+test("capture aliases a later transcript observation to a legacy hook without a native turn", async () => {
+  const { store, blobs } = await fixture();
+  const hookEvent = normalizeHookEvent({
+    cli: "codex",
+    installationId: "default",
+    capturePolicyRevision: store.getCapturePolicy().revision,
+    payload: { session_id: "alias-session", cwd: "/tmp/alias-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" }
+  });
+  await captureObservedSession({ store, blobs, event: hookEvent, rawText: "use direct SSH" });
+
+  const transcriptEvent = normalizeHookEvent({
+    cli: "codex",
+    installationId: "default",
+    capturePolicyRevision: store.getCapturePolicy().revision,
+    payload: { session_id: "alias-session", turn_id: "turn-1", cwd: "/tmp/alias-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:01.000Z" }
+  });
+  transcriptEvent.event_uid = "codex:default:alias-session:message:transcript-1";
+  transcriptEvent.source_event_id = "message:transcript-1";
+  transcriptEvent.source_namespace = "transcript_message";
+  transcriptEvent.observation_source_id = "transcript-1";
+  const captured = await captureObservedSession({ store, blobs, event: transcriptEvent, rawText: "use direct SSH" });
+
+  assert.equal(captured.duplicate, true);
+  assert.equal(captured.eventUid, hookEvent.event_uid);
+  assert.equal(store.listSessionEvents("/tmp/alias-project").length, 1);
+  assert.equal(store.getEventObservation("codex", "transcript_message", "transcript-1").event_uid, hookEvent.event_uid);
+  store.close();
+});
+
+test("identical hook messages in one native turn remain distinct occurrences", async () => {
+  const { store, blobs } = await fixture();
+  const input = { session_id: "repeat-session", turn_id: "turn-1", cwd: "/tmp/repeat-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" };
+  const first = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
+  const second = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
+
+  assert.notEqual(first.event_uid, second.event_uid);
+  await captureObservedSession({ store, blobs, event: first, rawText: input.prompt });
+  await captureObservedSession({ store, blobs, event: second, rawText: input.prompt });
+  assert.equal(store.listSessionEvents(input.cwd).length, 2);
+  store.close();
+});
+
+test("a hook without a native turn does not alias an older transcript event from another turn", async () => {
+  const { store, blobs } = await fixture();
+  const transcriptEvent = normalizeHookEvent({
+    cli: "codex",
+    installationId: "default",
+    capturePolicyRevision: store.getCapturePolicy().revision,
+    payload: { session_id: "late-session", turn_id: "turn-old", cwd: "/tmp/late-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" }
+  });
+  transcriptEvent.event_uid = "codex:default:late-session:message:old";
+  transcriptEvent.source_event_id = "message:old";
+  transcriptEvent.source_namespace = "transcript_message";
+  transcriptEvent.observation_source_id = "old";
+  await captureObservedSession({ store, blobs, event: transcriptEvent, rawText: "use direct SSH" });
+
+  const hookEvent = normalizeHookEvent({
+    cli: "codex",
+    installationId: "default",
+    capturePolicyRevision: store.getCapturePolicy().revision,
+    payload: { session_id: "late-session", cwd: "/tmp/late-project", prompt: "use direct SSH", timestamp: "2026-07-14T13:00:00.000Z" }
+  });
+  const captured = await captureObservedSession({ store, blobs, event: hookEvent, rawText: "use direct SSH" });
+
+  assert.equal(captured.duplicate, false);
+  assert.equal(store.listSessionEvents("/tmp/late-project").length, 2);
   store.close();
 });
 

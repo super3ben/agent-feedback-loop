@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import { resolveReviewerExecutable } from "./reviewer-provider.mjs";
 
 const CLI_LABELS = { codex: "Codex", claude: "Claude Code", gemini: "Gemini CLI" };
 const CLI_COMMANDS = { codex: "codex", claude: "claude", gemini: "gemini" };
@@ -18,7 +19,7 @@ async function resolveExecutable(command, pathValue = process.env.PATH || "") {
   return null;
 }
 
-export async function detectReviewerAdapter({ cli = "unknown", command = process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND, pathValue = process.env.PATH || "" } = {}) {
+export async function detectReviewerAdapter({ cli = "unknown", command = process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND, pathValue = process.env.PATH || "", env = process.env } = {}) {
   if (command) {
     const executable = await resolveExecutable(command, pathValue);
     return {
@@ -33,17 +34,19 @@ export async function detectReviewerAdapter({ cli = "unknown", command = process
         : "configured reviewer command is not executable or not present on PATH"
     };
   }
-  const hostExecutable = CLI_COMMANDS[cli] ? await resolveExecutable(CLI_COMMANDS[cli], pathValue) : null;
+  const hostExecutable = CLI_COMMANDS[cli]
+    ? await resolveReviewerExecutable({ cli, env: { ...env, PATH: pathValue } })
+    : null;
   return {
     cli,
     label: CLI_LABELS[cli] || cli,
-    mode: "prompt_delegated_subagent",
+    mode: "isolated_cli_process",
     available: Boolean(hostExecutable),
-    assurance: hostExecutable ? "delegated_unattested" : "unavailable",
-    command: null,
+    assurance: hostExecutable ? "process_lifecycle_isolated" : "unavailable",
+    command: hostExecutable,
     reason: hostExecutable
-      ? "model-visible hook delegates to a background subagent and accepts only a one-time receipt; native platform identity is not cryptographically attested"
-      : "the CLI executable is not present on PATH; hook configuration alone does not prove a usable reviewer host"
+      ? "built-in provider launches a short-lived isolated CLI process with bounded evidence; this is not an OS, filesystem, or network sandbox"
+      : "the provider CLI executable is unavailable; the review job remains pending without using the main conversation"
   };
 }
 

@@ -1,0 +1,11 @@
+{
+  "hooksConfig": {
+    "enabled": false
+  },
+  "skills": {
+    "enabled": false
+  },
+  "general": {
+    "defaultApprovalMode": "plan"
+  }
+}

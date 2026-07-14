@@ -1,17 +1,16 @@
 # Agent Feedback Loop: 严重度感知的长期行为记忆与反思学习设计
 
-- 日期: 2026-07-10, 2026-07-13 更新
-- 状态: 待书面评审
+- 日期: 2026-07-10, 2026-07-14 更新
+- 状态: `0.7.3` 已实现并通过真机验收, 待发布
 - 目标层级: 个人用户级可复用插件, 项目级行为记忆, 证据满足后可提升为个人全局行为记忆
 
 ## 1. 背景与问题
 
-当前插件已经能把用户消息写入队列, 到期后向当前 agent 注入「启动后台反思 subagent」的要求,
-生成 `.agent/reflections/` 报告并在必要时写入 `.agent/rules/feedback-loop.md`。但 shell hook
-本身不能创建宿主内部 subagent, 所以现状只能要求主 agent 委派, 不能证明三个 CLI 都真正启动了
-独立后台 reviewer。
-但这个链路只覆盖了「发现 -> 分析 -> 持久化」, 没有可靠覆盖
-「检索 -> 注入 -> 后续会话应用」。
+旧版只能把用户消息写入队列, 再向当前 agent 注入「启动后台反思 subagent」的要求。这个边界无法证明
+三个 CLI 真正启动了独立 reviewer, 也会占用主会话。`0.7.3` 改为由 hook/补扫器提交 job 后直接启动
+短生命周期的 Codex、Claude 或 Gemini headless CLI 进程；证据通过受限文件/stdin 传递, 主会话不接收
+反思提示。Codex 另外通过 60 秒增量 transcript 补扫关闭升级、热加载和同一 turn 追加纠正的漏采窗口。
+长期收益由结构化 lesson 选择、delivery observation 和复发 effectiveness 审计闭环验证。
 
 因此用户能看到记录不断增加, 却很难在同项目的新会话里感受到模型主动吸收了旧问题。
 这与之前 pipeline-orchestrator 中可感知的同项目反馈效果不同: 后者实际把既有教训
@@ -59,7 +58,8 @@ Agent 自己的行为教训, 不混入用户画像、项目事实或一般知识
 - 不把用户偏好、项目事实、业务知识或普通会话摘要写进本行为记忆库。
 - 不把完整会话或完整反思默认注入后续模型上下文。
 - 第一版不使用 embeddings 或向量数据库; 未来向量检索只能提供候选, 不能直接决定注入。
-- 不启动常驻 daemon; 允许到期时启动有 lease、有超时、可恢复的短生命周期独立 reviewer 进程。
+- 不启动常驻模型或常驻 reviewer; macOS 允许一个不读取正文、不调用模型的轻量本地调度 daemon，
+  负责周期性启动有界补扫子进程和恢复到期 lease。
 - 不保证删除宿主 CLI 自己的 transcript、操作系统备份或用户另外导出的副本; 插件只保证删除自己管理的数据闭包。
 
 ## 4. 核心架构
@@ -81,6 +81,13 @@ last_live_canary_id / last_live_canary_at / capability_status
 `capability_status=supported` 只能由 `doctor --live` 的隔离 canary 写入: runner 必须在 start-ack 超时内证明
 已脱离 hook 生命周期, 最终 receipt 通过 schema/epoch 校验, capture 也达到 manifest 声明的 completeness。
 静态配置存在但没有 live canary 时只能是 `configured_unverified`, 不能标 supported/complete。
+
+Codex transcript 补扫以原生 message id 或稳定字节偏移作为消息身份, 以 observation alias 合并 hook 与
+transcript 对同一消息的观察。同一 turn 中只有在 assistant 已输出后出现的真实用户消息才形成即时纠偏信号;
+assistant 输出前的连续补充只采集不快触发。即时 reviewer 启动前必须先持久化该 turn 最近可见 assistant referent。
+对于已被 Codex 压缩出普通消息流的记录, 只允许从有界 `compacted.replacement_history` 恢复最近真实用户消息,
+不得把整段压缩上下文送入 reviewer。补扫游标只保存 inode/offset/turn/id 等结构状态, 不保存会话正文。
+同一项目在一次补扫中出现多条即时信号时先入库再合并, 每次补扫最多唤醒一个 reviewer。
 
 最低捕获契约如下; 具体最低版本由发布验收生成, 不在未经真机验证时拍定:
 
@@ -138,8 +145,8 @@ project/lineage identity 记录 `normalization_version`。remote 规范化必须
 
 ### 4.2 ReviewerRunner: 独立后台评审执行契约
 
-shell hook 不能直接创建 Codex/Claude/Gemini 内部 subagent, 所以第一版必须新增版本化
-`ReviewerRunner` 接口, 而不是继续依赖主 agent 自觉委派:
+shell hook 不依赖 Codex/Claude/Gemini 主会话自行委派, 而是通过版本化 `ReviewerRunner` 直接启动独立
+CLI reviewer 进程:
 
 ```text
 submit(job_id, project_id, incident_ids, prompt_version) -> runner_job
@@ -149,13 +156,12 @@ complete(job_id, owner_id, attempt, lease_epoch, review_receipt_id)
 fail(job_id, owner_id, attempt, lease_epoch, retryable, reason_code)
 ```
 
-允许的 runner mode 只有两种:
-
-1. `native_background_agent`: 宿主真机能力证明能启动独立 agent, 且不会把完整评审塞进主会话;
-2. `isolated_cli_process`: hook 只创建一个短生命周期、非交互、独立上下文的 CLI reviewer 进程后立即返回。
+当前实现使用 `isolated_cli_process`: hook 只创建一个短生命周期、非交互、独立上下文的 CLI reviewer
+进程后立即返回。若未来宿主提供可证明生命周期隔离的原生后台 agent API, 可新增
+`native_background_agent` adapter, 但不得把 prompt 委派伪装成原生能力。
 
 `isolated_cli_process` 不是常驻 daemon。它必须有 job lease、硬超时、最多重试次数、独立日志、受限工作目录
-和完成回调; 崩溃后由下一次 hook/doctor 回收过期 lease。runner 只读取经过授权的 incident evidence,
+和完成回调; 崩溃后由下一次 hook 或周期补扫回收过期 lease。runner 只读取经过授权的 incident evidence,
 通过插件命令提交 report/lesson transaction, 不直接任意修改 store。
 
 `lease_epoch` 是每次成功 claim 单调递增的 fencing token。heartbeat、complete、fail 和最终 store transaction

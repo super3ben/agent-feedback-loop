@@ -28,7 +28,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.match(launcher, /current\.json/);
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
-  assert.equal(current.schemaVersion, 6);
+  assert.equal(current.schemaVersion, 7);
 });
 
 test("remove-files removes runtime but preserves durable data and keys", async () => {

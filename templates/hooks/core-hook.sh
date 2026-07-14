@@ -3,10 +3,10 @@ set -eu
 
 # Parameterized feedback-loop hook shared by all model-visible CLIs.
 #
-# Deferred-review model: every user prompt is appended to a persistent
-# per-project queue (zero tokens injected). Only when the queue is due for
-# review does the hook inject a single batch-review instruction, so most
-# turns cost nothing and reflection still cannot be forgotten.
+# Transactional mode captures each prompt locally with zero review tokens and
+# launches a short-lived reviewer process only when review is due. It never asks
+# the main conversation to perform reflection. The JSONL branch below is an
+# explicit legacy compatibility mode and retains its historical prompt contract.
 #
 # Flags:
 #   --event <name>   value for hookEventName (default: UserPromptSubmit)
@@ -29,9 +29,17 @@ payload="$(cat || true)"
 HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 LOG_FILE="${AGENT_FEEDBACK_LOOP_LOG:-$HOME/.agent/feedback-loop-data/logs/runtime.log}"
 if [ "$LOG_FILE" != "/dev/null" ]; then
-  if ! mkdir -p "$(dirname -- "$LOG_FILE")" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+  max_log_bytes="${AGENT_FEEDBACK_LOOP_MAX_LOG_BYTES:-5242880}"
+  case "$max_log_bytes" in *[!0-9]*|'') max_log_bytes=5242880 ;; esac
+  if [ -L "$LOG_FILE" ]; then
     LOG_FILE="/dev/null"
-  else
+  elif [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" 2>/dev/null || printf 0)" -gt "$max_log_bytes" ]; then
+    rm -f "$LOG_FILE.1" 2>/dev/null || true
+    mv "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || LOG_FILE="/dev/null"
+  fi
+  if [ "$LOG_FILE" != "/dev/null" ] && { ! mkdir -p "$(dirname -- "$LOG_FILE")" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; }; then
+    LOG_FILE="/dev/null"
+  elif [ "$LOG_FILE" != "/dev/null" ]; then
     chmod 0600 "$LOG_FILE" 2>/dev/null || true
   fi
 fi
@@ -45,8 +53,8 @@ else
 fi
 
 # New capture path: the stable launcher stores a normalized event and encrypted
-# evidence. Any failure is deliberately fail-open; the legacy queue below still
-# records the turn for review and provides a diagnostic fallback.
+# evidence. Any failure is deliberately fail-open; the legacy queue below is
+# used only when the caller explicitly opts into that compatibility mode.
 runtime_launcher="$HOME/.agent/feedback-loop/bin/afl-hook"
 runtime_available=0
 capture_ok=0
@@ -55,8 +63,12 @@ legacy_mode=0
 if [ "$legacy_mode" -eq 0 ] && [ -x "$runtime_launcher" ]; then
   runtime_available=1
   launcher_output="$(mktemp "${TMPDIR:-/tmp}/afl-hook.XXXXXX")"
-  if printf '%s' "$payload" | "$runtime_launcher" hook --cli "$CLI" --event "$EVENT" >"$launcher_output" 2>>"$LOG_FILE"; then
-    capture_ok=1
+  if [ "$WITH_CONTINUE" -eq 1 ]; then
+    printf '%s' "$payload" | "$runtime_launcher" hook --cli "$CLI" --event "$EVENT" --continue >"$launcher_output" 2>>"$LOG_FILE" && capture_ok=1
+  else
+    printf '%s' "$payload" | "$runtime_launcher" hook --cli "$CLI" --event "$EVENT" >"$launcher_output" 2>>"$LOG_FILE" && capture_ok=1
+  fi
+  if [ "$capture_ok" -eq 1 ]; then
     # Explicit legacy mode keeps the historical JSONL contract for callers and
     # tests that opt in. Normal installs return the launcher's JSON response.
     if [ "$legacy_mode" -eq 0 ] && [ -r "$HOOK_DIR/trigger-rules.sh" ]; then

@@ -7,7 +7,7 @@
 Local, severity-aware feedback memory for **Codex**, **Claude Code**, and
 **Gemini CLI**. [中文说明](README-zh.md)
 
-**Current repository version: `0.7.0`**
+**Current repository version: `0.7.3`**
 
 The plugin captures bounded conversation evidence, reviews retrospective user
 feedback in the background, compiles proven agent faults into scoped action cards,
@@ -20,7 +20,7 @@ reads/writes only: no per-turn classifier and no token-count API request.
 prompt/stop hooks
   -> normalized user + assistant evidence (encrypted raw, redacted index)
   -> delayed reviewer job (once-per-job wake + lease)
-  -> background reviewer (prompt delegation or isolated CLI process)
+  -> short-lived isolated CLI reviewer (Codex / Claude / Gemini / override)
   -> authenticated structured receipt
   -> report + lesson revision + active projection in one transaction
   -> local severity/scope selector
@@ -61,28 +61,113 @@ hook behavior after an upgrade.
 
 `install` backs up and updates the supported CLI configuration files, installs one
 shared prompt hook and one shared Stop/AfterAgent hook, and preserves user data on
-upgrade or uninstall.
+upgrade or uninstall. On macOS it also installs a lightweight `KeepAlive` LaunchAgent
+daemon. The daemon starts one bounded reconciliation child every 60 seconds, waits
+for it to finish, and performs no model call unless a review is actually due. This
+process structure avoids relying on one-shot `StartInterval` delivery.
+
+For Codex, writing a hook into `config.toml` is not enough: unmanaged hooks run only
+after their exact current definition is trusted. The installer therefore asks a
+newly spawned local Codex `app-server` for `hooks/list`, approves only the two commands it just
+generated, writes their current hashes through `config/batchWrite`, and verifies
+them again. Identity includes the exact cwd, user `config.toml`, source, event name,
+handler type, and command; unrelated or lookalike hooks are never approved. An
+RPC/configuration failure after that inspector has initialized is not hidden by
+falling back to another CLI binary. This does **not** prove that an already-running
+Desktop task reloaded the hook: `doctor` reports `inspectionScope=spawned_app_server`
+and `activeDesktopState=not_observed`, while transcript reconciliation catches up
+those tasks. `doctor` reports `configured` and `runnable` separately; `modified`,
+`untrusted`, `disabled`, or an unavailable inspector is unhealthy even when paths
+are present. Set
+`AGENT_FEEDBACK_LOOP_CODEX_COMMAND` only when an explicit host binary is required.
+
+Prompt hooks use a five-second native timeout on Codex/Claude and 5000 ms on Gemini.
+This is a failure ceiling for local encrypted evidence and SQLite work, not a delay
+added to every turn; hook failures remain fail-open and are written to the local
+runtime log.
+
+## When Review Triggers
+
+- Ordinary prompts are captured locally with zero model tokens. A review becomes due
+  at three pending entries by default, or when the oldest entry reaches the configured
+  maximum age.
+- A new prompt immediately following an interrupted prior turn is elevated to an
+  immediate review candidate. This uses the host transcript lifecycle event
+  (`turn_aborted`) within a 15-minute freshness window, not Chinese/English complaint
+  keywords and not an LLM classifier.
+- If Codex receives another real user message in an active turn after assistant
+  output, that message becomes a structural steering candidate. This deliberately
+  favors recall; it is not yet a verdict that the user was dissatisfied. Additive
+  user messages sent before any assistant output are captured but do not use the
+  immediate path. Before the reviewer can start, the latest visible assistant
+  message from that turn is durably captured as the referent; the correction can
+  never consume its job first and leave the reviewer with prompt-only evidence.
+- A 60-second incremental reconciler catches active Codex tasks whose hook was
+  missed during an upgrade/reload race. Native message ids are preferred; stable
+  byte offsets are used otherwise. Hook and transcript observations alias to one
+  canonical event without collapsing repeated same-text messages. If Codex has
+  already compacted those messages out of ordinary `response_item` records, the
+  parser accepts only structurally identified `compacted` records up to 8 MiB and
+  recovers at most the latest 24 real user messages from `replacement_history`.
+  Control/system records are excluded and the full compacted history is never
+  injected into a reviewer.
+- Multiple immediate corrections found for one project in a single pass are
+  persisted first and coalesced into one reviewer job, so historical catch-up does
+  not spend one model call per correction. Transcript cursors keep structural
+  turn/id/offset state only and never retain conversation text.
+- The immediate event is transactionally guaranteed to be in reviewer context and
+  bypasses the normal project review cooldown. An unprompted bounded job is reused by
+  displacing its oldest assigned event without deleting that evidence. If the prior
+  job was already prompted or is running, a fresh immediate job is created so a
+  reviewer that already read context cannot miss the correction. A host-provided
+  event id remains idempotent; when the host provides no event id, each hook call is
+  treated as a distinct occurrence so two identical same-turn messages are not lost.
+- Each reconciliation pass also requeues expired reviewer leases and retryable
+  failures without requiring a new user message. After three attempts by default,
+  the job becomes `retry_exhausted` instead of looping forever. A completion receipt
+  must include a non-empty substantive report; an empty or marker-only response does
+  not clear evidence.
+- A first ordinary prompt does not trigger. An older interruption followed by a
+  completed turn does not trigger the fast path. The background reviewer still decides
+  whether the candidate is real retrospective feedback; prospective requests are not
+  promoted into lessons.
+
+Codex receives both hook capture and macOS transcript reconciliation. Claude Code
+and Gemini CLI use their native prompt/stop hooks for newly launched sessions after
+installation; this release does not claim Codex-style historical transcript catch-up
+for those hosts. On non-macOS systems hooks still work, but there is no bundled
+scheduled transcript reconciler yet.
 
 ## Reviewer Modes
 
-### Prompt delegation (zero configuration)
+### Built-in isolated providers (zero configuration)
 
-All three supported CLIs expose a model-visible prompt hook. When a batch becomes
-due, the hook asks the active host exactly once to create a real background subagent.
-The main conversation may submit the resulting receipt, but must not perform the
-full reflection. If the host exposes no subagent tool, the job remains pending and
-reports `reviewer_unavailable`; there is no main-agent fallback.
+When a batch becomes due, the hook starts a detached `reviewer-run` process and
+returns immediately. It auto-selects the originating Codex, Claude Code, or Gemini
+CLI in headless mode, receives evidence through a bounded `0600` file, returns one
+schema-validated receipt, and exits. The main conversation receives no reflection
+instruction, does not wait, and never writes the report. If the provider executable
+is unavailable, the job remains pending and logs `reviewer_unavailable`; there is
+no main-agent fallback.
 
-This mode is usable out of the box. Its assurance is deliberately reported as
-`delegated_unattested`: the runtime can validate a one-time, replay-resistant receipt,
-but a shell hook cannot cryptographically prove that a claimed id came from the
-host's native subagent scheduler.
+Codex runs ephemerally with user hooks/rules disabled and read-only sandbox mode;
+Claude runs non-persistent with tools disabled; Gemini runs with an explicit
+admin-tier deny-all policy and hooks/skills/extensions disabled. These are provider controls plus process
+lifecycle isolation, not an OS or network sandbox.
+
+`doctor` reports hook configuration, hook runnability, reviewer availability,
+scheduler state, and reconciliation freshness separately. In real-home macOS mode,
+healthy requires a running scheduler, a successful reconciliation no older than five
+minutes, and at least one operational reviewer provider. Missing optional providers
+are reported as degraded instead of being hidden by another available CLI. A
+`completed_with_errors` pass is diagnostic evidence, not success, and therefore
+cannot satisfy real-home health even when the scheduler process is alive.
 
 ### Short-lived reviewer command (optional process boundary)
 
-`AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` is not a missing dependency. It is an optional
-executable used when an operator wants a detached reviewer process instead of prompt
-delegation. The process receives:
+`AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` is not a missing dependency. It optionally
+replaces the selected built-in provider with an operator-owned executable. The
+process receives:
 
 ```text
 AFL_REVIEW_JOB_ID
@@ -127,7 +212,8 @@ confirmation.
 - Raw evidence is encrypted locally and retained for 10 days by default. Pending
   review sessions (including nearby assistant referents) are not deleted by retention
   GC. Compact review receipts, reports, incidents, and lessons remain as the durable
-  audit/memory layer after transcript evidence expires.
+  audit/memory layer after transcript evidence expires. Incremental cursor state
+  contains no user or assistant transcript text.
 - Reports and transcripts are never injected into ordinary turns. Only complete,
   compact action cards are selectable.
 - Minor is never loaded. Major requires exact task/path/tool/signal relevance.
@@ -153,14 +239,23 @@ was delivered. The current release does not require or ship a vector database.
   store/feedback-loop.sqlite3        # transactional index and receipts
   blobs/sha256/                       # AES-GCM encrypted raw evidence
   reviewer-contexts/                  # short-lived 0600 context files
-  reviewer-receipts/                  # atomic prompt-delegation handoff
+  logs/reconcile.log                  # scheduler/reconciliation diagnostics
 ~/.agent/feedback-loop-keys/          # mode 0700; fallback key mode 0600
 ```
 
-Prompt-created receipts must be regular, current-user-owned `0600` files with
+Legacy prompt-created receipts must be regular, current-user-owned `0600` files with
 `write_complete=true`, a real background agent id, and a valid one-time capability.
 Capabilities expire, are hashed at rest, and are consumed in the completion
 transaction. Context and receipt text are treated as untrusted evidence.
+Credential assignments such as `password=...`, English `password is ...`, and
+Chinese `密码是...` are removed from the searchable index and logs. In credential
+reminder context, mixed credential-like tokens are redacted as well, so phrasing such
+as "already shared" does not leave the value searchable. Raw evidence stays encrypted
+under the configured retention policy; host-owned transcripts remain the host's
+responsibility.
+
+Managed runtime and reconciliation logs rotate at 5 MiB by default and never include
+raw prompt/report bodies.
 
 ## Commands
 
@@ -172,6 +267,7 @@ agent-feedback-loop capture status|on|off
 agent-feedback-loop memory list [project-id]
 agent-feedback-loop memory promote <lesson-id> [project-id]
 agent-feedback-loop gc status|run
+agent-feedback-loop reconcile [--home <path>]
 agent-feedback-loop reviewer-context --job-id <id>
 agent-feedback-loop reviewer-submit --job-id <id> --receipt-file <path>
 agent-feedback-loop uninstall [--remove-files]
@@ -185,7 +281,13 @@ AGENT_FEEDBACK_LOOP_REVIEW_BATCH_MAX         default 24
 AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE           default 3600 seconds
 AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN          default 900 seconds
 AGENT_FEEDBACK_LOOP_REVIEW_WAKE_COOLDOWN     default 300 seconds
+AGENT_FEEDBACK_LOOP_INTERRUPTION_WINDOW      default 900 seconds
+AGENT_FEEDBACK_LOOP_RECONCILE_LOOKBACK       default 900 seconds
+AGENT_FEEDBACK_LOOP_RECONCILE_INTERVAL       default 60 seconds (minimum 30)
+AGENT_FEEDBACK_LOOP_RECONCILE_KILL_GRACE_MS  default 2000 milliseconds
+AGENT_FEEDBACK_LOOP_REVIEW_MAX_ATTEMPTS      default 3
 AGENT_FEEDBACK_LOOP_RETENTION_DAYS           default 10
+AGENT_FEEDBACK_LOOP_MAX_LOG_BYTES            default 5242880
 AGENT_FEEDBACK_LOOP_MEMORY_BUDGET             optional absolute local override
 AGENT_FEEDBACK_LOOP_DEBUG=1                   operational transition logs on stderr
 AGENT_FEEDBACK_LOOP_LOG=<path>                default data/logs/runtime.log (0600)
@@ -199,9 +301,12 @@ written in parallel with the SQLite runtime.
 ## Honest Boundaries
 
 - JavaScript does not call an LLM. A reviewer is invoked only when a batch is due.
-- Prompt delegation can require a native subagent but cannot attest its platform
-  identity. A configured command is only a short-lived same-user process unless the
-  operator places that command inside a real sandbox/container.
+- The built-in reviewer is a short-lived same-user process, not a security boundary
+  against the provider itself. Use an operator-owned sandbox/container override when
+  stronger isolation is required.
+- A spawned Codex app-server can validate persisted hook configuration but cannot
+  certify hook state inside an already-running Desktop task. Reconciliation closes
+  the evidence gap; it does not pretend to hot-reload that process.
 - Prompt-only hosts cannot claim a hard tool gate. Severe overflow produces a
   checkpoint hold, not a false claim that dangerous calls are technically blocked.
 - The plugin deletes only its own managed evidence; it does not delete host CLI
@@ -216,10 +321,12 @@ node ./bin/agent-feedback-loop.mjs install --home /tmp/afl-home
 node ./bin/agent-feedback-loop.mjs doctor --home /tmp/afl-home --live
 ```
 
-The `0.7.0` implementation is covered by 89 automated tests, including a three-turn
-end-to-end case that captures feedback, commits a verified lesson, and injects that
-lesson into the next matching task. Run the suite locally instead of relying on this
-count as a permanent badge; the count will change as coverage grows.
+The suite includes a three-turn end-to-end lesson case, exact Codex trust-scope tests,
+modified-hook health checks, same-turn steering controls, hook/transcript race
+deduplication, bounded compaction recovery, referent-before-review ordering, reviewer
+lease recovery, scheduler liveness and forced child cleanup, strict degraded-health
+checks, timeout-unit checks, and credential-redaction regressions. Run it locally
+instead of relying on a static test-count badge.
 
 ## License
 

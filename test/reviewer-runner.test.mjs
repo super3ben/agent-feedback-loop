@@ -28,11 +28,21 @@ test("reviewer runner owns the job lifecycle and rejects stale completion", asyn
 test("isolated reviewer accepts only a bounded structured receipt", async () => {
   const result = await runIsolatedReview({
     command: process.execPath,
-    args: ["-e", "process.stdout.write(JSON.stringify({review_receipt_id:'r1', report_content_id:'report-1', status:'reviewed_no_lesson', lessons:[]}))"],
+    args: ["-e", "process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r1',report_content_id:'report-1',report_content:'No durable lesson was proven from the bounded evidence.',status:'reviewed_no_lesson',lessons:[]}))"],
     cwd: process.cwd(),
     timeoutMs: 2_000
   });
-  assert.deepEqual(result, { review_receipt_id: "r1", report_content_id: "report-1", status: "reviewed_no_lesson", lessons: [] });
+  assert.equal(result.write_complete, true);
+  assert.equal(result.review_receipt_id, "r1");
+});
+
+test("isolated reviewer rejects a nominal receipt with an empty report", async () => {
+  await assert.rejects(() => runIsolatedReview({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r-empty',report_content_id:'report-empty',report_content:'',status:'reviewed_no_lesson',lessons:[]}))"],
+    cwd: process.cwd(),
+    timeoutMs: 2_000
+  }), /invalid reviewer receipt|report/i);
 });
 
 test("runJob executes a short-lived reviewer and commits its structured receipt", async () => {
@@ -45,7 +55,7 @@ test("runJob executes a short-lived reviewer and commits its structured receipt"
     jobId: job.job_id,
     ownerId: "worker-run",
     command: process.execPath,
-    args: ["-e", "const fs=require('fs'); const c=JSON.parse(fs.readFileSync(process.env.AFL_REVIEW_CONTEXT_FILE,'utf8')); if(process.env.AFL_REVIEW_JOB_ID!==c.job.job_id||!c.events.some(e=>e.role==='assistant')||process.env.AFL_TEST_SECRET) process.exit(9); process.stdout.write(JSON.stringify({review_receipt_id:'r-run',report_content_id:'report-run',report_content:'reviewed bounded context',status:'reviewed_no_lesson',lessons:[]}))"],
+    args: ["-e", "const fs=require('fs'); const c=JSON.parse(fs.readFileSync(process.env.AFL_REVIEW_CONTEXT_FILE,'utf8')); if(process.env.AFL_REVIEW_JOB_ID!==c.job.job_id||!c.events.some(e=>e.role==='assistant')||process.env.AFL_TEST_SECRET) process.exit(9); process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r-run',report_content_id:'report-run',report_content:'The bounded evidence did not prove a durable reusable lesson.',status:'reviewed_no_lesson',lessons:[]}))"],
     cwd: process.cwd(),
     timeoutMs: 2_000,
     contextRoot: path.join(tmpdir(), "afl-review-contexts"),
@@ -72,6 +82,40 @@ test("context preparation failure returns the claimed reviewer job to pending", 
   }));
   assert.equal(store.getReviewerJob(job.job_id).status, "pending");
   assert.equal(store.submitDueReview({ projectId: "project-prep", minEntries: 1, cooldownMs: 0 }).status, "pending");
+  store.close();
+});
+
+test("runJob can invoke a built-in isolated provider without shelling through a main-session prompt", async () => {
+  const store = await fixture();
+  store.captureSessionEvent({ event_uid: "provider-user", session_uid: "provider-session", event_seq: 1, context_epoch: 1, project_id: "project-provider", source_event_id: "provider-user", role: "user", redacted_text: "the previous behavior was wrong", content_hash: "provider-hash", capture_policy_revision: 1, data_class: "normal" });
+  const job = store.submitDueReview({ projectId: "project-provider", minEntries: 1, cooldownMs: 0 });
+  const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
+  let called = 0;
+  const result = await runner.runJob({
+    jobId: job.job_id,
+    ownerId: "worker-provider",
+    cwd: process.cwd(),
+    timeoutMs: 2_000,
+    contextRoot: path.join(tmpdir(), "afl-provider-contexts"),
+    promptFile: "/tmp/reflection-agent.md",
+    review: async ({ contextFile, promptFile, env, timeoutMs }) => {
+      called += 1;
+      assert.equal(promptFile, "/tmp/reflection-agent.md");
+      assert.equal(env.AFL_REVIEW_JOB_ID, job.job_id);
+      assert.equal(env.AFL_REVIEW_CONTEXT_FILE, contextFile);
+      assert.equal(timeoutMs, 2_000);
+      return {
+        write_complete: true,
+        review_receipt_id: "provider-receipt",
+        report_content_id: "provider-report",
+        report_content: "No proven retrospective feedback.",
+        status: "reviewed_no_lesson",
+        lessons: []
+      };
+    }
+  });
+  assert.equal(called, 1);
+  assert.equal(result.status, "completed");
   store.close();
 });
 

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS session_events (
   project_id TEXT,
   source_event_id TEXT,
   source_namespace TEXT NOT NULL DEFAULT 'hook',
+  native_turn_id TEXT,
   parent_event_id TEXT,
   role TEXT NOT NULL,
   redacted_text TEXT,
@@ -42,10 +43,22 @@ CREATE TABLE IF NOT EXISTS session_events (
   textual_output_ref TEXT,
   file_refs_json TEXT,
   artifact_hashes_json TEXT,
+  source_timestamp TEXT,
   captured_at TEXT NOT NULL,
   UNIQUE(session_uid, event_seq),
   UNIQUE(session_uid, source_event_id)
 );
+CREATE TABLE IF NOT EXISTS event_observations (
+  provider TEXT NOT NULL,
+  source_namespace TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  event_uid TEXT NOT NULL REFERENCES session_events(event_uid) ON DELETE CASCADE,
+  source_offset INTEGER,
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY(provider, source_namespace, source_id),
+  UNIQUE(event_uid, provider, source_namespace)
+);
+CREATE INDEX IF NOT EXISTS event_observations_event_uid_idx ON event_observations(event_uid);
 CREATE TABLE IF NOT EXISTS queue_events (
   event_uid TEXT PRIMARY KEY REFERENCES session_events(event_uid),
   project_id TEXT,
@@ -160,5 +173,22 @@ CREATE TABLE IF NOT EXISTS lesson_effectiveness_events (
   corrective_action TEXT NOT NULL,
   report_content_id TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transcript_cursors (
+  provider TEXT NOT NULL,
+  transcript_path TEXT NOT NULL,
+  device_id TEXT,
+  inode_id TEXT,
+  offset INTEGER NOT NULL DEFAULT 0,
+  state_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(provider, transcript_path)
+);
+CREATE TABLE IF NOT EXISTS worker_leases (
+  name TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  lease_epoch INTEGER NOT NULL DEFAULT 1,
+  lease_until INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
 );
 `;

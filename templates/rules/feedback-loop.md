@@ -6,16 +6,17 @@ must not call an LLM.
 
 ## Review Dispatch
 
-1. If `AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` is configured, the runtime starts a
-   detached, lease-fenced reviewer process with a bounded `0600` context file.
-2. Otherwise the model-visible hook asks the active host to create a real background
-   subagent once per job/wake interval. The main conversation does not perform the
-   full reflection.
-3. Prompt delegation is usable on Codex, Claude Code, and Gemini CLI, but native
-   subagent identity is not cryptographically attested. The one-time receipt proves
-   bounded job authority and replay prevention, not platform provenance.
-4. If no background subagent tool exists, keep the job pending and report
-   `reviewer_unavailable`. Never substitute a main-agent reflection.
+1. The runtime starts a detached, lease-fenced reviewer process with a bounded
+   `0600` context file. It auto-selects the originating Codex, Claude Code, or
+   Gemini CLI in headless mode.
+2. `AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` optionally replaces that built-in provider
+   with an operator-owned executable. It is not required for normal use.
+3. The main conversation does not perform, delegate, display, or wait for the full
+   reflection. If no provider executable exists, keep the job pending and report
+   `reviewer_unavailable`; never substitute a main-agent reflection.
+4. Process isolation proves a separate lifecycle and bounded handoff, not an OS,
+   filesystem, or network sandbox. Provider-specific invocations disable tools or
+   use read-only/plan policy where supported.
 
 ## Review Quality
 

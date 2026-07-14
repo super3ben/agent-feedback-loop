@@ -16,12 +16,15 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
+import { createCodexHost } from "./codex-host.mjs";
+import { inspectReconcileScheduler, installReconcileScheduler, removeReconcileScheduler } from "./reconcile-scheduler.mjs";
 import { SCHEMA_VERSION } from "./schema.mjs";
+import { openStore } from "./store.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
-const RUNTIME_VERSION = "0.7.0";
+const RUNTIME_VERSION = "0.7.3";
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
@@ -39,7 +42,7 @@ const CLIS = [
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"],
     stopEvent: "Stop",
     stopArgs: ["--mode", "codex"],
-    hookTimeout: 2,
+    hookTimeout: 5,
     stopTimeout: 5,
     timeoutUnit: "seconds"
   },
@@ -53,7 +56,7 @@ const CLIS = [
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "claude"],
     stopEvent: "Stop",
     stopArgs: ["--mode", "claude"],
-    hookTimeout: 2,
+    hookTimeout: 5,
     stopTimeout: 5,
     timeoutUnit: "seconds"
   },
@@ -67,7 +70,7 @@ const CLIS = [
     hookArgs: ["--event", "BeforeAgent", "--cli", "gemini"],
     stopEvent: "AfterAgent",
     stopArgs: ["--mode", "gemini"],
-    hookTimeout: 2000,
+    hookTimeout: 5000,
     stopTimeout: 5000,
     timeoutUnit: "milliseconds"
   }
@@ -92,6 +95,11 @@ export function pathsFor(home = os.homedir()) {
     exportsRoot: path.join(dataRoot, "exports"),
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
+    reviewerSchema: path.join(packRoot, "schemas", "reviewer-receipt.schema.json"),
+    geminiReviewerPolicy: path.join(packRoot, "policies", "gemini-reviewer-deny-all.toml"),
+    geminiReviewerSettings: path.join(packRoot, "settings", "gemini-reviewer.json"),
+    reconcileLaunchAgent: path.join(home, "Library", "LaunchAgents", "io.github.super3ben.agent-feedback-loop.reconcile.plist"),
+    reconcileLog: path.join(dataRoot, "logs", "reconcile.log"),
     coreHook: path.join(packRoot, "hooks", "core-hook.sh"),
     stopHook: path.join(packRoot, "hooks", "stop-hook.sh"),
     triggerRules: path.join(packRoot, "hooks", "trigger-rules.sh"),
@@ -427,7 +435,37 @@ export async function install(options = {}) {
   for (const cli of CLIS) {
     await installCli(paths, cli, dryRun, actions);
   }
-  return { dryRun, paths, actions };
+  const scheduler = await installReconcileScheduler({
+    paths,
+    platform: options.platform || process.platform,
+    dryRun,
+    activate: options.activateScheduler ?? (!dryRun && path.resolve(home) === path.resolve(os.homedir())),
+    host: options.schedulerHost,
+    intervalSeconds: Number(options.reconcileIntervalSeconds || 60)
+  });
+  if (scheduler.supported) {
+    actions.push(`configure Codex transcript reconciliation every 60s -> ${paths.reconcileLaunchAgent}`);
+    if (scheduler.active) actions.push("start Codex transcript reconciliation scheduler");
+  } else {
+    actions.push("Codex transcript reconciliation scheduler unavailable on this platform; model-visible hooks remain enabled");
+  }
+  let codex = { available: false, configured: dryRun, runnable: false, status: dryRun ? "dry_run" : "unavailable" };
+  if (!dryRun) {
+    const cli = CLIS.find((entry) => entry.id === "codex");
+    const codexHost = options.codexHost || createCodexHost({ version: RUNTIME_VERSION });
+    codex = await codexHost.synchronize({
+      home,
+      cwd: options.cwd || process.cwd(),
+      promptCommand: hookCommand(paths, cli),
+      backstopCommand: stopCommand(paths, cli)
+    });
+    if (codex.runnable) {
+      actions.push(`Codex hooks verified for a newly spawned app-server via ${codex.hostCommand || "host inspector"}; already-running Desktop tasks are covered by transcript reconciliation`);
+    } else {
+      actions.push(`Codex hooks configured but not runnable (${codex.status}${codex.reason ? `: ${codex.reason}` : ""})`);
+    }
+  }
+  return { dryRun, paths, actions, codex, scheduler };
 }
 
 async function uninstallCli(paths, cli, dryRun, actions) {
@@ -456,6 +494,14 @@ export async function uninstall(options = {}) {
   for (const cli of CLIS) {
     await uninstallCli(paths, cli, dryRun, actions);
   }
+  const scheduler = await removeReconcileScheduler({
+    paths,
+    platform: options.platform || process.platform,
+    dryRun,
+    activate: options.activateScheduler ?? (!dryRun && path.resolve(home) === path.resolve(os.homedir())),
+    host: options.schedulerHost
+  });
+  if (scheduler.supported) actions.push(`remove Codex transcript reconciliation scheduler ${paths.reconcileLaunchAgent}`);
 
   if (removeFiles) {
     actions.push(`remove ${paths.packRoot}`);
@@ -467,7 +513,7 @@ export async function uninstall(options = {}) {
     await removeLegacyHooks(paths, dryRun, actions);
   }
 
-  return { dryRun, paths, actions };
+  return { dryRun, paths, actions, scheduler };
 }
 
 async function isExecutable(file) {
@@ -518,10 +564,31 @@ export async function doctor(options = {}) {
       const text = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
       const promptConnected = text.includes(paths.coreHook);
       const backstopConnected = text.includes(paths.stopHook);
+      const configured = promptConnected && backstopConnected;
+      const codexHost = options.codexHost || createCodexHost({ version: RUNTIME_VERSION });
+      const host = await codexHost.inspect({
+        home,
+        cwd: options.cwd || process.cwd(),
+        promptCommand: hookCommand(paths, cli),
+        backstopCommand: stopCommand(paths, cli)
+      });
+      const runnable = configured && host.runnable;
       clis[cli.id] = {
-        connected: promptConnected && backstopConnected,
-        promptConnected,
-        backstopConnected,
+        connected: runnable,
+        configured,
+        runnable,
+        promptConnected: configured && Boolean(host.prompt?.runnable),
+        backstopConnected: configured && Boolean(host.backstop?.runnable),
+        promptConfigured: promptConnected,
+        backstopConfigured: backstopConnected,
+        promptTrustStatus: host.prompt?.trustStatus || "unknown",
+        backstopTrustStatus: host.backstop?.trustStatus || "unknown",
+        status: host.status,
+        hostAvailable: host.available,
+        hostCommand: host.hostCommand,
+        inspectionScope: host.inspectionScope || "spawned_app_server",
+        activeDesktopState: host.activeDesktopState || "not_observed",
+        reason: host.reason,
         managedBlock: text.includes(CODEX_MARKER_START)
       };
     } else {
@@ -538,6 +605,8 @@ export async function doctor(options = {}) {
       const backstopConnected = cmds(cli.stopEvent).some((c) => c.includes(paths.stopHook));
       clis[cli.id] = {
         connected: promptConnected && backstopConnected,
+        configured: promptConnected && backstopConnected,
+        runnable: promptConnected && backstopConnected,
         promptConnected,
         backstopConnected
       };
@@ -545,12 +614,69 @@ export async function doctor(options = {}) {
   }
 
   const capability = runtimeCapability();
-  const reviewers = await detectAllReviewerAdapters();
-  const readyClis = Object.values(reviewers).filter((reviewer) => reviewer.available).map((reviewer) => reviewer.cli);
-  const unavailableClis = Object.values(reviewers).filter((reviewer) => !reviewer.available).map((reviewer) => reviewer.cli);
+  const scheduler = await inspectReconcileScheduler({
+    paths,
+    platform: options.platform || process.platform,
+    host: options.schedulerHost
+  });
+  let reconciliation = { status: "not_run" };
+  if (await exists(paths.storeFile)) {
+    try {
+      const store = openStore({ paths });
+      reconciliation = store.getRuntimeStatus("codex_reconcile") || reconciliation;
+      store.close();
+    } catch (error) {
+      reconciliation = { status: "unavailable", reason: error.message };
+    }
+  }
+  const reviewerDetector = options.reviewerDetector || detectAllReviewerAdapters;
+  const reviewers = await reviewerDetector();
+  const readyClis = [];
+  const unavailableClis = [];
+  for (const cli of CLIS) {
+    const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
+    const operational = Boolean(clis[cli.id].runnable && reviewer.available);
+    clis[cli.id] = {
+      ...clis[cli.id],
+      reviewerAvailable: Boolean(reviewer.available),
+      reviewerExecutable: reviewer.executable || reviewer.command || null,
+      operational
+    };
+    if (operational) readyClis.push(cli.id);
+    else unavailableClis.push(cli.id);
+  }
+  const schedulerRequired = options.requireScheduler ?? (scheduler.supported && path.resolve(home) === path.resolve(os.homedir()));
+  const schedulerReady = !schedulerRequired || Boolean(scheduler.configured && scheduler.active);
+  const reconciliationFreshnessMs = Math.max(60_000, Number(options.reconciliationFreshnessMs || 5 * 60 * 1000));
+  const reconciliationUpdatedAt = Date.parse(reconciliation.updatedAt || "");
+  const reconciliationFresh = Number.isFinite(reconciliationUpdatedAt)
+    && Date.now() - reconciliationUpdatedAt <= reconciliationFreshnessMs;
+  const reconciliationSuccessful = reconciliation.status === "completed";
+  const reconciliationReady = !schedulerRequired || (reconciliationSuccessful && reconciliationFresh);
+  scheduler.required = Boolean(schedulerRequired);
+  reconciliation.fresh = reconciliationFresh;
+  reconciliation.ready = reconciliationReady;
   const healthy = Object.values(files).every(Boolean)
-    && CLIS.every((cli) => clis[cli.id].connected);
-  return { healthy, home, files, runtime, clis, reviewers, operational: { readyClis, unavailableClis }, capability, dataRoot: paths.dataRoot, keyRoot: paths.keyRoot };
+    && CLIS.every((cli) => clis[cli.id].runnable)
+    && schedulerReady
+    && reconciliationReady
+    && readyClis.length > 0;
+  const degraded = reconciliation.status === "completed_with_errors" || unavailableClis.length > 0;
+  return {
+    healthy,
+    degraded,
+    home,
+    files,
+    runtime,
+    clis,
+    scheduler,
+    reconciliation,
+    reviewers,
+    operational: { readyClis, unavailableClis, schedulerReady, reconciliationReady },
+    capability,
+    dataRoot: paths.dataRoot,
+    keyRoot: paths.keyRoot
+  };
 }
 
 export async function assertTemplateTree() {

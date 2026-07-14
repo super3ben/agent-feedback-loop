@@ -1,14 +1,16 @@
 import os from "node:os";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
-import { captureSession, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
+import { captureObservedSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
+import { discoverCodexTranscriptCandidates, reconcileCodexTranscripts } from "./codex-reconcile.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { openStore } from "./store.mjs";
 import { ReviewerRunner } from "./reviewer-runner.mjs";
+import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { readSecureReceipt } from "./reviewer-auth.mjs";
 import { selectLessons } from "./selector.mjs";
 
@@ -18,17 +20,48 @@ function optionValue(args, name, fallback = null) {
 }
 
 function debugLog(message) {
-  if (process.env.AGENT_FEEDBACK_LOOP_DEBUG === "1") console.error(`agent-feedback-loop: ${message}`);
+  if (process.env.AGENT_FEEDBACK_LOOP_DEBUG === "1") console.error(`agent-feedback-loop: ${new Date().toISOString()} ${message}`);
 }
 
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+async function runRetentionMaintenance({ store, blobs }) {
+  const retentionDays = Number(process.env.AGENT_FEEDBACK_LOOP_RETENTION_DAYS || 10);
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) return { status: "disabled" };
+  const previous = store.getRuntimeStatus("retention_gc");
+  const previousAt = Date.parse(previous?.updatedAt || "");
+  if (Number.isFinite(previousAt) && Date.now() - previousAt < 24 * 60 * 60 * 1000) {
+    return { status: "not_due", previousAt: previous.updatedAt };
+  }
+  const beforeMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const gc = store.gcExpired({ beforeMs });
+  const prunedBlobs = gc.eventCount > 0
+    ? await blobs.pruneUnreferenced(store.listEncryptedRawRefs(), { beforeMs })
+    : [];
+  const result = { status: "completed", retentionDays, eventCount: gc.eventCount, jobCount: gc.jobCount, prunedBlobCount: prunedBlobs.length };
+  store.setRuntimeStatus("retention_gc", result);
+  return result;
+}
+
+async function rotateManagedLog(logFile, maxBytes = Number(process.env.AGENT_FEEDBACK_LOOP_MAX_LOG_BYTES || 5 * 1024 * 1024)) {
+  if (!logFile || logFile === "/dev/null") return false;
+  let info;
+  try { info = await lstat(logFile); } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw new Error("managed log must be a regular non-symlink file");
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("managed log must be owned by the current user");
+  if (info.size <= Math.max(256 * 1024, Number(maxBytes) || 5 * 1024 * 1024)) return false;
+  const rotated = `${logFile}.1`;
+  await rm(rotated, { force: true });
+  await rename(logFile, rotated);
+  return true;
 }
 
 async function openRuntimeLog(paths) {
   const logFile = process.env.AGENT_FEEDBACK_LOOP_LOG || path.join(paths.dataRoot, "logs", "runtime.log");
   if (logFile !== "/dev/null") {
     await mkdir(path.dirname(logFile), { recursive: true, mode: 0o700 });
+    await rotateManagedLog(logFile);
     try {
       const info = await lstat(logFile);
       if (info.isSymbolicLink()) throw new Error("runtime log must not be a symlink");
@@ -41,6 +74,71 @@ async function openRuntimeLog(paths) {
   const handle = await open(logFile, "a", 0o600);
   if (logFile !== "/dev/null") await chmod(logFile, 0o600);
   return handle;
+}
+
+export async function runReconcileDaemon(options) {
+  const paths = pathsFor(options.home);
+  const intervalMs = Math.max(30_000, Number(process.env.AGENT_FEEDBACK_LOOP_RECONCILE_INTERVAL || 60) * 1_000);
+  const killGraceMs = Math.max(100, Number(process.env.AGENT_FEEDBACK_LOOP_RECONCILE_KILL_GRACE_MS || 2_000));
+  const groupIsolated = process.platform !== "win32";
+  let stopping = false;
+  let activeChild = null;
+  let hardKillTimer = null;
+  let wakeSleep = null;
+  const signalChild = (signal) => {
+    if (!activeChild) return;
+    try {
+      if (groupIsolated && activeChild.pid) process.kill(-activeChild.pid, signal);
+      else activeChild.kill(signal);
+    } catch (error) {
+      if (error.code !== "ESRCH") debugLog(`reconcile.daemon.signal_failed signal=${signal} reason=${error.message}`);
+    }
+  };
+  const stop = () => {
+    stopping = true;
+    if (wakeSleep) wakeSleep();
+    if (activeChild && !hardKillTimer) {
+      signalChild("SIGTERM");
+      hardKillTimer = setTimeout(() => {
+        if (!activeChild) return;
+        debugLog(`reconcile.daemon.force_kill pid=${activeChild.pid || "unknown"}`);
+        signalChild("SIGKILL");
+      }, killGraceMs);
+    }
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  try {
+    while (!stopping) {
+      if (await rotateManagedLog(paths.reconcileLog)) return;
+      const exit = await new Promise((resolve) => {
+        const child = spawn(paths.runtimeLauncher, ["reconcile", "--home", paths.home, "--scheduled"], {
+          cwd: paths.dataRoot,
+          stdio: "inherit",
+          env: process.env,
+          detached: groupIsolated
+        });
+        activeChild = child;
+        child.once("error", (error) => resolve({ code: null, error }));
+        child.once("close", (code, signal) => resolve({ code, signal }));
+      });
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+      hardKillTimer = null;
+      activeChild = null;
+      if (exit.error) debugLog(`reconcile.daemon.child_error code=${exit.error.code || "spawn_failed"} reason=${exit.error.message}`);
+      else if (exit.code !== 0) debugLog(`reconcile.daemon.child_exit code=${exit.code ?? exit.signal}`);
+      if (stopping) break;
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, intervalMs);
+        wakeSleep = () => { clearTimeout(timer); resolve(); };
+      });
+      wakeSleep = null;
+    }
+  } finally {
+    if (hardKillTimer) clearTimeout(hardKillTimer);
+    process.removeListener("SIGTERM", stop);
+    process.removeListener("SIGINT", stop);
+  }
 }
 
 function parseArgs(args) {
@@ -82,10 +180,49 @@ Usage:
   agent-feedback-loop memory promote <lesson-id> [project-id] [--home <path>]
   agent-feedback-loop capture status|on|off [--home <path>]
   agent-feedback-loop gc status|run [--home <path>]
+  agent-feedback-loop reconcile [--home <path>]
+  agent-feedback-loop reconcile-daemon [--home <path>]
   agent-feedback-loop reviewer-context --job-id <id> [--home <path>]
   agent-feedback-loop reviewer-submit --job-id <id> --receipt-file <path> [--home <path>]
   agent-feedback-loop paths [--home <path>]
 `);
+}
+
+async function launchDetachedReviewer({ paths, cli, jobId }) {
+  const explicitCommand = process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND;
+  if (!explicitCommand) {
+    const executable = await resolveReviewerExecutable({ cli, env: process.env });
+    if (!executable) {
+      debugLog(`reviewer.unavailable cli=${cli} job=${jobId}`);
+      return { launched: false, mode: "unavailable", reason: "provider_executable_unavailable" };
+    }
+  }
+  const reviewerArgs = [
+    "reviewer-run",
+    "--home", paths.home,
+    "--job-id", jobId,
+    ...(explicitCommand
+      ? [
+        "--command", explicitCommand,
+        "--args-json", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_ARGS_JSON || "[]"
+      ]
+      : ["--provider", cli]),
+    "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || "180000"
+  ];
+  const logHandle = await openRuntimeLog(paths);
+  try {
+    const child = spawn(process.execPath, [process.argv[1], ...reviewerArgs], {
+      cwd: paths.dataRoot,
+      detached: true,
+      stdio: ["ignore", "ignore", logHandle.fd],
+      env: process.env
+    });
+    child.unref();
+    debugLog(`reviewer.launch cli=${cli} job=${jobId} mode=${explicitCommand ? "explicit_process" : "isolated_cli_process"} pid=${child.pid}`);
+    return { launched: true, pid: child.pid, mode: explicitCommand ? "explicit_process" : "isolated_cli_process" };
+  } finally {
+    await logHandle.close();
+  }
 }
 
 function printActions(result, title) {
@@ -149,6 +286,69 @@ export async function main(args) {
     console.log(JSON.stringify(pathsFor(options.home), null, 2));
     return;
   }
+  if (command === "reconcile") {
+    const paths = pathsFor(options.home);
+    const store = openStore({ paths });
+    const ownerId = `reconcile-${process.pid}-${Date.now()}`;
+    const lease = store.claimWorkerLease({ name: "codex_reconcile", ownerId, leaseMs: 120_000 });
+    if (!lease.acquired) {
+      debugLog(`reconcile.skipped reason=lease_held owner=${lease.ownerId}`);
+      store.close();
+      console.log(JSON.stringify({ status: "skipped", reason: "lease_held", leaseUntil: lease.leaseUntil }));
+      return;
+    }
+    try {
+      const lookbackSeconds = Number(process.env.AGENT_FEEDBACK_LOOP_RECONCILE_LOOKBACK || 900);
+      const candidates = await discoverCodexTranscriptCandidates({
+        home: options.home,
+        nowMs: Date.now(),
+        lookbackMs: (Number.isFinite(lookbackSeconds) && lookbackSeconds > 0 ? lookbackSeconds : 900) * 1000,
+        trackedCursors: store.listTranscriptCursors("codex")
+      });
+      const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
+      const result = await reconcileCodexTranscripts({
+        store,
+        blobs,
+        candidates,
+        reviewMinEntries: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES || 3),
+        reviewMaxEntries: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_BATCH_MAX || 24),
+        reviewMaxAgeMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE || 3_600) * 1000,
+        reviewCooldownMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN || 900) * 1000,
+        wakeCooldownMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_WAKE_COOLDOWN || 300) * 1000,
+        reviewMaxAttempts: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MAX_ATTEMPTS || 3),
+        launchReviewer: ({ cli, jobId }) => launchDetachedReviewer({ paths, cli, jobId })
+      });
+      const maintenance = await runRetentionMaintenance({ store, blobs });
+      store.setRuntimeStatus("codex_reconcile", {
+        status: result.errors.length > 0 ? "completed_with_errors" : "completed",
+        candidates: candidates.length,
+        filesScanned: result.filesScanned,
+        filesSkipped: result.filesSkipped,
+        eventsCaptured: result.eventsCaptured,
+        duplicateEvents: result.duplicateEvents,
+        immediateSignals: result.immediateSignals,
+        reviewersLaunched: result.reviewersLaunched,
+        recoveredReviewers: result.recoveredReviewers,
+        exhaustedReviewerJobs: result.exhaustedReviewerJobs,
+        maintenance,
+        coverageGaps: result.coverageGaps,
+        errors: result.errors
+      });
+      debugLog(`reconcile.done candidates=${candidates.length} scanned=${result.filesScanned} captured=${result.eventsCaptured} duplicates=${result.duplicateEvents} immediate=${result.immediateSignals} reviewers=${result.reviewersLaunched} recovered=${result.recoveredReviewers} exhausted=${result.exhaustedReviewerJobs} gc=${maintenance.status} coverage_gaps=${result.coverageGaps.length} errors=${result.errors.length}`);
+      console.log(JSON.stringify(result));
+    } catch (error) {
+      store.setRuntimeStatus("codex_reconcile", { status: "failed", code: error.code || "reconcile_failed", reason: error.message });
+      throw error;
+    } finally {
+      store.releaseWorkerLease({ name: "codex_reconcile", ownerId });
+      store.close();
+    }
+    return;
+  }
+  if (command === "reconcile-daemon") {
+    await runReconcileDaemon(options);
+    return;
+  }
   if (command === "capture-stop") {
     const payload = await new Promise((resolve) => {
       let value = "";
@@ -183,7 +383,7 @@ export async function main(args) {
       });
       if (event.redacted_text || event.tool_name || event.textual_output_ref) {
         const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
-        await captureSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
+        await captureObservedSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
         debugLog(`capture.stop.ok event=${event.event_uid} completeness=${event.capture_completeness} excerpt_chars=${event.redacted_text?.length || 0}`);
       }
       const observed = store.observeDeliveryNonces({ session_uid: event.session_uid, context_epoch: event.context_epoch, transcriptText });
@@ -200,18 +400,36 @@ export async function main(args) {
     const store = openStore({ paths });
     const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
     try {
+      const provider = optionValue(options.args, "--provider");
       const commandPath = optionValue(options.args, "--command", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND);
-      if (!commandPath) throw new Error("reviewer command is not configured");
       const argsJson = optionValue(options.args, "--args-json", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_ARGS_JSON || "[]");
+      if (!provider && !commandPath) throw new Error("reviewer command or provider is not configured");
+      const executable = provider ? await resolveReviewerExecutable({ cli: provider, env: process.env }) : null;
+      if (provider && !executable) throw new Error(`reviewer provider executable is unavailable: ${provider}`);
+      const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000));
       const result = await runner.runJob({
         jobId: optionValue(options.args, "--job-id"),
         ownerId: `reviewer-${process.pid}`,
         command: commandPath,
         args: JSON.parse(argsJson),
         cwd: paths.dataRoot,
-        timeoutMs: Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 30_000)),
+        timeoutMs,
         contextRoot: path.join(paths.dataRoot, "reviewer-contexts"),
-        promptFile: paths.promptFile
+        promptFile: paths.promptFile,
+        review: provider
+          ? ({ contextFile, promptFile, cwd, env }) => runReviewerProvider({
+            cli: provider,
+            executable,
+            contextFile,
+            promptFile,
+            schemaFile: paths.reviewerSchema,
+            policyFile: paths.geminiReviewerPolicy,
+            geminiSettingsFile: paths.geminiReviewerSettings,
+            cwd,
+            timeoutMs,
+            env
+          })
+          : null
       });
       console.log(JSON.stringify(result));
     } finally {
@@ -283,6 +501,7 @@ export async function main(args) {
   }
   if (command === "hook") {
     const cli = options.cli || options.args[0] || "unknown";
+    const withContinue = options.args.includes("--continue");
     const payload = await new Promise((resolve) => {
       let value = "";
       process.stdin.setEncoding("utf8");
@@ -291,32 +510,64 @@ export async function main(args) {
     });
     const paths = pathsFor(options.home);
     const store = openStore({ paths });
+    const parsedPayload = JSON.parse(payload || "{}");
+    const interruptionWindowSeconds = Number(process.env.AGENT_FEEDBACK_LOOP_INTERRUPTION_WINDOW || 900);
+    const signal = await detectStructuralFeedbackSignal(parsedPayload, {
+      maxSignalAgeMs: (Number.isFinite(interruptionWindowSeconds) && interruptionWindowSeconds >= 0 ? interruptionWindowSeconds : 900) * 1000
+    });
     const event = normalizeHookEvent({
       cli,
-      payload: JSON.parse(payload || "{}"),
+      payload: parsedPayload,
       installationId: "default",
       capturePolicyRevision: store.getCapturePolicy().revision
     });
     debugLog(`hook.capture.start cli=${event.cli} project=${event.project_id || "_"} session=${event.session_uid}`);
     const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
-    await captureSession({ store, blobs, event, rawText: payload });
-    debugLog(`hook.capture.ok event=${event.event_uid}`);
-    const retentionDays = Number(process.env.AGENT_FEEDBACK_LOOP_RETENTION_DAYS || 10);
-    if (Number.isFinite(retentionDays) && retentionDays > 0) {
-      const gc = store.gcExpired({ beforeMs: Date.now() - retentionDays * 24 * 60 * 60 * 1000 });
-      if (gc.eventCount > 0) {
-        await blobs.pruneUnreferenced(store.listEncryptedRawRefs(), { beforeMs: Date.now() - retentionDays * 24 * 60 * 60 * 1000 });
-      }
-      if (gc.eventCount || gc.jobCount) debugLog(`gc events=${gc.eventCount} jobs=${gc.jobCount} retention_days=${retentionDays}`);
+    if (signal.referent) {
+      const referentId = String(signal.referent.id).slice(0, 512);
+      const referentEvent = normalizeStopEvent({
+        cli,
+        installationId: "default",
+        capturePolicyRevision: store.getCapturePolicy().revision,
+        payload: {
+          session_id: event.native_session_id,
+          turn_id: signal.referent.turnId || event.native_turn_id,
+          event_id: `message:${referentId}`,
+          cwd: event.cwd,
+          project_id: event.project_id,
+          timestamp: signal.referent.timestamp,
+          last_assistant_message: signal.referent.text,
+          capture_completeness: "transcript_visible_assistant",
+          transcript_path: parsedPayload.transcript_path
+        }
+      });
+      referentEvent.event_uid = `${cli}:default:${event.native_session_id}:message:${referentId}`;
+      referentEvent.source_event_id = `message:${referentId}`;
+      referentEvent.source_namespace = "transcript_message";
+      referentEvent.observation_source_id = referentId;
+      referentEvent.capture_source = "hook_transcript_referent";
+      referentEvent.capture_completeness = "transcript_visible_assistant";
+      const referentCapture = await captureObservedSession({
+        store,
+        blobs,
+        event: referentEvent,
+        rawText: JSON.stringify({ id: referentId, turn_id: signal.referent.turnId, text: signal.referent.text })
+      });
+      debugLog(`hook.referent.ok event=${referentCapture.eventUid} duplicate=${referentCapture.duplicate ? 1 : 0}`);
     }
+    const captured = await captureObservedSession({ store, blobs, event, rawText: payload });
+    const canonicalEventUid = captured.eventUid;
+    debugLog(`hook.capture.ok event=${canonicalEventUid} duplicate=${captured.duplicate ? 1 : 0}`);
     const due = store.submitDueReview({
       projectId: event.project_id,
-      minEntries: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES || 3),
+      minEntries: signal.immediateReview ? 1 : Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES || 3),
       maxEntries: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_BATCH_MAX || 24),
       maxAgeMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE || 3_600) * 1000,
       cooldownMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN || 900) * 1000,
-      promptVersion: "v1"
+      promptVersion: "v1",
+      immediateEventUid: signal.immediateReview ? canonicalEventUid : null
     });
+    debugLog(`hook.signal signal=${signal.reason} immediate_review=${signal.immediateReview ? 1 : 0}`);
     debugLog(`hook.review status=${due.status} events=${due.eventCount}`);
     const injectedContexts = [];
     const wake = due.status === "pending"
@@ -324,36 +575,9 @@ export async function main(args) {
       : { action: "not_due", attempt: 0 };
     const shouldWake = wake.action === "inject" || wake.action === "retry";
     debugLog(`hook.review.wake action=${wake.action} attempt=${wake.attempt}`);
-    if (shouldWake && process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND) {
-      const reviewerArgs = [
-        "reviewer-run",
-        "--home", paths.home,
-        "--job-id", due.job_id,
-        "--command", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND,
-        "--args-json", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_ARGS_JSON || "[]",
-        "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || "30000"
-      ];
-      const logHandle = await openRuntimeLog(paths);
-      try {
-        const child = spawn(process.execPath, [process.argv[1], ...reviewerArgs], {
-          cwd: paths.dataRoot,
-          detached: true,
-          stdio: ["ignore", "ignore", logHandle.fd],
-          env: process.env
-        });
-        child.unref();
-      } finally {
-        await logHandle.close();
-      }
-    }
-    if (shouldWake && !process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND) {
-      const launcher = paths.runtimeLauncher;
-      const receiptFile = path.join(paths.dataRoot, "reviewer-receipts", `${due.job_id}.json`);
-      await mkdir(path.dirname(receiptFile), { recursive: true, mode: 0o700 });
-      const contextCommand = [launcher, "reviewer-context", "--home", paths.home, "--job-id", due.job_id].map(shellQuote).join(" ");
-      const submitCommand = [launcher, "reviewer-submit", "--home", paths.home, "--job-id", due.job_id, "--receipt-file", receiptFile].map(shellQuote).join(" ");
-      injectedContexts.push(`[agent-feedback-loop review required]\n立即启动一个真正的后台 subagent 完成反思，主会话不得自己做完整反思。把 ${shellQuote(paths.promptFile)} 作为 reviewer 规则，把以下命令返回的有界上下文作为证据：${contextCommand}。receipt 必须包含 write_complete=true、review_receipt_id、report_content_id、report_content、status、lessons、mode=background_subagent、background_agent_id，以及一次性 reviewer_capability=${wake.capability}。先写 ${shellQuote(`${receiptFile}.tmp`)}，设置权限 0600，完整关闭后原子 rename 为 ${shellQuote(receiptFile)}。后台 subagent 返回后，主会话只执行一次提交：${submitCommand}。主会话继续当前任务，不得代写完整反思或把报告贴进用户对话。平台没有后台 subagent 工具时保持 job pending，并仅在运行日志中记录 reviewer_unavailable，不得向用户追问，也不得由主会话伪造 receipt。`);
-      debugLog(`hook.review prompt_required job=${due.job_id}`);
+    if (shouldWake) {
+      const launched = await launchDetachedReviewer({ paths, cli, jobId: due.job_id });
+      debugLog(`hook.review.background job=${due.job_id} launched=${launched.launched ? 1 : 0} mode=${launched.mode}`);
     }
     if (due.status === "pending" && process.env.AGENT_FEEDBACK_LOOP_DEBUG === "1") {
       console.error(`agent-feedback-loop: reviewer_job=${due.job_id} status=pending events=${due.eventCount}`);
@@ -385,11 +609,11 @@ export async function main(args) {
     }
     if (injectedContexts.length > 0) {
       store.close();
-      console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: optionValue(options.args, "--event", "UserPromptSubmit"), additionalContext: injectedContexts.join("\n\n") } }));
+      console.log(JSON.stringify({ ...(withContinue ? { continue: true } : {}), hookSpecificOutput: { hookEventName: optionValue(options.args, "--event", "UserPromptSubmit"), additionalContext: injectedContexts.join("\n\n") } }));
       return;
     }
     store.close();
-    console.log(JSON.stringify({}));
+    console.log(JSON.stringify(withContinue ? { continue: true } : {}));
     return;
   }
   throw new Error(`Unknown command: ${command}`);

@@ -1,6 +1,6 @@
 {
   "name": "agent-feedback-loop",
-  "version": "0.7.0",
+  "version": "0.7.3",
   "description": "Local severity-aware feedback memory for Codex, Claude Code, and Gemini CLI.",
   "type": "module",
   "repository": {

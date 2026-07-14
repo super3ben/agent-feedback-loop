@@ -143,6 +143,72 @@ test("captured events become one due reviewer job without clearing pending evide
   store.close();
 });
 
+test("an immediate event replaces stale bounded evidence in an unprompted pending job", async () => {
+  const store = await storeFixture();
+  store.captureSessionEvent({ ...event("old-pending"), project_id: "project-immediate", session_uid: "immediate-session", event_seq: 1 });
+  const existing = store.submitDueReview({ projectId: "project-immediate", minEntries: 1, maxEntries: 1, cooldownMs: 0 });
+  store.captureSessionEvent({ ...event("current-correction"), project_id: "project-immediate", session_uid: "immediate-session", event_seq: 2 });
+
+  const immediate = store.submitDueReview({
+    projectId: "project-immediate",
+    minEntries: 99,
+    maxEntries: 1,
+    cooldownMs: 3_600_000,
+    immediateEventUid: "current-correction"
+  });
+
+  assert.equal(immediate.job_id, existing.job_id);
+  assert.equal(immediate.immediate, true);
+  assert.deepEqual(store.getReviewerContext(immediate.job_id).queued_event_ids, ["current-correction"]);
+  assert.equal(store.pendingReviewEventCount("project-immediate"), 2);
+  store.close();
+});
+
+test("an immediate event creates a fresh job when the prior pending job was already prompted", async () => {
+  const store = await storeFixture();
+  store.captureSessionEvent({ ...event("prompted-old"), project_id: "project-prompted", session_uid: "prompted-session", event_seq: 1 });
+  const existing = store.submitDueReview({ projectId: "project-prompted", minEntries: 1, cooldownMs: 0 });
+  assert.equal(store.claimReviewerWake({ jobId: existing.job_id, nowMs: 1_000, cooldownMs: 300_000 }).action, "inject");
+  store.captureSessionEvent({ ...event("prompted-correction"), project_id: "project-prompted", session_uid: "prompted-session", event_seq: 2 });
+
+  const immediate = store.submitDueReview({
+    projectId: "project-prompted",
+    minEntries: 99,
+    maxEntries: 1,
+    cooldownMs: 3_600_000,
+    immediateEventUid: "prompted-correction"
+  });
+
+  assert.equal(immediate.status, "pending");
+  assert.notEqual(immediate.job_id, existing.job_id);
+  assert.equal(immediate.immediate, true);
+  assert.deepEqual(store.getReviewerContext(immediate.job_id).queued_event_ids, ["prompted-correction"]);
+  assert.equal(store.claimReviewerWake({ jobId: immediate.job_id, nowMs: 2_000, cooldownMs: 300_000 }).action, "inject");
+  store.close();
+});
+
+test("an immediate event bypasses project review cooldown after a completed job", async () => {
+  const store = await storeFixture();
+  store.captureSessionEvent({ ...event("completed-old"), project_id: "project-force", session_uid: "force-session", event_seq: 1 });
+  const completed = store.submitDueReview({ projectId: "project-force", minEntries: 1, cooldownMs: 0 });
+  const lease = store.claimReviewerJob(completed.job_id, "force-reviewer", Date.now() + 100_000, 1);
+  store.completeReviewerJob(completed.job_id, "force-reviewer", 1, lease.lease_epoch, "force-receipt");
+  store.captureSessionEvent({ ...event("force-correction"), project_id: "project-force", session_uid: "force-session", event_seq: 2 });
+
+  const immediate = store.submitDueReview({
+    projectId: "project-force",
+    minEntries: 99,
+    maxEntries: 1,
+    cooldownMs: 3_600_000,
+    immediateEventUid: "force-correction"
+  });
+
+  assert.equal(immediate.status, "pending");
+  assert.equal(immediate.immediate, true);
+  assert.deepEqual(store.getReviewerContext(immediate.job_id).queued_event_ids, ["force-correction"]);
+  store.close();
+});
+
 test("review jobs and reviewer context stay bounded without deleting excess pending evidence", async () => {
   const store = await storeFixture();
   for (let index = 1; index <= 8; index += 1) {
@@ -162,6 +228,7 @@ test("review jobs and reviewer context stay bounded without deleting excess pend
   assert.equal(store.pendingReviewEventCount("project-bounded"), 8);
   const context = store.getReviewerContext(job.job_id, { priorEvents: 1, followingEvents: 1, maxEvents: 6, maxEventChars: 256, maxTotalChars: 1024 });
   assert.deepEqual(context.queued_event_ids, ["bounded-1", "bounded-2", "bounded-3"]);
+  assert.deepEqual(context.feedback_candidate_event_ids, ["bounded-1", "bounded-2", "bounded-3"]);
   assert.ok(context.events.length <= 4);
   assert.equal(context.events.some((item) => item.event_uid === "bounded-8"), false);
   assert.ok(context.events.every((item) => String(item.redacted_text || "").length <= 256));
@@ -221,6 +288,7 @@ test("an invalid prompt review returns the claimed job to pending without consum
     write_complete: true,
     review_receipt_id: "invalid-review",
     report_content_id: "invalid-report",
+    report_content: "The receipt claims a review but deliberately provides no lesson.",
     status: "reviewed",
     lessons: [],
     reviewer_capability: wake.capability,
@@ -233,6 +301,28 @@ test("an invalid prompt review returns the claimed job to pending without consum
   store.close();
 });
 
+test("a successful retry clears the prior reviewer failure reason", async () => {
+  const store = await storeFixture();
+  store.captureSessionEvent({ ...event("retry-clean"), project_id: "project-retry-clean", session_uid: "retry-clean-session" });
+  const job = store.submitDueReview({ projectId: "project-retry-clean", minEntries: 1, cooldownMs: 0 });
+  const first = store.claimReviewerJob(job.job_id, "reviewer-first", Date.now() + 100_000, 1);
+  store.failReviewerJob(job.job_id, "reviewer-first", 1, first.lease_epoch, true, "reviewer_failed");
+  const second = store.claimReviewerJob(job.job_id, "reviewer-second", Date.now() + 100_000, 2);
+  store.commitReview({ jobId: job.job_id, ownerId: "reviewer-second", attempt: 2, leaseEpoch: second.lease_epoch }, {
+    write_complete: true,
+    review_receipt_id: "retry-clean-receipt",
+    report_content_id: "retry-clean-report",
+    report_content: "The retry completed with a substantive no-lesson evidence review.",
+    status: "reviewed_no_lesson",
+    lessons: []
+  });
+
+  const completed = store.getReviewerJob(job.job_id);
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.reason_code, null);
+  store.close();
+});
+
 test("structured review commit atomically creates a lesson, receipt, report, and acknowledges its events", async () => {
   const store = await storeFixture();
   store.captureSessionEvent({ ...event("commit-assistant"), project_id: "project-commit", session_uid: "commit-evidence-session", source_event_id: "commit-assistant", event_seq: 1, role: "assistant", redacted_text: "I claimed completion without direct evidence" });
@@ -242,6 +332,7 @@ test("structured review commit atomically creates a lesson, receipt, report, and
   const job = store.submitDueReview({ projectId: "project-commit", minEntries: 3, cooldownMs: 0 });
   const lease = store.claimReviewerJob(job.job_id, "reviewer-a", Date.now() + 100_000, 1);
   store.commitReview({ jobId: job.job_id, ownerId: "reviewer-a", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
     review_receipt_id: "receipt-1",
     report_content_id: "report-1",
     report_content: "5-why report: the reviewer trusted an unverified state.",
@@ -283,8 +374,10 @@ test("structured review rejects shallow lessons and preserves pending evidence",
   const job = store.submitDueReview({ projectId: "project-shallow", minEntries: 1, cooldownMs: 0 });
   const lease = store.claimReviewerJob(job.job_id, "reviewer-shallow", Date.now() + 100_000, 1);
   assert.throws(() => store.commitReview({ jobId: job.job_id, ownerId: "reviewer-shallow", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
     review_receipt_id: "shallow-r",
     report_content_id: "shallow-report",
+    report_content: "The proposed lesson is intentionally shallow for validation.",
     status: "reviewed",
     lessons: [{ lesson_id: "shallow-lesson", revision: 1, base_revision: 0, project_id: "project-shallow", severity: "Major", card: { when: "task", must_do: "be careful", must_not: "guess", verify: "check", why: "mistake", exception: "none", source_ids: ["shallow-report"] } }]
   }), /causal|responsibility|method|quality/i);
@@ -299,6 +392,7 @@ test("structured review rejects invented evidence references and preserves pendi
   const job = store.submitDueReview({ projectId: "project-evidence", minEntries: 1, cooldownMs: 0 });
   const lease = store.claimReviewerJob(job.job_id, "reviewer-evidence", Date.now() + 100_000, 1);
   assert.throws(() => store.commitReview({ jobId: job.job_id, ownerId: "reviewer-evidence", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
     review_receipt_id: "evidence-receipt",
     report_content_id: "evidence-report",
     report_content: "The completion claim was not grounded in observed evidence.",
@@ -314,6 +408,7 @@ test("structured review rejects invented evidence references and preserves pendi
     }]
   }), /evidence|feedback|referent/i);
   assert.throws(() => store.commitReview({ jobId: job.job_id, ownerId: "reviewer-evidence", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
     review_receipt_id: "quote-receipt",
     report_content_id: "quote-report",
     report_content: "The completion claim was not grounded in observed evidence.",
@@ -342,6 +437,7 @@ test("two independent Blocker reviews can promote one lesson family globally", a
     const job = store.submitDueReview({ projectId: project, minEntries: 1, cooldownMs: 0 });
     const lease = store.claimReviewerJob(job.job_id, `reviewer-${suffix}`, Date.now() + 100_000, 1);
     store.commitReview({ jobId: job.job_id, ownerId: `reviewer-${suffix}`, attempt: 1, leaseEpoch: lease.lease_epoch }, {
+      write_complete: true,
       review_receipt_id: `receipt-${suffix}`,
       report_content_id: `report-${suffix}`,
       report_content: "independent blocker review",
@@ -444,6 +540,7 @@ test("same-project recurrence requires and stores an effectiveness audit bound t
   const job = store.submitDueReview({ projectId: "project-recurrence", minEntries: 1, cooldownMs: 0 });
   const lease = store.claimReviewerJob(job.job_id, "reviewer-recurrence", Date.now() + 100_000, 1);
   const baseReview = {
+    write_complete: true,
     review_receipt_id: "recurrence-receipt",
     report_content_id: "recurrence-report",
     report_content: "the lesson was observed but not followed",
@@ -491,7 +588,7 @@ test("retention GC deletes old evidence but keeps newer evidence", async () => {
   oldStore.captureSessionEvent({ ...event("old-event"), session_uid: "old-session" });
   const oldJob = oldStore.submitDueReview({ projectId: "project-a", minEntries: 1, cooldownMs: 0 });
   const oldLease = oldStore.claimReviewerJob(oldJob.job_id, "gc-reviewer", Date.now() + 100_000, 1);
-  oldStore.commitReview({ jobId: oldJob.job_id, ownerId: "gc-reviewer", attempt: 1, leaseEpoch: oldLease.lease_epoch }, { review_receipt_id: "gc-receipt", report_content_id: "gc-report", status: "reviewed_no_lesson", lessons: [] });
+  oldStore.commitReview({ jobId: oldJob.job_id, ownerId: "gc-reviewer", attempt: 1, leaseEpoch: oldLease.lease_epoch }, { write_complete: true, review_receipt_id: "gc-receipt", report_content_id: "gc-report", report_content: "No durable lesson was proven from this old retention fixture.", status: "reviewed_no_lesson", lessons: [] });
   oldStore.close();
   const currentStore = openStore({ paths });
   currentStore.captureSessionEvent({ ...event("new-event"), session_uid: "new-session" });
@@ -525,12 +622,49 @@ test("review cooldown prevents an immediate second batch after completion", asyn
   }
   const first = store.submitDueReview({ projectId: "project-cool", minEntries: 3, cooldownMs: 0 });
   const lease = store.claimReviewerJob(first.job_id, "reviewer-cool", Date.now() + 100_000, 1);
-  store.commitReview({ jobId: first.job_id, ownerId: "reviewer-cool", attempt: 1, leaseEpoch: lease.lease_epoch }, { review_receipt_id: "cool-r", report_content_id: "cool-report", status: "reviewed_no_lesson", lessons: [] });
+  store.commitReview({ jobId: first.job_id, ownerId: "reviewer-cool", attempt: 1, leaseEpoch: lease.lease_epoch }, { write_complete: true, review_receipt_id: "cool-r", report_content_id: "cool-report", report_content: "No durable lesson was proven from this cooldown fixture.", status: "reviewed_no_lesson", lessons: [] });
   for (const id of ["cool-4", "cool-5", "cool-6"]) {
     store.captureSessionEvent({ ...event(id), project_id: "project-cool", session_uid: `codex:install:${id}`, source_event_id: id });
   }
   const blocked = store.submitDueReview({ projectId: "project-cool", minEntries: 3, cooldownMs: 3_600_000 });
   assert.equal(blocked.status, "not_due");
   assert.equal(blocked.eventCount, 3);
+  store.close();
+});
+
+test("reconcile worker lease fences overlap and can be released by its owner", async () => {
+  const store = await storeFixture();
+  const first = store.claimWorkerLease({ name: "codex_reconcile", ownerId: "worker-a", nowMs: 1_000, leaseMs: 60_000 });
+  assert.equal(first.acquired, true);
+  assert.equal(store.claimWorkerLease({ name: "codex_reconcile", ownerId: "worker-b", nowMs: 2_000, leaseMs: 60_000 }).acquired, false);
+  assert.equal(store.releaseWorkerLease({ name: "codex_reconcile", ownerId: "worker-b" }), false);
+  assert.equal(store.releaseWorkerLease({ name: "codex_reconcile", ownerId: "worker-a" }), true);
+  assert.equal(store.claimWorkerLease({ name: "codex_reconcile", ownerId: "worker-b", nowMs: 3_000, leaseMs: 60_000 }).acquired, true);
+  store.close();
+});
+
+test("transcript cursor compare-and-swap rejects a stale worker", async () => {
+  const store = await storeFixture();
+  store.saveTranscriptCursor({ provider: "codex", transcriptPath: "/tmp/one.jsonl", inodeId: "1", offset: 10, state: {}, expectedMissing: true });
+  store.saveTranscriptCursor({ provider: "codex", transcriptPath: "/tmp/one.jsonl", inodeId: "1", offset: 20, state: {}, expectedOffset: 10, expectedInodeId: "1" });
+  assert.throws(
+    () => store.saveTranscriptCursor({ provider: "codex", transcriptPath: "/tmp/one.jsonl", inodeId: "1", offset: 15, state: {}, expectedOffset: 10, expectedInodeId: "1" }),
+    /cursor changed/i
+  );
+  assert.equal(store.getTranscriptCursor("codex", "/tmp/one.jsonl").offset, 20);
+  assert.deepEqual(
+    store.listTranscriptCursors("codex").map((cursor) => [cursor.transcript_path, cursor.offset]),
+    [["/tmp/one.jsonl", 20]]
+  );
+  store.close();
+});
+
+test("runtime status is durable and redacted for doctor diagnostics", async () => {
+  const store = await storeFixture();
+  store.setRuntimeStatus("codex_reconcile", { status: "completed", scanned: 2, detail: "password=synthetic-secret" });
+  const status = store.getRuntimeStatus("codex_reconcile");
+  assert.equal(status.status, "completed");
+  assert.equal(status.scanned, 2);
+  assert.doesNotMatch(JSON.stringify(status), /synthetic-secret/);
   store.close();
 });

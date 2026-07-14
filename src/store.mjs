@@ -93,10 +93,10 @@ function parseJsonOr(value, fallback) {
 }
 
 function validateLessonEvidence(db, job, lesson) {
-  const findFeedback = db.prepare(`SELECT e.rowid AS storage_order, e.event_uid, e.project_id, e.role, e.redacted_text
+  const findFeedback = db.prepare(`SELECT e.rowid AS storage_order, e.event_uid, e.project_id, e.role, e.redacted_text, e.source_timestamp
     FROM queue_events q JOIN session_events e ON e.event_uid=q.event_uid
     WHERE q.job_id=? AND e.event_uid=?`);
-  const findReferent = db.prepare("SELECT rowid AS storage_order, event_uid, project_id, role FROM session_events WHERE event_uid=?");
+  const findReferent = db.prepare("SELECT rowid AS storage_order, event_uid, project_id, role, source_timestamp FROM session_events WHERE event_uid=?");
   for (const evidence of lesson.evidence_refs || []) {
     const feedback = findFeedback.get(job.job_id, evidence.feedback_event_id);
     if (!feedback || feedback.role !== "user") {
@@ -113,7 +113,12 @@ function validateLessonEvidence(db, job, lesson) {
       if ((referent.project_id || null) !== (feedback.project_id || null)) {
         throw new TypeError(`evidence referent belongs to a different project: ${referentId}`);
       }
-      if (Number(referent.storage_order) >= Number(feedback.storage_order)) {
+      const referentTime = Date.parse(referent.source_timestamp || "");
+      const feedbackTime = Date.parse(feedback.source_timestamp || "");
+      const referentPrecedes = Number.isFinite(referentTime) && Number.isFinite(feedbackTime)
+        ? referentTime < feedbackTime
+        : Number(referent.storage_order) < Number(feedback.storage_order);
+      if (!referentPrecedes) {
         throw new TypeError(`evidence referent must precede the feedback event: ${referentId}`);
       }
       if (referent.role === "assistant") hasAssistantReferent = true;
@@ -175,6 +180,7 @@ export function openStore({ paths, now = () => new Date() }) {
     "ALTER TABLE lessons ADD COLUMN severity TEXT NOT NULL DEFAULT 'Major'",
     "ALTER TABLE lessons ADD COLUMN scope_json TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE session_events ADD COLUMN source_namespace TEXT NOT NULL DEFAULT 'hook'",
+    "ALTER TABLE session_events ADD COLUMN native_turn_id TEXT",
     "ALTER TABLE session_events ADD COLUMN parent_event_id TEXT",
     "ALTER TABLE session_events ADD COLUMN capture_source TEXT NOT NULL DEFAULT 'prompt_hook'",
     "ALTER TABLE session_events ADD COLUMN capture_completeness TEXT NOT NULL DEFAULT 'prompt_only'",
@@ -183,6 +189,7 @@ export function openStore({ paths, now = () => new Date() }) {
     "ALTER TABLE session_events ADD COLUMN textual_output_ref TEXT",
     "ALTER TABLE session_events ADD COLUMN file_refs_json TEXT",
     "ALTER TABLE session_events ADD COLUMN artifact_hashes_json TEXT",
+    "ALTER TABLE session_events ADD COLUMN source_timestamp TEXT",
     "ALTER TABLE reviewer_jobs ADD COLUMN wake_attempt INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE reviewer_jobs ADD COLUMN prompted_at INTEGER",
     "ALTER TABLE reviewer_jobs ADD COLUMN next_wake_at INTEGER",
@@ -209,6 +216,7 @@ export function openStore({ paths, now = () => new Date() }) {
       UPDATE queue_events SET project_id=(SELECT project_id FROM session_events WHERE session_events.event_uid=queue_events.event_uid) WHERE project_id IS NULL;
       UPDATE reviewer_jobs SET project_id=(SELECT project_id FROM queue_events WHERE queue_events.job_id=reviewer_jobs.job_id LIMIT 1)
         WHERE project_id IS NULL AND EXISTS (SELECT 1 FROM queue_events WHERE queue_events.job_id=reviewer_jobs.job_id);`);
+    db.exec("UPDATE reviewer_jobs SET reason_code=NULL, lease_until=NULL WHERE status='completed' AND (reason_code IS NOT NULL OR lease_until IS NOT NULL)");
     db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, nowIso(now));
     db.prepare("INSERT OR IGNORE INTO store_meta(key, value) VALUES ('capture_policy_revision', '1'), ('capture_enabled', '1')").run();
     db.exec("COMMIT");
@@ -240,6 +248,18 @@ export function openStore({ paths, now = () => new Date() }) {
     path: dbPath,
     capability: { backend: "node:sqlite", schemaVersion: SCHEMA_VERSION },
     getCapturePolicy() { return currentPolicy(); },
+    setRuntimeStatus(name, value) {
+      return transaction(() => {
+        const payload = boundedStructured({ ...(value || {}), updatedAt: nowIso(now) }, 16 * 1024);
+        db.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(`runtime_status:${ensureString(name, "name")}`, JSON.stringify(payload));
+        return payload;
+      });
+    },
+    getRuntimeStatus(name) {
+      const row = db.prepare("SELECT value FROM store_meta WHERE key=?").get(`runtime_status:${ensureString(name, "name")}`);
+      return row ? parseJsonOr(row.value, null) : null;
+    },
     assertCaptureAllowed(event) {
       const policy = currentPolicy();
       if (!policy.enabled || Number(event.capture_policy_revision) !== policy.revision) {
@@ -272,20 +292,29 @@ export function openStore({ paths, now = () => new Date() }) {
           event.installation_id || "unknown", event.project_id || null, event.context_epoch || 1, timestamp
         );
         db.prepare(`INSERT INTO session_events
-          (event_uid, session_uid, event_seq, context_epoch, project_id, source_event_id, source_namespace,
+          (event_uid, session_uid, event_seq, context_epoch, project_id, source_event_id, source_namespace, native_turn_id,
            parent_event_id, role, redacted_text, redaction_manifest_json, encrypted_raw_ref, content_hash,
            capture_policy_revision, data_class, capture_source, capture_completeness, tool_name, tool_args_json,
-           textual_output_ref, file_refs_json, artifact_hashes_json, captured_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+           textual_output_ref, file_refs_json, artifact_hashes_json, source_timestamp, captured_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           ensureString(event.event_uid, "event_uid"), event.session_uid, event.event_seq, event.context_epoch,
           event.project_id || null, event.source_event_id || null, event.source_namespace || "hook",
-          event.parent_event_id || null, event.role, redactedEventText,
+          event.native_turn_id || event.native_turn || null, event.parent_event_id || null, event.role, redactedEventText,
           JSON.stringify(redactionManifest), event.encrypted_raw_ref || null, event.content_hash,
           event.capture_policy_revision, event.data_class || "normal", event.capture_source || "prompt_hook",
           event.capture_completeness || "prompt_only", event.tool_name ? boundedText(event.tool_name, 512) : null,
           toolArgs == null ? null : JSON.stringify(toolArgs), event.textual_output_ref ? boundedText(event.textual_output_ref, 4 * 1024) : null,
-          JSON.stringify(fileRefs), JSON.stringify(artifactHashes), timestamp
+          JSON.stringify(fileRefs), JSON.stringify(artifactHashes), event.source_timestamp || null, timestamp
         );
+        if (event.source_event_id) {
+          db.prepare(`INSERT OR IGNORE INTO event_observations
+            (provider, source_namespace, source_id, event_uid, source_offset, observed_at)
+            VALUES (?, ?, ?, ?, ?, ?)`).run(
+            event.cli || "unknown", event.source_namespace || "hook",
+            event.observation_source_id || event.source_event_id, event.event_uid,
+            event.source_offset == null ? null : Math.max(0, Math.floor(Number(event.source_offset) || 0)), timestamp
+          );
+        }
         if (event.data_class !== "synthetic_canary" && event.role === "user") {
           db.prepare("INSERT OR IGNORE INTO queue_events(event_uid, project_id, status, created_at) VALUES (?, ?, 'pending', ?)").run(event.event_uid, event.project_id || null, timestamp);
         }
@@ -293,7 +322,123 @@ export function openStore({ paths, now = () => new Date() }) {
       });
     },
     listSessionEvents(projectId) {
-      return db.prepare("SELECT * FROM session_events WHERE project_id=? ORDER BY captured_at, event_seq").all(projectId);
+      return db.prepare("SELECT * FROM session_events WHERE project_id=? ORDER BY COALESCE(source_timestamp, captured_at), rowid").all(projectId);
+    },
+    hasSessionEvent(eventUid) {
+      return Boolean(db.prepare("SELECT 1 FROM session_events WHERE event_uid=?").get(eventUid));
+    },
+    getEventObservation(provider, sourceNamespace, sourceId) {
+      return db.prepare(`SELECT o.*, e.project_id, e.session_uid, e.role, e.content_hash, e.native_turn_id
+        FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
+        WHERE o.provider=? AND o.source_namespace=? AND o.source_id=?`).get(provider, sourceNamespace, sourceId) || null;
+    },
+    resolveEventObservation({ provider, sourceNamespace, sourceId, sourceOffset = null, sessionUid, nativeTurnId = null, role, contentHash, sourceTimestamp = null }) {
+      return transaction(() => {
+        const existing = db.prepare(`SELECT o.*, e.project_id, e.session_uid, e.role, e.content_hash, e.native_turn_id
+          FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
+          WHERE o.provider=? AND o.source_namespace=? AND o.source_id=?`).get(provider, sourceNamespace, sourceId);
+        if (existing) return existing;
+        let candidate = db.prepare(`SELECT e.* FROM session_events e
+          LEFT JOIN event_observations o
+            ON o.event_uid=e.event_uid AND o.provider=? AND o.source_namespace=?
+          WHERE e.session_uid=? AND e.role=? AND e.content_hash=?
+            AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
+            AND o.event_uid IS NULL
+          ORDER BY CASE WHEN e.source_namespace='prompt_hook' OR e.source_namespace='stop_hook' THEN 0 ELSE 1 END,
+            COALESCE(e.source_timestamp, e.captured_at), e.rowid
+          LIMIT 1`).get(provider, sourceNamespace, sessionUid, role, contentHash, nativeTurnId);
+        if (!candidate && nativeTurnId != null) {
+          const relaxed = db.prepare(`SELECT e.* FROM session_events e
+            LEFT JOIN event_observations o
+              ON o.event_uid=e.event_uid AND o.provider=? AND o.source_namespace=?
+            WHERE e.session_uid=? AND e.role=? AND e.content_hash=?
+              AND e.native_turn_id IS NULL
+              AND o.event_uid IS NULL
+            ORDER BY CASE WHEN e.source_namespace='prompt_hook' OR e.source_namespace='stop_hook' THEN 0 ELSE 1 END,
+              COALESCE(e.source_timestamp, e.captured_at), e.rowid
+            LIMIT 32`).all(provider, sourceNamespace, sessionUid, role, contentHash);
+          const incomingAt = Date.parse(sourceTimestamp || nowIso(now));
+          const aliasWindowMs = 5 * 60 * 1000;
+          const nearby = relaxed.filter((row) => {
+            const candidateAt = Date.parse(row.source_timestamp || row.captured_at || "");
+            return Number.isFinite(incomingAt) && Number.isFinite(candidateAt)
+              && Math.abs(incomingAt - candidateAt) <= aliasWindowMs;
+          });
+          if (nearby.length === 1) candidate = nearby[0];
+        }
+        if (!candidate) return null;
+        db.prepare(`INSERT INTO event_observations
+          (provider, source_namespace, source_id, event_uid, source_offset, observed_at)
+          VALUES (?, ?, ?, ?, ?, ?)`).run(
+          provider, sourceNamespace, sourceId, candidate.event_uid,
+          sourceOffset == null ? null : Math.max(0, Math.floor(Number(sourceOffset) || 0)), nowIso(now)
+        );
+        return { ...candidate, provider, source_namespace: sourceNamespace, source_id: sourceId, source_offset: sourceOffset };
+      });
+    },
+    getTranscriptCursor(provider, transcriptPath) {
+      return db.prepare("SELECT * FROM transcript_cursors WHERE provider=? AND transcript_path=?").get(provider, transcriptPath) || null;
+    },
+    listTranscriptCursors(provider) {
+      return db.prepare("SELECT * FROM transcript_cursors WHERE provider=? ORDER BY updated_at, transcript_path")
+        .all(ensureString(provider, "provider"));
+    },
+    saveTranscriptCursor({
+      provider,
+      transcriptPath,
+      deviceId = null,
+      inodeId = null,
+      offset,
+      state,
+      expectedMissing = false,
+      expectedOffset,
+      expectedInodeId
+    }) {
+      return transaction(() => {
+        const current = db.prepare("SELECT * FROM transcript_cursors WHERE provider=? AND transcript_path=?").get(provider, transcriptPath) || null;
+        if (expectedMissing && current) throw new RevisionConflictError("transcript cursor changed before commit");
+        if (expectedOffset !== undefined && (!current
+          || Number(current.offset) !== Number(expectedOffset)
+          || (expectedInodeId !== undefined && String(current.inode_id) !== String(expectedInodeId)))) {
+          throw new RevisionConflictError("transcript cursor changed before commit");
+        }
+        const stateJson = JSON.stringify(state || {});
+        db.prepare(`INSERT INTO transcript_cursors(provider, transcript_path, device_id, inode_id, offset, state_json, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(provider, transcript_path) DO UPDATE SET
+            device_id=excluded.device_id,
+            inode_id=excluded.inode_id,
+            offset=excluded.offset,
+            state_json=excluded.state_json,
+            updated_at=excluded.updated_at`).run(
+          ensureString(provider, "provider"), ensureString(transcriptPath, "transcript_path"),
+          deviceId == null ? null : String(deviceId), inodeId == null ? null : String(inodeId),
+          Math.max(0, Math.floor(Number(offset) || 0)), stateJson, nowIso(now)
+        );
+        return db.prepare("SELECT * FROM transcript_cursors WHERE provider=? AND transcript_path=?").get(provider, transcriptPath);
+      });
+    },
+    claimWorkerLease({ name, ownerId, nowMs = Date.now(), leaseMs = 120_000 }) {
+      return transaction(() => {
+        const leaseName = ensureString(name, "name");
+        const owner = ensureString(ownerId, "ownerId");
+        const current = db.prepare("SELECT * FROM worker_leases WHERE name=?").get(leaseName);
+        if (current && current.owner_id !== owner && Number(current.lease_until) > nowMs) {
+          return { acquired: false, ownerId: current.owner_id, leaseUntil: Number(current.lease_until), leaseEpoch: Number(current.lease_epoch) };
+        }
+        const epoch = Number(current?.lease_epoch || 0) + 1;
+        const leaseUntil = nowMs + Math.max(1_000, Math.floor(Number(leaseMs) || 120_000));
+        db.prepare(`INSERT INTO worker_leases(name, owner_id, lease_epoch, lease_until, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(name) DO UPDATE SET owner_id=excluded.owner_id, lease_epoch=excluded.lease_epoch,
+            lease_until=excluded.lease_until, updated_at=excluded.updated_at`).run(
+          leaseName, owner, epoch, leaseUntil, nowIso(now)
+        );
+        return { acquired: true, ownerId: owner, leaseUntil, leaseEpoch: epoch };
+      });
+    },
+    releaseWorkerLease({ name, ownerId }) {
+      return transaction(() => db.prepare("DELETE FROM worker_leases WHERE name=? AND owner_id=?").run(name, ownerId).changes === 1);
     },
     createIncident(input) {
       return transaction(() => {
@@ -400,27 +545,58 @@ export function openStore({ paths, now = () => new Date() }) {
     pendingReviewEventCount(projectId) {
       return Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND status='pending'").get(projectId).count);
     },
-    submitDueReview({ projectId, minEntries = 3, maxEntries = 24, maxAgeMs = 3_600_000, cooldownMs = 900_000, promptVersion = "v1" }) {
+    submitDueReview({ projectId, minEntries = 3, maxEntries = 24, maxAgeMs = 3_600_000, cooldownMs = 900_000, promptVersion = "v1", immediateEventUid = null }) {
       return transaction(() => {
-        const existing = db.prepare("SELECT job_id, status FROM reviewer_jobs WHERE project_id=? AND status IN ('pending','running') ORDER BY created_at DESC LIMIT 1").get(projectId);
-        if (existing) {
+        const boundedMaxEntries = Math.max(1, Math.floor(Number(maxEntries) || 24));
+        const immediateEvent = immediateEventUid
+          ? db.prepare("SELECT event_uid, job_id FROM queue_events WHERE event_uid=? AND project_id=? AND status='pending'").get(immediateEventUid, projectId)
+          : null;
+        if (immediateEventUid && !immediateEvent) {
+          return { status: "not_due", eventCount: this.pendingReviewEventCount(projectId), immediate: true, reason: "immediate_event_unavailable" };
+        }
+
+        const alreadyAssigned = immediateEvent?.job_id
+          ? db.prepare("SELECT job_id, status, wake_attempt FROM reviewer_jobs WHERE job_id=? AND status IN ('pending','running')").get(immediateEvent.job_id)
+          : null;
+        if (alreadyAssigned) {
+          const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, alreadyAssigned.job_id).count);
+          return { job_id: alreadyAssigned.job_id, status: alreadyAssigned.status, eventCount: count, existing: true, immediate: true };
+        }
+
+        const existing = db.prepare("SELECT job_id, status, wake_attempt FROM reviewer_jobs WHERE project_id=? AND status IN ('pending','running') ORDER BY created_at DESC LIMIT 1").get(projectId);
+        if (existing && !immediateEvent) {
           const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
           return { job_id: existing.job_id, status: existing.status, eventCount: count, existing: true };
         }
+        if (existing?.status === "pending" && Number(existing.wake_attempt || 0) === 0 && immediateEvent) {
+          const assigned = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
+          if (assigned >= boundedMaxEntries) {
+            const displaced = db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND job_id=? ORDER BY created_at, event_uid LIMIT 1").get(projectId, existing.job_id);
+            if (displaced) db.prepare("UPDATE queue_events SET job_id=NULL WHERE event_uid=? AND job_id=?").run(displaced.event_uid, existing.job_id);
+          }
+          db.prepare("UPDATE queue_events SET job_id=? WHERE event_uid=? AND project_id=? AND status='pending' AND job_id IS NULL").run(existing.job_id, immediateEventUid, projectId);
+          const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
+          return { job_id: existing.job_id, status: "pending", eventCount: count, existing: true, immediate: true };
+        }
+
         const latest = db.prepare("SELECT created_at FROM reviewer_jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1").get(projectId);
         const oldest = db.prepare("SELECT MIN(created_at) AS created_at FROM queue_events WHERE project_id=? AND status='pending'").get(projectId);
         const count = this.pendingReviewEventCount(projectId);
-        if (!oldest?.created_at || (latest?.created_at && (Date.now() - Date.parse(latest.created_at)) < cooldownMs) || (count < minEntries && (Date.now() - Date.parse(oldest.created_at)) < maxAgeMs)) {
+        if (!oldest?.created_at || (!immediateEvent && latest?.created_at && (Date.now() - Date.parse(latest.created_at)) < cooldownMs) || (!immediateEvent && count < minEntries && (Date.now() - Date.parse(oldest.created_at)) < maxAgeMs)) {
           return { status: "not_due", eventCount: count };
         }
-        const boundedMaxEntries = Math.max(1, Math.floor(Number(maxEntries) || 24));
-        const ids = db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND status='pending' AND job_id IS NULL ORDER BY created_at, event_uid LIMIT ?").all(projectId, boundedMaxEntries).map((row) => row.event_uid);
+        const ids = immediateEvent
+          ? db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND status='pending' AND job_id IS NULL ORDER BY CASE WHEN event_uid=? THEN 0 ELSE 1 END, created_at, event_uid LIMIT ?").all(projectId, immediateEventUid, boundedMaxEntries).map((row) => row.event_uid)
+          : db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND status='pending' AND job_id IS NULL ORDER BY created_at, event_uid LIMIT ?").all(projectId, boundedMaxEntries).map((row) => row.event_uid);
+        if (ids.length === 0 || (immediateEvent && !ids.includes(immediateEventUid))) {
+          return { status: "not_due", eventCount: count, immediate: Boolean(immediateEvent), reason: "no_assignable_events" };
+        }
         const jobId = createHash("sha256").update([promptVersion, projectId, ids[0], ids.at(-1)].join("\u0000")).digest("hex");
         const timestamp = nowIso(now);
         db.prepare("INSERT INTO reviewer_jobs(job_id, project_id, prompt_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(jobId, projectId, promptVersion, timestamp, timestamp);
         const assign = db.prepare("UPDATE queue_events SET job_id=? WHERE event_uid=? AND status='pending' AND job_id IS NULL");
         for (const eventUid of ids) assign.run(jobId, eventUid);
-        return { job_id: jobId, status: "pending", eventCount: ids.length, existing: false };
+        return { job_id: jobId, status: "pending", eventCount: ids.length, existing: false, immediate: Boolean(immediateEvent) };
       });
     },
     submitReviewerJob(input) {
@@ -432,6 +608,37 @@ export function openStore({ paths, now = () => new Date() }) {
     },
     getReviewerJob(jobId) {
       return db.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?").get(jobId) || null;
+    },
+    listRecoverableReviewerJobs({ nowMs = Date.now(), maxAttempts = 3, limit = 32 } = {}) {
+      const boundedAttempts = Math.max(1, Math.floor(Number(maxAttempts) || 3));
+      const boundedLimit = Math.max(1, Math.min(256, Math.floor(Number(limit) || 32)));
+      return db.prepare(`SELECT j.*,
+          COALESCE((SELECT s.cli FROM queue_events q
+            JOIN session_events e ON e.event_uid=q.event_uid
+            JOIN sessions s ON s.session_uid=e.session_uid
+            WHERE q.job_id=j.job_id ORDER BY q.created_at, q.event_uid LIMIT 1), 'codex') AS cli
+        FROM reviewer_jobs j
+        WHERE j.attempt < ? AND (
+          (j.status='pending' AND (j.next_wake_at IS NULL OR j.next_wake_at<=?))
+          OR (j.status='running' AND j.lease_until IS NOT NULL AND j.lease_until<=?)
+        )
+        ORDER BY j.updated_at, j.job_id LIMIT ?`).all(boundedAttempts, nowMs, nowMs, boundedLimit);
+    },
+    requeueExpiredReviewerJob({ jobId, nowMs = Date.now() }) {
+      return transaction(() => db.prepare(`UPDATE reviewer_jobs
+        SET status='pending', owner_id=NULL, lease_until=NULL, reason_code='lease_expired', updated_at=?
+        WHERE job_id=? AND status='running' AND lease_until IS NOT NULL AND lease_until<=?`).run(
+        nowIso(now), jobId, nowMs
+      ).changes === 1);
+    },
+    failExhaustedReviewerJobs({ nowMs = Date.now(), maxAttempts = 3 } = {}) {
+      const boundedAttempts = Math.max(1, Math.floor(Number(maxAttempts) || 3));
+      return transaction(() => db.prepare(`UPDATE reviewer_jobs
+        SET status='failed', reason_code='retry_exhausted', owner_id=NULL, lease_until=NULL, updated_at=?
+        WHERE attempt>=? AND (
+          (status='pending' AND (next_wake_at IS NULL OR next_wake_at<=?))
+          OR (status='running' AND lease_until IS NOT NULL AND lease_until<=?)
+        )`).run(nowIso(now), boundedAttempts, nowMs, nowMs).changes);
     },
     claimReviewerWake({ jobId, nowMs = Date.now(), cooldownMs = 300_000 }) {
       return transaction(() => {
@@ -457,7 +664,7 @@ export function openStore({ paths, now = () => new Date() }) {
       if (!job) throw new Error(`reviewer job not found: ${jobId}`);
       const queued = db.prepare(`SELECT e.event_uid, e.session_uid FROM queue_events q
         JOIN session_events e ON e.event_uid=q.event_uid WHERE q.job_id=?
-        ORDER BY e.captured_at, e.rowid`).all(jobId);
+        ORDER BY COALESCE(e.source_timestamp, e.captured_at), e.rowid`).all(jobId);
       const queuedIds = queued.map((row) => row.event_uid);
       const selectedIds = new Set(queuedIds);
       const sessionIds = [...new Set(queued.map((row) => row.session_uid))];
@@ -466,9 +673,9 @@ export function openStore({ paths, now = () => new Date() }) {
       const selectSession = db.prepare(`SELECT e.rowid AS storage_order, e.event_uid, e.session_uid, e.context_epoch, e.project_id,
           e.source_event_id, e.source_namespace, e.parent_event_id, e.role, e.redacted_text,
           e.capture_source, e.capture_completeness, e.tool_name, e.tool_args_json,
-          e.textual_output_ref, e.file_refs_json, e.artifact_hashes_json, e.captured_at
+          e.textual_output_ref, e.file_refs_json, e.artifact_hashes_json, e.source_timestamp, e.captured_at
         FROM session_events e WHERE e.session_uid=? AND (e.project_id=? OR ? IS NULL)
-        ORDER BY e.captured_at, e.rowid`);
+        ORDER BY COALESCE(e.source_timestamp, e.captured_at), e.rowid`);
       for (const sessionUid of sessionIds) {
         const sessionRows = selectSession.all(sessionUid, job.project_id || null, job.project_id || null);
         for (const row of sessionRows) rowsById.set(row.event_uid, row);
@@ -485,7 +692,12 @@ export function openStore({ paths, now = () => new Date() }) {
         const row = rowsById.get(eventUid);
         if (row) orderedRows.push(row);
       }
-      orderedRows.sort((left, right) => Number(left.storage_order) - Number(right.storage_order));
+      orderedRows.sort((left, right) => {
+        const leftTime = Date.parse(left.source_timestamp || left.captured_at || "");
+        const rightTime = Date.parse(right.source_timestamp || right.captured_at || "");
+        if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+        return Number(left.storage_order) - Number(right.storage_order);
+      });
       const requestedEventLimit = Number(maxEventChars);
       const requestedTotalLimit = Number(maxTotalChars);
       const eventLimit = Number.isFinite(requestedEventLimit) && requestedEventLimit >= 0 ? Math.floor(requestedEventLimit) : 16 * 1024;
@@ -541,6 +753,7 @@ export function openStore({ paths, now = () => new Date() }) {
           tool_name: row.tool_name,
           ...renderedMetadata,
           captured_at: row.captured_at,
+          source_timestamp: row.source_timestamp,
           queued_for_review: queuedIds.includes(row.event_uid),
           context_truncated: contextTruncated
         };
@@ -555,6 +768,7 @@ export function openStore({ paths, now = () => new Date() }) {
           created_at: job.created_at
         },
         queued_event_ids: queuedIds,
+        feedback_candidate_event_ids: queuedIds,
         events,
         truncated_event_ids: [...new Set(truncatedEventIds)],
         context_limits: { prior_events: priorEvents, following_events: followingEvents, max_events: maxEvents, max_event_chars: maxEventChars, max_total_content_chars: maxTotalChars, max_serialized_bytes: 512 * 1024 }
@@ -579,7 +793,9 @@ export function openStore({ paths, now = () => new Date() }) {
     },
     commitReview({ jobId, ownerId, attempt, leaseEpoch, capabilityHash = null }, review) {
       return transaction(() => {
-        if (!review || !review.review_receipt_id || !review.report_content_id || !["reviewed", "reviewed_no_lesson"].includes(review.status) || !Array.isArray(review.lessons)) {
+        if (!review || review.write_complete !== true || !review.review_receipt_id || !review.report_content_id
+          || String(review.report_content || "").trim().length < 24
+          || !["reviewed", "reviewed_no_lesson"].includes(review.status) || !Array.isArray(review.lessons)) {
           throw new TypeError("invalid structured review receipt");
         }
         validateReviewQuality(review);
@@ -673,7 +889,7 @@ export function openStore({ paths, now = () => new Date() }) {
         }
         db.prepare("INSERT INTO review_receipts(receipt_id, job_id, payload_json, created_at) VALUES (?, ?, ?, ?)").run(review.review_receipt_id, jobId, JSON.stringify(persistedReview), nowIso(now));
         db.prepare("INSERT INTO report_contents(content_id, job_id, content_text, created_at) VALUES (?, ?, ?, ?)").run(review.report_content_id, jobId, persistedReport, nowIso(now));
-        db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, updated_at=? WHERE job_id=?").run(review.review_receipt_id, nowIso(now), jobId);
+        db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, reason_code=NULL, lease_until=NULL, updated_at=? WHERE job_id=?").run(review.review_receipt_id, nowIso(now), jobId);
         if (capabilityHash) db.prepare("UPDATE reviewer_jobs SET capability_consumed_at=? WHERE job_id=?").run(Date.now(), jobId);
         db.prepare("UPDATE queue_events SET status='acknowledged' WHERE job_id=?").run(jobId);
         return { status: "completed", receipt_id: review.review_receipt_id, lessonCount: review.lessons.length };
@@ -702,6 +918,7 @@ export function openStore({ paths, now = () => new Date() }) {
         for (const row of events) {
           db.prepare("DELETE FROM incident_events WHERE event_uid=?").run(row.event_uid);
           db.prepare("DELETE FROM queue_events WHERE event_uid=?").run(row.event_uid);
+          db.prepare("DELETE FROM event_observations WHERE event_uid=?").run(row.event_uid);
           db.prepare("DELETE FROM session_events WHERE event_uid=?").run(row.event_uid);
         }
         db.prepare("DELETE FROM sessions WHERE session_uid NOT IN (SELECT DISTINCT session_uid FROM session_events)").run();
@@ -727,7 +944,7 @@ export function openStore({ paths, now = () => new Date() }) {
       if (result.changes !== 1) throw new LeaseConflictError("stale reviewer heartbeat");
     },
     completeReviewerJob(jobId, ownerId, attempt, leaseEpoch, receiptId) {
-      const result = db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, updated_at=? WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?").run(receiptId, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now());
+      const result = db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, reason_code=NULL, lease_until=NULL, updated_at=? WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?").run(receiptId, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now());
       if (result.changes !== 1) throw new LeaseConflictError("stale reviewer completion");
     },
     failReviewerJob(jobId, ownerId, attempt, leaseEpoch, retryable, reasonCode) {

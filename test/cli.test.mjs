@@ -6,7 +6,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, it } from "node:test";
 
-import { doctor, install, uninstall } from "../src/index.mjs";
+import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
+import { openStore } from "../src/store.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -46,6 +47,115 @@ function runWithInput(file, input, env, args = []) {
 }
 
 describe("agent-feedback-loop package", () => {
+  it("synchronizes Codex trust after writing its managed hook block", async () => {
+    const home = await tempHome();
+    const calls = [];
+    const codexHost = {
+      async synchronize(input) {
+        calls.push(input);
+        return {
+          available: true,
+          configured: true,
+          runnable: true,
+          status: "trusted",
+          prompt: { trustStatus: "trusted", enabled: true },
+          backstop: { trustStatus: "trusted", enabled: true }
+        };
+      }
+    };
+
+    const result = await install({ home, cwd: home, codexHost });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].home, home);
+    assert.match(calls[0].promptCommand, /core-hook\.sh/);
+    assert.match(calls[0].backstopCommand, /stop-hook\.sh/);
+    assert.ok(result.actions.some((action) => /newly spawned app-server/i.test(action)));
+    assert.ok(result.actions.some((action) => /already-running Desktop tasks.*transcript reconciliation/i.test(action)));
+  });
+
+  it("doctor reports a configured but modified Codex hook as non-runnable", async () => {
+    const home = await tempHome();
+    await install({ home, codexHost: { synchronize: async () => ({ available: false, configured: true, runnable: false, status: "unavailable" }) } });
+    const codexHost = {
+      async inspect() {
+        return {
+          available: true,
+          configured: true,
+          runnable: false,
+          status: "modified",
+          prompt: { found: true, trustStatus: "modified", enabled: true },
+          backstop: { found: true, trustStatus: "modified", enabled: true }
+        };
+      }
+    };
+
+    const health = await doctor({ home, cwd: home, codexHost });
+
+    assert.equal(health.healthy, false);
+    assert.equal(health.clis.codex.configured, true);
+    assert.equal(health.clis.codex.runnable, false);
+    assert.equal(health.clis.codex.connected, false);
+    assert.equal(health.clis.codex.promptTrustStatus, "modified");
+    assert.equal(health.clis.codex.backstopTrustStatus, "modified");
+  });
+
+  it("doctor requires an active fresh reconciliation loop for the real-home operating mode", async () => {
+    const home = await tempHome();
+    const codexHost = {
+      async synchronize() { return { available: true, configured: true, runnable: true, status: "trusted" }; },
+      async inspect() {
+        return {
+          available: true,
+          configured: true,
+          runnable: true,
+          status: "trusted",
+          prompt: { runnable: true, trustStatus: "trusted" },
+          backstop: { runnable: true, trustStatus: "trusted" }
+        };
+      }
+    };
+    const schedulerHost = {
+      async install() { return { active: false }; },
+      async inspect() { return { active: false }; }
+    };
+    const reviewerDetector = async () => ({
+      codex: { cli: "codex", available: true, executable: "/opt/codex" },
+      claude: { cli: "claude", available: false, executable: null },
+      gemini: { cli: "gemini", available: false, executable: null }
+    });
+    await install({ home, codexHost, schedulerHost, activateScheduler: false });
+
+    const inactive = await doctor({ home, codexHost, schedulerHost, reviewerDetector, requireScheduler: true });
+    assert.equal(inactive.healthy, false);
+    assert.equal(inactive.operational.schedulerReady, false);
+    assert.equal(inactive.operational.reconciliationReady, false);
+
+    schedulerHost.inspect = async () => ({ active: true });
+    const store = openStore({ paths: pathsFor(home) });
+    store.setRuntimeStatus("codex_reconcile", { status: "completed", filesScanned: 1 });
+    store.close();
+    const ready = await doctor({ home, codexHost, schedulerHost, reviewerDetector, requireScheduler: true });
+    assert.equal(ready.healthy, true);
+    assert.equal(ready.operational.schedulerReady, true);
+    assert.equal(ready.operational.reconciliationReady, true);
+    assert.deepEqual(ready.operational.readyClis, ["codex"]);
+    assert.equal(ready.clis.gemini.operational, false);
+
+    const failedStore = openStore({ paths: pathsFor(home) });
+    failedStore.setRuntimeStatus("codex_reconcile", {
+      status: "completed_with_errors",
+      filesScanned: 0,
+      candidates: 1,
+      errors: [{ code: "EIO", path: "/tmp/unreadable-rollout.jsonl" }]
+    });
+    failedStore.close();
+    const failed = await doctor({ home, codexHost, schedulerHost, reviewerDetector, requireScheduler: true });
+    assert.equal(failed.healthy, false);
+    assert.equal(failed.degraded, true);
+    assert.equal(failed.operational.reconciliationReady, false);
+  });
+
   it("installs prompt pack, patches configs, and uninstalls config hooks", async () => {
     const home = await tempHome();
 
@@ -53,6 +163,9 @@ describe("agent-feedback-loop package", () => {
 
     const promptFile = path.join(home, ".agent", "feedback-loop", "prompts", "reflection-agent.md");
     const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const reviewerSchema = path.join(home, ".agent", "feedback-loop", "schemas", "reviewer-receipt.schema.json");
+    const geminiReviewerPolicy = path.join(home, ".agent", "feedback-loop", "policies", "gemini-reviewer-deny-all.toml");
+    const geminiReviewerSettings = path.join(home, ".agent", "feedback-loop", "settings", "gemini-reviewer.json");
     const codexConfig = path.join(home, ".codex", "config.toml");
     const claudeSettings = path.join(home, ".claude", "settings.json");
     const geminiSettings = path.join(home, ".gemini", "settings.json");
@@ -64,11 +177,18 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(promptFile), /real background subagent/);
     assert.match(await readText(promptFile), /mode=background_subagent/);
     assert.match(await readText(promptFile), /project-scoped active projection/);
+    assert.match(await readText(promptFile), /feedback_candidate_event_ids/);
     assert.match(await readText(path.join(home, ".agent", "feedback-loop", "rules", "feedback-loop.md")), /commit atomically/);
     assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
+    const schema = JSON.parse(await readText(reviewerSchema));
+    assert.equal(schema.properties.status.enum.includes("reviewed_no_lesson"), true);
+    assert.match(await readText(geminiReviewerPolicy), /toolName = "\*"/);
+    assert.equal(JSON.parse(await readText(geminiReviewerSettings)).hooksConfig.enabled, false);
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
     assert.match(await readText(codexConfig), /core-hook\.sh/);
     assert.match(await readText(codexConfig), /--continue/);
+    const codexPromptBlock = (await readText(codexConfig)).split("[[hooks.Stop]]")[0];
+    assert.match(codexPromptBlock, /timeout = 5/);
     // backstop: Codex Stop hook wired to stop-hook.sh
     assert.match(await readText(codexConfig), /\[\[hooks\.Stop\]\]/);
     assert.match(await readText(codexConfig), /stop-hook\.sh/);
@@ -77,6 +197,7 @@ describe("agent-feedback-loop package", () => {
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
     assert.ok(userPromptHooks.some((hook) => hook.command?.includes("core-hook.sh")));
+    assert.ok(userPromptHooks.some((hook) => hook.command?.includes("core-hook.sh") && hook.timeout === 5));
     // Claude's type:"agent" hook starts a subagent, but it blocks the hook.
     // Keep the hook itself command-based; the injected contract forces the
     // active agent to start the platform's background subagent tool.
@@ -88,6 +209,7 @@ describe("agent-feedback-loop package", () => {
     const beforeAgentHooks = gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks);
     assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("core-hook.sh")));
     assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("--event") && hook.command?.includes("BeforeAgent")));
+    assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("core-hook.sh") && hook.timeout === 5000));
     const geminiAfterAgent = gemini.hooks.AfterAgent.flatMap((entry) => entry.hooks);
     assert.ok(geminiAfterAgent.some((hook) => hook.command?.includes("stop-hook.sh") && hook.command?.includes("--mode") && hook.command?.includes("gemini")));
 
@@ -382,6 +504,56 @@ describe("agent-feedback-loop package", () => {
     assert.equal(geminiJson.continue, undefined);
     assert.equal(geminiJson.hookSpecificOutput.hookEventName, "BeforeAgent");
     assert.match(geminiJson.hookSpecificOutput.additionalContext, /mode=background_subagent/);
+  });
+
+  it("queues an immediate background review after an interrupted prior turn", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const transcript = path.join(home, "rollout.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "prior-turn" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "prior-turn", reason: "interrupted" } })
+    ].join("\n"), "utf8");
+    const env = {
+      ...process.env,
+      HOME: home,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "3",
+      AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "3600",
+      AGENT_FEEDBACK_LOOP_DEBUG: "1",
+      AGENT_FEEDBACK_LOOP_LOG: path.join(home, "runtime.log"),
+      AGENT_FEEDBACK_LOOP_CODEX_COMMAND: path.join(home, "missing-codex")
+    };
+    const firstInput = JSON.stringify({
+      session_id: "interrupted-session",
+      turn_id: "initial-turn",
+      cwd: "/tmp/interrupted-project",
+      prompt: "Initial neutral evidence."
+    });
+    const first = await runWithInput(coreHook, firstInput, {
+      ...env,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "1"
+    }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    assert.deepEqual(JSON.parse(first.stdout), { continue: true });
+
+    const input = JSON.stringify({
+      session_id: "interrupted-session",
+      turn_id: "current-turn",
+      cwd: "/tmp/interrupted-project",
+      transcript_path: transcript,
+      prompt: "This wording is deliberately neutral."
+    });
+
+    const output = await runWithInput(coreHook, input, env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    const response = JSON.parse(output.stdout);
+
+    assert.equal(response.continue, true);
+    assert.equal(response.hookSpecificOutput, undefined);
+    const log = await readText(env.AGENT_FEEDBACK_LOOP_LOG);
+    assert.match(log, /signal=prior_turn_interrupted immediate_review=1/);
+    assert.match(log, /reviewer\.unavailable cli=codex/);
+    const jobIds = [...log.matchAll(/background job=([a-f0-9]+)/g)].map((match) => match[1]);
+    assert.equal(new Set(jobIds).size, 2);
   });
 
   it("core hook fails open when shared trigger rules are missing", async () => {

@@ -1,14 +1,14 @@
-import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { runProcessWithInput } from "./reviewer-provider.mjs";
 
 export class ReviewerUnavailableError extends Error {}
 
 function validateReceipt(value) {
-  if (!value || typeof value !== "object" || typeof value.review_receipt_id !== "string" || typeof value.report_content_id !== "string" || !["reviewed", "reviewed_no_lesson"].includes(value.status) || !Array.isArray(value.lessons)) {
+  if (!value || typeof value !== "object" || value.write_complete !== true
+    || typeof value.review_receipt_id !== "string" || typeof value.report_content_id !== "string"
+    || typeof value.report_content !== "string" || value.report_content.trim().length < 24
+    || !["reviewed", "reviewed_no_lesson"].includes(value.status) || !Array.isArray(value.lessons)) {
     throw new Error("invalid reviewer receipt");
   }
   return value;
@@ -28,7 +28,7 @@ function reviewerEnvironment(source = process.env) {
 }
 
 export async function runIsolatedReview({ command, args = [], cwd, timeoutMs = 30_000, env = process.env }) {
-  const { stdout } = await execFileAsync(command, args, { cwd, env: reviewerEnvironment(env), timeout: timeoutMs, maxBuffer: 256 * 1024, windowsHide: true });
+  const { stdout } = await runProcessWithInput({ command, args, cwd, env: reviewerEnvironment(env), input: "", timeoutMs });
   return validateReceipt(JSON.parse(stdout));
 }
 
@@ -61,7 +61,7 @@ export class ReviewerRunner {
     return this.store.failReviewerJob(jobId, ownerId, attempt, leaseEpoch, retryable, reasonCode);
   }
 
-  async runJob({ jobId, ownerId, command, args = [], cwd, timeoutMs = 30_000, contextRoot = path.join(cwd, "reviewer-contexts"), promptFile = "", env = process.env }) {
+  async runJob({ jobId, ownerId, command, args = [], review = null, cwd, timeoutMs = 30_000, contextRoot = path.join(cwd, "reviewer-contexts"), promptFile = "", env = process.env }) {
     if (this.capability !== "supported") return { status: "pending", reason: "reviewer_unavailable" };
     const job = this.store.getReviewerJob(jobId);
     if (!job) throw new Error(`reviewer job not found: ${jobId}`);
@@ -85,19 +85,16 @@ export class ReviewerRunner {
       contextFile = path.join(contextRoot, `${jobId}.${lease.lease_epoch}.json`);
       await writeFile(contextFile, serializedContext, { mode: 0o600, flag: "wx" });
       await chmod(contextFile, 0o600);
-      const receipt = await runIsolatedReview({
-        command,
-        args,
-        cwd,
-        timeoutMs,
-        env: {
-          ...env,
-          AFL_REVIEW_JOB_ID: jobId,
-          AFL_REVIEW_CONTEXT_FILE: contextFile,
-          AFL_REVIEW_PROMPT_FILE: promptFile,
-          AFL_REVIEW_SUBMIT_PROTOCOL: "stdout_json_receipt"
-        }
-      });
+      const reviewEnv = {
+        ...env,
+        AFL_REVIEW_JOB_ID: jobId,
+        AFL_REVIEW_CONTEXT_FILE: contextFile,
+        AFL_REVIEW_PROMPT_FILE: promptFile,
+        AFL_REVIEW_SUBMIT_PROTOCOL: "stdout_json_receipt"
+      };
+      const receipt = review
+        ? validateReceipt(await review({ contextFile, promptFile, cwd, timeoutMs, env: reviewerEnvironment(reviewEnv) }))
+        : await runIsolatedReview({ command, args, cwd, timeoutMs, env: reviewEnv });
       return this.store.commitReview({ jobId, ownerId, attempt, leaseEpoch: lease.lease_epoch }, receipt);
     } catch (error) {
       try { this.fail(jobId, ownerId, attempt, lease.lease_epoch, true, error.code || "reviewer_failed"); } catch {}
