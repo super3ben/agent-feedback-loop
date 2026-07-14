@@ -3,7 +3,7 @@
 # Marker needle the Stop/AfterAgent backstop greps for in the model reply.
 # A review turn must end its reply with: <!--afl-reflection:done responsibility=...-->
 AFL_DONE_MARKER='<!--afl-reflection:done'
-AFL_DONE_PATTERN='<!--afl-reflection:done[[:space:]][^>]*responsibility=[^[:space:]>]+[^>]*mode=(background_subagent|fallback_no_subagent)'
+AFL_DONE_PATTERN='<!--afl-reflection:done[[:space:]][^>]*responsibility=[^[:space:]>]+[^>]*mode=background_subagent'
 
 # Deferred-review model: no keyword matching and no per-turn semantic gate.
 # Every user prompt is appended to a persistent per-project queue at zero
@@ -13,8 +13,8 @@ AFL_DONE_PATTERN='<!--afl-reflection:done[[:space:]][^>]*responsibility=[^[:spac
 #         AND (entries >= min-entries OR seconds since last review >= max-age)
 # The queue lives on disk and survives sessions, so deferred feedback is
 # reviewed eventually even if the session that produced it already ended.
-AFL_REVIEW_MIN_ENTRIES="${AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES:-5}"
-AFL_REVIEW_MAX_AGE="${AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE:-14400}"
+AFL_REVIEW_MIN_ENTRIES="${AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES:-3}"
+AFL_REVIEW_MAX_AGE="${AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE:-3600}"
 AFL_REVIEW_COOLDOWN="${AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN:-900}"
 
 agent_feedback_has_done_marker() {
@@ -115,12 +115,12 @@ agent_feedback_review_message() {
   prompt_file="$1"
   queue="$2"
   count="$3"
-  printf '反馈评审到期：队列文件 %s 已积累 %s 条用户消息记录。请立即启动一个后台评审 subagent（不得由主会话自己完成评审），把 %s 和该队列文件路径交给它：由它读取队列，按「回顾性反馈」标准筛选——仅当消息针对 agent 既有产出表达不满/纠正，或同一要求被重复提出时才算反馈；对新任务的前置要求、约束、偏好一律不算，宁漏报不误报；判为反馈必须能逐字引用用户原话并指明所指的既有产出，引用不出就不算；结论为「无新过错/预防性提醒」时严禁写规则或改既有规则、也不归档报告。忽略普通消息；仅对真实反馈按该提示完成反思。反思必须有深度：对每条真实反馈做 5 Why 逐层追因到「过程/默认假设」层的系统性根因，抽象成可复用的方法论类别，并给出「以后要这样做」的方法改进（不是单条「不要再犯 X」）；浅层复述或只加一条窄规则视为不合格。评审是分析不是跑测试：严禁启动后台或长驻进程（不得用 run_in_background、测试 watch、tail -f、dev server），确需取证只能同步、有超时、非交互地跑一次，结束前必须确保没有遗留运行中的子进程或 shell。报告写入对应项目 .agent/reflections/<时间戳>-<短标题>.md；agent_fault 且有证据、中高置信度、具备具体防复发约束时默认直接写入该项目 .agent/rules/feedback-loop.md，无需询问用户。评审完成后清空该队列文件。主会话继续处理用户当前请求，仅在回复结尾输出一行 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。若当前平台确实没有后台 subagent 工具，才允许主会话自行快速评审并输出 `%s responsibility=<分类或none> mode=fallback_no_subagent reason=<原因>-->`。反思报告默认使用中文，除非用户明确选择其他语言。' "$queue" "$count" "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+  printf '旧版 JSONL 反馈评审到期：队列文件 %s 已积累 %s 条记录。立即启动真正的后台评审 subagent，把 %s 和队列路径交给它；主会话不得代做。仅接受回顾性反馈：必须逐字引用用户原话并指向既有 agent 产出；前瞻要求不是反馈，agent 主动发起的澄清/评审轮次里的草稿纠正也不是反馈，除非同一纠正再次重复、用户批评流程本身或产物已经交付；宁漏报不误报。反思按严重度完成至少 5 Why 因果链、方法分类和行动卡，不得调用任务执行流水线，不得使用 run_in_background 或启动长驻进程。后台评审完成并安全落盘后清空该旧版队列，主会话只输出 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。平台没有后台 subagent 时保持队列不变并报告 reviewer_unavailable，不允许主会话 fallback。反思默认中文。' "$queue" "$count" "$prompt_file" "$AFL_DONE_MARKER"
 }
 
 # Continuation prompt the Stop/AfterAgent backstop sends when a review was
 # due this turn but the done-marker is missing.
 agent_feedback_stop_reason() {
   prompt_file="$1"
-  printf '检测到本轮反馈评审到期但未见合格完成标记。请立即启动一个后台评审 subagent，遵循 %s 处理积压反馈队列；不得由主会话自己完成完整评审。完成后输出 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。若当前平台确实没有后台 subagent 工具，才允许主会话 fallback 并输出 `%s responsibility=<分类或none> mode=fallback_no_subagent reason=<原因>-->`。agent_fault 且有证据、中高置信度、具备具体防复发约束时，默认直接写入项目 .agent/rules/feedback-loop.md，无需再询问用户。' "$prompt_file" "$AFL_DONE_MARKER" "$AFL_DONE_MARKER"
+  printf '检测到旧版反馈评审到期但未见后台 subagent 完成标记。请遵循 %s 启动真正的后台评审；主会话不得代做。完成后输出 `%s responsibility=<分类或none> mode=background_subagent agent_id=<后台agent_id>-->`。平台没有后台 subagent 时保持队列待处理并报告 reviewer_unavailable。' "$prompt_file" "$AFL_DONE_MARKER"
 }

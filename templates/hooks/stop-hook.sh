@@ -21,6 +21,23 @@ done
 PROMPT_FILE="${AGENT_FEEDBACK_LOOP_PROMPT:-$HOME/.agent/feedback-loop/prompts/reflection-agent.md}"
 payload="$(cat || true)"
 HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+LOG_FILE="${AGENT_FEEDBACK_LOOP_LOG:-$HOME/.agent/feedback-loop-data/logs/runtime.log}"
+if [ "$LOG_FILE" != "/dev/null" ]; then
+  if ! mkdir -p "$(dirname -- "$LOG_FILE")" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+    LOG_FILE="/dev/null"
+  else
+    chmod 0600 "$LOG_FILE" 2>/dev/null || true
+  fi
+fi
+
+# Capture assistant-visible output and explicit transcript/tool references before
+# evaluating the backstop. Capture is fail-open and never changes stop output.
+runtime_launcher="$HOME/.agent/feedback-loop/bin/afl-hook"
+legacy_mode=0
+[ -n "${AGENT_FEEDBACK_LOOP_QUEUE_DIR:-}" ] || [ "${AGENT_FEEDBACK_LOOP_LEGACY_QUEUE:-0}" = "1" ] && legacy_mode=1
+if [ "$legacy_mode" -eq 0 ] && [ -x "$runtime_launcher" ]; then
+  printf '%s' "$payload" | "$runtime_launcher" capture-stop --cli "$MODE" >/dev/null 2>>"$LOG_FILE" || true
+fi
 
 # pass = allow the agent to stop normally (no-op output per CLI schema).
 afl_pass() {

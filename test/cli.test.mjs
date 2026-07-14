@@ -60,18 +60,19 @@ describe("agent-feedback-loop package", () => {
     assert.match(await readText(promptFile), /user_misunderstanding/);
     assert.match(await readText(promptFile), /默认使用中文/);
     assert.match(await readText(promptFile), /用户明确选择的语言/);
-    assert.match(await readText(promptFile), /\.agent\/reflections/);
-    assert.match(await readText(promptFile), /必须先启动一个后台反思 subagent/);
+    assert.match(await readText(promptFile), /transactional store is the source of truth/);
+    assert.match(await readText(promptFile), /real background subagent/);
     assert.match(await readText(promptFile), /mode=background_subagent/);
-    assert.match(await readText(promptFile), /无需再询问用户是否写入/);
-    assert.match(await readText(path.join(home, ".agent", "feedback-loop", "rules", "feedback-loop.md")), /默认直接写入项目规则/);
+    assert.match(await readText(promptFile), /project-scoped active projection/);
+    assert.match(await readText(path.join(home, ".agent", "feedback-loop", "rules", "feedback-loop.md")), /commit atomically/);
     assert.equal((await stat(coreHook)).mode & 0o111, 0o111);
     assert.match(await readText(codexConfig), /agent-feedback-loop:start/);
     assert.match(await readText(codexConfig), /core-hook\.sh/);
     assert.match(await readText(codexConfig), /--continue/);
     // backstop: Codex Stop hook wired to stop-hook.sh
     assert.match(await readText(codexConfig), /\[\[hooks\.Stop\]\]/);
-    assert.match(await readText(codexConfig), /stop-hook\.sh --mode codex/);
+    assert.match(await readText(codexConfig), /stop-hook\.sh/);
+    assert.match(await readText(codexConfig), /--mode/);
 
     const settings = JSON.parse(await readText(claudeSettings));
     const userPromptHooks = settings.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks);
@@ -81,14 +82,14 @@ describe("agent-feedback-loop package", () => {
     // active agent to start the platform's background subagent tool.
     assert.equal(userPromptHooks.some((hook) => hook.type === "agent"), false);
     const claudeStop = settings.hooks.Stop.flatMap((entry) => entry.hooks);
-    assert.ok(claudeStop.some((hook) => hook.command?.includes("stop-hook.sh --mode claude")));
+    assert.ok(claudeStop.some((hook) => hook.command?.includes("stop-hook.sh") && hook.command?.includes("--mode") && hook.command?.includes("claude")));
 
     const gemini = JSON.parse(await readText(geminiSettings));
     const beforeAgentHooks = gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks);
     assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("core-hook.sh")));
-    assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("--event BeforeAgent")));
+    assert.ok(beforeAgentHooks.some((hook) => hook.command?.includes("--event") && hook.command?.includes("BeforeAgent")));
     const geminiAfterAgent = gemini.hooks.AfterAgent.flatMap((entry) => entry.hooks);
-    assert.ok(geminiAfterAgent.some((hook) => hook.command?.includes("stop-hook.sh --mode gemini")));
+    assert.ok(geminiAfterAgent.some((hook) => hook.command?.includes("stop-hook.sh") && hook.command?.includes("--mode") && hook.command?.includes("gemini")));
 
     const health = await doctor({ home });
     assert.equal(health.healthy, true);
@@ -136,6 +137,7 @@ describe("agent-feedback-loop package", () => {
     assert.deepEqual(JSON.parse(second.stdout), {});
     const queueFile = path.join(queueDir, "_tmp_proj-a.jsonl");
     assert.equal((await readText(queueFile)).trim().split("\n").length, 2);
+    await assert.rejects(stat(path.join(home, ".agent", "feedback-loop-data", "store", "feedback-loop.sqlite3")));
     await assert.rejects(stat(path.join(tmp, "afl-reflect", "s1.1.required")));
 
     // threshold reached: batch review injected, per-turn marker written for the backstop
@@ -145,6 +147,7 @@ describe("agent-feedback-loop package", () => {
     assert.match(ctx, /_tmp_proj-a\.jsonl/);
     assert.match(ctx, /回顾性反馈/);
     assert.match(ctx, /宁漏报不误报/);
+    assert.match(ctx, /澄清\/评审轮次/);
     assert.match(ctx, /逐字引用用户原话/);
     assert.match(ctx, /5 Why/);
     assert.match(ctx, /run_in_background/);
@@ -176,6 +179,13 @@ describe("agent-feedback-loop package", () => {
     await runWithInput(coreHook, JSON.stringify({ session_id: "sd", prompt_id: "p3", cwd: "/tmp/proj-dd", prompt: "继续" }), env, ["--event", "UserPromptSubmit"]);
     // and the same text again later (not back-to-back) is a fresh entry
     await runWithInput(coreHook, dup("p4"), env, ["--event", "UserPromptSubmit"]);
+    assert.equal((await readText(queueFile)).trim().split("\n").length, 3);
+
+    // machine-generated payloads (task notifications, local command echoes) are never queued
+    for (const machine of ["<task-notification>agent finished</task-notification>", "<local-command-caveat>ran /model</local-command-caveat>", "<command-name>/model</command-name>"]) {
+      const out = await runWithInput(coreHook, JSON.stringify({ session_id: "sd", prompt_id: "pm", cwd: "/tmp/proj-dd", prompt: machine }), env, ["--event", "UserPromptSubmit"]);
+      assert.deepEqual(JSON.parse(out.stdout), {});
+    }
     assert.equal((await readText(queueFile)).trim().split("\n").length, 3);
   });
 
@@ -292,6 +302,18 @@ describe("agent-feedback-loop package", () => {
     assert.ok(result.actions.some((a) => a.includes("remove legacy hook") && a.includes("codex-hook.sh")));
     // core hook must survive the cleanup
     assert.equal((await stat(path.join(hookDir, "core-hook.sh"))).mode & 0o111, 0o111);
+  });
+
+  it("install removes unmarked legacy Codex hook blocks without touching unrelated hooks", async () => {
+    const home = await tempHome();
+    const config = path.join(home, ".codex", "config.toml");
+    await mkdir(path.dirname(config), { recursive: true });
+    await writeFile(config, `[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\ntype = "command"\ncommand = "/tmp/context_guard.py"\ntimeout = 5\n\n[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\ntype = "command"\ncommand = "${home}/.agent/feedback-loop/hooks/codex-hook.sh"\ntimeout = 2\n`, "utf8");
+    await install({ home, dryRun: false });
+    const installed = await readText(config);
+    assert.match(installed, /context_guard\.py/);
+    assert.doesNotMatch(installed, /codex-hook\.sh/);
+    assert.match(installed, /core-hook\.sh/);
   });
 
   it("install removes stale prompt-pack tests left over from older versions", async () => {

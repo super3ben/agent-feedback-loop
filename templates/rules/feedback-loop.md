@@ -1,40 +1,55 @@
-# Feedback Loop Rule
+# Feedback Loop Runtime Rule
 
-Use this rule when a deferred feedback review comes due and real retrospective feedback is found in the queue.
+This rule applies when the transactional feedback-loop runtime creates a due
+reviewer job. Normal prompt capture and lesson selection are local operations and
+must not call an LLM.
 
-Do not assume user anger means the agent was wrong.
+## Review Dispatch
 
-## Trigger Model (deferred review, no keywords)
+1. If `AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` is configured, the runtime starts a
+   detached, lease-fenced reviewer process with a bounded `0600` context file.
+2. Otherwise the model-visible hook asks the active host to create a real background
+   subagent once per job/wake interval. The main conversation does not perform the
+   full reflection.
+3. Prompt delegation is usable on Codex, Claude Code, and Gemini CLI, but native
+   subagent identity is not cryptographically attested. The one-time receipt proves
+   bounded job authority and replay prevention, not platform provenance.
+4. If no background subagent tool exists, keep the job pending and report
+   `reviewer_unavailable`. Never substitute a main-agent reflection.
 
-- The hook never judges message content and injects nothing on normal turns: every user prompt is appended to a persistent per-project queue at `~/.agent/feedback-loop/queue/<project>.jsonl` (zero token cost).
-- A single batch-review instruction is injected only when the queue is due: enough entries accumulated, or the oldest pending entry is old enough, and the review cooldown has passed. Thresholds are tunable via `AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES` / `AGENT_FEEDBACK_LOOP_REVIEW_MAX_AGE` / `AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN`.
-- The queue survives sessions, so reflection is delayed but never forgotten; the reviewer clears the queue only after a successful review.
-- Feedback is **retrospective only**: the message must point at something the agent already produced and call it wrong/unsatisfactory, or repeat an earlier requirement. Prospective constraints on new tasks (“记得一定要…”, “不要…” inside a task description) are normal instructions, never feedback. When uncertain, prefer skipping over reflecting.
-- Most reviews finding zero real feedback is the expected, healthy outcome (`responsibility=none`); do not write a report or rule in that case.
-- Reflection reports default to Chinese unless the user explicitly selected another language for reflection reports.
+## Review Quality
 
-## Required Response
+- Accept only retrospective feedback with an exact user quote and concrete prior
+  agent referent. Prospective constraints and elicited draft corrections are not
+  feedback. Prefer false negatives over false positives.
+- Reflection examines why the user was dissatisfied, why the working method drifted,
+  which execution-time signal was missed, and why the class can recur. It does not
+  invoke task-execution pipelines or Superpowers.
+- Minor findings remain trend evidence and create no active lesson. Major requires a
+  full causal chain, method class, and complete action card. Critical adds a decision
+  timeline, counterfactual checkpoint, and recurrence effectiveness audit. Blocker
+  adds impact, stop, and rollback/isolation controls.
+- An applicable lesson recurrence must bind its effectiveness audit to the real
+  application/delivery receipt. `emitted_unconfirmed` is not proof the model loaded
+  the lesson and must not be blamed on agent execution.
 
-Reflection must never block the user, and its full report must never flood the conversation. The main session keeps working on the user's current remediation the whole time.
+## Persistence And Loading
 
-1. Do not pause normal execution. Give the user one short visible line: a major issue was caught and the full reflection was saved to a file, then keep going.
-2. When the platform exposes a true background subagent tool, the main agent must first start a background reflection subagent. It must not perform the full reflection in the main conversation. 中文会话里也一样：必须先启动一个后台反思 subagent。
-3. The background subagent writes the full reflection (per `prompts/reflection-agent.md`) to `.agent/reflections/<timestamp>-<slug>.md` in the project. The turn reply stays to one line plus the completion marker — do not paste the full report inline.
-4. Fallback to main-agent file writing only when no true background subagent tool exists. In that case record the limitation in `released_agent_ids` and use `mode=fallback_no_subagent` in the completion marker.
-5. Classify responsibility as `agent_fault`, `user_misunderstanding`, `shared_ambiguity`, `external_limit`, or `insufficient_evidence`.
-6. For every `agent_fault` / `shared_ambiguity`, the report must go deep, not wide: a 5-Whys causal chain down to a process/assumption-level root cause, an abstraction to the general *class* of mistake, and a reusable "do this going forward" method change — not a shallow restatement plus a narrow "don't do X" line. A reflection that would not change how the agent approaches a whole class of future tasks has failed its purpose. See `prompts/reflection-agent.md` › Analysis Depth.
-7. Reflection is analysis, not a test run. The reviewer must not launch background or long-running processes (`run_in_background`, test watchers, `tail -f`, dev servers); any evidence command runs synchronously, bounded, non-interactive. Before finishing it must leave no running child process or open shell — a leaked background shell is itself an agent fault.
-8. If a background subagent was used, close/release it after consuming the report and record `released_agent_ids`.
-9. When the finding is an `agent_fault` with evidence, medium/high confidence, and a concrete future constraint, default directly write the project rule to `.agent/rules/feedback-loop.md`. Do not ask the user whether to write it. 中文会话也按同一规则：默认直接写入项目规则。
-10. Write project-specific rules to `.agent/rules/feedback-loop.md`, not to `AGENTS.md` or `CLAUDE.md`.
-11. Do not auto-write low-confidence, insufficient-evidence, or global personal rules; record the reason in the reflection report instead.
-12. Only promote to global personal rules for Blocker-level, generalizable, cross-project agent faults.
+- The user-level transactional data root is the source of truth. Reports, lesson
+  revisions, application receipts, effectiveness events, and queue acknowledgement
+  commit atomically. Project Git is not mutated by an automatic review.
+- Only active lessons are selectable. Minor is never loaded. Major requires exact
+  task/path/tool/signal scope. Critical and Blocker remain bounded by project scope
+  and context epoch.
+- Selection uses a conservative local token estimate and complete cards. It makes no
+  provider token-count request. Low-severity cards are skipped whole when over budget;
+  severe overflow becomes an explicit checkpoint hold.
+- Global promotion requires independent Blocker evidence from at least two repository
+  lineages. A reviewer proposal alone cannot bypass the aggregate.
 
-## Severity Policy
+## Completion Authority
 
-Severity affects how prominently the one-line conclusion is surfaced, not whether the user is blocked. No severity pauses the main session or pastes the full report inline.
-
-- Minor: record trend only; no visible interruption needed.
-- Major: reflect (to file); surface the one-line conclusion when ready.
-- Critical: reflect in the background immediately; surface the conclusion prominently once ready.
-- Blocker: reflect in the background immediately; surface the conclusion prominently and make the root cause and rule decision explicit. The user is still free to continue remediation in parallel.
+A review is complete only after a structured receipt transaction stores the report,
+lesson projection and any effectiveness event, consumes the queued evidence, and
+consumes the one-time capability. A conversation marker or Markdown file alone is not
+completion authority.

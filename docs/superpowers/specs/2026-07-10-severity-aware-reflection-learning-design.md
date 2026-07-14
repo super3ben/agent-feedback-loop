@@ -439,10 +439,8 @@ revision 和已消费 queue event 都存在。这样「写了报告并清队列,
     "corrective_action": "add observable delivery confirmation for this CLI"
   },
   "evidence_refs": [{
-    "incident_id": "afl-incident-...",
     "feedback_event_id": "afl-event-...",
-    "quote_span": [120, 148],
-    "quote_hash": "sha256:...",
+    "feedback_quote": "用户脱敏事件中的逐字原话",
     "referent_event_ids": ["afl-event-..."]
   }],
   "created_at": "...",
@@ -455,6 +453,9 @@ revision 和已消费 queue event 都存在。这样「写了报告并清队列,
   }
 }
 ```
+
+`incident_fingerprint` 由 store 根据已验证的 feedback/referent event ids 与项目身份确定性生成，
+不接受 reviewer 自报；`feedback_quote` 必须是对应脱敏用户事件的原文子串。
 
 `signals` 由 reviewer 针对具体 lesson 生成, 可同时包含中英文别名。它不是全局写死的
 「不满词表」, 只用于判断某项方法教训是否与当前任务有关。

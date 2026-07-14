@@ -4,8 +4,10 @@ import {
   chmod,
   copyFile,
   cp,
+  lstat,
   mkdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile
@@ -13,10 +15,13 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
+import { SCHEMA_VERSION } from "./schema.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
+const RUNTIME_VERSION = "0.7.0";
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
@@ -31,9 +36,12 @@ const CLIS = [
     configKey: "codexConfig",
     configPath: [".codex", "config.toml"],
     hookEvent: "UserPromptSubmit",
-    hookArgs: ["--event", "UserPromptSubmit", "--continue"],
+    hookArgs: ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"],
     stopEvent: "Stop",
-    stopArgs: ["--mode", "codex"]
+    stopArgs: ["--mode", "codex"],
+    hookTimeout: 2,
+    stopTimeout: 5,
+    timeoutUnit: "seconds"
   },
   {
     id: "claude",
@@ -42,9 +50,12 @@ const CLIS = [
     configKey: "claudeSettings",
     configPath: [".claude", "settings.json"],
     hookEvent: "UserPromptSubmit",
-    hookArgs: ["--event", "UserPromptSubmit"],
+    hookArgs: ["--event", "UserPromptSubmit", "--cli", "claude"],
     stopEvent: "Stop",
-    stopArgs: ["--mode", "claude"]
+    stopArgs: ["--mode", "claude"],
+    hookTimeout: 2,
+    stopTimeout: 5,
+    timeoutUnit: "seconds"
   },
   {
     id: "gemini",
@@ -53,17 +64,32 @@ const CLIS = [
     configKey: "geminiSettings",
     configPath: [".gemini", "settings.json"],
     hookEvent: "BeforeAgent",
-    hookArgs: ["--event", "BeforeAgent"],
+    hookArgs: ["--event", "BeforeAgent", "--cli", "gemini"],
     stopEvent: "AfterAgent",
-    stopArgs: ["--mode", "gemini"]
+    stopArgs: ["--mode", "gemini"],
+    hookTimeout: 2000,
+    stopTimeout: 5000,
+    timeoutUnit: "milliseconds"
   }
 ];
 
 export function pathsFor(home = os.homedir()) {
   const packRoot = path.join(home, ".agent", "feedback-loop");
+  const runtimeRoot = path.join(packRoot, "versions", RUNTIME_VERSION);
+  const dataRoot = path.join(home, ".agent", "feedback-loop-data");
+  const keyRoot = path.join(home, ".agent", "feedback-loop-keys");
   const paths = {
     home,
     packRoot,
+    runtimeRoot,
+    runtimeLauncher: path.join(packRoot, "bin", "afl-hook"),
+    runtimeCurrent: path.join(packRoot, "current.json"),
+    dataRoot,
+    keyRoot,
+    storeFile: path.join(dataRoot, "store", "feedback-loop.sqlite3"),
+    blobRoot: path.join(dataRoot, "blobs", "sha256"),
+    safetyProjection: path.join(dataRoot, "safety", "guard.json.mac"),
+    exportsRoot: path.join(dataRoot, "exports"),
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
     coreHook: path.join(packRoot, "hooks", "core-hook.sh"),
@@ -88,14 +114,43 @@ export function pathsFor(home = os.homedir()) {
   return paths;
 }
 
+export function runtimeCapability({ nodeVersion = process.versions.node } = {}) {
+  const [major, minor] = String(nodeVersion).split(".").map(Number);
+  const supported = major > 24 || (major === 24 && minor >= 15);
+  return {
+    backend: "node:sqlite",
+    minimumNode: "24.15.0",
+    nodeVersion: String(nodeVersion),
+    status: supported ? "configured_unverified" : "unavailable",
+    reason: supported
+      ? "node:sqlite backend can be checked by live doctor"
+      : "Node 24.15 or newer is required for the transactional backend"
+  };
+}
+
 // Full shell command a CLI config should invoke for the prompt-time hook.
+function shellArgument(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
 function hookCommand(paths, cli) {
-  return [paths.coreHook, ...cli.hookArgs].join(" ");
+  return [paths.coreHook, ...cli.hookArgs].map(shellArgument).join(" ");
 }
 
 // Full shell command for the post-turn backstop hook.
 function stopCommand(paths, cli) {
-  return [paths.stopHook, ...cli.stopArgs].join(" ");
+  return [paths.stopHook, ...cli.stopArgs].map(shellArgument).join(" ");
+}
+
+function writeRuntimeLauncher(paths, dryRun, actions) {
+  const target = paths.runtimeLauncher;
+  actions.push(`write stable launcher -> ${target}`);
+  if (dryRun) return;
+  const resolver = "const fs=require('fs');const path=require('path');const current=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));const root=path.resolve(current.runtimeRoot);const versions=path.resolve(process.argv[2],'versions')+path.sep;if(!root.startsWith(versions))throw new Error('runtimeRoot is outside managed versions');process.stdout.write(root);";
+  const launcher = `#!/bin/sh\nset -eu\nruntime_root="$(${JSON.stringify(process.execPath)} -e ${JSON.stringify(resolver)} ${JSON.stringify(paths.runtimeCurrent)} ${JSON.stringify(paths.packRoot)})"\nexec ${JSON.stringify(process.execPath)} "$runtime_root/bin/agent-feedback-loop.mjs" "$@"\n`;
+  return mkdir(path.dirname(target), { recursive: true, mode: 0o700 })
+    .then(() => writeFile(target, launcher, { mode: 0o700 }))
+    .then(() => chmod(target, 0o700));
 }
 
 async function exists(file) {
@@ -105,6 +160,39 @@ async function exists(file) {
   } catch {
     return false;
   }
+}
+
+async function ensureSafeInstallRoot(home, directory, label, { create }) {
+  const relative = path.relative(home, directory);
+  if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} must be a child of the selected home directory`);
+  }
+  let current = home;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    let info;
+    try {
+      info = await lstat(current);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      if (!create) return;
+      await mkdir(current, { mode: 0o700 });
+      info = await lstat(current);
+    }
+    if (info.isSymbolicLink()) throw new Error(`${label} path must not contain a symlink: ${current}`);
+    if (!info.isDirectory()) throw new Error(`${label} path component must be a directory: ${current}`);
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+      throw new Error(`${label} path must be owned by the current user: ${current}`);
+    }
+  }
+  if (create) await chmod(directory, 0o700);
+}
+
+async function validateInstallRoots(paths, dryRun) {
+  const options = { create: !dryRun };
+  await ensureSafeInstallRoot(paths.home, paths.packRoot, "runtime root", options);
+  await ensureSafeInstallRoot(paths.home, paths.dataRoot, "data root", options);
+  await ensureSafeInstallRoot(paths.home, paths.keyRoot, "key root", options);
 }
 
 function timestamp() {
@@ -150,6 +238,27 @@ function removeMarkedCodexBlock(text) {
   return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
 }
 
+function removeUnmarkedLegacyCodexBlocks(text) {
+  const lines = text.split(/\r?\n/);
+  const chunks = [];
+  let current = [];
+  const isTopLevelHook = (line) => /^\s*\[\[hooks\.[^.\]]+\]\]\s*$/.test(line);
+  for (const line of lines) {
+    if (isTopLevelHook(line) && current.length > 0) {
+      chunks.push(current);
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks
+    .filter((chunk) => !/(?:codex|claude)-hook\.sh/.test(chunk.join("\n")))
+    .flat()
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
 function codexHookBlock(paths, cli) {
   return [
     CODEX_MARKER_START,
@@ -158,7 +267,7 @@ function codexHookBlock(paths, cli) {
     `[[hooks.${cli.hookEvent}.hooks]]`,
     'type = "command"',
     `command = ${tomlString(hookCommand(paths, cli))}`,
-    "timeout = 2",
+    `timeout = ${cli.hookTimeout}`,
     'statusMessage = "Injecting feedback reflection prompt"',
     "",
     `[[hooks.${cli.stopEvent}]]`,
@@ -166,7 +275,7 @@ function codexHookBlock(paths, cli) {
     `[[hooks.${cli.stopEvent}.hooks]]`,
     'type = "command"',
     `command = ${tomlString(stopCommand(paths, cli))}`,
-    "timeout = 5",
+    `timeout = ${cli.stopTimeout}`,
     'statusMessage = "Checking feedback reflection backstop"',
     CODEX_MARKER_END
   ].join("\n");
@@ -230,6 +339,28 @@ async function writePromptPack(paths, dryRun, actions) {
   }
   await mkdir(path.dirname(paths.packRoot), { recursive: true });
   await cp(TEMPLATE_ROOT, paths.packRoot, { recursive: true });
+  await mkdir(paths.runtimeRoot, { recursive: true, mode: 0o700 });
+  await chmod(paths.runtimeRoot, 0o700);
+  await cp(path.join(PACKAGE_ROOT, "bin"), path.join(paths.runtimeRoot, "bin"), { recursive: true });
+  await cp(path.join(PACKAGE_ROOT, "src"), path.join(paths.runtimeRoot, "src"), { recursive: true });
+  await chmod(path.join(paths.runtimeRoot, "bin", "agent-feedback-loop.mjs"), 0o755);
+  await mkdir(paths.dataRoot, { recursive: true, mode: 0o700 });
+  await chmod(paths.dataRoot, 0o700);
+  await mkdir(paths.keyRoot, { recursive: true, mode: 0o700 });
+  await chmod(paths.keyRoot, 0o700);
+  await mkdir(path.dirname(paths.runtimeCurrent), { recursive: true, mode: 0o700 });
+  const currentPayload = `${JSON.stringify({
+    runtimeVersion: RUNTIME_VERSION,
+    runtimeRoot: paths.runtimeRoot,
+    schemaVersion: SCHEMA_VERSION,
+    capability: runtimeCapability(),
+    installedAt: new Date().toISOString()
+  }, null, 2)}\n`;
+  const currentTemp = `${paths.runtimeCurrent}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(currentTemp, currentPayload, { mode: 0o600, flag: "wx" });
+  await chmod(currentTemp, 0o600);
+  await rename(currentTemp, paths.runtimeCurrent);
+  await chmod(paths.runtimeCurrent, 0o600);
   await chmod(paths.coreHook, 0o755);
   await chmod(paths.stopHook, 0o755);
   await removeStalePromptPackEntries(paths, dryRun, actions);
@@ -242,7 +373,7 @@ async function installTomlBlock(paths, cli, dryRun, actions) {
   const configFile = paths[cli.configKey];
   await backup(configFile, dryRun, actions);
   const current = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
-  const cleaned = removeMarkedCodexBlock(current);
+  const cleaned = removeUnmarkedLegacyCodexBlocks(removeMarkedCodexBlock(current));
   const block = codexHookBlock(paths, cli);
   const next = `${cleaned.trimEnd()}${cleaned.trim() ? "\n\n" : ""}${block}\n`;
   actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
@@ -260,12 +391,12 @@ async function installJsonHooks(paths, cli, dryRun, actions) {
   settings.hooks[cli.hookEvent] = settings.hooks[cli.hookEvent] || [];
   settings.hooks[cli.hookEvent].push({
     matcher: "",
-    hooks: [{ type: "command", command: hookCommand(paths, cli), timeout: 2 }]
+    hooks: [{ type: "command", command: hookCommand(paths, cli), timeout: cli.hookTimeout }]
   });
   settings.hooks[cli.stopEvent] = settings.hooks[cli.stopEvent] || [];
   settings.hooks[cli.stopEvent].push({
     matcher: "",
-    hooks: [{ type: "command", command: stopCommand(paths, cli), timeout: 5 }]
+    hooks: [{ type: "command", command: stopCommand(paths, cli), timeout: cli.stopTimeout }]
   });
   actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
   actions.push(`connect ${cli.label} backstop -> ${paths.stopHook}`);
@@ -286,9 +417,13 @@ async function installCli(paths, cli, dryRun, actions) {
 export async function install(options = {}) {
   const home = options.home || os.homedir();
   const dryRun = Boolean(options.dryRun);
+  const capability = runtimeCapability({ nodeVersion: options.nodeVersion || process.versions.node });
+  if (capability.status === "unavailable") throw new Error(capability.reason);
   const paths = pathsFor(home);
   const actions = [];
+  await validateInstallRoots(paths, dryRun);
   await writePromptPack(paths, dryRun, actions);
+  await writeRuntimeLauncher(paths, dryRun, actions);
   for (const cli of CLIS) {
     await installCli(paths, cli, dryRun, actions);
   }
@@ -301,7 +436,7 @@ async function uninstallCli(paths, cli, dryRun, actions) {
   await backup(configFile, dryRun, actions);
   if (cli.format === "toml") {
     const current = await readFile(configFile, "utf8");
-    const next = `${removeMarkedCodexBlock(current)}\n`;
+    const next = `${removeUnmarkedLegacyCodexBlocks(removeMarkedCodexBlock(current))}\n`;
     actions.push(`disconnect ${cli.label} hook`);
     if (!dryRun) await writeFile(configFile, next, "utf8");
   } else {
@@ -324,7 +459,10 @@ export async function uninstall(options = {}) {
 
   if (removeFiles) {
     actions.push(`remove ${paths.packRoot}`);
-    if (!dryRun) await rm(paths.packRoot, { recursive: true, force: true });
+    if (!dryRun) {
+      await rm(paths.packRoot, { recursive: true, force: true });
+      await rm(paths.runtimeRoot, { recursive: true, force: true });
+    }
   } else {
     await removeLegacyHooks(paths, dryRun, actions);
   }
@@ -348,12 +486,30 @@ export async function doctor(options = {}) {
   const files = {
     prompt: await exists(paths.promptFile),
     rule: await exists(paths.ruleFile),
+    runtimeLauncher: await exists(paths.runtimeLauncher),
+    runtimeCurrent: await exists(paths.runtimeCurrent),
     coreHook: await exists(paths.coreHook),
     stopHook: await exists(paths.stopHook),
     triggerRules: await exists(paths.triggerRules),
     coreHookExecutable: await isExecutable(paths.coreHook),
     stopHookExecutable: await isExecutable(paths.stopHook)
   };
+  let runtime = { selected: false, expectedVersion: RUNTIME_VERSION, expectedSchemaVersion: SCHEMA_VERSION };
+  try {
+    const current = JSON.parse(await readFile(paths.runtimeCurrent, "utf8"));
+    runtime = {
+      ...runtime,
+      selected: current.runtimeVersion === RUNTIME_VERSION
+        && path.resolve(current.runtimeRoot) === path.resolve(paths.runtimeRoot)
+        && Number(current.schemaVersion) === SCHEMA_VERSION,
+      runtimeVersion: current.runtimeVersion,
+      runtimeRoot: current.runtimeRoot,
+      schemaVersion: current.schemaVersion
+    };
+  } catch (error) {
+    runtime.reason = error.message;
+  }
+  files.runtimeSelected = runtime.selected;
 
   const clis = {};
   for (const cli of CLIS) {
@@ -388,9 +544,13 @@ export async function doctor(options = {}) {
     }
   }
 
+  const capability = runtimeCapability();
+  const reviewers = await detectAllReviewerAdapters();
+  const readyClis = Object.values(reviewers).filter((reviewer) => reviewer.available).map((reviewer) => reviewer.cli);
+  const unavailableClis = Object.values(reviewers).filter((reviewer) => !reviewer.available).map((reviewer) => reviewer.cli);
   const healthy = Object.values(files).every(Boolean)
     && CLIS.every((cli) => clis[cli.id].connected);
-  return { healthy, home, files, clis };
+  return { healthy, home, files, runtime, clis, reviewers, operational: { readyClis, unavailableClis }, capability, dataRoot: paths.dataRoot, keyRoot: paths.keyRoot };
 }
 
 export async function assertTemplateTree() {

@@ -14,9 +14,11 @@ set -eu
 
 EVENT="UserPromptSubmit"
 WITH_CONTINUE=0
+CLI="unknown"
 while [ $# -gt 0 ]; do
   case "$1" in
     --event) EVENT="$2"; shift 2 ;;
+    --cli) CLI="$2"; shift 2 ;;
     --continue) WITH_CONTINUE=1; shift ;;
     *) shift ;;
   esac
@@ -25,6 +27,14 @@ done
 PROMPT_FILE="${AGENT_FEEDBACK_LOOP_PROMPT:-$HOME/.agent/feedback-loop/prompts/reflection-agent.md}"
 payload="$(cat || true)"
 HOOK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+LOG_FILE="${AGENT_FEEDBACK_LOOP_LOG:-$HOME/.agent/feedback-loop-data/logs/runtime.log}"
+if [ "$LOG_FILE" != "/dev/null" ]; then
+  if ! mkdir -p "$(dirname -- "$LOG_FILE")" 2>/dev/null || ! touch "$LOG_FILE" 2>/dev/null; then
+    LOG_FILE="/dev/null"
+  else
+    chmod 0600 "$LOG_FILE" 2>/dev/null || true
+  fi
+fi
 
 if [ "$WITH_CONTINUE" -eq 1 ]; then
   fail_open='{"continue":true}'
@@ -32,6 +42,38 @@ if [ "$WITH_CONTINUE" -eq 1 ]; then
 else
   fail_open='{}'
   continue_field=''
+fi
+
+# New capture path: the stable launcher stores a normalized event and encrypted
+# evidence. Any failure is deliberately fail-open; the legacy queue below still
+# records the turn for review and provides a diagnostic fallback.
+runtime_launcher="$HOME/.agent/feedback-loop/bin/afl-hook"
+runtime_available=0
+capture_ok=0
+legacy_mode=0
+[ -n "${AGENT_FEEDBACK_LOOP_QUEUE_DIR:-}" ] || [ "${AGENT_FEEDBACK_LOOP_LEGACY_QUEUE:-0}" = "1" ] && legacy_mode=1
+if [ "$legacy_mode" -eq 0 ] && [ -x "$runtime_launcher" ]; then
+  runtime_available=1
+  launcher_output="$(mktemp "${TMPDIR:-/tmp}/afl-hook.XXXXXX")"
+  if printf '%s' "$payload" | "$runtime_launcher" hook --cli "$CLI" --event "$EVENT" >"$launcher_output" 2>>"$LOG_FILE"; then
+    capture_ok=1
+    # Explicit legacy mode keeps the historical JSONL contract for callers and
+    # tests that opt in. Normal installs return the launcher's JSON response.
+    if [ "$legacy_mode" -eq 0 ] && [ -r "$HOOK_DIR/trigger-rules.sh" ]; then
+      cat "$launcher_output"
+      rm -f "$launcher_output"
+      exit 0
+    fi
+  fi
+  rm -f "$launcher_output"
+fi
+
+# JSONL is an explicit legacy compatibility mode only. It is never written in
+# parallel with a successful SQLite capture, and callers must opt in with a
+# queue directory or AFL_LEGACY_QUEUE=1.
+if [ "$runtime_available" -eq 1 ] && [ -z "${AGENT_FEEDBACK_LOOP_QUEUE_DIR:-}" ] && [ "${AGENT_FEEDBACK_LOOP_LEGACY_QUEUE:-0}" != "1" ]; then
+  printf '%s\n' "$fail_open"
+  exit 0
 fi
 
 if [ ! -r "$HOOK_DIR/trigger-rules.sh" ]; then
@@ -62,9 +104,19 @@ afl_debug_log() {
 }
 
 # Record this prompt for the deferred batch review. Never blocks the turn.
+# Skip machine-generated payloads (background-task notifications, local
+# command echoes) — they are harness artifacts, not user messages, and they
+# inflate the queue count toward the review threshold.
 # Dedup key = session + prompt text (NOT the raw payload: duplicate hook
 # firings for one user message carry a fresh prompt_id, so raw lines differ).
 prompt_text="$(afl_json_field prompt)"
+case "$payload" in
+  *'<task-notification>'*|*'<local-command-caveat>'*|*'<command-name>'*)
+    afl_debug_log "skip-machine"
+    printf '%s\n' "$fail_open"
+    exit 0
+    ;;
+esac
 agent_feedback_queue_append "$queue_path" "$payload" "${session_id}:${prompt_text}"
 
 if agent_feedback_review_due "$queue_path"; then
