@@ -70,13 +70,14 @@ test("receipt renderer detects the requested language deterministically", () => 
 test("receipt renderer accepts all six real Task 1 outbox row shapes and matches the tracked copy", async () => {
   const rows = await realOutboxRows();
   const rendered = Object.fromEntries(rows.map((row) => [row.kind, renderReceiptLine(row)]));
+  const receipt = Object.fromEntries(rows.map((row) => [row.kind, row.notification_id.slice(0, 6)]));
 
-  assert.equal(rendered.candidate_captured, "[AFL] 已捕获反馈候选 · event=8350ca");
-  assert.equal(rendered.review_queued, "[AFL] 后台反思已排队 · job=7e876e");
-  assert.equal(rendered.review_completed, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e");
-  assert.equal(rendered.reviewed_no_lesson, "[AFL] 已复核，本次未形成长期经验 · job=7e876e");
-  assert.equal(rendered.review_exhausted, "[AFL] 反思失败，证据已保留并等待重试 · job=7e876e");
-  assert.equal(rendered.lesson_delivered, "[AFL] 已向本任务投递 1 条历史经验");
+  assert.equal(rendered.candidate_captured, `[AFL] 已捕获反馈候选 · event=8350ca · receipt=${receipt.candidate_captured}`);
+  assert.equal(rendered.review_queued, `[AFL] 后台反思已排队 · job=7e876e · receipt=${receipt.review_queued}`);
+  assert.equal(rendered.review_completed, `[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e · receipt=${receipt.review_completed}`);
+  assert.equal(rendered.reviewed_no_lesson, `[AFL] 已复核，本次未形成长期经验 · job=7e876e · receipt=${receipt.reviewed_no_lesson}`);
+  assert.equal(rendered.review_exhausted, `[AFL] 反思失败，证据已保留并等待重试 · job=7e876e · receipt=${receipt.review_exhausted}`);
+  assert.equal(rendered.lesson_delivered, `[AFL] 已向本任务投递 1 条历史经验 · receipt=${receipt.lesson_delivered}`);
   assert.equal(rows.find((row) => row.kind === "candidate_captured").job_id, null);
   assert.equal(rows.find((row) => row.kind === "lesson_delivered").job_id, null);
 });
@@ -84,7 +85,7 @@ test("receipt renderer accepts all six real Task 1 outbox row shapes and matches
 test("receipt renderer emits the exact visible and canonical hidden receipt control", () => {
   const rendered = renderReceiptControl(notification);
 
-  assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e");
+  assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e · receipt=111111");
   assert.match(rendered.marker, /^<!--afl-receipt id=[a-f0-9]{64} nonce=[a-f0-9]{16} state=review_completed-->$/);
   assert.ok(rendered.line.length <= 160);
   assert.ok(rendered.text.length <= 512);
@@ -107,6 +108,28 @@ test("receipt stripping removes only a recognized adjacent line and exact matchi
   assert.equal(stripReceiptControlText(`${rendered.line}\n${wrongNonce}`), `${rendered.line}\n${wrongNonce}`);
   assert.equal(stripReceiptControlText(`normal answer\n${rendered.line}\n${rendered.marker}`), "normal answer");
   assert.equal(stripReceiptControlText(`${rendered.line}\n${rendered.marker}`), "");
+});
+
+test("receipt stripping preserves fenced, fabricated, mismatched, and wrong-state control pairs", () => {
+  const rendered = renderReceiptControl(notification);
+  const otherNotification = { ...notification, notification_id: "2".repeat(64) };
+  const other = renderReceiptControl(otherNotification);
+  const oldShapeFabrication = rendered.line.replace(" · receipt=111111", "");
+  const mismatchedBinding = rendered.line.replace("receipt=111111", "receipt=222222");
+  const wrongStateMarker = rendered.marker.replace("state=review_completed", "state=review_queued");
+  const quotedPair = [`> ${rendered.line}`, `> ${rendered.marker}`].join("\n");
+  const backtickFence = ["```text", rendered.line, rendered.marker, "```"].join("\n");
+  const tildeFence = ["~~~", rendered.line, rendered.marker, "~~~~"].join("\n");
+  const mixedFenceCharacters = ["```", "```~", rendered.line, rendered.marker, "```"].join("\n");
+
+  assert.equal(stripReceiptControlText(quotedPair), quotedPair);
+  assert.equal(stripReceiptControlText(backtickFence), backtickFence);
+  assert.equal(stripReceiptControlText(tildeFence), tildeFence);
+  assert.equal(stripReceiptControlText(mixedFenceCharacters), mixedFenceCharacters);
+  assert.equal(stripReceiptControlText(`${oldShapeFabrication}\n${rendered.marker}`), `${oldShapeFabrication}\n${rendered.marker}`);
+  assert.equal(stripReceiptControlText(`${mismatchedBinding}\n${rendered.marker}`), `${mismatchedBinding}\n${rendered.marker}`);
+  assert.equal(stripReceiptControlText(`${rendered.line}\n${other.marker}`), `${rendered.line}\n${other.marker}`);
+  assert.equal(stripReceiptControlText(`${rendered.line}\n${wrongStateMarker}`), `${rendered.line}\n${wrongStateMarker}`);
 });
 
 test("receipt renderer keeps the instruction bounded and verbatim", () => {

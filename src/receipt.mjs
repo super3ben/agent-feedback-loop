@@ -38,14 +38,15 @@ const REQUIRED_PAYLOAD_KEYS = Object.freeze({
 });
 
 const CANONICAL_ID_PATTERN = /^[a-f0-9]{64}$/;
+const LEGACY_ID_PATTERN = /^notification-([1-9]\d{0,15})$/;
 const RECEIPT_MARKER_PATTERN = /^<!--afl-receipt id=([a-f0-9]{64}) nonce=([a-f0-9]{16}) state=([a-z_]+)-->$/;
 const VISIBLE_LINE_PATTERNS = Object.freeze({
-  candidate_captured: /^\[AFL\] (?:已捕获反馈候选|Feedback candidate captured) · event=[a-f0-9]{6}$/,
-  review_queued: /^\[AFL\] (?:后台反思已排队|Background review queued) · job=[a-f0-9]{6}$/,
-  review_completed: /^\[AFL\] (?:反思完成|Review completed) · severity=(?:Minor|Major|Critical|Blocker) · lessons=\d+ · job=[a-f0-9]{6}$/,
-  reviewed_no_lesson: /^\[AFL\] (?:已复核，本次未形成长期经验|Reviewed; no long-term lesson was created) · job=[a-f0-9]{6}$/,
-  review_exhausted: /^\[AFL\] (?:反思失败，证据已保留并等待重试|Review failed; evidence retained for retry) · job=[a-f0-9]{6}$/,
-  lesson_delivered: /^\[AFL\] (?:已向本任务投递 \d+ 条历史经验|Delivered \d+ prior lessons to this task)$/
+  candidate_captured: /^\[AFL\] (?:已捕获反馈候选|Feedback candidate captured) · event=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_queued: /^\[AFL\] (?:后台反思已排队|Background review queued) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_completed: /^\[AFL\] (?:反思完成|Review completed) · severity=(?:Minor|Major|Critical|Blocker) · lessons=\d+ · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  reviewed_no_lesson: /^\[AFL\] (?:已复核，本次未形成长期经验|Reviewed; no long-term lesson was created) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_exhausted: /^\[AFL\] (?:反思失败，证据已保留并等待重试|Review failed; evidence retained for retry) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  lesson_delivered: /^\[AFL\] (?:已向本任务投递 \d+ 条历史经验|Delivered \d+ prior lessons to this task) · receipt=([a-f0-9]{6})$/
 });
 const MAX_EVENT_ID_CHARS = 2048;
 const MAX_VISIBLE_LINE_CHARS = 160;
@@ -79,7 +80,17 @@ export function receiptNonce(notificationId) {
   return createHash("sha256").update(`receipt:v1\u0000${notificationId}`).digest("hex").slice(0, 16);
 }
 
+function isSupportedObservationId(notificationId) {
+  if (typeof notificationId !== "string") return false;
+  if (CANONICAL_ID_PATTERN.test(notificationId)) return true;
+  const legacy = LEGACY_ID_PATTERN.exec(notificationId);
+  return Boolean(legacy && BigInt(legacy[1]) <= BigInt(Number.MAX_SAFE_INTEGER));
+}
+
 export function containsReceiptMarker(text, notification) {
+  if (!notification || typeof notification !== "object" || Array.isArray(notification)) return false;
+  if (!isSupportedObservationId(notification.notification_id)) return false;
+  if (!Object.hasOwn(PAYLOAD_KEYS, notification.kind)) return false;
   const marker = `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
   return String(text || "").includes(marker);
 }
@@ -136,7 +147,7 @@ export function renderReceiptLine(notification) {
   } else if (notification.kind !== "lesson_delivered") {
     reference = ` · job=${notification.job_id.slice(0, 6)}`;
   }
-  const line = `[AFL] ${body}${reference}`;
+  const line = `[AFL] ${body}${reference} · receipt=${notification.notification_id.slice(0, 6)}`;
   if (line.length > MAX_VISIBLE_LINE_CHARS) throw new TypeError("receipt visible line exceeds the bounded length");
   return line;
 }
@@ -164,14 +175,28 @@ export function renderReceiptInstruction(notification) {
 export function stripReceiptControlText(text) {
   const lines = String(text ?? "").split(/\r?\n/);
   const retained = [];
+  let fence = null;
   for (let index = 0; index < lines.length; index += 1) {
     const visibleLine = lines[index];
+    if (fence) {
+      retained.push(visibleLine);
+      const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(visibleLine);
+      if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(visibleLine);
+    if (opening && !(opening[1][0] === "`" && opening[2].includes("`"))) {
+      fence = { character: opening[1][0], length: opening[1].length };
+      retained.push(visibleLine);
+      continue;
+    }
     const markerLine = lines[index + 1];
     const marker = RECEIPT_MARKER_PATTERN.exec(markerLine || "");
     if (marker) {
       const [, notificationId, nonce, state] = marker;
       const visiblePattern = VISIBLE_LINE_PATTERNS[state];
-      if (visiblePattern?.test(visibleLine) && nonce === receiptNonce(notificationId)) {
+      const visible = visiblePattern?.exec(visibleLine);
+      if (visible && visible[1] === notificationId.slice(0, 6) && nonce === receiptNonce(notificationId)) {
         index += 1;
         continue;
       }

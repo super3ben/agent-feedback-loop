@@ -282,10 +282,15 @@ export function receiptNonce(notificationId) {
 }
 
 export function containsReceiptMarker(text, notification) {
+  if (!notification || typeof notification !== "object" || Array.isArray(notification)) return false;
+  if (!isCanonical64Hex(notification.notification_id) && !isBoundedLegacyNotificationId(notification.notification_id)) return false;
+  if (!Object.hasOwn(PAYLOAD_KEYS, notification.kind)) return false;
   const marker = `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
   return String(text || "").includes(marker);
 }
 ```
+
+`isCanonical64Hex` accepts only lowercase 64-hex IDs. `isBoundedLegacyNotificationId` exists only for observation of historical rows and accepts the proven `notification-<positive safe integer>` grammar; UUID, `msg_UUID`, colon/session, path, zero, leading-zero, and oversized forms are rejected. Add real SQLite outbox-flow tests proving unsafe rows do not transition to `observed` while canonical IDs and the exact `notification-1` fixture do.
 
 Extend `openStore` to accept `receiptLanguage = process.env.AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE || "auto"`. Completion notifications inherit an existing job notification's language; otherwise they detect language from the referenced feedback event's redacted text. Validate every payload before it enters SQLite.
 
@@ -471,6 +476,7 @@ git commit -m "feat: add transactional notification outbox"
 - Modify: `src/capture.mjs:1-340`
 - Modify: `src/codex-reconcile.mjs:1-220`
 - Test: `test/receipt.test.mjs`
+- Test: `test/store.test.mjs`
 - Test: `test/capture.test.mjs`
 - Test: `test/codex-reconcile.test.mjs`
 
@@ -493,21 +499,21 @@ assert.equal(detectReceiptLanguage("why was no review started", "auto"), "en");
 assert.equal(detectReceiptLanguage("why", "zh"), "zh");
 
 const rendered = renderReceiptControl({
-  notification_id: "notification-1234567890",
-  job_id: "7e876e123",
+  notification_id: "1".repeat(64),
+  job_id: `7e876e${"2".repeat(58)}`,
   kind: "review_completed",
   payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
   language: "zh"
 });
-assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e");
-assert.match(rendered.marker, /^<!--afl-receipt id=notification-1234567890 nonce=[a-f0-9]{16} state=review_completed-->$/);
+assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e · receipt=111111");
+assert.match(rendered.marker, /^<!--afl-receipt id=[a-f0-9]{64} nonce=[a-f0-9]{16} state=review_completed-->$/);
 assert.ok(rendered.line.length <= 160);
 assert.ok(rendered.text.length <= 512);
 assert.equal(stripReceiptControlText(`normal answer\n${rendered.line}\n${rendered.marker}`), "normal answer");
 assert.equal(stripReceiptControlText(`${rendered.line}\n${rendered.marker}`), "");
 ```
 
-Also assert that an unknown kind, unknown payload key, invalid severity, full session id, path-shaped value, or visible line over 160 characters throws `TypeError` before rendering.
+Also assert that an unknown kind, unknown payload key, invalid severity, full session id, path-shaped value, or visible line over 160 characters throws `TypeError` before rendering. Exact-copy tests for every real outbox kind must include `receipt=<notification_id.slice(0, 6)>`.
 
 - [ ] **Step 2: Run renderer tests and verify RED**
 
@@ -526,7 +532,7 @@ In the first user-visible update or final answer, output the following line and 
 <hidden marker>
 ```
 
-`renderReceiptInstruction` must assert the complete instruction is at most 512 characters. `stripReceiptControlText` removes only lines beginning exactly with `[AFL] ` and markers matching `/^<!--afl-receipt id=[^\\s>]+ nonce=[a-f0-9]{16} state=[a-z_]+-->$/`; it must leave ordinary user text containing the letters `AFL` unchanged.
+`renderReceiptInstruction` must assert the complete instruction is at most 512 characters. `stripReceiptControlText` removes only an adjacent generated line/marker pair after verifying canonical 64-hex ID, known state, deterministic nonce, state-specific visible grammar, and `receipt=<marker id first 6>`. It must preserve ordinary AFL prose, quoted or malformed pairs, mismatched binding/state/nonce, old lines without binding, and complete controls inside backtick or tilde fenced code blocks.
 
 - [ ] **Step 4: Run renderer tests and verify GREEN**
 
@@ -561,6 +567,8 @@ Import `stripReceiptControlText` into `capture.mjs` and apply it before redactio
 Run: `node --test test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs`
 
 Expected: all tests PASS and receipt-only events create no queue entries.
+
+Before committing, run receipt/store focused tests and a real store-flow probe. Confirm current rendering/stripping never accepts legacy identifiers, while observation compatibility is limited to `notification-<positive safe integer>` and rejects UUID, `msg_UUID`, colon/session, and path-shaped rows.
 
 ```bash
 git add src/receipt.mjs src/capture.mjs src/codex-reconcile.mjs test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs

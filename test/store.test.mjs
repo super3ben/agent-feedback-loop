@@ -88,6 +88,73 @@ test("receipt payload validation and markers reject unbounded content", () => {
   const marker = `<!--afl-receipt id=notification-1 nonce=${receiptNonce("notification-1")} state=review_completed-->`;
   assert.equal(containsReceiptMarker(marker, notification), true);
   assert.equal(containsReceiptMarker(marker, { ...notification, notification_id: "notification-2" }), false);
+  assert.equal(containsReceiptMarker(marker.replace("state=review_completed", "state=review_queued"), notification), false);
+  assert.equal(containsReceiptMarker(marker, { ...notification, kind: "wrong_state" }), false);
+  for (const unsafeId of [
+    "notification-0",
+    "notification-01",
+    "notification-9007199254740992",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "msg_550e8400-e29b-41d4-a716-446655440000",
+    "codex:default:session-1",
+    "/Users/example/private/notification"
+  ]) {
+    const unsafeMarker = `<!--afl-receipt id=${unsafeId} nonce=${receiptNonce(unsafeId)} state=review_completed-->`;
+    assert.equal(containsReceiptMarker(unsafeMarker, { notification_id: unsafeId, kind: "review_completed" }), false);
+  }
+});
+
+test("chat observation accepts canonical and exact legacy receipt IDs but rejects unsafe legacy-shaped rows", async () => {
+  async function observeMutatedRow(notificationId) {
+    const home = await mkdtemp(path.join(tmpdir(), "afl-observation-id-"));
+    const paths = pathsFor(home);
+    let store = openStore({ paths });
+    const captured = { ...event(`observation-${notificationId}`), session_uid: `observation-session-${notificationId}` };
+    store.captureSessionEvent(captured);
+    const notification = store.createNotification({
+      sessionUid: captured.session_uid,
+      contextEpoch: 1,
+      kind: "candidate_captured",
+      eventUid: captured.event_uid,
+      payload: {},
+      language: "en"
+    });
+    store.claimChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "observation-turn" });
+    store.close();
+
+    if (notificationId !== notification.notification_id) {
+      const db = new DatabaseSync(paths.storeFile);
+      db.prepare("UPDATE notification_outbox SET notification_id=? WHERE notification_id=?").run(notificationId, notification.notification_id);
+      db.close();
+    }
+
+    store = openStore({ paths });
+    const result = store.confirmChatNotification({
+      sessionUid: captured.session_uid,
+      contextEpoch: 1,
+      nativeTurnId: "observation-turn",
+      transcriptText: `<!--afl-receipt id=${notificationId} nonce=${receiptNonce(notificationId)} state=candidate_captured-->`
+    });
+    const [row] = store.listNotifications({ sessionUid: captured.session_uid });
+    store.close();
+    return { originalId: notification.notification_id, action: result.action, state: row.chat_state };
+  }
+
+  const canonical = await observeMutatedRow("a".repeat(64));
+  assert.deepEqual({ action: canonical.action, state: canonical.state }, { action: "observed", state: "observed" });
+
+  const legacy = await observeMutatedRow("notification-1");
+  assert.deepEqual({ action: legacy.action, state: legacy.state }, { action: "observed", state: "observed" });
+
+  for (const unsafeId of [
+    "550e8400-e29b-41d4-a716-446655440000",
+    "msg_550e8400-e29b-41d4-a716-446655440000",
+    "codex:default:session-1",
+    "/Users/example/private/notification"
+  ]) {
+    const unsafe = await observeMutatedRow(unsafeId);
+    assert.deepEqual({ action: unsafe.action, state: unsafe.state }, { action: "block", state: "emitted" }, unsafeId);
+  }
 });
 
 test("schema v8 reopens a realistic v7 store idempotently with valid foreign keys", async () => {
