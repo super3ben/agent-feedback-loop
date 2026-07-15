@@ -285,12 +285,14 @@ export function containsReceiptMarker(text, notification) {
   if (!notification || typeof notification !== "object" || Array.isArray(notification)) return false;
   if (!isCanonical64Hex(notification.notification_id) && !isBoundedLegacyNotificationId(notification.notification_id)) return false;
   if (!Object.hasOwn(PAYLOAD_KEYS, notification.kind)) return false;
-  const marker = `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
+  const marker = isCanonical64Hex(notification.notification_id)
+    ? renderReceiptControl(notification).marker
+    : `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
   return String(text || "").includes(marker);
 }
 ```
 
-`isCanonical64Hex` accepts only lowercase 64-hex IDs. `isBoundedLegacyNotificationId` exists only for observation of historical rows and accepts the proven `notification-<positive safe integer>` grammar; UUID, `msg_UUID`, colon/session, path, zero, leading-zero, and oversized forms are rejected. Add real SQLite outbox-flow tests proving unsafe rows do not transition to `observed` while canonical IDs and the exact `notification-1` fixture do.
+`receiptNonce` is the v1 compatibility function, not the current canonical-control nonce. `isCanonical64Hex` accepts only lowercase 64-hex IDs. `isBoundedLegacyNotificationId` exists only for observation of historical rows and accepts the proven `notification-<positive safe integer>` grammar; UUID, `msg_UUID`, colon/session, path, zero, leading-zero, and oversized forms are rejected. Task 2 makes canonical observation authoritative by re-rendering the row and requiring its exact v2 marker. Add real SQLite outbox-flow tests proving unsafe rows and canonical v1 markers do not transition to `observed`, while canonical v2 controls and the exact legacy `notification-1` v1 fixture do.
 
 Extend `openStore` to accept `receiptLanguage = process.env.AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE || "auto"`. Completion notifications inherit an existing job notification's language; otherwise they detect language from the referenced feedback event's redacted text. Validate every payload before it enters SQLite.
 
@@ -487,7 +489,8 @@ git commit -m "feat: add transactional notification outbox"
 - Produces: `renderReceiptControl(notification) -> { line, marker, text }`
 - Produces: `renderReceiptInstruction(notification) -> string`
 - Produces: `stripReceiptControlText(text) -> string`
-- Consumes: Task 1 `receiptNonce` and `containsReceiptMarker`.
+- Consumes: Task 1 legacy-v1 `receiptNonce` and `containsReceiptMarker`.
+- Produces: a domain-separated v2 current-control nonce over canonical notification ID, state, and exact visible line, truncated to 16 hex.
 
 - [ ] **Step 1: Write renderer and stripping tests**
 
@@ -513,7 +516,7 @@ assert.equal(stripReceiptControlText(`normal answer\n${rendered.line}\n${rendere
 assert.equal(stripReceiptControlText(`${rendered.line}\n${rendered.marker}`), "");
 ```
 
-Also assert that an unknown kind, unknown payload key, invalid severity, full session id, path-shaped value, or visible line over 160 characters throws `TypeError` before rendering. Exact-copy tests for every real outbox kind must include `receipt=<notification_id.slice(0, 6)>`.
+Also assert that an unknown kind, unknown payload key, invalid severity, full session id, path-shaped value, or visible line over 160 characters throws `TypeError` before rendering. Exact-copy tests for every real outbox kind must include `receipt=<notification_id.slice(0, 6)>`. For every rendered kind, alter each grammar-valid dynamic field (`event`, `job`, `severity`, `lesson_count`) while retaining the original marker and assert the complete altered pair survives. Assert every exact generated pair strips.
 
 - [ ] **Step 2: Run renderer tests and verify RED**
 
@@ -523,7 +526,7 @@ Expected: FAIL because `renderReceiptControl`, `renderReceiptLine`, `renderRecei
 
 - [ ] **Step 3: Implement the pure renderer**
 
-Define immutable copy maps for `zh` and `en`; parse `payload_json`, validate it with Task 1's contract, and reuse `receiptNonce(notification_id)`. Use this instruction format:
+Define immutable copy maps for `zh` and `en`; parse `payload_json` and validate it with Task 1's contract. Keep Task 1 `receiptNonce(notification_id)` only for bounded numeric legacy observation. Current canonical controls use SHA-256 over `receipt-control:v2`, NUL separators, canonical `notification_id`, `state`, and the exact rendered visible line, truncated to 16 hex. Use this instruction format:
 
 ```text
 [agent-feedback-loop receipt]
@@ -532,7 +535,7 @@ In the first user-visible update or final answer, output the following line and 
 <hidden marker>
 ```
 
-`renderReceiptInstruction` must assert the complete instruction is at most 512 characters. `stripReceiptControlText` removes only an adjacent generated line/marker pair after verifying canonical 64-hex ID, known state, deterministic nonce, state-specific visible grammar, and `receipt=<marker id first 6>`. It must preserve ordinary AFL prose, quoted or malformed pairs, mismatched binding/state/nonce, old lines without binding, and complete controls inside backtick or tilde fenced code blocks.
+`renderReceiptInstruction` must assert the complete instruction is at most 512 characters. `stripReceiptControlText` removes only an adjacent generated line/marker pair after verifying canonical 64-hex ID, known state, state-specific visible grammar, `receipt=<marker id first 6>`, and the exact v2 nonce recomputed from that adjacent complete line. It must preserve ordinary AFL prose, quoted or malformed pairs, any grammar-valid visible-field edit retaining an old marker, mismatched binding/state/nonce, old lines without binding, and complete controls inside backtick or tilde fenced code blocks. `containsReceiptMarker` must require the authoritative row's v2 marker for canonical rows; a canonical ID-only v1 marker must not observe. Numeric legacy observation remains a separate bounded v1 path and must not broaden.
 
 - [ ] **Step 4: Run renderer tests and verify GREEN**
 
@@ -550,7 +553,7 @@ assert.equal(store.pendingReviewEventCount(projectId), 0);
 assert.equal(store.listSessionEvents(projectId).some((event) => event.redacted_text?.includes("[AFL]")), false);
 ```
 
-Add a mixed-output case and assert the normal answer is captured after receipt controls are removed.
+Add a mixed-output case and assert the normal answer is captured after receipt controls are removed. Add a real assistant transcript record with `content: []` plus tool, textual-output, file, and artifact references; assert the event is stored with all references and the cursor reaches transcript EOF.
 
 - [ ] **Step 6: Run exclusion tests and verify RED**
 
@@ -560,7 +563,7 @@ Expected: FAIL because receipt text is currently treated as assistant evidence.
 
 - [ ] **Step 7: Strip controls at both ingestion boundaries**
 
-Import `stripReceiptControlText` into `capture.mjs` and apply it before redaction/hash normalization for assistant events. In `codex-reconcile.mjs`, strip controls from parsed assistant message content before constructing the reconciled event; skip the event when no semantic text, tool reference, file reference, or artifact hash remains. Preserve source offsets/cursors even when the receipt-only event is skipped so the scheduler does not scan it forever.
+Import `stripReceiptControlText` into `capture.mjs` and apply it before redaction/hash normalization for assistant events. In `codex-reconcile.mjs`, extract structural evidence before any empty-text decision, strip controls from parsed assistant message content, and skip only when `hasCaptureEvidence` is false for semantic text plus tool/output/file/artifact references. Preserve structural-only events and source offsets/cursors; receipt-only events without structural evidence are skipped while the cursor still advances so the scheduler does not scan them forever.
 
 - [ ] **Step 8: Run focused and full capture tests, then commit**
 
@@ -568,7 +571,7 @@ Run: `node --test test/receipt.test.mjs test/capture.test.mjs test/codex-reconci
 
 Expected: all tests PASS and receipt-only events create no queue entries.
 
-Before committing, run receipt/store focused tests and a real store-flow probe. Confirm current rendering/stripping never accepts legacy identifiers, while observation compatibility is limited to `notification-<positive safe integer>` and rejects UUID, `msg_UUID`, colon/session, and path-shaped rows.
+Before committing, run receipt/store focused tests and a real store-flow probe. Confirm current rendering/stripping never accepts legacy identifiers, canonical observation rejects v1 ID-only markers and requires the authoritative v2 marker, while v1 observation compatibility is limited to `notification-<positive safe integer>` and rejects UUID, `msg_UUID`, colon/session, and path-shaped rows.
 
 ```bash
 git add src/receipt.mjs src/capture.mjs src/codex-reconcile.mjs test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs

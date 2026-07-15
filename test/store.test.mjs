@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { containsReceiptMarker, detectReceiptLanguage, receiptNonce, validateReceiptPayload } from "../src/receipt.mjs";
+import { containsReceiptMarker, detectReceiptLanguage, receiptNonce, renderReceiptControl, validateReceiptPayload } from "../src/receipt.mjs";
 import { selectLessons } from "../src/selector.mjs";
 import { CapturePolicyError, LeaseConflictError, RevisionConflictError, openStore } from "../src/store.mjs";
 
@@ -104,8 +104,8 @@ test("receipt payload validation and markers reject unbounded content", () => {
   }
 });
 
-test("chat observation accepts canonical and exact legacy receipt IDs but rejects unsafe legacy-shaped rows", async () => {
-  async function observeMutatedRow(notificationId) {
+test("chat observation requires authoritative v2 canonical controls and bounds v1 compatibility to exact legacy IDs", async () => {
+  async function observeMutatedRow(notificationId, markerVersion = "v1") {
     const home = await mkdtemp(path.join(tmpdir(), "afl-observation-id-"));
     const paths = pathsFor(home);
     let store = openStore({ paths });
@@ -129,19 +129,26 @@ test("chat observation accepts canonical and exact legacy receipt IDs but reject
     }
 
     store = openStore({ paths });
+    const [authoritativeRow] = store.listNotifications({ sessionUid: captured.session_uid });
+    const transcriptText = markerVersion === "v2"
+      ? renderReceiptControl(authoritativeRow).text
+      : `<!--afl-receipt id=${notificationId} nonce=${receiptNonce(notificationId)} state=candidate_captured-->`;
     const result = store.confirmChatNotification({
       sessionUid: captured.session_uid,
       contextEpoch: 1,
       nativeTurnId: "observation-turn",
-      transcriptText: `<!--afl-receipt id=${notificationId} nonce=${receiptNonce(notificationId)} state=candidate_captured-->`
+      transcriptText
     });
     const [row] = store.listNotifications({ sessionUid: captured.session_uid });
     store.close();
     return { originalId: notification.notification_id, action: result.action, state: row.chat_state };
   }
 
-  const canonical = await observeMutatedRow("a".repeat(64));
+  const canonical = await observeMutatedRow("a".repeat(64), "v2");
   assert.deepEqual({ action: canonical.action, state: canonical.state }, { action: "observed", state: "observed" });
+
+  const canonicalV1 = await observeMutatedRow("b".repeat(64));
+  assert.deepEqual({ action: canonicalV1.action, state: canonicalV1.state }, { action: "block", state: "emitted" });
 
   const legacy = await observeMutatedRow("notification-1");
   assert.deepEqual({ action: legacy.action, state: legacy.state }, { action: "observed", state: "observed" });
@@ -294,7 +301,7 @@ test("chat claim and confirm fence one native turn", async () => {
     sessionUid: captured.session_uid,
     contextEpoch: 1,
     nativeTurnId: "turn-3",
-    transcriptText: `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`
+    transcriptText: renderReceiptControl(notification).text
   });
   assert.equal(observed.action, "observed");
   assert.equal(observed.notification.chat_state, "observed");

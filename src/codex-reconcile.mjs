@@ -328,7 +328,15 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
     if (record.type === "response_item" && record.payload?.type === "message" && state.currentTurnId) {
       const role = String(record.payload.role || "");
       const text = textFromMessage(record.payload);
-      if (!text) continue;
+      const structural = structuralEvidenceFromMessage(record.payload);
+      const semanticText = role === "assistant" ? stripReceiptControlText(text) : text;
+      if (!hasCaptureEvidence({
+        semantic_text: semanticText,
+        tool_refs: structural.toolRefs,
+        textual_output_ref: structural.textualOutputRefs[0],
+        file_refs: structural.fileRefs,
+        artifact_hashes: structural.artifactHashes
+      })) continue;
       if (role === "user" && !isControlMessage(text)) {
         const nativeTurnId = String(record.payload.internal_chat_message_metadata_passthrough?.turn_id || state.currentTurnId);
         const interrupted = state.userMessageCount === 0 && state.lastTerminalType === "turn_aborted"
@@ -355,15 +363,6 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
         state.assistantSinceLastUser = false;
         state.sensitiveTokenHashes = credentialContextTokenHashes(text);
       } else if (role === "assistant") {
-        const semanticText = stripReceiptControlText(text);
-        const structural = structuralEvidenceFromMessage(record.payload);
-        if (!hasCaptureEvidence({
-          semantic_text: semanticText,
-          tool_refs: structural.toolRefs,
-          textual_output_ref: structural.textualOutputRefs[0],
-          file_refs: structural.fileRefs,
-          artifact_hashes: structural.artifactHashes
-        })) continue;
         if (semanticText.trim()) {
           state.assistantTail = redactText(`${state.assistantTail}${state.assistantTail ? "\n" : ""}${semanticText}`, {
             blockedTokenHashes: state.sensitiveTokenHashes

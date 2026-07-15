@@ -414,6 +414,43 @@ test("receipt-only Codex text with structural references is captured and advance
   store.close();
 });
 
+test("empty Codex message content with structural references is captured and advances the cursor", async () => {
+  const { transcript, store, blobs, candidate } = await fixture("empty-content-structural");
+  const payload = {
+    id: "msg_019f2234-5678-7abc-8def-0123456789ab",
+    type: "message",
+    role: "assistant",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-empty-content-structural" },
+    content: [],
+    tool_refs: ["exec_command"],
+    textual_output_refs: ["command-output:42"],
+    file_refs: ["src/codex-reconcile.mjs"],
+    artifact_hashes: ["sha256:def456"]
+  };
+  await writeFile(transcript, [
+    turnContext("2026-07-14T12:00:00.000Z", "turn-empty-content-structural", candidate.cwd),
+    record("2026-07-14T12:00:01.000Z", "response_item", payload)
+  ].join(""), { mode: 0o600 });
+
+  const result = await reconcileCodexTranscripts({
+    store,
+    blobs,
+    candidates: [candidate],
+    reviewMinEntries: 99,
+    launchReviewer: async () => assert.fail("assistant structural evidence must not launch a reviewer")
+  });
+
+  assert.equal(result.eventsCaptured, 1);
+  const [event] = store.listSessionEvents(candidate.cwd);
+  assert.equal(event.redacted_text, "");
+  assert.equal(event.tool_name, "exec_command");
+  assert.equal(event.textual_output_ref, "command-output:42");
+  assert.deepEqual(JSON.parse(event.file_refs_json), ["src/codex-reconcile.mjs"]);
+  assert.deepEqual(JSON.parse(event.artifact_hashes_json), ["sha256:def456"]);
+  assert.equal(store.getTranscriptCursor("codex", transcript).offset, (await stat(transcript)).size);
+  store.close();
+});
+
 test("disabled capture skips transcript IO and oversized records produce an explicit coverage gap", async () => {
   const disabled = await fixture("disabled-before-read");
   disabled.store.setCapturePolicy({ enabled: false, revision: 2 });

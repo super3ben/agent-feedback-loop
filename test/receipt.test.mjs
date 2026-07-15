@@ -86,7 +86,7 @@ test("receipt renderer emits the exact visible and canonical hidden receipt cont
   const rendered = renderReceiptControl(notification);
 
   assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e · receipt=111111");
-  assert.match(rendered.marker, /^<!--afl-receipt id=[a-f0-9]{64} nonce=[a-f0-9]{16} state=review_completed-->$/);
+  assert.equal(rendered.marker, `<!--afl-receipt id=${NOTIFICATION_ID} nonce=03941ce38a08b1dc state=review_completed-->`);
   assert.ok(rendered.line.length <= 160);
   assert.ok(rendered.text.length <= 512);
 });
@@ -108,6 +108,46 @@ test("receipt stripping removes only a recognized adjacent line and exact matchi
   assert.equal(stripReceiptControlText(`${rendered.line}\n${wrongNonce}`), `${rendered.line}\n${wrongNonce}`);
   assert.equal(stripReceiptControlText(`normal answer\n${rendered.line}\n${rendered.marker}`), "normal answer");
   assert.equal(stripReceiptControlText(`${rendered.line}\n${rendered.marker}`), "");
+});
+
+test("receipt stripping binds every dynamic visible field to the generated marker", async () => {
+  const rows = await realOutboxRows();
+  const mutations = {
+    candidate_captured: [
+      (line) => line.replace(/event=[a-f0-9]{6}/, "event=abcdef")
+    ],
+    review_queued: [
+      (line) => line.replace(/job=[a-f0-9]{6}/, "job=abcdef")
+    ],
+    review_completed: [
+      (line) => line.replace("severity=Major", "severity=Critical"),
+      (line) => line.replace("lessons=1", "lessons=2"),
+      (line) => line.replace(/job=[a-f0-9]{6}/, "job=abcdef")
+    ],
+    reviewed_no_lesson: [
+      (line) => line.replace(/job=[a-f0-9]{6}/, "job=abcdef")
+    ],
+    review_exhausted: [
+      (line) => line.replace(/job=[a-f0-9]{6}/, "job=abcdef")
+    ],
+    lesson_delivered: [
+      (line) => line.replace(" 1 ", " 2 ")
+    ]
+  };
+
+  for (const row of rows) {
+    const rendered = renderReceiptControl(row);
+    assert.equal(stripReceiptControlText(rendered.text), "", `${row.kind} exact generated pair`);
+    for (const mutate of mutations[row.kind]) {
+      const alteredLine = mutate(rendered.line);
+      assert.notEqual(alteredLine, rendered.line, `${row.kind} mutation must change the line`);
+      assert.equal(
+        stripReceiptControlText(`${alteredLine}\n${rendered.marker}`),
+        `${alteredLine}\n${rendered.marker}`,
+        `${row.kind} altered visible field`
+      );
+    }
+  }
 });
 
 test("receipt stripping preserves fenced, fabricated, mismatched, and wrong-state control pairs", () => {

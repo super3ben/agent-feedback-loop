@@ -80,6 +80,13 @@ export function receiptNonce(notificationId) {
   return createHash("sha256").update(`receipt:v1\u0000${notificationId}`).digest("hex").slice(0, 16);
 }
 
+function receiptControlNonce(notificationId, state, visibleLine) {
+  return createHash("sha256")
+    .update(`receipt-control:v2\u0000${notificationId}\u0000${state}\u0000${visibleLine}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
 function isSupportedObservationId(notificationId) {
   if (typeof notificationId !== "string") return false;
   if (CANONICAL_ID_PATTERN.test(notificationId)) return true;
@@ -91,7 +98,16 @@ export function containsReceiptMarker(text, notification) {
   if (!notification || typeof notification !== "object" || Array.isArray(notification)) return false;
   if (!isSupportedObservationId(notification.notification_id)) return false;
   if (!Object.hasOwn(PAYLOAD_KEYS, notification.kind)) return false;
-  const marker = `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
+  let marker;
+  if (CANONICAL_ID_PATTERN.test(notification.notification_id)) {
+    try {
+      marker = renderReceiptControl(notification).marker;
+    } catch {
+      return false;
+    }
+  } else {
+    marker = `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
+  }
   return String(text || "").includes(marker);
 }
 
@@ -130,8 +146,9 @@ function parseNotificationPayload(notification) {
   return validated;
 }
 
-function receiptMarker(notification) {
-  return `<!--afl-receipt id=${notification.notification_id} nonce=${receiptNonce(notification.notification_id)} state=${notification.kind}-->`;
+function receiptMarker(notification, visibleLine) {
+  const nonce = receiptControlNonce(notification.notification_id, notification.kind, visibleLine);
+  return `<!--afl-receipt id=${notification.notification_id} nonce=${nonce} state=${notification.kind}-->`;
 }
 
 export function renderReceiptLine(notification) {
@@ -154,7 +171,7 @@ export function renderReceiptLine(notification) {
 
 export function renderReceiptControl(notification) {
   const line = renderReceiptLine(notification);
-  const marker = receiptMarker(notification);
+  const marker = receiptMarker(notification, line);
   const text = `${line}\n${marker}`;
   if (text.length > MAX_INSTRUCTION_CHARS) throw new TypeError("receipt control exceeds the bounded length");
   return Object.freeze({ line, marker, text });
@@ -196,7 +213,9 @@ export function stripReceiptControlText(text) {
       const [, notificationId, nonce, state] = marker;
       const visiblePattern = VISIBLE_LINE_PATTERNS[state];
       const visible = visiblePattern?.exec(visibleLine);
-      if (visible && visible[1] === notificationId.slice(0, 6) && nonce === receiptNonce(notificationId)) {
+      if (visible
+        && visible[1] === notificationId.slice(0, 6)
+        && nonce === receiptControlNonce(notificationId, state, visibleLine)) {
         index += 1;
         continue;
       }
