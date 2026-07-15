@@ -309,15 +309,17 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     const resolvedLanguage = notificationLanguage({
       language, jobId, eventUid, sessionUid: safeSessionUid, contextEpoch: safeContextEpoch
     });
+    const chatState = kind === "lesson_delivered" ? "suppressed" : "pending";
     const systemState = ["review_completed", "reviewed_no_lesson", "review_exhausted"].includes(kind) ? "pending" : "not_applicable";
     const timestamp = nowIso(now);
     db.prepare(`INSERT INTO notification_outbox
       (notification_id, session_uid, context_epoch, job_id, event_uid, application_id, semantic_key, kind,
-       payload_json, language, system_state, next_attempt_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       payload_json, language, chat_state, system_state, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT DO NOTHING`).run(
       notificationId, safeSessionUid, safeContextEpoch, jobId, eventUid, applicationId, safeSemanticKey, kind,
-      JSON.stringify(safePayload), resolvedLanguage, systemState, systemState === "pending" ? 0 : null, timestamp, timestamp
+      JSON.stringify(safePayload), resolvedLanguage, chatState, systemState,
+      systemState === "pending" ? 0 : null, timestamp, timestamp
     );
     if (kind === "review_queued") {
       db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?

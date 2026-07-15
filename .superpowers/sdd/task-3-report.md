@@ -104,3 +104,10 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 - Codex receipt confirmation, role filtering, disabled-channel suppression, one-block/two-emission fencing, native JSON, zero-injection, and v2 controls passed independent review.
 - A remaining Gemini-specific gap is known: native `AfterAgent` output arrives as `prompt_response`, while the confirmation path currently reads `last_assistant_message`. Per the vertical-first execution decision, Gemini expansion is paused until a real Codex main-chat receipt reaches `observed`.
 - This report does not claim cross-host or real-user acceptance. The next step is an atomic `0.7.5` install and true Codex session evidence.
+
+### First Real Install Finding
+
+- Runtime `0.7.5` was installed to the real user home and the installed Stop hook hash matched the packaged template.
+- A new ordinary Codex task (`019f65db-5414-77a1-a851-065a6e4a6123`) created no reviewer job, but incorrectly displayed a `lesson_delivered` receipt (`aee8c25f75b2d94d0956174a6740d18ff2092631ab8bc9484d53458db0eb5e37`).
+- The receipt was observed, proving hook forwarding, but it violated the required ordinary-prompt zero-receipt baseline.
+- `lesson_delivered` remains in the notification outbox for audit but now starts with `chat_state=suppressed`, so only feedback/review lifecycle states can claim the main-chat receipt channel.

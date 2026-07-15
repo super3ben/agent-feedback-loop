@@ -789,6 +789,7 @@ test("notification creation is transaction-bound to queue review and delivery wr
   });
   assert.equal(deliveries.inserted, 2);
   assert.equal(deliveries.notification.kind, "lesson_delivered");
+  assert.equal(deliveries.notification.chat_state, "suppressed");
   assert.equal(JSON.parse(deliveries.notification.payload_json).lesson_count, 2);
   assert.equal(store.listNotifications({ sessionUid: feedback.session_uid }).filter((row) => row.kind === "lesson_delivered").length, 1);
   store.close();
@@ -813,6 +814,22 @@ test("delivery notification identity covers the complete sorted application set"
   assert.notEqual(overlapping.notification.notification_id, expanded.notification.notification_id);
   assert.equal(JSON.parse(expanded.notification.payload_json).lesson_count, 3);
   assert.equal(store.listNotifications({ sessionUid }).filter((row) => row.kind === "lesson_delivered").length, 3);
+  store.close();
+});
+
+test("lesson delivery remains audit-only and cannot claim a main-chat receipt", async () => {
+  const store = await storeFixture();
+  const sessionUid = "lesson-audit-only-session";
+  const result = store.recordDeliveries({
+    deliveries: [{ application_id: "lesson-audit-app", lesson_id: "lesson-audit", revision: 1 }],
+    sessionUid,
+    contextEpoch: 1,
+    language: "en"
+  });
+
+  assert.equal(result.notification.kind, "lesson_delivered");
+  assert.equal(result.notification.chat_state, "suppressed");
+  assert.equal(store.claimChatNotification({ sessionUid, contextEpoch: 1, nativeTurnId: "ordinary-turn" }), null);
   store.close();
 });
 
