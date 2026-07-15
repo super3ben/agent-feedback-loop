@@ -365,15 +365,28 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     return db.prepare("SELECT * FROM reviewer_job_events WHERE job_event_id=?").get(jobEventId);
   };
 
-  const notificationSessionsForJob = (jobId) => db.prepare(`SELECT DISTINCT e.session_uid, e.context_epoch
-    FROM queue_events q
-    JOIN session_events e ON e.event_uid=q.event_uid
-    WHERE q.job_id=? AND EXISTS (
-      SELECT 1 FROM notification_outbox n
-      WHERE n.session_uid=e.session_uid AND n.context_epoch=e.context_epoch AND n.event_uid=q.event_uid
-        AND (n.kind='candidate_captured' OR (n.kind='review_queued' AND n.job_id=q.job_id))
-    )
-    ORDER BY e.session_uid, e.context_epoch`).all(jobId);
+  const notificationSessionsForJob = (jobId) => {
+    const assignments = db.prepare(`SELECT e.session_uid, e.context_epoch, q.event_uid,
+        (SELECT n.language FROM notification_outbox n
+          WHERE n.session_uid=e.session_uid AND n.context_epoch=e.context_epoch AND n.event_uid=q.event_uid
+            AND (n.kind='candidate_captured' OR (n.kind='review_queued' AND n.job_id=q.job_id))
+          ORDER BY CASE n.kind WHEN 'review_queued' THEN 0 ELSE 1 END, n.created_at, n.notification_id
+          LIMIT 1) AS language
+      FROM queue_events q
+      JOIN session_events e ON e.event_uid=q.event_uid
+      WHERE q.job_id=? AND EXISTS (
+        SELECT 1 FROM notification_outbox n
+        WHERE n.session_uid=e.session_uid AND n.context_epoch=e.context_epoch AND n.event_uid=q.event_uid
+          AND (n.kind='candidate_captured' OR (n.kind='review_queued' AND n.job_id=q.job_id))
+      )
+      ORDER BY e.session_uid, e.context_epoch, q.created_at, q.event_uid`).all(jobId);
+    const sessions = new Map();
+    for (const assignment of assignments) {
+      const key = `${assignment.session_uid}\u0000${assignment.context_epoch}`;
+      if (!sessions.has(key)) sessions.set(key, assignment);
+    }
+    return [...sessions.values()];
+  };
 
   const suppressQueueNotificationInTransaction = (jobId, eventUid) => db.prepare(`UPDATE notification_outbox
     SET chat_state='suppressed', updated_at=?
@@ -388,7 +401,8 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
       contextEpoch: session.context_epoch,
       jobId,
       kind: "review_exhausted",
-      payload: { reason_code: reasonCode }
+      payload: { reason_code: reasonCode },
+      language: session.language
     })
   );
 
@@ -1401,10 +1415,15 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
           const bySession = new Map();
           for (const lesson of review.lessons) {
             for (const evidence of lesson.evidence_refs || []) {
-              const source = db.prepare("SELECT session_uid, context_epoch FROM session_events WHERE event_uid=?").get(evidence.feedback_event_id);
+              const source = db.prepare("SELECT session_uid, context_epoch, redacted_text FROM session_events WHERE event_uid=?").get(evidence.feedback_event_id);
               if (!source) continue;
               const key = `${source.session_uid}\u0000${source.context_epoch}`;
-              const current = bySession.get(key) || { ...source, severity: lesson.severity, lessonIds: new Set() };
+              const current = bySession.get(key) || {
+                ...source,
+                language: detectReceiptLanguage(source.redacted_text, receiptLanguage),
+                severity: lesson.severity,
+                lessonIds: new Set()
+              };
               if (SEVERITY_RANK[lesson.severity] > SEVERITY_RANK[current.severity]) current.severity = lesson.severity;
               current.lessonIds.add(lesson.lesson_id);
               bySession.set(key, current);
@@ -1416,7 +1435,8 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
               contextEpoch: session.context_epoch,
               jobId,
               kind: "review_completed",
-              payload: { severity: session.severity, lesson_count: session.lessonIds.size }
+              payload: { severity: session.severity, lesson_count: session.lessonIds.size },
+              language: session.language
             }));
           }
         } else {
@@ -1426,7 +1446,8 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
               contextEpoch: session.context_epoch,
               jobId,
               kind: "reviewed_no_lesson",
-              payload: {}
+              payload: {},
+              language: session.language
             }));
           }
         }

@@ -60,9 +60,9 @@
 - Produces: `store.claimChatNotification({ sessionUid, contextEpoch, nativeTurnId }) -> NotificationRow | null`
 - Produces: `store.confirmChatNotification({ sessionUid, contextEpoch, nativeTurnId, transcriptText }) -> { action, notification }`
 - Produces: `store.claimSystemNotifications({ ownerId, nowMs, leaseMs, limit }) -> NotificationRow[]`
-- Produces: `store.completeSystemNotification({ notificationId, ownerId, deliveredAt }) -> boolean`
-- Produces: `store.failSystemNotification({ notificationId, ownerId, reasonCode, nowMs }) -> boolean`
-- Produces: `store.markSystemNotificationUnsupported({ notificationId, ownerId, reasonCode }) -> boolean`
+- Produces: `store.completeSystemNotification({ notificationId, ownerId, leaseEpoch, deliveredAt }) -> boolean`
+- Produces: `store.failSystemNotification({ notificationId, ownerId, leaseEpoch, reasonCode, nowMs }) -> boolean`
+- Produces: `store.markSystemNotificationUnsupported({ notificationId, ownerId, leaseEpoch, reasonCode }) -> boolean`
 - Produces: `store.listNotifications({ sessionUid, jobId }) -> NotificationRow[]`
 - Produces: `store.recordDeliveries({ deliveries, sessionUid, contextEpoch, language }) -> { inserted, notification }`
 - Produces: `store.setReviewerProvider({ jobId, provider }) -> boolean`
@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     'not_applicable','pending','delivering','delivered','failed','unsupported','suppressed'
   )),
   system_owner TEXT,
+  system_lease_epoch INTEGER NOT NULL DEFAULT 0,
   system_lease_until INTEGER,
   system_attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER,
@@ -390,20 +391,22 @@ chat confirm:
   marker absent and chat_block_attempted == 1 -> emitted_unconfirmed, return pass_unconfirmed
 
 system claim:
-  pending/failed due now -> delivering with owner, lease and attempts+1
-  expired delivering -> delivering with new owner, lease and attempts+1
+  pending/failed due now -> delivering with owner, lease, system_lease_epoch+1 and attempts+1
+  expired delivering -> delivering with new owner, lease, system_lease_epoch+1 and attempts+1
   active delivering lease -> not claimable
 
 system complete:
-  delivering + matching owner -> delivered, clear lease and owner
+  delivering + matching owner + matching leaseEpoch -> delivered, clear lease and owner
 
 system failure:
-  delivering + matching owner -> failed, clear lease and owner,
+  delivering + matching owner + matching leaseEpoch -> failed, clear lease and owner,
   next_attempt_at = now + min(21600000, 60000 * 2 ** (attempts - 1))
 
 system unsupported:
-  delivering + matching owner -> unsupported, clear lease and owner, persist reason code
+  delivering + matching owner + matching leaseEpoch -> unsupported, clear lease and owner, persist reason code
 ```
+
+Every complete, fail, and unsupported call must pass `leaseEpoch` from the claimed row's `system_lease_epoch`. Owner identity alone is not a fence: tests must reclaim with the same owner and assert all three terminal methods reject the stale epoch before accepting the current epoch.
 
 Use one chat claim per native turn. Order final review states before queue/candidate, then `lesson_delivered`, so a later terminal fact supersedes a stale progress line. When inserting `review_queued`, update matching `candidate_captured` rows to `chat_state='suppressed'`; when inserting a terminal review state, suppress pending/emitted-unconfirmed progress rows for the same session/job.
 
@@ -677,7 +680,11 @@ git commit -m "feat: confirm review receipts in main conversations"
 - Test: `test/e2e-smoke.test.mjs`
 
 **Interfaces:**
-- Consumes: `store.claimSystemNotifications`, `store.completeSystemNotification`, `store.failSystemNotification`, `store.markSystemNotificationUnsupported`, and Task 2 renderer.
+- Consumes: `store.claimSystemNotifications({ ownerId, nowMs, leaseMs, limit }) -> NotificationRow[]`
+- Consumes: `store.completeSystemNotification({ notificationId, ownerId, leaseEpoch: claimed.system_lease_epoch, deliveredAt }) -> boolean`
+- Consumes: `store.failSystemNotification({ notificationId, ownerId, leaseEpoch: claimed.system_lease_epoch, reasonCode, nowMs }) -> boolean`
+- Consumes: `store.markSystemNotificationUnsupported({ notificationId, ownerId, leaseEpoch: claimed.system_lease_epoch, reasonCode }) -> boolean`
+- Consumes: Task 2 renderer.
 - Produces: `createSystemNotifier({ platform, env, execFileImpl, accessImpl }) -> { adapter, supported, send }`
 - Produces: `drainSystemNotifications({ store, notifier, ownerId, nowMs, leaseMs, limit, log }) -> { claimed, delivered, failed, unsupported }`
 
@@ -702,7 +709,7 @@ assert.deepEqual(result, { claimed: 1, delivered: 1, failed: 0, unsupported: 0 }
 assert.equal(store.listNotifications({ jobId })[0].system_state, "delivered");
 ```
 
-Add Linux `notify-send`, Windows unsupported, process failure/backoff, two-worker lease fencing, and expired-lease recovery cases.
+Add Linux `notify-send`, Windows unsupported, process failure/backoff, two-worker lease fencing, and expired-lease recovery cases. Reclaim three rows with the same owner and assert complete, fail, and unsupported calls using each stale `system_lease_epoch` return `false`; then assert the same calls succeed with each current claimed row's epoch.
 
 - [ ] **Step 2: Run notifier tests and verify RED**
 
@@ -721,11 +728,11 @@ win32:  supported=false, reason=adapter_unverified
 other:  supported=false, reason=platform_unsupported
 ```
 
-The title is `Agent Feedback Loop`; the body is the deterministic visible receipt line. Escape AppleScript backslashes and double quotes in data before passing the script as one `-e` argument. On unsupported platforms, claim each due notification and call `markSystemNotificationUnsupported` with a reason code so the scheduler does not spin.
+The title is `Agent Feedback Loop`; the body is the deterministic visible receipt line. Escape AppleScript backslashes and double quotes in data before passing the script as one `-e` argument. On unsupported platforms, claim each due notification and call `markSystemNotificationUnsupported({ notificationId: claimed.notification_id, ownerId, leaseEpoch: claimed.system_lease_epoch, reasonCode })` so the scheduler does not spin.
 
 - [ ] **Step 4: Implement leased draining and structured logs**
 
-`drainSystemNotifications` claims at most 16 rows with a 30-second lease, sends sequentially, and calls exactly one terminal store method per row. Emit these log events through the provided logger:
+`drainSystemNotifications` claims at most 16 rows with a 30-second lease, sends sequentially, and calls exactly one terminal store method per row. Delivery calls `completeSystemNotification` with `leaseEpoch: claimed.system_lease_epoch`; transport errors call `failSystemNotification` with that same claimed epoch; unsupported adapters call `markSystemNotificationUnsupported` with that same claimed epoch. Never look up or substitute a later epoch by notification id. Emit these log events through the provided logger:
 
 ```text
 receipt.system.delivered notification=<id> adapter=<adapter>

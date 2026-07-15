@@ -759,6 +759,50 @@ test("event and terminal notification languages stay scoped to a shared job sess
   store.close();
 });
 
+test("terminal language follows the assigned candidate without a queued notification", async () => {
+  const store = await storeFixture();
+  const candidate = {
+    ...event("language-assigned-candidate"),
+    project_id: "project-assigned-language",
+    session_uid: "language-assigned-session",
+    event_seq: 1,
+    redacted_text: "please review this issue"
+  };
+  store.captureSessionEvent(candidate);
+  store.createNotification({
+    sessionUid: candidate.session_uid,
+    contextEpoch: 1,
+    kind: "candidate_captured",
+    eventUid: candidate.event_uid,
+    payload: {},
+    language: "en"
+  });
+  const job = store.submitDueReview({ projectId: candidate.project_id, minEntries: 1, cooldownMs: 0 });
+  assert.equal(store.listNotifications({ jobId: job.job_id }).some((row) => row.kind === "review_queued"), false);
+
+  store.captureSessionEvent({
+    ...event("language-unrelated-later"),
+    project_id: candidate.project_id,
+    session_uid: candidate.session_uid,
+    event_seq: 2,
+    redacted_text: "这是之后无关的用户文本"
+  });
+  const lease = store.claimReviewerJob(job.job_id, "language-assigned-reviewer", Date.now() + 100_000, 1);
+  store.commitReview({ jobId: job.job_id, ownerId: "language-assigned-reviewer", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
+    review_receipt_id: "language-assigned-receipt",
+    report_content_id: "language-assigned-report",
+    report_content: "The assigned candidate was reviewed without a durable lesson.",
+    status: "reviewed_no_lesson",
+    lessons: []
+  });
+
+  const terminal = store.listNotifications({ sessionUid: candidate.session_uid })
+    .find((row) => row.kind === "reviewed_no_lesson");
+  assert.equal(terminal.language, "en");
+  store.close();
+});
+
 test("reviewer provider and retry exhaustion are recorded without private context", async () => {
   const store = await storeFixture();
   const feedback = { ...event("exhausted-feedback"), project_id: "project-exhausted", session_uid: "exhausted-session" };
