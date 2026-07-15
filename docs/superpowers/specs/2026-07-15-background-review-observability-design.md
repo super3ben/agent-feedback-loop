@@ -67,6 +67,10 @@
 `candidate_captured` 后即使最终判定不是回顾性反馈，也必须补发 `reviewed_no_lesson`，让用户知道后台
 确实完成了复核，而不是无声丢弃。
 
+为避免普通批处理产生噪声，`reviewed_no_lesson` 和 `review_exhausted` 只投递给此前已有
+`candidate_captured`/`review_queued` 可见状态的 session；无强触发信号的延迟批次只有在 reviewer 形成
+真实 lesson 时才向对应证据 session 投递 `review_completed`。
+
 ## 4. 架构
 
 ### 4.1 ReceiptOutbox
@@ -80,16 +84,19 @@ job_id / event_uid / application_id
 kind
 payload_json
 chat_state = pending | emitted | observed | emitted_unconfirmed | suppressed
-system_state = pending | delivered | failed | unsupported
-emit_attempts / next_attempt_at
-created_at / updated_at / chat_emitted_at / chat_observed_at / system_delivered_at
+chat_turn_id / chat_emit_attempts / chat_block_attempted / chat_emitted_at
+system_state = not_applicable | pending | delivering | delivered | failed | unsupported | suppressed
+system_owner / system_lease_until / system_attempts / next_attempt_at
+created_at / updated_at / chat_observed_at / system_delivered_at
 ```
 
 唯一键按回执语义建立，例如 `(session_uid, job_id, kind)`；重复 hook、重复 scheduler 扫描或 worker 重试
 只能幂等命中同一条回执。创建 `review_completed` 时必须与 review receipt 同事务提交；创建
 `lesson_delivered` 时必须与 delivery receipt 的 `emitted` 状态同事务提交。
 
-outbox 保存结构字段，不保存已渲染的用户原文。最终文案由版本化 renderer 生成，payload 只允许严重度、
+chat/system 领取必须在事务内完成。chat receipt 绑定当前 native turn，Stop 只确认该 turn 已发出的 nonce；
+system notifier 使用 owner + lease 领取，进程崩溃后由 scheduler 回收过期 `delivering`，禁止两个 worker
+并发发送同一通知。outbox 保存结构字段，不保存已渲染的用户原文。最终文案由版本化 renderer 生成，payload 只允许严重度、
 lesson 数量、短身份、reason code 和本地化语言等白名单字段。
 
 ### 4.2 主会话投递
@@ -139,6 +146,9 @@ agent-feedback-loop review show <job-id> [--home <path>]
 `review show` 显示结构化报告、证据身份、receipt、失败历史、lesson 和后续 application/effectiveness；默认仍对
 敏感正文脱敏。命令展示正式 reviewer 产物，不展示 provider 的隐藏 chain of thought。
 
+失败历史来自同事务写入的 `reviewer_job_events`（claim/requeue/completed/failed/retry_exhausted），只保存
+attempt、lease epoch、provider、状态和 reason code，不保存 reviewer 输入输出正文。
+
 ## 5. Token 与噪声控制
 
 - 单条主会话回执硬限制为 160 字符；隐藏标记不携带语义正文。
@@ -187,6 +197,10 @@ AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE=auto
 关闭 chat receipt 只影响可见回执，不关闭 capture/reviewer/lesson。升级使用 schema migration，不修改既有
 review receipt 和 delivery receipt 的语义。历史已完成 job 不批量制造通知；只对升级后新状态转换创建 outbox，
 避免安装后刷出大量旧消息。
+
+关闭 chat 或 system receipt 时，本轮可投递项进入 `suppressed`，重新启用后不追发关闭期间的历史回执，
+避免配置切换造成消息洪峰。`reviewer_jobs` 同时持久化实际 reviewer provider（原生 CLI、显式命令或
+prompt subagent），审计命令不得用来源会话 CLI 冒充实际 reviewer provider。
 
 ## 8. 测试与验收
 
