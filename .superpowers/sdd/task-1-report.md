@@ -59,3 +59,46 @@ Implemented the schema-v8 notification outbox and store state-machine contract i
 
 - The two other-owned tests listed above must be updated by their owning tasks before the repository-wide suite can be fully green.
 - UI-level real-machine verification could not proceed while the Mac was locked; no UI behavior is part of this store-only task.
+
+## Review Fixes
+
+### Status
+
+All five Important findings from the independent Task 1 review are fixed in implementation commit `2caf297bc529124e4a05b726bcc681158bfba98b`.
+
+### RED Evidence
+
+1. `node --test --test-name-pattern="delivery notification identity|bounded immediate replacement|system lease epoch|languages stay scoped|exhausted reviewer job fails visibly" test/store.test.mjs test/codex-reconcile.test.mjs`
+   - Result before production changes: 0 passed, 5 failed.
+   - Delivery-set failure: expanded and overlapping batches returned the first batch's notification ID.
+   - Queue replacement failure: the displaced session's `review_queued` row remained `pending`.
+   - Lease failure: claimed rows had no `system_lease_epoch`, so same-owner reuse had no fencing token.
+   - Language failure: the English session inherited `zh` from another session on the shared job.
+   - Compatibility failure: `exhaustedReviewerJobs` was `{ count, notificationRefs }` instead of numeric `1`.
+2. `node --test --test-name-pattern="realistic v7|delivery writes roll back|reviewer provider and retry exhaustion|retention GC deletes old evidence" test/store.test.mjs`
+   - Result before production changes: 3 passed, 1 failed.
+   - Expected migration failure: the reopened schema-v8 outbox lacked `semantic_key` and `system_lease_epoch`.
+
+### Fixes
+
+- Aggregated delivery identity now includes the complete sorted application-ID set; reordered batches deduplicate while expanded or overlapping sets create distinct payloads.
+- Bounded replacement suppresses the displaced queue notification, and terminal recipients require a current `queue_events` assignment plus a matching candidate/queue notification for that exact event.
+- System notification claims increment a durable monotonic `system_lease_epoch`; completion, failure, and unsupported transitions require owner plus epoch.
+- Event-bound language detection uses the referenced event, while terminal inheritance is constrained by job, session, and context epoch.
+- Codex reconciliation keeps `exhaustedReviewerJobs` numeric and aggregates notification references separately in `notificationRefs`.
+- Schema version remains 8. Both realistic v7 reopen and pre-fence v8 same-version migration preserve rows, reopen idempotently, and pass `PRAGMA foreign_key_check`.
+
+### Tests And Results
+
+- Targeted five-finding GREEN command above: 5 passed, 0 failed.
+- `node --test --test-name-pattern="realistic v7|delivery writes roll back|reviewer provider and retry exhaustion|retention GC deletes old evidence|system lease expires" test/store.test.mjs`: 5 passed, 0 failed.
+- `node --test --test-name-pattern="pre-fence v8" test/store.test.mjs`: 1 passed, 0 failed.
+- `node --test test/store.test.mjs test/codex-reconcile.test.mjs test/runtime.test.mjs`: 69 passed, 0 failed.
+- `npm test`: 168 passed, 0 failed.
+- `git diff --check`: passed with no whitespace errors.
+- Computer Use real-machine attempt: the Mac was locked and automatic unlock failed. The host macOS Node/SQLite tests above ran on the real machine; this task has no UI behavior.
+
+### Remaining Concerns
+
+- A pre-fix v8 multi-application notification did not store its full application set, so that exact legacy aggregate cannot be reconstructed during migration. It is retained under a legacy semantic key; a later replay creates one fresh, correct set-based notification rather than reusing stale payload.
+- Task 4's system notifier must pass each claimed row's `system_lease_epoch` into completion, failure, and unsupported transitions. No notifier call site exists in the current Task 1 code.
