@@ -189,14 +189,30 @@ export function renderReceiptInstruction(notification) {
   return instruction;
 }
 
+function receiptTextLines(text) {
+  const lines = [];
+  let start = 0;
+  while (start < text.length) {
+    const newline = text.indexOf("\n", start);
+    if (newline === -1) {
+      lines.push({ start, end: text.length, contentEnd: text.length, content: text.slice(start) });
+      break;
+    }
+    const contentEnd = newline > start && text[newline - 1] === "\r" ? newline - 1 : newline;
+    lines.push({ start, end: newline + 1, contentEnd, content: text.slice(start, contentEnd) });
+    start = newline + 1;
+  }
+  return lines;
+}
+
 export function stripReceiptControlText(text) {
-  const lines = String(text ?? "").split(/\r?\n/);
-  const retained = [];
+  const source = String(text ?? "");
+  const lines = receiptTextLines(source);
+  const removals = [];
   let fence = null;
   for (let index = 0; index < lines.length; index += 1) {
-    const visibleLine = lines[index];
+    const visibleLine = lines[index].content;
     if (fence) {
-      retained.push(visibleLine);
       const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(visibleLine);
       if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = null;
       continue;
@@ -204,11 +220,10 @@ export function stripReceiptControlText(text) {
     const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(visibleLine);
     if (opening && !(opening[1][0] === "`" && opening[2].includes("`"))) {
       fence = { character: opening[1][0], length: opening[1].length };
-      retained.push(visibleLine);
       continue;
     }
     const markerLine = lines[index + 1];
-    const marker = RECEIPT_MARKER_PATTERN.exec(markerLine || "");
+    const marker = RECEIPT_MARKER_PATTERN.exec(markerLine?.content || "");
     if (marker) {
       const [, notificationId, nonce, state] = marker;
       const visiblePattern = VISIBLE_LINE_PATTERNS[state];
@@ -216,11 +231,20 @@ export function stripReceiptControlText(text) {
       if (visible
         && visible[1] === notificationId.slice(0, 6)
         && nonce === receiptControlNonce(notificationId, state, visibleLine)) {
+        const start = index === 0 ? lines[index].start : lines[index - 1].contentEnd;
+        const end = index === 0 ? markerLine.end : markerLine.contentEnd;
+        removals.push({ start, end });
         index += 1;
         continue;
       }
     }
-    retained.push(visibleLine);
   }
-  return retained.join("\n");
+  if (removals.length === 0) return source;
+  let stripped = "";
+  let cursor = 0;
+  for (const removal of removals) {
+    stripped += source.slice(cursor, removal.start);
+    cursor = removal.end;
+  }
+  return stripped + source.slice(cursor);
 }

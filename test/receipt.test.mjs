@@ -172,6 +172,37 @@ test("receipt stripping preserves fenced, fabricated, mismatched, and wrong-stat
   assert.equal(stripReceiptControlText(`${rendered.line}\n${wrongStateMarker}`), `${rendered.line}\n${wrongStateMarker}`);
 });
 
+test("receipt stripping preserves original line delimiters outside exact controls", () => {
+  const rendered = renderReceiptControl(notification);
+  const tampered = rendered.marker.replace(/nonce=[a-f0-9]{16}/, "nonce=0000000000000000");
+  const ordinaryCrLf = "first evidence\r\nsecond evidence\r\n";
+  const ordinaryMixed = "first evidence\nsecond evidence\r\nthird evidence\n";
+  const backtickFence = `\`\`\`text\r\n${rendered.line}\r\n${rendered.marker}\r\n\`\`\`\n`;
+  const tildeFence = `~~~\n${rendered.line}\r\n${rendered.marker}\n~~~\r\n`;
+  const mismatched = `before\r\n${rendered.line}\r\n${tampered}\nafter\r\n`;
+
+  assert.equal(stripReceiptControlText(ordinaryCrLf), ordinaryCrLf);
+  assert.equal(stripReceiptControlText(ordinaryMixed), ordinaryMixed);
+  assert.equal(stripReceiptControlText(backtickFence), backtickFence);
+  assert.equal(stripReceiptControlText(tildeFence), tildeFence);
+  assert.equal(stripReceiptControlText(mismatched), mismatched);
+  assert.equal(
+    stripReceiptControlText(`${rendered.line}\r\n${rendered.marker}\r\nafter\n`),
+    "after\n",
+    "beginning control removes its own following delimiter"
+  );
+  assert.equal(
+    stripReceiptControlText(`before\r\n${rendered.line}\r\n${rendered.marker}\nafter\r\n`),
+    "before\nafter\r\n",
+    "middle control preserves the marker's following delimiter"
+  );
+  assert.equal(
+    stripReceiptControlText(`before\n${rendered.line}\r\n${rendered.marker}`),
+    "before",
+    "end control removes its preceding delimiter"
+  );
+});
+
 test("receipt renderer keeps the instruction bounded and verbatim", () => {
   const rendered = renderReceiptControl(notification);
   const instruction = renderReceiptInstruction(notification);
