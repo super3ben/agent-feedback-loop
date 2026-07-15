@@ -52,3 +52,51 @@ Implemented deterministic review-receipt rendering and synthetic-control exclusi
 
 - No functional concerns found in the Task 2 ownership boundary.
 - UI-level Computer Use verification was blocked by the host safety policy; this task has no UI surface, and local real-runtime tests provide the available machine evidence.
+
+## Review Fixes
+
+### Status
+
+All Task 2 review findings, including the Critical structural-evidence loss, are fixed in implementation commit `036b58c1c9a8d423bf39fef293dae786ec90a542`.
+
+### RED Evidence
+
+Command:
+
+```text
+node --test test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs test/cli.test.mjs
+```
+
+Initial result: 67 passed, 5 failed.
+
+1. Real `candidate_captured` outbox row failed with `TypeError: receipt job id is invalid` because its Task 1 `job_id` is `null`.
+2. Standalone `[AFL] This is legitimate standalone prose` was reduced to an empty string.
+3. UUID and `msg_UUID` notification identifiers were accepted by the old broad safe-ID grammar.
+4. Receipt-only Codex text with tool/file/artifact references produced `eventsCaptured=0` instead of preserving the structural event.
+5. Real `capture-stop` with receipt-only text and file/artifact references wrote no event row.
+
+The first full-suite run then exposed one Task 1 compatibility fixture in `containsReceiptMarker`: 180 passed, 1 failed. Compatibility was retained only for that observation helper; renderer emission and stripping remain canonical-ID-only.
+
+### Fixes And Self-Review
+
+- Renderer tests now construct all six inputs from actual schema-v8 store outbox rows. Candidate rows use a six-hex SHA-256 event reference, review states use the canonical job prefix, and `lesson_delivered` exposes no job/event reference.
+- Chinese visible text matches `docs/superpowers/specs/2026-07-15-background-review-observability-design.md` exactly. English copy follows the same state distinctions.
+- Receipt emission accepts only canonical 64-hex Task 1 notification/job IDs. Candidate event UIDs are never exposed directly; UUID, `msg_UUID`, path, and session-shaped values are rejected in notification/job positions.
+- Stripping requires an adjacent recognized visible line plus an exact canonical marker whose nonce and state match. Standalone, quoted, embedded, malformed, native-message-shaped, and wrong-nonce content remains intact.
+- One shared `hasCaptureEvidence` predicate gates Codex reconciliation and real Stop CLI capture. Tool refs, textual output refs, file refs, and artifact hashes are extracted before the skip decision and persisted even when receipt stripping leaves no semantic text.
+- Cursor regression proves a structural-only Codex message advances to the transcript file size without losing the stored event.
+- Privacy review found no visible or hidden session/message identifier path. The hidden marker contains only the canonical notification ID plus deterministic nonce/state control fields.
+
+### Verification
+
+- `node --test test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs test/cli.test.mjs`: 72 passed, 0 failed.
+- `node --test test/e2e-smoke.test.mjs`: 14 passed, 0 failed.
+- `node --test --test-name-pattern="receipt|structural references|payload validation and markers" test/receipt.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs test/cli.test.mjs test/store.test.mjs`: 15 passed, 0 failed.
+- `npm test`: 181 passed, 0 failed.
+- `git diff --check` and `git diff --cached --check`: passed.
+- Computer Use attempted `com.apple.Terminal`; the host safety layer returned `Computer Use is not allowed to use the app 'com.apple.Terminal' for safety reasons.` Local macOS CLI, installed-hook, reconciliation, SQLite, and e2e tests are the available real-machine evidence.
+
+### Concerns
+
+- UI-level verification remains unavailable because Computer Use cannot access Terminal on this host. There is no Task 2 product UI surface.
+- `containsReceiptMarker` still recognizes its legacy Task 1 fixed-ID test shape for compatibility. Generated controls and synthetic-control stripping are stricter and accept only canonical 64-hex notification IDs.
