@@ -139,3 +139,37 @@ Both remaining Important Task 1 re-review findings are fixed in implementation c
 ### Remaining Concerns
 
 - Task 4 has not been implemented yet, so native notification delivery is outside this Task 1 re-review. Its regenerated brief now carries the required claimed-row lease-epoch contract.
+
+## Retention GC Important Fix
+
+### Status
+
+The remaining Task 1 retention-GC finding is fixed in implementation commit `9705425305f4fcfca33e965bb93ffc84605ea37e`.
+
+### RED Evidence
+
+- `node --test --test-name-pattern="retention GC removes event-bound notifications" test/store.test.mjs`
+  - Result before the store fix: 0 passed, 1 failed.
+  - Exact failure: `UNIQUE constraint failed: index 'notification_outbox_semantic_idx'` while `gcExpired` deleted the second of three old event rows in one retained session/context.
+  - The fixture bound three old `candidate_captured` notifications to distinct old events and retained one newer event plus its event-bound notification in the same session/context.
+
+### Fix
+
+- `gcExpired` now deletes each selected event's event-bound `notification_outbox` rows before deleting the corresponding `session_events` row, inside the existing immediate transaction. This prevents `ON DELETE SET NULL` from collapsing multiple notification identities through the semantic unique index.
+- Notifications whose source events are retained are not selected or deleted. The GC result includes `notificationCount`, which is emitted by the existing retention CLI JSON result for operational diagnosis.
+
+### GREEN Evidence
+
+- Focused regression: 1 passed, 0 failed. It asserts three old events and three old event-bound notifications are removed, the retained event and its notification survive, and `PRAGMA foreign_key_check` is empty.
+- `node --test test/store.test.mjs`: 48 passed, 0 failed.
+- `npm test`: 170 passed, 0 failed, 0 skipped.
+- `git diff --check`: passed with no whitespace errors.
+- Computer Use real-machine attempt: controlling `Terminal.app` was denied by the safety runtime, then alternate app discovery could not proceed because the Mac was locked. The tests above did execute on the macOS host against real local files and Node's SQLite runtime; this store-only fix has no UI surface.
+
+### Commit SHA
+
+- Implementation: `9705425305f4fcfca33e965bb93ffc84605ea37e`
+
+### Remaining Concerns
+
+- UI-driven verification remains unavailable while the Mac is locked. No store correctness concern remains from the reproduced retention collision.
