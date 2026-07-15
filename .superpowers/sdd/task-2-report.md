@@ -100,3 +100,47 @@ The first full-suite run then exposed one Task 1 compatibility fixture in `conta
 
 - UI-level verification remains unavailable because Computer Use cannot access Terminal on this host. There is no Task 2 product UI surface.
 - `containsReceiptMarker` still recognizes its legacy Task 1 fixed-ID test shape for compatibility. Generated controls and synthetic-control stripping are stricter and accept only canonical 64-hex notification IDs.
+
+## Receipt Protocol Re-review Fixes
+
+### Status
+
+Both remaining Task 2 re-review findings are fixed in implementation commit `1b5fcc290a3bdf72ea21baa6087f41181415ba15`.
+
+### RED Evidence
+
+1. `node --test test/receipt.test.mjs test/store.test.mjs`: 51 passed, 5 failed.
+   - All six real outbox exact-copy assertions lacked the authoritative short receipt binding.
+   - A complete receipt pair inside a backtick fence was stripped.
+   - UUID/native-message-shaped markers were accepted by `containsReceiptMarker`.
+   - A real SQLite outbox row mutated to a UUID transitioned from `emitted` to `observed`.
+2. `node --test --test-name-pattern="fenced, fabricated" test/receipt.test.mjs`: 0 passed, 1 failed.
+   - Self-review proved mixed fence characters such as `three backticks followed by ~` incorrectly closed a backtick fence and exposed the following pair to stripping.
+
+### GREEN Evidence
+
+- `node --test test/receipt.test.mjs test/store.test.mjs`: 56 passed, 0 failed.
+- `node --test test/receipt.test.mjs test/store.test.mjs test/capture.test.mjs test/codex-reconcile.test.mjs test/cli.test.mjs`: 122 passed, 0 failed.
+- `npm test -- --test-reporter=dot`: 184 test points, exit code 0.
+- `git diff --check` and `git diff --cached --check`: passed before the implementation commit.
+- Boundary probe: visible line 69 characters, control 202 characters, instruction 436 characters; limits remain 160/512 and no session/message/path shape appeared.
+- Real store-flow coverage confirms canonical 64-hex and exact legacy `notification-1` rows can reach `observed`; UUID, `msg_UUID`, colon/session, and path rows return `block` and remain `emitted`.
+
+### Protocol And Self-review
+
+- Every generated visible line now carries `receipt=<first 6 canonical notification_id>`; stripping verifies that binding with the adjacent marker ID, known state, deterministic nonce, and state-specific line grammar.
+- Backtick and tilde fenced content, quoted pairs, malformed markers, old unbound lines, mixed fence characters, and mismatched ID/state/nonce/binding pairs are preserved.
+- New rendering and stripping remain canonical 64-hex only. Observation compatibility is bounded to `notification-<positive safe integer>`; zero, leading-zero, oversized, UUID, `msg_UUID`, colon/session, path, and unknown-state forms are rejected.
+- No receipt value is added to logs. The short binding is deterministic and non-sensitive; full session/message/path identifiers remain absent from visible and hidden controls.
+- The design and implementation plan are updated. Ignored generated working artifacts `.superpowers/sdd/task-1-brief.md` and `.superpowers/sdd/task-2-brief.md` were regenerated from the affected plan sections.
+
+### SHAs
+
+- Re-review implementation: `1b5fcc290a3bdf72ea21baa6087f41181415ba15`
+- Reviewed baseline implementation: `036b58c1c9a8d423bf39fef293dae786ec90a542`
+- Previous Task 2 report: `d61f3fb37d22f0ffa6fdc1374378a0fab65f2878`
+
+### Concerns
+
+- Computer Use was attempted through the local Mac runtime but returned: `The Mac is locked and automatic unlock could not unlock it. Ask the user to unlock the Mac manually before continuing.` There is no Task 2 UI surface; local macOS installed-hook, SQLite, reconciliation, CLI, and full-suite tests are the available real-machine evidence.
+- No functional or privacy concern remains inside the Task 2 ownership boundary.
