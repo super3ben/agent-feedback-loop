@@ -24,7 +24,7 @@ import { openStore } from "./store.mjs";
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
-const RUNTIME_VERSION = "0.7.5";
+const RUNTIME_VERSION = "0.7.6";
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";

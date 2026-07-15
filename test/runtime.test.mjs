@@ -28,7 +28,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.match(launcher, /current\.json/);
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
-  assert.equal(current.runtimeVersion, "0.7.5");
+  assert.equal(current.runtimeVersion, "0.7.6");
   assert.equal(current.schemaVersion, 8);
 });
 

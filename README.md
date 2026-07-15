@@ -7,7 +7,7 @@
 Local, severity-aware feedback memory for **Codex**, **Claude Code**, and
 **Gemini CLI**. [中文说明](README-zh.md)
 
-**Current repository version: `0.7.5`**
+**Current repository version: `0.7.6`**
 
 The plugin captures bounded conversation evidence, reviews retrospective user
 feedback in the background, compiles proven agent faults into scoped action cards,
@@ -140,6 +140,13 @@ and Gemini CLI use their native prompt/stop hooks for newly launched sessions af
 installation; this release does not claim Codex-style historical transcript catch-up
 for those hosts. On non-macOS systems hooks still work, but there is no bundled
 scheduled transcript reconciler yet.
+
+Codex `[AFL]` receipts are claimed only by a top-level user turn. Internal child-agent
+prompt and Stop hooks neither create feedback evidence nor claim/confirm a parent
+receipt, so the receipt cannot disappear inside a collapsed subagent notification.
+Queue receipts can appear on the correction turn; a reviewer completion produced
+after that turn appears on the next top-level turn because hooks cannot push a new
+message into an idle conversation asynchronously.
 
 ## Reviewer Modes
 

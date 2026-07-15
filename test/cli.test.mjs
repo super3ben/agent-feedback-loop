@@ -541,6 +541,60 @@ describe("agent-feedback-loop package", () => {
     assert.doesNotMatch(`${codex.stdout}${claude.stdout}${gemini.stdout}`, /\[AFL\]/);
   });
 
+  it("Codex child-agent prompts cannot capture feedback or claim a main-chat receipt", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const paths = pathsFor(home);
+    const env = {
+      ...process.env,
+      HOME: home,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99"
+    };
+    await runWithInput(paths.coreHook, JSON.stringify({
+      session_id: "parent-session",
+      turn_id: "parent-turn",
+      cwd: "/tmp/child-agent-boundary",
+      prompt: "Inspect the current implementation."
+    }), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+
+    const store = openStore({ paths });
+    const [mainEvent] = store.listSessionEvents("/tmp/child-agent-boundary");
+    const notification = store.createNotification({
+      sessionUid: mainEvent.session_uid,
+      contextEpoch: mainEvent.context_epoch,
+      kind: "candidate_captured",
+      eventUid: mainEvent.event_uid,
+      payload: {},
+      language: "en"
+    });
+    store.close();
+
+    const result = await runWithInput(paths.coreHook, JSON.stringify({
+      session_id: "parent-session",
+      turn_id: "child-turn",
+      agent_id: "child-agent-id",
+      agent_type: "explorer",
+      cwd: "/tmp/child-agent-boundary",
+      prompt: "Return the current review conclusion."
+    }), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+    assert.doesNotMatch(result.stdout, /\[AFL\]/);
+    const verify = openStore({ paths });
+    assert.equal(verify.listSessionEvents("/tmp/child-agent-boundary").length, 1);
+    assert.equal(verify.listNotifications({ sessionUid: mainEvent.session_uid }).find((row) => row.notification_id === notification.notification_id).chat_state, "pending");
+    assert.equal(verify.listRecoverableReviewerJobs().filter((row) => row.project_id === "/tmp/child-agent-boundary").length, 0);
+    verify.close();
+
+    const mainFollowUp = await runWithInput(paths.coreHook, JSON.stringify({
+      session_id: "parent-session",
+      turn_id: "parent-follow-up",
+      cwd: "/tmp/child-agent-boundary",
+      prompt: "Continue the main task."
+    }), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    assert.match(JSON.parse(mainFollowUp.stdout).hookSpecificOutput.additionalContext, /\[AFL\] Feedback candidate captured/);
+  });
+
   it("core hook review instruction targets the correct event name per CLI", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
@@ -797,6 +851,33 @@ describe("agent-feedback-loop package", () => {
     assert.deepEqual(JSON.parse(result.stdout), { continue: true });
     const store = openStore({ paths: fixture.paths });
     assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "observed");
+    store.close();
+  });
+
+  it("Codex child-agent Stop cannot observe a main-chat receipt", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "child-stop-parent-session",
+      turnId: "child-turn",
+      projectId: "/tmp/child-stop-boundary"
+    });
+    const control = renderReceiptControl(fixture.notification);
+    const result = await runWithInput(fixture.paths.stopHook, JSON.stringify({
+      session_id: "child-stop-parent-session",
+      turn_id: "child-turn",
+      agent_id: "child-agent-id",
+      agent_type: "explorer",
+      cwd: "/tmp/child-stop-boundary",
+      last_assistant_message: control.text
+    }), { ...process.env, HOME: home }, ["--mode", "codex"]);
+
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+    const store = openStore({ paths: fixture.paths });
+    assert.equal(store.listSessionEvents("/tmp/child-stop-boundary").length, 1);
+    assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "emitted");
     store.close();
   });
 

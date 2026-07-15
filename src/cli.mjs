@@ -29,6 +29,20 @@ function receiptLog(message) {
   console.error(`agent-feedback-loop: ${new Date().toISOString()} ${message}`);
 }
 
+function isCodexChildAgentPayload(cli, payload) {
+  if (cli !== "codex" || !payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const agentId = String(payload.agent_id || payload.agentId || "").trim();
+  if (!agentId) return false;
+  const sessionId = String(payload.session_id || payload.sessionId || "").trim();
+  return !sessionId || agentId !== sessionId;
+}
+
+function logChildAgentBypass(payload, phase) {
+  const sessionId = String(payload?.session_id || payload?.sessionId || "unknown");
+  const sessionHash = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  receiptLog(`hook.child_agent.bypassed phase=${phase} session=${sessionHash}`);
+}
+
 function logCreatedNotifications(notifications) {
   for (const notification of notifications || []) {
     const sessionHash = createHash("sha256").update(String(notification.session_uid)).digest("hex").slice(0, 12);
@@ -397,10 +411,16 @@ export async function main(args) {
       process.stdin.on("data", (chunk) => { value += chunk; });
       process.stdin.on("end", () => resolve(value));
     });
+    const parsedPayload = JSON.parse(payload || "{}");
+    const cli = options.cli || options.args[0] || "unknown";
+    if (isCodexChildAgentPayload(cli, parsedPayload)) {
+      logChildAgentBypass(parsedPayload, "stop");
+      console.log(JSON.stringify(stopResponse(cli, { action: "pass", notification: null })));
+      return;
+    }
     const paths = pathsFor(options.home);
     const store = openStore({ paths });
     try {
-      const parsedPayload = JSON.parse(payload || "{}");
       let transcriptText = "";
       if (parsedPayload.transcript_path) {
         try {
@@ -409,7 +429,6 @@ export async function main(args) {
           debugLog(`capture.stop.transcript_unavailable reason=${error.code || "invalid"}`);
         }
       }
-      const cli = options.cli || options.args[0] || "unknown";
       const lastAssistantMessage = String(parsedPayload.last_assistant_message || "").slice(-32 * 1024);
       const transcriptAssistantOutput = extractRoleValidatedAssistantOutput(transcriptText, { maxChars: 64 * 1024 });
       if (transcriptText && !transcriptAssistantOutput) {
@@ -589,9 +608,14 @@ export async function main(args) {
       process.stdin.on("data", (chunk) => { value += chunk; });
       process.stdin.on("end", () => resolve(value));
     });
+    const parsedPayload = JSON.parse(payload || "{}");
+    if (isCodexChildAgentPayload(cli, parsedPayload)) {
+      logChildAgentBypass(parsedPayload, "prompt");
+      console.log(JSON.stringify(withContinue ? { continue: true } : {}));
+      return;
+    }
     const paths = pathsFor(options.home);
     const store = openStore({ paths });
-    const parsedPayload = JSON.parse(payload || "{}");
     const interruptionWindowSeconds = Number(process.env.AGENT_FEEDBACK_LOOP_INTERRUPTION_WINDOW || 900);
     const signal = await detectStructuralFeedbackSignal(parsedPayload, {
       maxSignalAgeMs: (Number.isFinite(interruptionWindowSeconds) && interruptionWindowSeconds >= 0 ? interruptionWindowSeconds : 900) * 1000
