@@ -177,6 +177,7 @@ Usage:
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
   agent-feedback-loop memory list|show [--home <path>]
+  agent-feedback-loop memory explain <session-id> [--verbose] [--home <path>]
   agent-feedback-loop memory promote <lesson-id> [project-id] [--home <path>]
   agent-feedback-loop capture status|on|off [--home <path>]
   agent-feedback-loop gc status|run [--home <path>]
@@ -399,6 +400,7 @@ export async function main(args) {
     const paths = pathsFor(options.home);
     const store = openStore({ paths });
     const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
+    const jobId = optionValue(options.args, "--job-id");
     try {
       const provider = optionValue(options.args, "--provider");
       const commandPath = optionValue(options.args, "--command", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND);
@@ -407,8 +409,9 @@ export async function main(args) {
       const executable = provider ? await resolveReviewerExecutable({ cli: provider, env: process.env }) : null;
       if (provider && !executable) throw new Error(`reviewer provider executable is unavailable: ${provider}`);
       const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000));
+      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.start job=${jobId || "unknown"} provider=${provider || "command"}`);
       const result = await runner.runJob({
-        jobId: optionValue(options.args, "--job-id"),
+        jobId,
         ownerId: `reviewer-${process.pid}`,
         command: commandPath,
         args: JSON.parse(argsJson),
@@ -431,7 +434,11 @@ export async function main(args) {
           })
           : null
       });
+      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.complete job=${jobId || "unknown"} status=${result.status} lessons=${Number(result.lessonCount || 0)}`);
       console.log(JSON.stringify(result));
+    } catch (error) {
+      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.failed job=${jobId || "unknown"} reason=${error.code || error.name || "reviewer_failed"}`);
+      throw error;
     } finally {
       store.close();
     }
@@ -471,6 +478,14 @@ export async function main(args) {
         if (action === "promote") {
           const promoted = store.promoteLesson({ lessonId: options.args[1], projectId: options.args[2] || null });
           console.log(JSON.stringify({ command, action, lesson: promoted }, null, 2));
+        } else if (action === "explain") {
+          const reference = options.args[1];
+          if (!reference) throw new Error("memory explain requires a session id");
+          const trace = store.explainMemory(reference);
+          if (!trace) throw new Error(`feedback memory session not found: ${reference}`);
+          const outputTrace = options.args.includes("--verbose") ? trace : { ...trace };
+          if (!options.args.includes("--verbose")) delete outputTrace.events;
+          console.log(JSON.stringify({ command, action, trace: outputTrace }, null, 2));
         } else {
           const rows = store.selectLessons({ projectId: action === "list" ? (options.args[1] || null) : null });
           console.log(JSON.stringify({ command, action, lessons: rows }, null, 2));
@@ -570,6 +585,13 @@ export async function main(args) {
     debugLog(`hook.signal signal=${signal.reason} immediate_review=${signal.immediateReview ? 1 : 0}`);
     debugLog(`hook.review status=${due.status} events=${due.eventCount}`);
     const injectedContexts = [];
+    if (signal.immediateReview) {
+      injectedContexts.push([
+        "[agent-feedback-loop correction checkpoint]",
+        "Apply the user's correction now and stop the superseded execution path before doing more work.",
+        "A background reviewer handles durable learning independently; do not perform, display, or wait for it in the main conversation."
+      ].join("\n"));
+    }
     const wake = due.status === "pending"
       ? store.claimReviewerWake({ jobId: due.job_id, cooldownMs: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_WAKE_COOLDOWN || 300) * 1000 })
       : { action: "not_due", attempt: 0 };
@@ -591,6 +613,9 @@ export async function main(args) {
       store
     });
     debugLog(`hook.selection cards=${selection.cards.length} hold=${selection.hold || "none"} tokens=${selection.tokenEstimate}`);
+    if (signal.immediateReview || selection.cards.length > 0 || selection.hold) {
+      console.error(`agent-feedback-loop: ${new Date().toISOString()} hook.outcome signal=${signal.reason} immediate=${signal.immediateReview ? 1 : 0} cards=${selection.cards.length} hold=${selection.hold || "none"} review=${due.status} job=${due.job_id || "none"}`);
+    }
     if (selection.cards.length > 0) {
       const nonce = selection.cards.map((card) => card.application_id).join("").slice(0, 16);
       for (const card of selection.cards) {

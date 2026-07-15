@@ -92,3 +92,72 @@ test("selector filters lesson cards by task type, path, and tool scope", () => {
   assert.equal(selectLessons({ lessons: [lesson], session: { session_uid: "s", context_epoch: 1 }, task: base, budget: 10_000 }).cards.length, 1);
   assert.equal(selectLessons({ lessons: [lesson], session: { session_uid: "s", context_epoch: 1 }, task: { ...base, tools: ["npm"] }, budget: 10_000 }).cards.length, 0);
 });
+
+test("Major retrieval treats absent host metadata as unknown and matches the action-card trigger locally", () => {
+  const lesson = card("Major", {
+    lesson_id: "ssh-before-termius",
+    scope: {
+      task_types: ["remote-environment-testing", "deployment-debugging"],
+      paths: [],
+      tools: ["ssh", "Termius", "computer-use"],
+      signals: ["user says use ssh", "remote host access required"]
+    },
+    card: {
+      when: "需要连接用户已有服务器、公司主机、现场机器或真机环境时",
+      must_do: "优先使用既有 SSH 入口",
+      must_not: "不要默认启用 Termius",
+      verify: "保留 SSH 连接证据",
+      why: "远程访问方式是已有项目约定",
+      exception: "用户明确要求 GUI 时除外",
+      source_ids: ["incident-ssh"]
+    }
+  });
+  const result = selectLessons({
+    lessons: [lesson],
+    session: { session_uid: "codex:default:ssh-task", context_epoch: 1, project_id: "project-a" },
+    task: {
+      project_id: "project-a",
+      fingerprint: "ssh-task",
+      prompt: "现在连接的服务器环境就是公司主机，本机作为现场桥接笔记本"
+    },
+    budget: 10_000
+  });
+  assert.equal(result.cards.length, 1);
+  assert.equal(result.cards[0].lesson_id, "ssh-before-termius");
+
+  const unrelated = selectLessons({
+    lessons: [lesson],
+    session: { session_uid: "codex:default:server-health", context_epoch: 1, project_id: "project-a" },
+    task: {
+      project_id: "project-a",
+      fingerprint: "server-health",
+      prompt: "请检查服务器状态和磁盘空间"
+    },
+    budget: 10_000
+  });
+  assert.equal(unrelated.cards.length, 0);
+});
+
+test("a lesson created from the current session is injected on the next turn even when the user only says continue", () => {
+  const session = { session_uid: "codex:default:active-task", context_epoch: 1, project_id: "project-a" };
+  const lesson = card("Major", {
+    lesson_id: "active-task-correction",
+    scope: { task_types: ["remote-environment-testing"], tools: ["ssh"], signals: ["remote host access required"] },
+    card: {
+      when: "需要连接远程主机时",
+      must_do: "使用已经确认的 SSH 入口",
+      must_not: "不要切回 GUI 远程工具",
+      verify: "记录连接结果",
+      why: "本任务刚因远程入口选择错误被纠正",
+      exception: "SSH 已被真实证据证明不可用",
+      source_ids: [`${session.session_uid}:generated:feedback-1`]
+    }
+  });
+  const result = selectLessons({
+    lessons: [lesson],
+    session,
+    task: { project_id: "project-a", fingerprint: "active-task", prompt: "继续" },
+    budget: 10_000
+  });
+  assert.equal(result.cards.length, 1);
+});

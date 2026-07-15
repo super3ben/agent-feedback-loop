@@ -7,7 +7,7 @@
 Local, severity-aware feedback memory for **Codex**, **Claude Code**, and
 **Gemini CLI**. [中文说明](README-zh.md)
 
-**Current repository version: `0.7.3`**
+**Current repository version: `0.7.4`**
 
 The plugin captures bounded conversation evidence, reviews retrospective user
 feedback in the background, compiles proven agent faults into scoped action cards,
@@ -101,7 +101,10 @@ runtime log.
   user messages sent before any assistant output are captured but do not use the
   immediate path. Before the reviewer can start, the latest visible assistant
   message from that turn is durably captured as the referent; the correction can
-  never consume its job first and leave the reviewer with prompt-only evidence.
+  never consume its job first and leave the reviewer with prompt-only evidence. The
+  same turn receives only a compact correction checkpoint: apply the user's correction
+  and stop the superseded path. The full review remains invisible and runs in the
+  detached reviewer process.
 - A 60-second incremental reconciler catches active Codex tasks whose hook was
   missed during an upgrade/reload race. Native message ids are preferred; stable
   byte offsets are used otherwise. Hook and transcript observations alias to one
@@ -216,9 +219,13 @@ confirmation.
   contains no user or assistant transcript text.
 - Reports and transcripts are never injected into ordinary turns. Only complete,
   compact action cards are selectable.
-- Minor is never loaded. Major requires exact task/path/tool/signal relevance.
-  Critical and Blocker are loaded within their applicable project scope and context
-  epoch.
+- Minor is never loaded. Major requires task/path relevance, an explicit scoped
+  signal/tool mention, or a stronger local phrase overlap with the card's `when`
+  trigger; one generic CJK word is insufficient. Missing host metadata is
+  unknown, not a mismatch; a known conflicting value still excludes the card. A
+  lesson produced from the current task is eligible once on its next prompt, including
+  a bare `continue`. Critical and Blocker are loaded within their applicable project
+  scope and context epoch.
 - Token cost is estimated locally with a conservative CJK-aware estimator. Budgets
   are calibrated from whole cards; cards are never cut mid-field. Oversized Major
   cards are skipped whole, while severe overflow creates an explicit checkpoint hold.
@@ -255,7 +262,11 @@ under the configured retention policy; host-owned transcripts remain the host's
 responsibility.
 
 Managed runtime and reconciliation logs rotate at 5 MiB by default and never include
-raw prompt/report bodies.
+raw prompt/report bodies. Immediate hook outcomes and detached reviewer lifecycle
+transitions include timestamps and job ids. `memory explain <session-id>` separates
+delivery of lessons produced by that session (`emitted/observed`) from pre-existing
+lessons delivered into it (`delivered_into_session/observed_in_session`), without
+returning event text.
 
 ## Commands
 
@@ -265,6 +276,7 @@ agent-feedback-loop doctor [--live] [--home <path>]
 agent-feedback-loop paths
 agent-feedback-loop capture status|on|off
 agent-feedback-loop memory list [project-id]
+agent-feedback-loop memory explain <session-id> [--verbose]
 agent-feedback-loop memory promote <lesson-id> [project-id]
 agent-feedback-loop gc status|run
 agent-feedback-loop reconcile [--home <path>]

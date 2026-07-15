@@ -133,7 +133,10 @@ process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'refe
     timestamp: "2026-07-14T12:00:20.000Z",
     prompt: "do not send it to the group; send it only to me"
   }), env);
-  assert.deepEqual(JSON.parse(result.stdout), {});
+  const immediate = JSON.parse(result.stdout);
+  assert.match(immediate.hookSpecificOutput.additionalContext, /correction checkpoint/i);
+  assert.match(immediate.hookSpecificOutput.additionalContext, /apply the user's correction now/i);
+  assert.doesNotMatch(immediate.hookSpecificOutput.additionalContext, /full causal|5[- ]why|report_content/i);
   await waitFor(() => {
     const store = openStore({ paths });
     try { return store.getReportContent("referent-report"); } finally { store.close(); }
@@ -143,6 +146,10 @@ process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'refe
   assert.deepEqual(events.map((event) => event.role), ["assistant", "user"]);
   assert.equal(events[0].capture_completeness, "transcript_visible_assistant");
   completed.close();
+  const runtimeLog = await readFile(path.join(paths.dataRoot, "logs", "runtime.log"), "utf8");
+  assert.match(runtimeLog, /hook\.outcome signal=active_turn_steering immediate=1 cards=0/);
+  assert.match(runtimeLog, /agent-feedback-loop: \d{4}-\d{2}-\d{2}T[^ ]+ reviewer\.job\.complete job=/);
+  assert.doesNotMatch(runtimeLog, /send it only to me/);
 });
 
 test("reconcile command repairs a stale Codex thread and completes review in a detached process", async () => {
@@ -345,6 +352,21 @@ process.stdout.write(JSON.stringify({
   assert.equal(committed.listIncidents(projectId).length, 1);
   committed.close();
 
+  const explained = JSON.parse((await execFileAsync(process.execPath, [
+    "bin/agent-feedback-loop.mjs", "memory", "explain", "closed-loop", "--home", home
+  ], { cwd: path.resolve(import.meta.dirname, ".."), env })).stdout);
+  assert.equal(explained.trace.stages.captured, true);
+  assert.equal(explained.trace.stages.reviewed, true);
+  assert.equal(explained.trace.stages.lesson_compiled, true);
+  assert.equal(explained.trace.stages.emitted, false);
+  assert.ok(explained.trace.produced_lessons.some((lesson) => lesson.lesson_id === "closed-loop-lesson"));
+  assert.equal(explained.trace.events, undefined);
+  const verboseExplain = JSON.parse((await execFileAsync(process.execPath, [
+    "bin/agent-feedback-loop.mjs", "memory", "explain", "closed-loop", "--verbose", "--home", home
+  ], { cwd: path.resolve(import.meta.dirname, ".."), env })).stdout);
+  assert.ok(verboseExplain.trace.events.length > 0);
+  assert.equal(verboseExplain.trace.events.some((event) => Object.hasOwn(event, "redacted_text")), false);
+
   const fourth = JSON.parse((await runHook(paths.coreHook, JSON.stringify({ session_id: "closed-loop-next", turn_id: "1", cwd: projectId, task_type: "verification", task_fingerprint: "closed-loop-next-verification", prompt: "再次检查完成条件" }), env)).stdout);
   assert.match(fourth.hookSpecificOutput.additionalContext, /读取并核对真实产物/);
   assert.match(fourth.hookSpecificOutput.additionalContext, /用实现推断代替验收证据/);
@@ -405,6 +427,54 @@ test("hook injects a stored lesson once and records emitted delivery", async () 
   observedStore.close();
   const second = JSON.parse((await runHook(paths.coreHook, JSON.stringify({ session_id: "lesson-session", turn_id: "2", task_fingerprint: "lesson-task", cwd: "/tmp/lesson-hook", prompt: "continue again" }), env)).stdout);
   assert.deepEqual(second, {});
+});
+
+test("real hook retrieves the SSH-over-Termius lesson from a Chinese remote-host prompt without host metadata", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-ssh-memory-hook-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const projectId = "/tmp/ssh-memory-project";
+  const store = openStore({ paths });
+  store.upsertLessonRevision({
+    lesson_id: "ssh-before-termius",
+    revision: 1,
+    project_id: projectId,
+    severity: "Major",
+    scope: {
+      task_types: ["remote-environment-testing", "deployment-debugging"],
+      paths: [],
+      tools: ["ssh", "Termius", "computer-use"],
+      signals: ["user says use ssh", "remote host access required"]
+    },
+    card_json: JSON.stringify({
+      when: "需要连接用户已有服务器、公司主机、现场机器或真机环境时",
+      must_do: "优先使用既有 SSH 入口",
+      must_not: "不要默认启用 Termius",
+      verify: "保留 SSH 连接证据",
+      why: "远程访问方式是已有项目约定",
+      exception: "用户明确要求 GUI 时除外",
+      source_ids: ["prior-ssh-incident"]
+    })
+  }, 0);
+  store.promoteLesson({ lessonId: "ssh-before-termius", projectId });
+  store.close();
+
+  const response = JSON.parse((await runHook(paths.coreHook, JSON.stringify({
+    session_id: "remote-host-task",
+    turn_id: "1",
+    cwd: projectId,
+    prompt: "现在连接的服务器环境就是公司主机，本机作为现场桥接笔记本"
+  }), { ...process.env, HOME: home, TMPDIR: home })).stdout);
+  assert.match(response.hookSpecificOutput.additionalContext, /优先使用既有 SSH 入口/);
+  assert.match(response.hookSpecificOutput.additionalContext, /不要默认启用 Termius/);
+
+  const delivered = openStore({ paths });
+  const trace = delivered.explainMemory("remote-host-task");
+  assert.equal(trace.stages.lesson_compiled, false);
+  assert.equal(trace.stages.emitted, false);
+  assert.equal(trace.stages.delivered_into_session, true);
+  assert.equal(trace.deliveries_into_session[0].lesson_id, "ssh-before-termius");
+  delivered.close();
 });
 
 test("CLI live doctor runs an isolated synthetic canary", async () => {

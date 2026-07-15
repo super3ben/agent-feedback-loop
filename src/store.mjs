@@ -324,6 +324,117 @@ export function openStore({ paths, now = () => new Date() }) {
     listSessionEvents(projectId) {
       return db.prepare("SELECT * FROM session_events WHERE project_id=? ORDER BY COALESCE(source_timestamp, captured_at), rowid").all(projectId);
     },
+    explainMemory(reference) {
+      const value = ensureString(reference, "session reference");
+      const session = db.prepare(`SELECT * FROM sessions
+        WHERE session_uid=? OR native_session_id=?
+        ORDER BY CASE WHEN session_uid=? THEN 0 ELSE 1 END, started_at DESC
+        LIMIT 1`).get(value, value, value) || null;
+      if (!session) return null;
+
+      const events = db.prepare(`SELECT e.event_uid, e.event_seq, e.context_epoch, e.role, e.capture_source,
+          e.capture_completeness, e.source_timestamp, e.captured_at,
+          q.status AS queue_status, q.job_id,
+          j.status AS reviewer_status, j.attempt AS reviewer_attempt, j.reason_code,
+          j.receipt_id, j.created_at AS reviewer_created_at, j.updated_at AS reviewer_updated_at
+        FROM session_events e
+        LEFT JOIN queue_events q ON q.event_uid=e.event_uid
+        LEFT JOIN reviewer_jobs j ON j.job_id=q.job_id
+        WHERE e.session_uid=?
+        ORDER BY COALESCE(e.source_timestamp, e.captured_at), e.rowid`).all(session.session_uid);
+
+      const eventIds = new Set(events.map((event) => event.event_uid));
+      const jobs = [];
+      const seenJobs = new Set();
+      const producedLessons = [];
+      const seenLessons = new Set();
+      for (const event of events) {
+        if (!event.job_id || seenJobs.has(event.job_id)) continue;
+        seenJobs.add(event.job_id);
+        jobs.push({
+          job_id: event.job_id,
+          status: event.reviewer_status,
+          attempt: Number(event.reviewer_attempt || 0),
+          reason_code: event.reason_code || null,
+          receipt_id: event.receipt_id || null,
+          created_at: event.reviewer_created_at || null,
+          updated_at: event.reviewer_updated_at || null
+        });
+        if (!event.receipt_id) continue;
+        const receipt = db.prepare("SELECT payload_json FROM review_receipts WHERE receipt_id=?").get(event.receipt_id);
+        const payload = receipt ? parseJsonOr(receipt.payload_json, {}) : {};
+        for (const lesson of payload.lessons || []) {
+          const feedbackIds = (lesson.evidence_refs || [])
+            .map((evidence) => evidence?.feedback_event_id)
+            .filter(Boolean);
+          if (!feedbackIds.some((eventUid) => eventIds.has(eventUid))) continue;
+          const key = `${lesson.lesson_id || "unknown"}:${lesson.revision || 0}`;
+          if (seenLessons.has(key)) continue;
+          seenLessons.add(key);
+          producedLessons.push({
+            lesson_id: lesson.lesson_id,
+            revision: Number(lesson.revision || 0),
+            severity: lesson.severity || null,
+            responsibility: lesson.responsibility || null,
+            method_class: lesson.method_class || null,
+            class_id: lesson.class_id || null
+          });
+        }
+      }
+
+      const normalizeDelivery = (delivery) => ({
+        ...delivery,
+        revision: Number(delivery.revision),
+        context_epoch: Number(delivery.context_epoch),
+        observed: Boolean(delivery.observed)
+      });
+      const deliveriesIntoSession = db.prepare(`SELECT application_id, lesson_id, revision, session_uid, context_epoch, state, observed, created_at
+        FROM delivery_receipts WHERE session_uid=? ORDER BY created_at, application_id`).all(session.session_uid)
+        .map(normalizeDelivery);
+      const producedLessonDeliveries = producedLessons.flatMap((lesson) => db.prepare(`SELECT application_id, lesson_id, revision, session_uid, context_epoch, state, observed, created_at
+        FROM delivery_receipts WHERE lesson_id=? AND revision=? ORDER BY created_at, application_id`).all(lesson.lesson_id, lesson.revision))
+        .map(normalizeDelivery);
+      const queueEvents = events.filter((event) => event.queue_status != null);
+      return {
+        session,
+        stages: {
+          captured: events.length > 0,
+          queued: queueEvents.length > 0,
+          reviewed: jobs.some((job) => job.status === "completed"),
+          lesson_compiled: producedLessons.length > 0,
+          emitted: producedLessonDeliveries.some((delivery) => ["emitted", "emitted_unconfirmed", "observed"].includes(delivery.state)),
+          observed: producedLessonDeliveries.some((delivery) => delivery.state === "observed" && delivery.observed),
+          delivered_into_session: deliveriesIntoSession.some((delivery) => ["emitted", "emitted_unconfirmed", "observed"].includes(delivery.state)),
+          observed_in_session: deliveriesIntoSession.some((delivery) => delivery.state === "observed" && delivery.observed)
+        },
+        counts: {
+          events: events.length,
+          feedback_candidates: queueEvents.length,
+          reviewer_jobs: jobs.length,
+          produced_lessons: producedLessons.length,
+          produced_lesson_deliveries: producedLessonDeliveries.length,
+          deliveries_into_session: deliveriesIntoSession.length,
+          deliveries: deliveriesIntoSession.length
+        },
+        events: events.map((event) => ({
+          event_uid: event.event_uid,
+          event_seq: Number(event.event_seq),
+          context_epoch: Number(event.context_epoch),
+          role: event.role,
+          capture_source: event.capture_source,
+          capture_completeness: event.capture_completeness,
+          source_timestamp: event.source_timestamp || null,
+          captured_at: event.captured_at,
+          queue_status: event.queue_status || null,
+          job_id: event.job_id || null
+        })),
+        reviewer_jobs: jobs,
+        produced_lessons: producedLessons,
+        produced_lesson_deliveries: producedLessonDeliveries,
+        deliveries_into_session: deliveriesIntoSession,
+        deliveries: deliveriesIntoSession
+      };
+    },
     hasSessionEvent(eventUid) {
       return Boolean(db.prepare("SELECT 1 FROM session_events WHERE event_uid=?").get(eventUid));
     },

@@ -365,6 +365,24 @@ test("structured review commit atomically creates a lesson, receipt, report, and
   assert.equal(incidents[0].responsibility, "agent_fault");
   assert.equal(incidents[0].severity, "Major");
   assert.deepEqual(incidents[0].event_uids.sort(), ["commit-3", "commit-assistant"]);
+
+  store.recordDelivery({
+    application_id: "lesson-commit-cross-session",
+    lesson_id: "lesson-commit",
+    revision: 1,
+    session_uid: "codex:install:later-session",
+    context_epoch: 1,
+    state: "emitted"
+  });
+  const unrelatedTrace = store.explainMemory("codex:install:commit-1");
+  assert.equal(unrelatedTrace.stages.reviewed, true);
+  assert.equal(unrelatedTrace.stages.lesson_compiled, false);
+  const originTrace = store.explainMemory("codex:install:commit-3");
+  assert.equal(originTrace.stages.lesson_compiled, true);
+  assert.equal(originTrace.stages.emitted, true);
+  assert.equal(originTrace.stages.delivered_into_session, false);
+  assert.equal(originTrace.produced_lessons[0].lesson_id, "lesson-commit");
+  assert.equal(originTrace.produced_lesson_deliveries[0].session_uid, "codex:install:later-session");
   store.close();
 });
 

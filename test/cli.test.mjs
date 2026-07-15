@@ -548,7 +548,10 @@ describe("agent-feedback-loop package", () => {
     const response = JSON.parse(output.stdout);
 
     assert.equal(response.continue, true);
-    assert.equal(response.hookSpecificOutput, undefined);
+    assert.equal(response.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(response.hookSpecificOutput.additionalContext, /correction checkpoint/i);
+    assert.match(response.hookSpecificOutput.additionalContext, /stop the superseded execution path/i);
+    assert.doesNotMatch(response.hookSpecificOutput.additionalContext, /5[- ]why|report_content/i);
     const log = await readText(env.AGENT_FEEDBACK_LOOP_LOG);
     assert.match(log, /signal=prior_turn_interrupted immediate_review=1/);
     assert.match(log, /reviewer\.unavailable cli=codex/);

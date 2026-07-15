@@ -69,7 +69,7 @@ test("detects an immediately preceding interrupted turn without matching prompt 
   assert.deepEqual(signal, { immediateReview: true, reason: "prior_turn_interrupted" });
 });
 
-test("does not reuse an older interruption when the latest prior turn completed", async () => {
+test("completed-turn corrective wording stays on deferred review instead of a keyword fast path", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-signal-control-"));
   const transcript = path.join(home, "rollout.jsonl");
   await writeFile(transcript, [
@@ -77,7 +77,11 @@ test("does not reuse an older interruption when the latest prior turn completed"
     JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-2" } })
   ].join("\n"), "utf8");
 
-  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-3" });
+  const signal = await detectStructuralFeedbackSignal({
+    transcript_path: transcript,
+    turn_id: "turn-3",
+    prompt: "为什么又用了 Termius，之前已经说过应该直接用 SSH"
+  });
   assert.deepEqual(signal, { immediateReview: false, reason: "none" });
 });
 
