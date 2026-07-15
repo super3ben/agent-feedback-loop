@@ -102,3 +102,40 @@ All five Important findings from the independent Task 1 review are fixed in impl
 
 - A pre-fix v8 multi-application notification did not store its full application set, so that exact legacy aggregate cannot be reconstructed during migration. It is retained under a legacy semantic key; a later replay creates one fresh, correct set-based notification rather than reusing stale payload.
 - Task 4's system notifier must pass each claimed row's `system_lease_epoch` into completion, failure, and unsupported transitions. No notifier call site exists in the current Task 1 code.
+
+## Important Re-review Fixes
+
+### Status
+
+Both remaining Important Task 1 re-review findings are fixed in implementation commit `02f98a054e3e9c4674cb5d6af453b0761464d63f`.
+
+### RED Evidence
+
+- `node --test --test-name-pattern="terminal language follows the assigned candidate" test/store.test.mjs`
+  - Result before the store fix: 0 passed, 1 failed.
+  - Exact assertion: actual `zh`, expected `en`.
+  - The fixture had an English candidate notification assigned to the job, no `review_queued` row, and a later unrelated Chinese user event in the same session.
+
+### Fixes
+
+- Terminal no-lesson and exhausted notifications now receive language explicitly from the exact current queue assignment's candidate/queue notification. Review-completed notifications receive language explicitly from the validated feedback evidence event assigned to the same job. No terminal path in this change falls back to the session's latest unrelated user event.
+- The tracked implementation plan now requires `leaseEpoch` for complete, fail, and unsupported store transitions, documents `system_lease_epoch`, requires every Task 4 notifier call to pass the claimed row's epoch, and requires stale same-owner writes to fail for all three terminal methods.
+- Regenerated `.superpowers/sdd/task-1-brief.md` and `.superpowers/sdd/task-4-brief.md` with `/Users/sunxingda/.codex/skills/subagent-driven-development/scripts/task-brief`. The generated outputs were 420 and 93 lines respectively and matched fresh temporary generator output byte-for-byte.
+
+### Tests And Results
+
+- Focused RED-to-GREEN rerun: `node --test --test-name-pattern="terminal language follows the assigned candidate" test/store.test.mjs`: 1 passed, 0 failed.
+- Focused language and lease-contract run: `node --test --test-name-pattern="terminal language follows the assigned candidate|system lease epoch fences stale transitions" test/store.test.mjs`: 2 passed, 0 failed.
+- Full store run: `node --test test/store.test.mjs`: 47 passed, 0 failed.
+- Full repository run: `npm test`: 169 passed, 0 failed, 0 skipped.
+- `git diff --check`: passed with no whitespace errors before the implementation commit.
+- Self-review confirmed only `src/store.mjs`, `test/store.test.mjs`, and the tracked implementation plan were included in the implementation commit; generated briefs remain ignored derived artifacts.
+- Computer Use real-machine attempt: controlling `com.apple.Terminal` was denied by the Computer Use safety runtime. The macOS host Node/SQLite tests above executed locally; Task 1 has no native system-notifier UI to exercise.
+
+### Commit SHA
+
+- Implementation: `02f98a054e3e9c4674cb5d6af453b0761464d63f`
+
+### Remaining Concerns
+
+- Task 4 has not been implemented yet, so native notification delivery is outside this Task 1 re-review. Its regenerated brief now carries the required claimed-row lease-epoch contract.
