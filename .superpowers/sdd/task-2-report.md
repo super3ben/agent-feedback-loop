@@ -185,3 +185,33 @@ The final two Task 2 findings are fixed in implementation commit `f0295b13011a79
 
 - UI-level Terminal inspection remains unavailable because the Computer Use safety policy denies Terminal access. No Task 2 product UI exists.
 - No functional, backward-compatibility, forged-control, privacy, or structural-cursor concern remains inside the requested ownership boundary.
+
+## Final CRLF Preservation Fix
+
+### Status
+
+The final Task 2 CRLF preservation finding is fixed in implementation commit `b282d194b078afd254e9cfa3a601494b8ffd69de`.
+
+### RED Evidence
+
+- `node --test test/receipt.test.mjs`: 8 passed, 1 failed.
+  - Ordinary CRLF evidence was rewritten from `\r\n` to `\n` even when no receipt control was present.
+
+### GREEN Evidence
+
+- `node --test test/receipt.test.mjs`: 9 passed, 0 failed.
+- Complete Task 2 suite (`receipt`, `capture`, `codex-reconcile`, `cli`, `store`): 125 passed, 0 failed.
+- `npm test`: 186 passed, 0 failed.
+- `git diff --check`: passed before the implementation commit.
+
+### Implementation And Self-review
+
+- `stripReceiptControlText` now scans the original source into line ranges and deletes only exact, validated receipt-control byte ranges.
+- Ordinary CRLF, mixed LF/CRLF, backtick/tilde fenced controls, and mismatched controls are returned byte-for-byte unchanged.
+- Exact beginning, middle, and end controls retain the prior deterministic removal behavior while preserving every unrelated line delimiter in its original form.
+- v2 nonce validation, visible-line binding, fence handling, legacy observation compatibility, structural-evidence handling, and the no-receipt-logging privacy boundary remain unchanged.
+
+### Concerns
+
+- Computer Use attempted `com.apple.Terminal`, but the host safety policy denied it. There is no Task 2 product UI; local macOS Node, SQLite, installed-hook, CLI, reconciliation, and full-suite tests are the available real-machine evidence.
+- No functional or protocol concern remains in the requested ownership boundary.
