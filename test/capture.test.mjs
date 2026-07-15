@@ -7,7 +7,17 @@ import { test } from "node:test";
 import { pathsFor } from "../src/index.mjs";
 import { captureObservedSession, captureSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
+import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
+
+const RECEIPT_CONTROL = renderReceiptControl({
+  notification_id: "1".repeat(64),
+  job_id: `7e876e${"2".repeat(58)}`,
+  event_uid: null,
+  kind: "review_completed",
+  payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
+  language: "en"
+}).text;
 
 async function fixture() {
   const home = await mkdtemp(path.join(tmpdir(), "afl-capture-"));
@@ -135,7 +145,7 @@ test("does not treat a receipt-only assistant transcript message as a steering r
         role: "assistant",
         content: [{
           type: "output_text",
-          text: "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e\n<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
+          text: RECEIPT_CONTROL
         }]
       }
     })
@@ -353,10 +363,7 @@ test("normalizes stop payloads into assistant evidence with honest completeness"
 test("receipt control stop capture excludes synthetic receipt-only and preserves mixed assistant output", async () => {
   const { store, blobs } = await fixture();
   const projectId = "/tmp/receipt-stop-project";
-  const control = [
-    "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e",
-    "<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
-  ].join("\n");
+  const control = RECEIPT_CONTROL;
   const normalized = normalizeStopEvent({
     cli: "codex",
     installationId: "install-receipt",

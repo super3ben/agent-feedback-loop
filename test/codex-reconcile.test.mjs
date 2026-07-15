@@ -9,7 +9,17 @@ import { normalizeHookEvent } from "../src/capture.mjs";
 import { EncryptedBlobStore, BlobKeyProvider } from "../src/crypto-store.mjs";
 import { pathsFor } from "../src/index.mjs";
 import { discoverCodexTranscriptCandidates, reconcileCodexTranscripts } from "../src/codex-reconcile.mjs";
+import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
+
+const RECEIPT_CONTROL = renderReceiptControl({
+  notification_id: "1".repeat(64),
+  job_id: `7e876e${"2".repeat(58)}`,
+  event_uid: null,
+  kind: "review_completed",
+  payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
+  language: "en"
+}).text;
 
 function record(timestamp, type, payload) {
   return `${JSON.stringify({ timestamp, type, payload })}\n`;
@@ -343,10 +353,7 @@ test("control records are not misclassified as user feedback", async () => {
 
 test("receipt control transcript capture skips synthetic output and preserves mixed semantic output", async () => {
   const { transcript, store, blobs, candidate } = await fixture("receipt-control");
-  const control = [
-    "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e",
-    "<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
-  ].join("\n");
+  const control = RECEIPT_CONTROL;
   await writeFile(transcript, [
     turnContext("2026-07-14T12:00:00.000Z", "turn-receipt", candidate.cwd),
     message("2026-07-14T12:00:01.000Z", "assistant", control, "msg-receipt-only", "turn-receipt"),
@@ -368,6 +375,41 @@ test("receipt control transcript capture skips synthetic output and preserves mi
     store.listSessionEvents(candidate.cwd).filter((event) => event.role === "assistant").map((event) => event.redacted_text),
     ["normal answer"]
   );
+  assert.equal(store.getTranscriptCursor("codex", transcript).offset, (await stat(transcript)).size);
+  store.close();
+});
+
+test("receipt-only Codex text with structural references is captured and advances the cursor", async () => {
+  const { transcript, store, blobs, candidate } = await fixture("receipt-structural");
+  const payload = {
+    id: "msg_019f1234-5678-7abc-8def-0123456789ab",
+    type: "message",
+    role: "assistant",
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-receipt-structural" },
+    content: [{ type: "output_text", text: RECEIPT_CONTROL }],
+    tool_refs: ["apply_patch"],
+    file_refs: ["src/receipt.mjs"],
+    artifact_hashes: ["sha256:abc123"]
+  };
+  await writeFile(transcript, [
+    turnContext("2026-07-14T12:00:00.000Z", "turn-receipt-structural", candidate.cwd),
+    record("2026-07-14T12:00:01.000Z", "response_item", payload)
+  ].join(""), { mode: 0o600 });
+
+  const result = await reconcileCodexTranscripts({
+    store,
+    blobs,
+    candidates: [candidate],
+    reviewMinEntries: 99,
+    launchReviewer: async () => assert.fail("assistant structural evidence must not launch a reviewer")
+  });
+
+  assert.equal(result.eventsCaptured, 1);
+  const [event] = store.listSessionEvents(candidate.cwd);
+  assert.equal(event.redacted_text, "");
+  assert.equal(event.tool_name, "apply_patch");
+  assert.deepEqual(JSON.parse(event.file_refs_json), ["src/receipt.mjs"]);
+  assert.deepEqual(JSON.parse(event.artifact_hashes_json), ["sha256:abc123"]);
   assert.equal(store.getTranscriptCursor("codex", transcript).offset, (await stat(transcript)).size);
   store.close();
 });

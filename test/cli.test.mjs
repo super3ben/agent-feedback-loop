@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { describe, it } from "node:test";
 
 import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
+import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -594,6 +595,38 @@ describe("agent-feedback-loop package", () => {
     const result = await execFileAsync(BIN, ["doctor", "--home", home]);
 
     assert.match(result.stdout, /healthy/i);
+  });
+
+  it("capture-stop preserves receipt-only structural references without semantic text", async () => {
+    const home = await tempHome();
+    const control = renderReceiptControl({
+      notification_id: "1".repeat(64),
+      job_id: `7e876e${"2".repeat(58)}`,
+      event_uid: null,
+      kind: "review_completed",
+      payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
+      language: "en"
+    }).text;
+    const payload = JSON.stringify({
+      session_id: "capture-stop-structural",
+      turn_id: "turn-1",
+      cwd: "/tmp/capture-stop-structural",
+      last_assistant_message: control,
+      tool_refs: ["apply_patch"],
+      file_refs: ["src/receipt.mjs"],
+      artifact_hashes: ["sha256:def456"]
+    });
+
+    const result = await runWithInput(BIN, payload, { ...process.env, HOME: home }, ["capture-stop", "--home", home, "--cli", "codex"]);
+    assert.deepEqual(JSON.parse(result.stdout), {});
+
+    const store = openStore({ paths: pathsFor(home) });
+    const [event] = store.listSessionEvents("/tmp/capture-stop-structural");
+    assert.equal(event.redacted_text, "");
+    assert.equal(event.tool_name, "apply_patch");
+    assert.deepEqual(JSON.parse(event.file_refs_json), ["src/receipt.mjs"]);
+    assert.deepEqual(JSON.parse(event.artifact_hashes_json), ["sha256:def456"]);
+    store.close();
   });
 
   it("CLI prints help from top-level --help", async () => {

@@ -3,7 +3,7 @@ import { lstat, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { captureObservedSession, credentialContextTokenHashes, normalizeHookEvent, normalizeStopEvent, redactText } from "./capture.mjs";
+import { captureObservedSession, credentialContextTokenHashes, hasCaptureEvidence, normalizeHookEvent, normalizeStopEvent, redactText } from "./capture.mjs";
 import { stripReceiptControlText } from "./receipt.mjs";
 
 const DEFAULT_INITIAL_TAIL_BYTES = 32 * 1024 * 1024;
@@ -33,6 +33,10 @@ function parseState(cursor, candidate) {
     assistantMessageId: parsed.assistantMessageId || null,
     assistantSourceOffset: Number.isFinite(Number(parsed.assistantSourceOffset)) ? Number(parsed.assistantSourceOffset) : null,
     assistantSourceTimestamp: parsed.assistantSourceTimestamp || null,
+    assistantToolRefs: [],
+    assistantTextualOutputRefs: [],
+    assistantFileRefs: [],
+    assistantArtifactHashes: [],
     sensitiveTokenHashes: Array.isArray(parsed.sensitiveTokenHashes)
       ? parsed.sensitiveTokenHashes.filter((value) => /^[a-f0-9]{64}$/.test(value)).slice(0, 64)
       : [],
@@ -51,6 +55,29 @@ function textFromMessage(payload) {
     .map((item) => String(item.text || ""))
     .filter(Boolean)
     .join("\n");
+}
+
+function boundedStringRefs(values) {
+  const refs = [];
+  for (const value of values.flat(Infinity)) {
+    if (typeof value !== "string") continue;
+    const ref = value.trim();
+    if (!ref || ref.length > 4 * 1024 || refs.includes(ref)) continue;
+    refs.push(ref);
+    if (refs.length >= 64) break;
+  }
+  return refs;
+}
+
+function structuralEvidenceFromMessage(payload) {
+  const content = Array.isArray(payload?.content) ? payload.content.filter((item) => item && typeof item === "object") : [];
+  const records = [payload, ...content];
+  return {
+    toolRefs: boundedStringRefs(records.flatMap((item) => [item?.tool_refs || [], item?.toolRefs || [], item?.tool_name || []])),
+    textualOutputRefs: boundedStringRefs(records.flatMap((item) => [item?.textual_output_refs || [], item?.textual_output_ref || []])),
+    fileRefs: boundedStringRefs(records.flatMap((item) => [item?.file_refs || [], item?.fileRefs || []])),
+    artifactHashes: boundedStringRefs(records.flatMap((item) => [item?.artifact_hashes || [], item?.artifactHashes || []]))
+  };
 }
 
 function isControlMessage(text) {
@@ -81,7 +108,7 @@ function nativeMessageTimestamp(messageId, fallback) {
   return new Date(timestampMs).toISOString();
 }
 
-function transcriptMessageEvent({ state, candidate, role, text, messageId, turnId, timestamp, sourceOffset }) {
+function transcriptMessageEvent({ state, candidate, role, text, messageId, turnId, timestamp, sourceOffset, structural = {} }) {
   const common = {
     cli: "codex",
     installationId: "default",
@@ -90,7 +117,12 @@ function transcriptMessageEvent({ state, candidate, role, text, messageId, turnI
       turn_id: turnId,
       event_id: `message:${messageId}`,
       cwd: state.currentTurnCwd || state.cwd || candidate.cwd,
-      timestamp
+      timestamp,
+      tool_name: structural.toolRefs?.[0] || null,
+      tool_args: structural.toolRefs?.length ? { tool_refs: structural.toolRefs } : null,
+      textual_output_ref: structural.textualOutputRefs?.[0] || null,
+      file_refs: structural.fileRefs || [],
+      artifact_hashes: structural.artifactHashes || []
     },
     capturePolicyRevision: candidate.capturePolicyRevision
   };
@@ -113,7 +145,19 @@ function transcriptMessageEvent({ state, candidate, role, text, messageId, turnI
 }
 
 function flushAssistantEvent(events, state, candidate) {
-  if (!state.currentTurnId || !state.assistantTail) return;
+  const structural = {
+    toolRefs: state.assistantToolRefs,
+    textualOutputRefs: state.assistantTextualOutputRefs,
+    fileRefs: state.assistantFileRefs,
+    artifactHashes: state.assistantArtifactHashes
+  };
+  if (!state.currentTurnId || !hasCaptureEvidence({
+    redacted_text: state.assistantTail,
+    tool_refs: structural.toolRefs,
+    textual_output_ref: structural.textualOutputRefs?.[0],
+    file_refs: structural.fileRefs,
+    artifact_hashes: structural.artifactHashes
+  })) return;
   const messageId = String(state.assistantMessageId || `assistant-span:${state.currentTurnId}`);
   const event = transcriptMessageEvent({
     state,
@@ -123,13 +167,18 @@ function flushAssistantEvent(events, state, candidate) {
     messageId,
     turnId: state.currentTurnId,
     timestamp: state.assistantSourceTimestamp,
-    sourceOffset: state.assistantSourceOffset
+    sourceOffset: state.assistantSourceOffset,
+    structural
   });
   events.push({ event, rawText: state.assistantTail, immediate: false });
   state.assistantTail = "";
   state.assistantMessageId = null;
   state.assistantSourceOffset = null;
   state.assistantSourceTimestamp = null;
+  state.assistantToolRefs = [];
+  state.assistantTextualOutputRefs = [];
+  state.assistantFileRefs = [];
+  state.assistantArtifactHashes = [];
 }
 
 async function readCompleteLines(file, {
@@ -240,6 +289,10 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
         state.assistantMessageId = null;
         state.assistantSourceOffset = null;
         state.assistantSourceTimestamp = null;
+        state.assistantToolRefs = [];
+        state.assistantTextualOutputRefs = [];
+        state.assistantFileRefs = [];
+        state.assistantArtifactHashes = [];
         state.sensitiveTokenHashes = [];
         state.assistantTail = "";
       } else if (record.payload?.cwd) {
@@ -303,10 +356,23 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
         state.sensitiveTokenHashes = credentialContextTokenHashes(text);
       } else if (role === "assistant") {
         const semanticText = stripReceiptControlText(text);
-        if (!semanticText.trim()) continue;
-        state.assistantTail = redactText(`${state.assistantTail}${state.assistantTail ? "\n" : ""}${semanticText}`, {
-          blockedTokenHashes: state.sensitiveTokenHashes
-        }).text.slice(-MAX_ASSISTANT_STATE_CHARS);
+        const structural = structuralEvidenceFromMessage(record.payload);
+        if (!hasCaptureEvidence({
+          semantic_text: semanticText,
+          tool_refs: structural.toolRefs,
+          textual_output_ref: structural.textualOutputRefs[0],
+          file_refs: structural.fileRefs,
+          artifact_hashes: structural.artifactHashes
+        })) continue;
+        if (semanticText.trim()) {
+          state.assistantTail = redactText(`${state.assistantTail}${state.assistantTail ? "\n" : ""}${semanticText}`, {
+            blockedTokenHashes: state.sensitiveTokenHashes
+          }).text.slice(-MAX_ASSISTANT_STATE_CHARS);
+        }
+        state.assistantToolRefs = boundedStringRefs([state.assistantToolRefs, structural.toolRefs]);
+        state.assistantTextualOutputRefs = boundedStringRefs([state.assistantTextualOutputRefs, structural.textualOutputRefs]);
+        state.assistantFileRefs = boundedStringRefs([state.assistantFileRefs, structural.fileRefs]);
+        state.assistantArtifactHashes = boundedStringRefs([state.assistantArtifactHashes, structural.artifactHashes]);
         state.assistantSinceLastUser = true;
         state.assistantMessageId = messageIdentity(record.payload, lineOffset);
         state.assistantSourceOffset = lineOffset;
@@ -316,7 +382,7 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
     }
     if (record.type === "event_msg" && ["task_complete", "turn_aborted"].includes(record.payload?.type)) {
       const terminalTurnId = String(record.payload?.turn_id || state.currentTurnId || "");
-      if (terminalTurnId && state.assistantTail) flushAssistantEvent(events, state, candidate);
+      if (terminalTurnId) flushAssistantEvent(events, state, candidate);
       state.lastTerminalType = record.payload.type;
       state.lastTerminalTurnId = terminalTurnId || null;
       state.lastTerminalAt = Number.isFinite(timestampMs) ? timestampMs : 0;
@@ -327,13 +393,17 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
       state.assistantMessageId = null;
       state.assistantSourceOffset = null;
       state.assistantSourceTimestamp = null;
+      state.assistantToolRefs = [];
+      state.assistantTextualOutputRefs = [];
+      state.assistantFileRefs = [];
+      state.assistantArtifactHashes = [];
       state.sensitiveTokenHashes = [];
       state.assistantTail = "";
     }
   }
   // Do not persist transcript text in the cursor. Capturing the current tail here
   // preserves evidence across scans while the cursor keeps only structural state.
-  if (state.assistantTail) flushAssistantEvent(events, state, candidate);
+  flushAssistantEvent(events, state, candidate);
   return events;
 }
 

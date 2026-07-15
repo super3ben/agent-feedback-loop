@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
+import { pathsFor } from "../src/index.mjs";
 import {
   detectReceiptLanguage,
   renderReceiptControl,
@@ -8,14 +12,54 @@ import {
   renderReceiptLine,
   stripReceiptControlText
 } from "../src/receipt.mjs";
+import { openStore } from "../src/store.mjs";
+
+const NOTIFICATION_ID = "1".repeat(64);
+const JOB_ID = `7e876e${"2".repeat(58)}`;
+const EVENT_UID = "codex:default:019f1234-5678-7abc-8def-0123456789ab:message:msg_019f1234-5678-7abc-8def-0123456789ab";
 
 const notification = Object.freeze({
-  notification_id: "notification-1234567890",
-  job_id: "7e876e123",
+  notification_id: NOTIFICATION_ID,
+  job_id: JOB_ID,
+  event_uid: null,
   kind: "review_completed",
   payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
   language: "zh"
 });
+
+async function realOutboxRows() {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-receipt-rows-"));
+  const store = openStore({ paths: pathsFor(home) });
+  store.captureSessionEvent({
+    event_uid: EVENT_UID,
+    session_uid: "codex:default:019f1234-5678-7abc-8def-0123456789ab",
+    event_seq: 1,
+    context_epoch: 1,
+    project_id: "/tmp/receipt-project",
+    source_event_id: "message:msg_019f1234-5678-7abc-8def-0123456789ab",
+    role: "user",
+    redacted_text: "需要复核这个问题",
+    content_hash: "receipt-row-hash",
+    capture_policy_revision: 1,
+    data_class: "normal"
+  });
+  store.submitReviewerJob({ job_id: JOB_ID, project_id: "/tmp/receipt-project", prompt_version: "v1" });
+  const common = { sessionUid: "codex:default:019f1234-5678-7abc-8def-0123456789ab", contextEpoch: 1, language: "zh" };
+  store.createNotification({ ...common, kind: "candidate_captured", eventUid: EVENT_UID, payload: {} });
+  store.createNotification({ ...common, kind: "review_queued", jobId: JOB_ID, eventUid: EVENT_UID, payload: {} });
+  store.createNotification({ ...common, kind: "review_completed", jobId: JOB_ID, payload: { severity: "Major", lesson_count: 1 } });
+  store.createNotification({ ...common, kind: "reviewed_no_lesson", jobId: JOB_ID, payload: {} });
+  store.createNotification({ ...common, kind: "review_exhausted", jobId: JOB_ID, payload: { reason_code: "provider_failed" } });
+  store.recordDeliveries({
+    deliveries: [{ application_id: "receipt-app-1", lesson_id: "receipt-lesson-1", revision: 1 }],
+    sessionUid: common.sessionUid,
+    contextEpoch: 1,
+    language: "zh"
+  });
+  const rows = store.listNotifications({ sessionUid: common.sessionUid });
+  store.close();
+  return rows;
+}
 
 test("receipt renderer detects the requested language deterministically", () => {
   assert.equal(detectReceiptLanguage("为什么没有触发反思", "auto"), "zh");
@@ -23,31 +67,46 @@ test("receipt renderer detects the requested language deterministically", () => 
   assert.equal(detectReceiptLanguage("why", "zh"), "zh");
 });
 
-test("receipt renderer renders every notification kind from fixed bilingual copy", () => {
-  const cases = [
-    [{ kind: "candidate_captured", payload_json: "{}", language: "zh" }, "[AFL] 已捕获候选 · job=7e876e"],
-    [{ kind: "review_queued", payload_json: "{}", language: "en" }, "[AFL] Review queued · job=7e876e"],
-    [{ kind: "review_completed", payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }), language: "zh" }, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e"],
-    [{ kind: "reviewed_no_lesson", payload_json: "{}", language: "en" }, "[AFL] Review completed · no lessons · job=7e876e"],
-    [{ kind: "review_exhausted", payload_json: JSON.stringify({ reason_code: "provider_failed" }), language: "zh" }, "[AFL] 反思未完成 · reason=provider_failed · job=7e876e"],
-    [{ kind: "lesson_delivered", payload_json: JSON.stringify({ lesson_count: 2 }), language: "en" }, "[AFL] Lessons delivered · lessons=2 · job=7e876e"]
-  ];
+test("receipt renderer accepts all six real Task 1 outbox row shapes and matches the tracked copy", async () => {
+  const rows = await realOutboxRows();
+  const rendered = Object.fromEntries(rows.map((row) => [row.kind, renderReceiptLine(row)]));
 
-  for (const [overrides, expected] of cases) {
-    assert.equal(renderReceiptLine({ ...notification, ...overrides }), expected);
-  }
+  assert.equal(rendered.candidate_captured, "[AFL] 已捕获反馈候选 · event=8350ca");
+  assert.equal(rendered.review_queued, "[AFL] 后台反思已排队 · job=7e876e");
+  assert.equal(rendered.review_completed, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e");
+  assert.equal(rendered.reviewed_no_lesson, "[AFL] 已复核，本次未形成长期经验 · job=7e876e");
+  assert.equal(rendered.review_exhausted, "[AFL] 反思失败，证据已保留并等待重试 · job=7e876e");
+  assert.equal(rendered.lesson_delivered, "[AFL] 已向本任务投递 1 条历史经验");
+  assert.equal(rows.find((row) => row.kind === "candidate_captured").job_id, null);
+  assert.equal(rows.find((row) => row.kind === "lesson_delivered").job_id, null);
 });
 
-test("receipt renderer emits the exact visible and hidden receipt control", () => {
+test("receipt renderer emits the exact visible and canonical hidden receipt control", () => {
   const rendered = renderReceiptControl(notification);
 
   assert.equal(rendered.line, "[AFL] 反思完成 · severity=Major · lessons=1 · job=7e876e");
-  assert.match(rendered.marker, /^<!--afl-receipt id=notification-1234567890 nonce=[a-f0-9]{16} state=review_completed-->$/);
+  assert.match(rendered.marker, /^<!--afl-receipt id=[a-f0-9]{64} nonce=[a-f0-9]{16} state=review_completed-->$/);
   assert.ok(rendered.line.length <= 160);
   assert.ok(rendered.text.length <= 512);
+});
+
+test("receipt stripping removes only a recognized adjacent line and exact matching marker", () => {
+  const rendered = renderReceiptControl(notification);
+  const standalone = "[AFL] This is legitimate standalone prose";
+  const quoted = "> [AFL] This quoted line is evidence";
+  const embedded = "The literal text [AFL] must remain embedded.";
+  const malformed = "<!--afl-receipt id=not-canonical nonce=0123456789abcdef state=review_completed-->";
+  const nativeMessageMarker = "<!--afl-receipt id=msg_550e8400-e29b-41d4-a716-446655440000 nonce=0123456789abcdef state=review_completed-->";
+  const wrongNonce = rendered.marker.replace(/nonce=[a-f0-9]{16}/, "nonce=0000000000000000");
+
+  assert.equal(stripReceiptControlText(standalone), standalone);
+  assert.equal(stripReceiptControlText(quoted), quoted);
+  assert.equal(stripReceiptControlText(embedded), embedded);
+  assert.equal(stripReceiptControlText(`${rendered.line}\n${malformed}`), `${rendered.line}\n${malformed}`);
+  assert.equal(stripReceiptControlText(`${rendered.line}\n${nativeMessageMarker}`), `${rendered.line}\n${nativeMessageMarker}`);
+  assert.equal(stripReceiptControlText(`${rendered.line}\n${wrongNonce}`), `${rendered.line}\n${wrongNonce}`);
   assert.equal(stripReceiptControlText(`normal answer\n${rendered.line}\n${rendered.marker}`), "normal answer");
   assert.equal(stripReceiptControlText(`${rendered.line}\n${rendered.marker}`), "");
-  assert.equal(stripReceiptControlText("AFL is part of this ordinary user sentence."), "AFL is part of this ordinary user sentence.");
 });
 
 test("receipt renderer keeps the instruction bounded and verbatim", () => {
@@ -63,13 +122,16 @@ test("receipt renderer keeps the instruction bounded and verbatim", () => {
   assert.ok(instruction.length <= 512);
 });
 
-test("receipt renderer rejects untrusted, private, or oversized notification values", () => {
+test("receipt renderer rejects native session/message identifiers and noncanonical IDs", () => {
+  const uuid = "550e8400-e29b-41d4-a716-446655440000";
+  const messageUuid = `msg_${uuid}`;
   assert.throws(() => renderReceiptLine({ ...notification, kind: "unknown", payload_json: "{}" }), TypeError);
   assert.throws(() => renderReceiptLine({ ...notification, payload_json: JSON.stringify({ severity: "Major", lesson_count: 1, secret: "no" }) }), TypeError);
   assert.throws(() => renderReceiptLine({ ...notification, payload_json: JSON.stringify({ severity: "Severe", lesson_count: 1 }) }), TypeError);
-  assert.throws(() => renderReceiptLine({ ...notification, notification_id: 1234567890 }), /notification id is invalid/);
-  assert.throws(() => renderReceiptLine({ ...notification, job_id: 123456 }), /job id is invalid/);
-  assert.throws(() => renderReceiptLine({ ...notification, job_id: "codex:default:session-0123456789abcdef" }), TypeError);
-  assert.throws(() => renderReceiptLine({ ...notification, job_id: "/Users/example/private/job" }), TypeError);
-  assert.throws(() => renderReceiptLine({ ...notification, job_id: "a".repeat(161) }), TypeError);
+  assert.throws(() => renderReceiptLine({ ...notification, notification_id: uuid }), /notification id is invalid/);
+  assert.throws(() => renderReceiptLine({ ...notification, notification_id: messageUuid }), /notification id is invalid/);
+  assert.throws(() => renderReceiptLine({ ...notification, job_id: uuid }), /job id is invalid/);
+  assert.throws(() => renderReceiptLine({ ...notification, job_id: messageUuid }), /job id is invalid/);
+  assert.throws(() => renderReceiptLine({ ...notification, job_id: "codex:default:session-0123456789abcdef" }), /job id is invalid/);
+  assert.throws(() => renderReceiptLine({ ...notification, job_id: "/Users/example/private/job" }), /job id is invalid/);
 });

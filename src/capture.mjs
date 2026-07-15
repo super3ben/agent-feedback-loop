@@ -14,6 +14,21 @@ const CREDENTIAL_CONTEXT_PATTERN = /\b(?:password|passwd|passcode|credential|api
 const CONTEXT_TOKEN_PATTERN = /[^\s,，;；。!?！？"'`<>]+/g;
 const TERMINAL_TURN_EVENTS = new Set(["task_complete", "turn_aborted"]);
 
+function hasArrayValues(value) {
+  return Array.isArray(value) && value.some((item) => String(item ?? "").trim());
+}
+
+export function hasCaptureEvidence(event) {
+  return Boolean(
+    String(event?.redacted_text ?? event?.semantic_text ?? "").trim()
+    || String(event?.tool_name ?? "").trim()
+    || String(event?.textual_output_ref ?? "").trim()
+    || hasArrayValues(event?.tool_refs)
+    || hasArrayValues(event?.file_refs)
+    || hasArrayValues(event?.artifact_hashes)
+  );
+}
+
 function looksLikeCredentialToken(value) {
   if (value.length < 6 || value.length > 256 || value.includes("[REDACTED]")) return false;
   const hasDigit = /\d/.test(value);
@@ -190,6 +205,7 @@ export function extractTranscriptExcerpt(transcriptText, { maxChars = 12 * 1024 
 
 export function normalizeHookEvent({ cli, payload, installationId = "unknown", timeout, timeoutUnit, capturePolicyRevision = 1 }) {
   const input = typeof payload === "string" ? { prompt: payload } : (payload || {});
+  const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];
   const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
   const generatedId = `generated:${Date.now().toString(36)}:${randomUUID()}`;
   const explicitEventId = input.event_id || input.eventId || input.prompt_id || input.promptId;
@@ -229,8 +245,9 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
     data_class: input.data_class || "normal",
     capture_source: "prompt_hook",
     capture_completeness: "prompt_only",
-    tool_name: input.tool_name || null,
-    tool_args: input.tool_args || null,
+    tool_name: input.tool_name || toolRefs.find((value) => typeof value === "string" && value.trim()) || null,
+    tool_args: input.tool_args || (toolRefs.length ? { tool_refs: toolRefs } : null),
+    tool_refs: toolRefs,
     textual_output_ref: input.textual_output_ref || null,
     file_refs: Array.isArray(input.file_refs) ? input.file_refs : [],
     artifact_hashes: Array.isArray(input.artifact_hashes) ? input.artifact_hashes : [],
@@ -242,6 +259,7 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
 
 export function normalizeStopEvent({ cli, payload, installationId = "unknown", capturePolicyRevision = 1 }) {
   const input = payload || {};
+  const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];
   const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
   const nativeTurn = String(input.turn_id || input.turnId || input.native_turn || "unknown");
   const sourceEventId = String(input.event_id || input.eventId || `stop:${nativeTurn}`);
@@ -276,8 +294,9 @@ export function normalizeStopEvent({ cli, payload, installationId = "unknown", c
     data_class: input.data_class || "normal",
     capture_source: input.transcript_path ? "stop_payload+transcript_ref" : "stop_payload",
     capture_completeness: input.capture_completeness || (input.transcript_path ? "partial" : "partial"),
-    tool_name: input.tool_name || null,
-    tool_args: input.tool_args || null,
+    tool_name: input.tool_name || toolRefs.find((value) => typeof value === "string" && value.trim()) || null,
+    tool_args: input.tool_args || (toolRefs.length ? { tool_refs: toolRefs } : null),
+    tool_refs: toolRefs,
     textual_output_ref: input.transcript_path || input.textual_output_ref || null,
     file_refs: Array.isArray(input.file_refs) ? input.file_refs : [],
     artifact_hashes: Array.isArray(input.artifact_hashes) ? input.artifact_hashes : [],

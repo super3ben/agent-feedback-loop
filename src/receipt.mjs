@@ -11,20 +11,20 @@ const PAYLOAD_KEYS = Object.freeze({
 
 const RECEIPT_COPY = Object.freeze({
   zh: Object.freeze({
-    candidate_captured: () => "已捕获候选",
-    review_queued: () => "反思已排队",
+    candidate_captured: () => "已捕获反馈候选",
+    review_queued: () => "后台反思已排队",
     review_completed: (payload) => `反思完成 · severity=${payload.severity} · lessons=${payload.lesson_count}`,
-    reviewed_no_lesson: () => "反思完成 · 无新经验",
-    review_exhausted: (payload) => `反思未完成 · reason=${payload.reason_code}`,
-    lesson_delivered: (payload) => `经验已送达 · lessons=${payload.lesson_count}`
+    reviewed_no_lesson: () => "已复核，本次未形成长期经验",
+    review_exhausted: () => "反思失败，证据已保留并等待重试",
+    lesson_delivered: (payload) => `已向本任务投递 ${payload.lesson_count} 条历史经验`
   }),
   en: Object.freeze({
-    candidate_captured: () => "Candidate captured",
-    review_queued: () => "Review queued",
+    candidate_captured: () => "Feedback candidate captured",
+    review_queued: () => "Background review queued",
     review_completed: (payload) => `Review completed · severity=${payload.severity} · lessons=${payload.lesson_count}`,
-    reviewed_no_lesson: () => "Review completed · no lessons",
-    review_exhausted: (payload) => `Review not completed · reason=${payload.reason_code}`,
-    lesson_delivered: (payload) => `Lessons delivered · lessons=${payload.lesson_count}`
+    reviewed_no_lesson: () => "Reviewed; no long-term lesson was created",
+    review_exhausted: () => "Review failed; evidence retained for retry",
+    lesson_delivered: (payload) => `Delivered ${payload.lesson_count} prior lessons to this task`
   })
 });
 
@@ -37,9 +37,17 @@ const REQUIRED_PAYLOAD_KEYS = Object.freeze({
   lesson_delivered: Object.freeze(["lesson_count"])
 });
 
-const RECEIPT_MARKER_PATTERN = /^<!--afl-receipt id=[^\s>]+ nonce=[a-f0-9]{16} state=[a-z_]+-->$/;
-const SAFE_NOTIFICATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const CANONICAL_ID_PATTERN = /^[a-f0-9]{64}$/;
+const RECEIPT_MARKER_PATTERN = /^<!--afl-receipt id=([a-f0-9]{64}) nonce=([a-f0-9]{16}) state=([a-z_]+)-->$/;
+const VISIBLE_LINE_PATTERNS = Object.freeze({
+  candidate_captured: /^\[AFL\] (?:已捕获反馈候选|Feedback candidate captured) · event=[a-f0-9]{6}$/,
+  review_queued: /^\[AFL\] (?:后台反思已排队|Background review queued) · job=[a-f0-9]{6}$/,
+  review_completed: /^\[AFL\] (?:反思完成|Review completed) · severity=(?:Minor|Major|Critical|Blocker) · lessons=\d+ · job=[a-f0-9]{6}$/,
+  reviewed_no_lesson: /^\[AFL\] (?:已复核，本次未形成长期经验|Reviewed; no long-term lesson was created) · job=[a-f0-9]{6}$/,
+  review_exhausted: /^\[AFL\] (?:反思失败，证据已保留并等待重试|Review failed; evidence retained for retry) · job=[a-f0-9]{6}$/,
+  lesson_delivered: /^\[AFL\] (?:已向本任务投递 \d+ 条历史经验|Delivered \d+ prior lessons to this task)$/
+});
+const MAX_EVENT_ID_CHARS = 2048;
 const MAX_VISIBLE_LINE_CHARS = 160;
 const MAX_INSTRUCTION_CHARS = 512;
 
@@ -82,11 +90,17 @@ function parseNotificationPayload(notification) {
   }
   if (!Object.hasOwn(RECEIPT_COPY, notification.language)) throw new TypeError("receipt language is invalid");
   if (!Object.hasOwn(RECEIPT_COPY[notification.language], notification.kind)) throw new TypeError("unsupported receipt kind");
-  if (typeof notification.notification_id !== "string" || !SAFE_NOTIFICATION_ID.test(notification.notification_id)) {
+  if (typeof notification.notification_id !== "string" || !CANONICAL_ID_PATTERN.test(notification.notification_id)) {
     throw new TypeError("receipt notification id is invalid");
   }
-  if (typeof notification.job_id !== "string" || !SAFE_JOB_ID.test(notification.job_id)) {
-    throw new TypeError("receipt job id is invalid");
+  if (notification.kind === "candidate_captured") {
+    if (typeof notification.event_uid !== "string" || notification.event_uid.length < 1 || notification.event_uid.length > MAX_EVENT_ID_CHARS) {
+      throw new TypeError("receipt event id is invalid");
+    }
+  } else if (!["lesson_delivered"].includes(notification.kind)) {
+    if (typeof notification.job_id !== "string" || !CANONICAL_ID_PATTERN.test(notification.job_id)) {
+      throw new TypeError("receipt job id is invalid");
+    }
   }
   if (typeof notification.payload_json !== "string" || notification.payload_json.length > 512) {
     throw new TypeError("receipt payload JSON is invalid");
@@ -112,7 +126,17 @@ function receiptMarker(notification) {
 export function renderReceiptLine(notification) {
   const payload = parseNotificationPayload(notification);
   const body = RECEIPT_COPY[notification.language][notification.kind](payload);
-  const line = `[AFL] ${body} · job=${notification.job_id.slice(0, 6)}`;
+  let reference = "";
+  if (notification.kind === "candidate_captured") {
+    const eventReference = createHash("sha256")
+      .update(`receipt-event-ref:v1\u0000${notification.event_uid}`)
+      .digest("hex")
+      .slice(0, 6);
+    reference = ` · event=${eventReference}`;
+  } else if (notification.kind !== "lesson_delivered") {
+    reference = ` · job=${notification.job_id.slice(0, 6)}`;
+  }
+  const line = `[AFL] ${body}${reference}`;
   if (line.length > MAX_VISIBLE_LINE_CHARS) throw new TypeError("receipt visible line exceeds the bounded length");
   return line;
 }
@@ -138,8 +162,21 @@ export function renderReceiptInstruction(notification) {
 }
 
 export function stripReceiptControlText(text) {
-  return String(text ?? "")
-    .split(/\r?\n/)
-    .filter((line) => !line.startsWith("[AFL] ") && !RECEIPT_MARKER_PATTERN.test(line))
-    .join("\n");
+  const lines = String(text ?? "").split(/\r?\n/);
+  const retained = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const visibleLine = lines[index];
+    const markerLine = lines[index + 1];
+    const marker = RECEIPT_MARKER_PATTERN.exec(markerLine || "");
+    if (marker) {
+      const [, notificationId, nonce, state] = marker;
+      const visiblePattern = VISIBLE_LINE_PATTERNS[state];
+      if (visiblePattern?.test(visibleLine) && nonce === receiptNonce(notificationId)) {
+        index += 1;
+        continue;
+      }
+    }
+    retained.push(visibleLine);
+  }
+  return retained.join("\n");
 }

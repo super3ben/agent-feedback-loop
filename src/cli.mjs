@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
-import { captureObservedSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
+import { captureObservedSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, hasCaptureEvidence, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
 import { discoverCodexTranscriptCandidates, reconcileCodexTranscripts } from "./codex-reconcile.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { openStore } from "./store.mjs";
@@ -382,7 +382,7 @@ export async function main(args) {
         installationId: "default",
         capturePolicyRevision: store.getCapturePolicy().revision
       });
-      if (event.redacted_text || event.tool_name || event.textual_output_ref) {
+      if (hasCaptureEvidence(event)) {
         const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
         await captureObservedSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
         debugLog(`capture.stop.ok event=${event.event_uid} completeness=${event.capture_completeness} excerpt_chars=${event.redacted_text?.length || 0}`);
