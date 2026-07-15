@@ -144,3 +144,44 @@ Both remaining Task 2 re-review findings are fixed in implementation commit `1b5
 
 - Computer Use was attempted through the local Mac runtime but returned: `The Mac is locked and automatic unlock could not unlock it. Ask the user to unlock the Mac manually before continuing.` There is no Task 2 UI surface; local macOS installed-hook, SQLite, reconciliation, CLI, and full-suite tests are the available real-machine evidence.
 - No functional or privacy concern remains inside the Task 2 ownership boundary.
+
+## Final Exact-line Commitment Fixes
+
+### Status
+
+The final two Task 2 findings are fixed in implementation commit `f0295b13011a79be30a6f15144d76c3f782397ca`.
+
+### RED Evidence
+
+- `node --test test/receipt.test.mjs test/store.test.mjs test/codex-reconcile.test.mjs`: 75 passed, 3 failed.
+- Grammar-valid `candidate_captured` event mutation retained the old marker and was stripped instead of preserved.
+- A canonical 64-hex row carrying the old ID-only v1 marker transitioned to `observed` instead of remaining `emitted`.
+- A real Codex assistant transcript event with `content: []` plus tool/output/file/artifact refs produced `eventsCaptured=0` instead of one durable event.
+
+### Implementation And Self-review
+
+- Current canonical controls now use a domain-separated SHA-256 v2 nonce over canonical `notification_id`, `state`, and the exact rendered visible line, truncated to 16 hex. The fixed fixture commits to nonce `03941ce38a08b1dc`.
+- `renderReceiptControl` emits the v2 marker. Stripping recomputes v2 from the adjacent exact line, so grammar-valid changes to event, job, severity, or lesson count preserve the complete pair while every exact generated pair strips.
+- Canonical observation re-renders the authoritative outbox row and accepts only its exact v2 marker. A canonical ID-only v1 marker no longer observes.
+- `receiptNonce` remains the isolated v1 compatibility path for exact `notification-<positive safe integer>` rows. Zero, leading-zero, oversized, UUID, `msg_UUID`, colon/session, path, and unknown-state forms remain rejected.
+- Codex reconciliation extracts structural refs before its evidence decision and skips only when `hasCaptureEvidence` is false. The `content: []` regression stores tool/output/file/artifact refs and advances the cursor to transcript EOF.
+- The tracked design and implementation plan describe the v2/v1 boundary and structural-only cursor contract. Task 1 and Task 2 briefs were regenerated to 427 and 107 lines and matched fresh generator output byte-for-byte.
+
+### Verification
+
+- Focused receipt/Codex/store suite: 78 passed, 0 failed.
+- Complete Task 2 suite (`receipt`, `capture`, `codex-reconcile`, `cli`, `store`): 124 passed, 0 failed; the final dot-reporter rerun exited 0 after the exact nonce assertion was pinned.
+- `npm test`: 185 passed, 0 failed.
+- `git diff --check` and `git diff --cached --check`: passed before the implementation commit.
+- Computer Use attempted `com.apple.Terminal`; the host safety layer returned `Computer Use is not allowed to use the app 'com.apple.Terminal' for safety reasons.` Task 2 has no product UI; installed-hook, local macOS CLI, SQLite, transcript reconciliation, and full-suite tests are the real-machine evidence.
+
+### SHAs
+
+- Exact-line implementation/docs/tests: `f0295b13011a79be30a6f15144d76c3f782397ca`
+- Prior receipt-protocol implementation: `1b5fcc290a3bdf72ea21baa6087f41181415ba15`
+- Prior Task 2 report: `aadc7d3`
+
+### Concerns
+
+- UI-level Terminal inspection remains unavailable because the Computer Use safety policy denies Terminal access. No Task 2 product UI exists.
+- No functional, backward-compatibility, forged-control, privacy, or structural-cursor concern remains inside the requested ownership boundary.
