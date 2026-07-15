@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
-import { captureObservedSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, hasCaptureEvidence, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
+import { captureObservedSession, detectStructuralFeedbackSignal, extractRoleValidatedAssistantOutput, extractTranscriptExcerpt, hasCaptureEvidence, normalizeHookEvent, normalizeStopEvent } from "./capture.mjs";
 import { discoverCodexTranscriptCandidates, reconcileCodexTranscripts } from "./codex-reconcile.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { openStore } from "./store.mjs";
@@ -411,7 +411,11 @@ export async function main(args) {
       }
       const cli = options.cli || options.args[0] || "unknown";
       const lastAssistantMessage = String(parsedPayload.last_assistant_message || "").slice(-32 * 1024);
-      const confirmationText = [transcriptText, lastAssistantMessage].filter(Boolean).join("\n");
+      const transcriptAssistantOutput = extractRoleValidatedAssistantOutput(transcriptText, { maxChars: 64 * 1024 });
+      if (transcriptText && !transcriptAssistantOutput) {
+        debugLog("capture.stop.confirmation_coverage_gap reason=no_role_validated_assistant_output");
+      }
+      const confirmationText = [transcriptAssistantOutput, lastAssistantMessage].filter(Boolean).join("\n");
       const event = normalizeStopEvent({
         cli,
         payload: {
@@ -718,7 +722,7 @@ export async function main(args) {
       debugLog(`hook.selection.hold state=${selection.hold} absolute_budget=${selection.budgets?.absolute || 0}`);
     }
     if (process.env.AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS === "0") {
-      const suppressed = store.suppressPendingChatNotifications({ sessionUid: event.session_uid, contextEpoch: event.context_epoch });
+      const suppressed = store.suppressClaimableChatNotifications({ sessionUid: event.session_uid, contextEpoch: event.context_epoch });
       debugLog(`hook.receipt.suppressed count=${suppressed}`);
     } else {
       const claimed = store.claimChatNotification({

@@ -167,6 +167,48 @@ function textFromValue(value) {
     .join("\n");
 }
 
+function outputTextFromAssistantContent(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(outputTextFromAssistantContent).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  const type = String(value.type || "").toLowerCase();
+  if (type && !["text", "output_text"].includes(type)) return "";
+  if (typeof value.text === "string") return value.text;
+  if (typeof value.output_text === "string") return value.output_text;
+  return type ? "" : outputTextFromAssistantContent(value.content || value.message);
+}
+
+function roleValidatedAssistantMessage(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  if (record.type === "response_item") {
+    return record.payload?.type === "message" && record.payload?.role === "assistant"
+      ? record.payload
+      : null;
+  }
+  if (["message", "assistant_message"].includes(record.type) || !record.type) {
+    return record.role === "assistant" ? record : null;
+  }
+  if (record.type === "assistant" && record.message?.role === "assistant") return record.message;
+  return null;
+}
+
+export function extractRoleValidatedAssistantOutput(transcriptText, { maxChars = 64 * 1024 } = {}) {
+  if (!Number.isInteger(maxChars) || maxChars < 1) throw new TypeError("maxChars must be a positive integer");
+  const fragments = [];
+  for (const line of String(transcriptText || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const message = roleValidatedAssistantMessage(JSON.parse(line));
+      const text = outputTextFromAssistantContent(message?.content ?? message?.text);
+      if (text) fragments.push(text);
+    } catch {
+      // A bounded tail may begin mid-record. Unparsed bytes are never treated
+      // as assistant output and remain available only as encrypted evidence.
+    }
+  }
+  return fragments.join("\n").slice(-maxChars);
+}
+
 function collectAssistantText(value, output, seen = new Set()) {
   if (!value || typeof value !== "object" || seen.has(value)) return;
   seen.add(value);

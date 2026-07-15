@@ -408,13 +408,35 @@ test("disabled receipt channels suppress rather than replay pending rows", async
     data_class: "normal"
   };
   store.captureSessionEvent(captured);
-  store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "candidate_captured", eventUid: captured.event_uid, payload: {}, language: "en" });
-  assert.equal(store.suppressPendingChatNotifications({ sessionUid: captured.session_uid, contextEpoch: 1 }), 1);
+  const observedJobId = "b".repeat(64);
+  store.submitReviewerJob({ job_id: observedJobId, project_id: captured.project_id, prompt_version: "v1" });
+  const observed = store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "review_exhausted", jobId: observedJobId, payload: { reason_code: "reviewer_failed" }, language: "en" });
+  store.claimChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "disabled-turn-1" });
+  store.confirmChatNotification({
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    nativeTurnId: "disabled-turn-1",
+    transcriptText: renderReceiptControl(observed).text
+  });
+  const emittedJobId = "a".repeat(64);
+  store.submitReviewerJob({ job_id: emittedJobId, project_id: captured.project_id, prompt_version: "v1" });
+  const emitted = store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "reviewed_no_lesson", jobId: emittedJobId, payload: {}, language: "en" });
+  store.claimChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "disabled-turn-2" });
+  store.confirmChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "disabled-turn-2", transcriptText: "no receipt" });
+  store.confirmChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "disabled-turn-2", transcriptText: "no receipt" });
+  const pending = store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "candidate_captured", eventUid: captured.event_uid, payload: {}, language: "en" });
+
+  assert.equal(store.suppressClaimableChatNotifications({ sessionUid: captured.session_uid, contextEpoch: 1 }), 2);
+  const byId = new Map(store.listNotifications({ sessionUid: captured.session_uid }).map((row) => [row.notification_id, row]));
+  assert.equal(byId.get(pending.notification_id).chat_state, "suppressed");
+  assert.equal(byId.get(emitted.notification_id).chat_state, "suppressed");
+  assert.equal(byId.get(observed.notification_id).chat_state, "observed");
+  assert.equal(store.claimChatNotification({ sessionUid: captured.session_uid, contextEpoch: 1, nativeTurnId: "disabled-turn-3" }), null);
 
   store.submitReviewerJob({ job_id: "job-system-suppressed", project_id: captured.project_id, prompt_version: "v1" });
   store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "reviewed_no_lesson", jobId: "job-system-suppressed", payload: {}, language: "en" });
-  assert.equal(store.suppressDueSystemNotifications({ nowMs: 31_001, reasonCode: "disabled_by_config" }), 1);
-  assert.deepEqual(store.listNotifications({ sessionUid: captured.session_uid }).map((row) => row.system_state).sort(), ["not_applicable", "suppressed"]);
+  assert.equal(store.suppressDueSystemNotifications({ nowMs: 31_001, reasonCode: "disabled_by_config" }), 3);
+  assert.deepEqual(store.listNotifications({ sessionUid: captured.session_uid }).map((row) => row.system_state).sort(), ["not_applicable", "suppressed", "suppressed", "suppressed"]);
   store.close();
 });
 

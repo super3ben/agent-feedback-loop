@@ -419,6 +419,13 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     })];
   };
 
+  const suppressClaimableChatNotifications = ({ sessionUid, contextEpoch }) => transaction(() => db.prepare(`UPDATE notification_outbox
+    SET chat_state='suppressed', updated_at=?
+    WHERE session_uid=? AND context_epoch=?
+      AND chat_state IN ('pending','emitted','emitted_unconfirmed')`).run(
+    nowIso(now), ensureString(sessionUid, "sessionUid"), Math.max(1, Math.floor(Number(contextEpoch) || 1))
+  ).changes);
+
   return {
     path: dbPath,
     capability: { backend: "node:sqlite", schemaVersion: SCHEMA_VERSION },
@@ -577,11 +584,11 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         ).changes === 1;
       });
     },
-    suppressPendingChatNotifications({ sessionUid, contextEpoch }) {
-      return transaction(() => db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?
-        WHERE session_uid=? AND context_epoch=? AND chat_state='pending'`).run(
-        nowIso(now), ensureString(sessionUid, "sessionUid"), Math.max(1, Math.floor(Number(contextEpoch) || 1))
-      ).changes);
+    suppressClaimableChatNotifications(input) {
+      return suppressClaimableChatNotifications(input);
+    },
+    suppressPendingChatNotifications(input) {
+      return suppressClaimableChatNotifications(input);
     },
     suppressDueSystemNotifications({ nowMs = Date.now(), reasonCode }) {
       return transaction(() => {

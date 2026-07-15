@@ -8,6 +8,7 @@ import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
 import { install, pathsFor } from "../src/index.mjs";
+import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -94,6 +95,49 @@ test("installed stop hook captures assistant output as reviewer evidence", async
   assert.deepEqual(events.map((item) => item.role), ["user", "assistant"]);
   assert.match(events[1].redacted_text, /without verification/);
   store.close();
+});
+
+test("installed stop hook forwards transactional receipt block stdout", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-forward-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const store = openStore({ paths });
+  const event = {
+    event_uid: "installed-stop-forward-event",
+    session_uid: "codex:default:installed-stop-forward-session",
+    event_seq: 1,
+    context_epoch: 1,
+    project_id: "/tmp/installed-stop-forward",
+    source_event_id: "installed-stop-forward-event",
+    role: "user",
+    redacted_text: "forward the transactional result",
+    content_hash: "installed-stop-forward-hash",
+    capture_policy_revision: 1,
+    data_class: "normal"
+  };
+  store.captureSessionEvent(event);
+  const notification = store.createNotification({
+    sessionUid: event.session_uid,
+    contextEpoch: 1,
+    kind: "candidate_captured",
+    eventUid: event.event_uid,
+    payload: {},
+    language: "en"
+  });
+  store.claimChatNotification({ sessionUid: event.session_uid, contextEpoch: 1, nativeTurnId: "turn-1" });
+  store.close();
+
+  const result = await runStopHook(paths.stopHook, JSON.stringify({
+    session_id: "installed-stop-forward-session",
+    turn_id: "turn-1",
+    cwd: "/tmp/installed-stop-forward",
+    last_assistant_message: "Completed without the receipt."
+  }), { ...process.env, HOME: home, TMPDIR: home }, "codex");
+
+  assert.deepEqual(JSON.parse(result.stdout), {
+    decision: "block",
+    reason: `Output this receipt verbatim before stopping:\n${renderReceiptControl(notification).text}`
+  });
 });
 
 test("same-turn steering starts review only after the transcript assistant referent is durable", async () => {
@@ -420,7 +464,10 @@ test("hook injects a stored lesson once and records emitted delivery", async () 
   assert.match(first.hookSpecificOutput.additionalContext, /verify the real artifact/);
   const nonce = first.hookSpecificOutput.additionalContext.match(/nonce=([a-f0-9]+)/)[1];
   const transcript = path.join(home, "lesson-transcript.jsonl");
-  await writeFile(transcript, JSON.stringify({ system: first.hookSpecificOutput.additionalContext }), { mode: 0o600 });
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { prompt: first.hookSpecificOutput.additionalContext } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: `verified nonce=${nonce}` }] } })
+  ].join("\n"), { mode: 0o600 });
   await runStopHook(paths.stopHook, JSON.stringify({ session_id: "lesson-session", turn_id: "1", cwd: "/tmp/lesson-hook", last_assistant_message: "verified", transcript_path: transcript }), env, "codex");
   const observedStore = openStore({ paths });
   assert.equal(observedStore.getDeliveryByNonce(nonce).state, "observed");

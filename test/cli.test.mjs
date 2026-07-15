@@ -800,24 +800,61 @@ describe("agent-feedback-loop package", () => {
     store.close();
   });
 
-  it("receipt marker is observed from the bounded tail of a large transcript", async () => {
+  it("receipt marker in non-assistant Codex tail records does not observe an emitted notification", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const fixture = await bindEmittedReceipt({
       home,
       cli: "codex",
-      sessionId: "receipt-tail-session",
+      sessionId: "receipt-tail-role-session",
       turnId: "turn-1",
-      projectId: "/tmp/receipt-tail"
+      projectId: "/tmp/receipt-tail-role"
     });
-    const transcript = path.join(home, "large-transcript.jsonl");
+    const transcript = path.join(home, "role-validated-transcript.jsonl");
     const control = renderReceiptControl(fixture.notification);
-    await writeFile(transcript, `${"x".repeat(2 * 1024 * 1024)}\n${control.text}\n`, { mode: 0o600 });
+    await writeFile(transcript, [
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call_output", output: control.text } }),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: control.text }] } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_complete", message: control.text } }),
+      JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-1", prompt: control.text } }),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Completed without the receipt." }] } })
+    ].join("\n"), { mode: 0o600 });
 
     const result = await runWithInput(fixture.paths.stopHook, JSON.stringify({
-      session_id: "receipt-tail-session",
+      session_id: "receipt-tail-role-session",
       turn_id: "turn-1",
-      cwd: "/tmp/receipt-tail",
+      cwd: "/tmp/receipt-tail-role",
+      transcript_path: transcript,
+      last_assistant_message: "Completed without duplicating the control."
+    }), { ...process.env, HOME: home }, ["--mode", "codex"]);
+
+    assert.equal(JSON.parse(result.stdout).decision, "block");
+    const store = openStore({ paths: fixture.paths });
+    assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "emitted");
+    store.close();
+  });
+
+  it("receipt marker is observed from role-validated assistant output in a bounded Codex tail", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "receipt-tail-assistant-session",
+      turnId: "turn-1",
+      projectId: "/tmp/receipt-tail-assistant"
+    });
+    const transcript = path.join(home, "large-assistant-transcript.jsonl");
+    const control = renderReceiptControl(fixture.notification);
+    await writeFile(transcript, [
+      "x".repeat(2 * 1024 * 1024),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: `Completed.\n${control.text}` }] } })
+    ].join("\n"), { mode: 0o600 });
+
+    const result = await runWithInput(fixture.paths.stopHook, JSON.stringify({
+      session_id: "receipt-tail-assistant-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/receipt-tail-assistant",
       transcript_path: transcript,
       last_assistant_message: "Completed without duplicating the control."
     }), { ...process.env, HOME: home }, ["--mode", "codex"]);
@@ -870,6 +907,47 @@ describe("agent-feedback-loop package", () => {
     const [notification] = store.listNotifications({ sessionUid: fixture.event.session_uid });
     assert.equal(notification.chat_emit_attempts, 2);
     assert.notEqual(notification.chat_state, "observed");
+    store.close();
+  });
+
+  it("disabling receipts cancels an unconfirmed emission so re-enable cannot replay it", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "receipt-disable-after-stop-session",
+      turnId: "turn-1",
+      projectId: "/tmp/receipt-disable-after-stop"
+    });
+    const enabledEnv = { ...process.env, HOME: home, AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99" };
+    const stopPayload = JSON.stringify({
+      session_id: "receipt-disable-after-stop-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/receipt-disable-after-stop",
+      last_assistant_message: "Completed without the receipt."
+    });
+    assert.equal(JSON.parse((await runWithInput(fixture.paths.stopHook, stopPayload, enabledEnv, ["--mode", "codex"])).stdout).decision, "block");
+    assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, stopPayload, enabledEnv, ["--mode", "codex"])).stdout), { continue: true });
+
+    const prompt = (turnId) => JSON.stringify({
+      session_id: "receipt-disable-after-stop-session",
+      turn_id: turnId,
+      cwd: "/tmp/receipt-disable-after-stop",
+      prompt: "Continue inspecting the implementation."
+    });
+    const disabled = await runWithInput(fixture.paths.coreHook, prompt("turn-2"), {
+      ...enabledEnv,
+      AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS: "0"
+    }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    assert.deepEqual(JSON.parse(disabled.stdout), { continue: true });
+
+    const reenabled = await runWithInput(fixture.paths.coreHook, prompt("turn-3"), enabledEnv, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    assert.deepEqual(JSON.parse(reenabled.stdout), { continue: true });
+    const store = openStore({ paths: fixture.paths });
+    const [notification] = store.listNotifications({ sessionUid: fixture.event.session_uid });
+    assert.equal(notification.chat_state, "suppressed");
+    assert.equal(notification.chat_emit_attempts, 1);
     store.close();
   });
 
