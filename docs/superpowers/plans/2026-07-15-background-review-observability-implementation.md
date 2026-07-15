@@ -66,7 +66,7 @@
 - Produces: `store.listNotifications({ sessionUid, jobId }) -> NotificationRow[]`
 - Produces: `store.recordDeliveries({ deliveries, sessionUid, contextEpoch, language }) -> { inserted, notification }`
 - Produces: `store.setReviewerProvider({ jobId, provider }) -> boolean`
-- Produces: `store.suppressPendingChatNotifications({ sessionUid, contextEpoch }) -> number`
+- Produces: `store.suppressClaimableChatNotifications({ sessionUid, contextEpoch }) -> number`; `suppressPendingChatNotifications` remains a compatibility wrapper with the same cancellation semantics.
 - Produces: `store.suppressDueSystemNotifications({ nowMs, reasonCode }) -> number`
 - Produces: `store.listReviewerJobEvents(jobId) -> ReviewerJobEvent[]`
 - Produces: `validateReceiptPayload(kind, payload) -> object`
@@ -620,7 +620,7 @@ In the `hook` command:
 4. After queue and lesson producers finish, call `claimChatNotification` once using `event.session_uid`, `event.context_epoch`, and `event.native_turn_id`.
 5. Append `renderReceiptInstruction(claimed)` to `injectedContexts`.
 
-Respect `AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS=0` by calling `suppressPendingChatNotifications` and injecting nothing. Pass `AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE` through `detectReceiptLanguage(event.redacted_text, override)` when creating notifications. For every `notificationRefs` result, hash `session_uid` with SHA-256 to 12 hex characters and write `receipt.outbox.created notification=<id> kind=<kind> session=<hash>` through a dedicated receipt logger that is active even when general debug logging is off; never log the visible line or payload.
+Respect `AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS=0` by calling `suppressClaimableChatNotifications` and injecting nothing. Disabling cancels `pending`, `emitted`, and `emitted_unconfirmed` rows for the session/epoch without modifying `observed`; re-enabling cannot replay those historical rows. Pass `AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE` through `detectReceiptLanguage(event.redacted_text, override)` when creating notifications. For every `notificationRefs` result, hash `session_uid` with SHA-256 to 12 hex characters and write `receipt.outbox.created notification=<id> kind=<kind> session=<hash>` through a dedicated receipt logger that is active even when general debug logging is off; never log the visible line or payload.
 
 - [ ] **Step 4: Write failing Stop observation/loop-guard tests for all host schemas**
 
@@ -645,7 +645,7 @@ Expected: FAIL because `capture-stop` always returns `{}` and `stop-hook.sh` dis
 
 - [ ] **Step 6: Make `capture-stop` authoritative in transactional mode**
 
-Build `transcriptText` from the bounded transcript tail plus `last_assistant_message`. Call `confirmChatNotification`; when it returns `block`, render the exact line and marker in the reason and emit the native host schema:
+Build confirmation text only from role-validated assistant message output parsed from the bounded transcript tail plus the bounded host `last_assistant_message`. Raw bytes, user messages, tool output, control records, and prompts are evidence-only and cannot confirm a receipt. Keep owned-file, regular-file, inode/device, and tail-size checks; log a coverage gap when a readable tail has no recognized assistant output. Call `confirmChatNotification`; when it returns `block`, render the exact line and marker in the reason and emit the native host schema:
 
 ```js
 function stopResponse(cli, result) {
@@ -940,6 +940,8 @@ git commit -m "docs: publish observable background review workflow"
 - Consumes: packaged runtime `0.7.5`, all host hooks, scheduler, reviewer adapters, notification outbox, and audit commands.
 - Produces: reproducible acceptance evidence with real IDs, counts, before/after state, and explicit unavailable boundaries.
 
+Tasks 1-6 must use disposable `--home` roots and must not install a partial branch into the real `~/.agent`. Task 7 owns the first atomic replacement of the user-level runtime after the complete package is assembled. It must record the pre-install `current.json` and hook hashes, install once, verify the installed version/schema and template hashes, and prove transactional Stop stdout forwarding from the real installed hook before any L1 claim.
+
 - [ ] **Step 1: Establish a clean automated baseline**
 
 Run:
@@ -951,7 +953,7 @@ node ./bin/agent-feedback-loop.mjs doctor --home "$HOME" --live
 node ./bin/agent-feedback-loop.mjs review list --home "$HOME"
 ```
 
-Expected: tests pass; installed current runtime is `0.7.5`, schema is `8`, `doctor --live` reports only capabilities it actually tested, and `review list` returns valid JSON.
+Expected: tests pass; the atomic install replaces the previously recorded runtime, installed current runtime is `0.7.5`, schema is `8`, installed hook hashes match the packaged templates, a bound receipt proves the real installed Stop hook forwards transactional stdout, `doctor --live` reports only capabilities it actually tested, and `review list` returns valid JSON.
 
 - [ ] **Step 2: Prove a new Codex task and a non-trigger control**
 
@@ -1052,3 +1054,4 @@ git commit -m "test: verify observable background reviews"
 - [ ] Scheduler repeat, provider failure, lease expiry, stale worker fencing, and no-trigger control are evidenced.
 - [ ] Computer Use is attempted and the visible UI result or exact access limitation is recorded.
 - [ ] Full tests, installed `doctor --live`, actual event rows, final review receipt, and visible/system receipt are reported as separate proof layers.
+- [ ] The real `~/.agent` runtime is replaced only in Task 7 and its installed Stop hook is proven to forward transactional stdout.
