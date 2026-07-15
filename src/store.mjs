@@ -198,6 +198,8 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     "ALTER TABLE reviewer_jobs ADD COLUMN capability_expires_at INTEGER",
     "ALTER TABLE reviewer_jobs ADD COLUMN capability_consumed_at INTEGER",
     "ALTER TABLE reviewer_jobs ADD COLUMN reviewer_provider TEXT",
+    "ALTER TABLE notification_outbox ADD COLUMN semantic_key TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE notification_outbox ADD COLUMN system_lease_epoch INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE lessons ADD COLUMN responsibility TEXT",
     "ALTER TABLE lessons ADD COLUMN confidence TEXT",
     "ALTER TABLE lessons ADD COLUMN method_class TEXT",
@@ -213,6 +215,20 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         if (!/duplicate column name/i.test(error.message)) throw error;
       }
     }
+    db.exec(`UPDATE notification_outbox
+      SET semantic_key=CASE
+        WHEN kind='lesson_delivered' AND application_id IS NOT NULL
+          AND json_extract(payload_json, '$.lesson_count')=1 THEN json_array(application_id)
+        WHEN kind='lesson_delivered' THEN 'legacy:' || notification_id
+        ELSE ''
+      END
+      WHERE semantic_key='';
+      DROP INDEX IF EXISTS notification_outbox_semantic_idx;
+      CREATE UNIQUE INDEX notification_outbox_semantic_idx
+        ON notification_outbox(
+          session_uid, context_epoch, kind,
+          IFNULL(job_id, ''), IFNULL(event_uid, ''), IFNULL(application_id, ''), semantic_key
+        );`);
     db.exec(`UPDATE session_events SET project_id='unscoped:' || session_uid WHERE project_id IS NULL;
       UPDATE sessions SET project_id='unscoped:' || session_uid WHERE project_id IS NULL;
       UPDATE queue_events SET project_id=(SELECT project_id FROM session_events WHERE session_events.event_uid=queue_events.event_uid) WHERE project_id IS NULL;
@@ -246,41 +262,61 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     return { revision, enabled };
   };
 
-  const notificationIdFor = ({ sessionUid, contextEpoch, kind, jobId, eventUid, applicationId }) => createHash("sha256")
-    .update(["notification:v1", sessionUid, contextEpoch, kind, jobId || "", eventUid || "", applicationId || ""].join("\u0000"))
+  const notificationIdFor = ({ sessionUid, contextEpoch, kind, jobId, eventUid, applicationId, semanticKey }) => createHash("sha256")
+    .update([
+      semanticKey ? "notification:v2" : "notification:v1",
+      sessionUid, contextEpoch, kind, jobId || "", eventUid || "", applicationId || "",
+      ...(semanticKey ? [semanticKey] : [])
+    ].join("\u0000"))
     .digest("hex");
 
-  const notificationLanguage = ({ language, jobId, eventUid, sessionUid }) => {
+  const notificationLanguage = ({ language, jobId, eventUid, sessionUid, contextEpoch }) => {
     if (language !== undefined && language !== null) return detectReceiptLanguage("", language);
+    if (eventUid) {
+      const eventSource = db.prepare(`SELECT session_uid, context_epoch, redacted_text
+        FROM session_events WHERE event_uid=?`).get(eventUid);
+      if (eventSource && (eventSource.session_uid !== sessionUid || Number(eventSource.context_epoch) !== Number(contextEpoch))) {
+        throw new TypeError("notification event does not belong to its session and context epoch");
+      }
+      if (eventSource) return detectReceiptLanguage(eventSource.redacted_text, receiptLanguage);
+    }
     if (jobId) {
-      const inherited = db.prepare("SELECT language FROM notification_outbox WHERE job_id=? ORDER BY created_at, notification_id LIMIT 1").get(jobId);
+      const inherited = db.prepare(`SELECT language FROM notification_outbox
+        WHERE job_id=? AND session_uid=? AND context_epoch=? AND kind='review_queued'
+        ORDER BY created_at, notification_id LIMIT 1`).get(jobId, sessionUid, contextEpoch);
       if (inherited) return inherited.language;
     }
-    const source = eventUid
-      ? db.prepare("SELECT redacted_text FROM session_events WHERE event_uid=?").get(eventUid)
-      : db.prepare("SELECT redacted_text FROM session_events WHERE session_uid=? AND role='user' ORDER BY event_seq DESC, rowid DESC LIMIT 1").get(sessionUid);
+    const source = db.prepare(`SELECT redacted_text FROM session_events
+      WHERE session_uid=? AND context_epoch=? AND role='user'
+      ORDER BY event_seq DESC, rowid DESC LIMIT 1`).get(sessionUid, contextEpoch);
     return detectReceiptLanguage(source?.redacted_text, receiptLanguage);
   };
 
   const createNotificationInTransaction = ({
     sessionUid, contextEpoch, kind, jobId = null, eventUid = null, applicationId = null,
-    payload = {}, language
+    semanticKey = null, payload = {}, language
   }) => {
     const safePayload = validateReceiptPayload(kind, payload);
     const safeSessionUid = ensureString(sessionUid, "sessionUid");
     const safeContextEpoch = Math.max(1, Math.floor(Number(contextEpoch) || 1));
+    const safeSemanticKey = semanticKey === null
+      ? (kind === "lesson_delivered" && applicationId ? JSON.stringify([String(applicationId)]) : "")
+      : String(semanticKey);
     const notificationId = notificationIdFor({
-      sessionUid: safeSessionUid, contextEpoch: safeContextEpoch, kind, jobId, eventUid, applicationId
+      sessionUid: safeSessionUid, contextEpoch: safeContextEpoch, kind, jobId, eventUid, applicationId,
+      semanticKey: safeSemanticKey
     });
-    const resolvedLanguage = notificationLanguage({ language, jobId, eventUid, sessionUid: safeSessionUid });
+    const resolvedLanguage = notificationLanguage({
+      language, jobId, eventUid, sessionUid: safeSessionUid, contextEpoch: safeContextEpoch
+    });
     const systemState = ["review_completed", "reviewed_no_lesson", "review_exhausted"].includes(kind) ? "pending" : "not_applicable";
     const timestamp = nowIso(now);
     db.prepare(`INSERT INTO notification_outbox
-      (notification_id, session_uid, context_epoch, job_id, event_uid, application_id, kind,
+      (notification_id, session_uid, context_epoch, job_id, event_uid, application_id, semantic_key, kind,
        payload_json, language, system_state, next_attempt_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT DO NOTHING`).run(
-      notificationId, safeSessionUid, safeContextEpoch, jobId, eventUid, applicationId, kind,
+      notificationId, safeSessionUid, safeContextEpoch, jobId, eventUid, applicationId, safeSemanticKey, kind,
       JSON.stringify(safePayload), resolvedLanguage, systemState, systemState === "pending" ? 0 : null, timestamp, timestamp
     );
     if (kind === "review_queued") {
@@ -301,7 +337,13 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         timestamp, safeSessionUid, safeContextEpoch, jobId, jobId, jobId
       );
     }
-    return db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(notificationId);
+    return db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(notificationId)
+      || db.prepare(`SELECT * FROM notification_outbox
+        WHERE session_uid=? AND context_epoch=? AND kind=?
+          AND IFNULL(job_id, '')=? AND IFNULL(event_uid, '')=? AND IFNULL(application_id, '')=?
+          AND semantic_key=?`).get(
+        safeSessionUid, safeContextEpoch, kind, jobId || "", eventUid || "", applicationId || "", safeSemanticKey
+      );
   };
 
   const asNotificationRef = (row) => ({
@@ -323,11 +365,22 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     return db.prepare("SELECT * FROM reviewer_job_events WHERE job_event_id=?").get(jobEventId);
   };
 
-  const notificationSessionsForJob = (jobId) => db.prepare(`SELECT DISTINCT n.session_uid, n.context_epoch
-    FROM notification_outbox n
-    WHERE (n.job_id=? AND n.kind='review_queued')
-       OR (n.kind='candidate_captured' AND n.event_uid IN (SELECT event_uid FROM queue_events WHERE job_id=?))
-    ORDER BY n.session_uid, n.context_epoch`).all(jobId, jobId);
+  const notificationSessionsForJob = (jobId) => db.prepare(`SELECT DISTINCT e.session_uid, e.context_epoch
+    FROM queue_events q
+    JOIN session_events e ON e.event_uid=q.event_uid
+    WHERE q.job_id=? AND EXISTS (
+      SELECT 1 FROM notification_outbox n
+      WHERE n.session_uid=e.session_uid AND n.context_epoch=e.context_epoch AND n.event_uid=q.event_uid
+        AND (n.kind='candidate_captured' OR (n.kind='review_queued' AND n.job_id=q.job_id))
+    )
+    ORDER BY e.session_uid, e.context_epoch`).all(jobId);
+
+  const suppressQueueNotificationInTransaction = (jobId, eventUid) => db.prepare(`UPDATE notification_outbox
+    SET chat_state='suppressed', updated_at=?
+    WHERE job_id=? AND event_uid=? AND kind='review_queued'
+      AND chat_state IN ('pending','emitted','emitted_unconfirmed')`).run(
+    nowIso(now), jobId, eventUid
+  ).changes;
 
   const createExhaustedNotificationsInTransaction = (jobId, reasonCode) => notificationSessionsForJob(jobId).map((session) =>
     createNotificationInTransaction({
@@ -452,7 +505,8 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         const timestamp = nowIso(now);
         for (const row of rows) {
           const result = db.prepare(`UPDATE notification_outbox
-            SET system_state='delivering', system_owner=?, system_lease_until=?, system_attempts=system_attempts+1,
+            SET system_state='delivering', system_owner=?, system_lease_epoch=system_lease_epoch+1,
+                system_lease_until=?, system_attempts=system_attempts+1,
                 system_reason_code=NULL, updated_at=?
             WHERE notification_id=? AND (
               (system_state IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
@@ -463,43 +517,49 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         return claimed;
       });
     },
-    completeSystemNotification({ notificationId, ownerId, deliveredAt = nowIso(now) }) {
+    completeSystemNotification({ notificationId, ownerId, leaseEpoch, deliveredAt = nowIso(now) }) {
+      const safeLeaseEpoch = Math.floor(Number(leaseEpoch));
+      if (!Number.isInteger(safeLeaseEpoch) || safeLeaseEpoch < 1) throw new TypeError("leaseEpoch must be a positive integer");
       return transaction(() => db.prepare(`UPDATE notification_outbox
         SET system_state='delivered', system_owner=NULL, system_lease_until=NULL, next_attempt_at=NULL,
             system_reason_code=NULL, system_delivered_at=?, updated_at=?
-        WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
-        deliveredAt, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+        WHERE notification_id=? AND system_state='delivering' AND system_owner=? AND system_lease_epoch=?`).run(
+        deliveredAt, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId"), safeLeaseEpoch
       ).changes === 1);
     },
-    failSystemNotification({ notificationId, ownerId, reasonCode, nowMs = Date.now() }) {
+    failSystemNotification({ notificationId, ownerId, leaseEpoch, reasonCode, nowMs = Date.now() }) {
       return transaction(() => {
         const safeReasonCode = ensureString(reasonCode, "reasonCode");
         if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+        const safeLeaseEpoch = Math.floor(Number(leaseEpoch));
+        if (!Number.isInteger(safeLeaseEpoch) || safeLeaseEpoch < 1) throw new TypeError("leaseEpoch must be a positive integer");
         const safeNowMs = Number(nowMs);
         if (!Number.isFinite(safeNowMs)) throw new TypeError("nowMs must be finite");
         const row = db.prepare(`SELECT system_attempts FROM notification_outbox
-          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).get(
-          ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=? AND system_lease_epoch=?`).get(
+          ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId"), safeLeaseEpoch
         );
         if (!row) return false;
         const delay = Math.min(21_600_000, 60_000 * (2 ** Math.max(0, Number(row.system_attempts) - 1)));
         return db.prepare(`UPDATE notification_outbox
           SET system_state='failed', system_owner=NULL, system_lease_until=NULL, next_attempt_at=?,
               system_reason_code=?, updated_at=?
-          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
-          safeNowMs + delay, safeReasonCode, nowIso(now), notificationId, ownerId
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=? AND system_lease_epoch=?`).run(
+          safeNowMs + delay, safeReasonCode, nowIso(now), notificationId, ownerId, safeLeaseEpoch
         ).changes === 1;
       });
     },
-    markSystemNotificationUnsupported({ notificationId, ownerId, reasonCode }) {
+    markSystemNotificationUnsupported({ notificationId, ownerId, leaseEpoch, reasonCode }) {
       return transaction(() => {
         const safeReasonCode = ensureString(reasonCode, "reasonCode");
         if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+        const safeLeaseEpoch = Math.floor(Number(leaseEpoch));
+        if (!Number.isInteger(safeLeaseEpoch) || safeLeaseEpoch < 1) throw new TypeError("leaseEpoch must be a positive integer");
         return db.prepare(`UPDATE notification_outbox
           SET system_state='unsupported', system_owner=NULL, system_lease_until=NULL, next_attempt_at=NULL,
               system_reason_code=?, updated_at=?
-          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
-          safeReasonCode, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=? AND system_lease_epoch=?`).run(
+          safeReasonCode, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId"), safeLeaseEpoch
         ).changes === 1;
       });
     },
@@ -879,6 +939,7 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
       return transaction(() => {
         const safeSessionUid = ensureString(sessionUid, "sessionUid");
         const safeContextEpoch = Math.max(1, Math.floor(Number(contextEpoch) || 1));
+        const applicationIds = [...new Set(deliveries.map((delivery) => ensureString(delivery.application_id, "application_id")))].sort();
         const timestamp = nowIso(now);
         db.prepare(`INSERT OR IGNORE INTO sessions
           (session_uid, cli, native_session_id, installation_id, project_id, context_epoch, started_at)
@@ -897,13 +958,14 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
           );
           if (!exists) inserted += 1;
         }
-        const applicationId = [...deliveries].map((item) => String(item.application_id)).sort()[0];
+        const applicationId = applicationIds[0];
         const notification = createNotificationInTransaction({
           sessionUid: safeSessionUid,
           contextEpoch: safeContextEpoch,
           applicationId,
+          semanticKey: JSON.stringify(applicationIds),
           kind: "lesson_delivered",
-          payload: { lesson_count: deliveries.length },
+          payload: { lesson_count: applicationIds.length },
           language
         });
         return { inserted, notification };
@@ -994,7 +1056,10 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
           const assigned = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
           if (assigned >= boundedMaxEntries) {
             const displaced = db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND job_id=? ORDER BY created_at, event_uid LIMIT 1").get(projectId, existing.job_id);
-            if (displaced) db.prepare("UPDATE queue_events SET job_id=NULL WHERE event_uid=? AND job_id=?").run(displaced.event_uid, existing.job_id);
+            if (displaced) {
+              const cleared = db.prepare("UPDATE queue_events SET job_id=NULL WHERE event_uid=? AND job_id=?").run(displaced.event_uid, existing.job_id).changes;
+              if (cleared === 1) suppressQueueNotificationInTransaction(existing.job_id, displaced.event_uid);
+            }
           }
           db.prepare("UPDATE queue_events SET job_id=? WHERE event_uid=? AND project_id=? AND status='pending' AND job_id IS NULL").run(existing.job_id, immediateEventUid, projectId);
           const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);

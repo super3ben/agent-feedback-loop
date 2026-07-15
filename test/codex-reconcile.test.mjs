@@ -464,7 +464,7 @@ test("an exhausted reviewer job fails visibly instead of retrying forever", asyn
     payload: { session_id: "exhausted-session", turn_id: "turn-1", cwd: candidate.cwd, prompt: "do not retry forever" }
   });
   store.captureSessionEvent(event);
-  const due = store.submitDueReview({ projectId: candidate.cwd, minEntries: 1, cooldownMs: 0 });
+  const due = store.submitDueReview({ projectId: candidate.cwd, minEntries: 1, cooldownMs: 0, immediateEventUid: event.event_uid });
   const nowMs = Date.now();
   store.claimReviewerWake({ jobId: due.job_id, nowMs: nowMs - 2_000, cooldownMs: 1_000 });
   store.claimReviewerJob(due.job_id, "last-worker", nowMs - 1, 3);
@@ -479,6 +479,7 @@ test("an exhausted reviewer job fails visibly instead of retrying forever", asyn
   });
 
   assert.equal(result.exhaustedReviewerJobs, 1);
+  assert.deepEqual(result.notificationRefs.map((row) => row.kind), ["review_exhausted"]);
   assert.equal(result.recoveredReviewers, 0);
   assert.equal(store.getReviewerJob(due.job_id).status, "failed");
   assert.equal(store.getReviewerJob(due.job_id).reason_code, "retry_exhausted");

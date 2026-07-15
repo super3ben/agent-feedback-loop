@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   job_id TEXT REFERENCES reviewer_jobs(job_id) ON DELETE CASCADE,
   event_uid TEXT REFERENCES session_events(event_uid) ON DELETE SET NULL,
   application_id TEXT REFERENCES delivery_receipts(application_id) ON DELETE SET NULL,
+  semantic_key TEXT NOT NULL DEFAULT '',
   kind TEXT NOT NULL CHECK(kind IN (
     'candidate_captured','review_queued','review_completed','reviewed_no_lesson',
     'review_exhausted','lesson_delivered'
@@ -199,6 +200,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     'not_applicable','pending','delivering','delivered','failed','unsupported','suppressed'
   )),
   system_owner TEXT,
+  system_lease_epoch INTEGER NOT NULL DEFAULT 0,
   system_lease_until INTEGER,
   system_attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER,
@@ -207,11 +209,6 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS notification_outbox_semantic_idx
-  ON notification_outbox(
-    session_uid, context_epoch, kind,
-    IFNULL(job_id, ''), IFNULL(event_uid, ''), IFNULL(application_id, '')
-  );
 CREATE INDEX IF NOT EXISTS notification_outbox_chat_due_idx
   ON notification_outbox(session_uid, context_epoch, chat_state, created_at);
 CREATE INDEX IF NOT EXISTS notification_outbox_system_due_idx

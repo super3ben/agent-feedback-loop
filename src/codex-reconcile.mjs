@@ -455,6 +455,7 @@ export async function reconcileCodexTranscripts({
     reviewersLaunched: 0,
     recoveredReviewers: 0,
     exhaustedReviewerJobs: 0,
+    notificationRefs: [],
     oversizedLinesSkipped: 0,
     coverageGaps: [],
     errors: []
@@ -553,7 +554,10 @@ export async function reconcileCodexTranscripts({
             promptVersion: "v1",
             immediateEventUid
           });
-          if (candidateDue.status === "pending") due = candidateDue;
+          if (candidateDue.status === "pending") {
+            due = candidateDue;
+            result.notificationRefs.push(...(candidateDue.notificationRefs || []));
+          }
         }
       } else {
         due = store.submitDueReview({
@@ -564,6 +568,7 @@ export async function reconcileCodexTranscripts({
           cooldownMs: reviewCooldownMs,
           promptVersion: "v1"
         });
+        result.notificationRefs.push(...(due.notificationRefs || []));
       }
       if (!due || due.status !== "pending") continue;
       const wake = store.claimReviewerWake({ jobId: due.job_id, nowMs: now(), cooldownMs: wakeCooldownMs });
@@ -577,7 +582,13 @@ export async function reconcileCodexTranscripts({
       result.errors.push({ projectId, code: error.code || "reviewer_schedule_failed", message: error.message });
     }
   }
-  result.exhaustedReviewerJobs = store.failExhaustedReviewerJobs({ nowMs: now(), maxAttempts: reviewMaxAttempts });
+  const exhausted = store.failExhaustedReviewerJobs({ nowMs: now(), maxAttempts: reviewMaxAttempts });
+  if (typeof exhausted === "number") {
+    result.exhaustedReviewerJobs = exhausted;
+  } else {
+    result.exhaustedReviewerJobs = Number(exhausted?.count || 0);
+    result.notificationRefs.push(...(exhausted?.notificationRefs || []));
+  }
   for (const job of store.listRecoverableReviewerJobs({ nowMs: now(), maxAttempts: reviewMaxAttempts })) {
     if (launchedJobs.has(job.job_id)) continue;
     try {

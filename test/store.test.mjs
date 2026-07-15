@@ -90,40 +90,101 @@ test("receipt payload validation and markers reject unbounded content", () => {
   assert.equal(containsReceiptMarker(marker, { ...notification, notification_id: "notification-2" }), false);
 });
 
-test("schema v8 preserves a v7 session while adding notification outbox", async () => {
+test("schema v8 reopens a realistic v7 store idempotently with valid foreign keys", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-notification-migrate-"));
   const paths = pathsFor(home);
-  await mkdir(path.dirname(paths.storeFile), { recursive: true, mode: 0o700 });
+  const seeded = openStore({ paths });
+  const captured = { ...event("legacy-event"), session_uid: "codex:install:legacy-session", project_id: "legacy-project" };
+  seeded.captureSessionEvent(captured);
+  const job = seeded.submitDueReview({ projectId: captured.project_id, minEntries: 1, cooldownMs: 0 });
+  seeded.recordDelivery({
+    application_id: "legacy-application",
+    lesson_id: "legacy-lesson",
+    revision: 1,
+    session_uid: captured.session_uid,
+    context_epoch: 1,
+    state: "emitted"
+  });
+  seeded.close();
+
   const legacy = new DatabaseSync(paths.storeFile);
   legacy.exec(`
-    CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
-    CREATE TABLE store_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE sessions (
-      session_uid TEXT PRIMARY KEY,
-      cli TEXT NOT NULL,
-      native_session_id TEXT,
-      installation_id TEXT NOT NULL,
-      project_id TEXT,
-      context_epoch INTEGER NOT NULL DEFAULT 1,
-      started_at TEXT NOT NULL,
-      ended_at TEXT
-    );
-    INSERT INTO schema_migrations VALUES (7, '2026-07-14T00:00:00.000Z');
-    INSERT INTO store_meta VALUES ('capture_policy_revision', '1');
-    INSERT INTO store_meta VALUES ('capture_enabled', '1');
-    INSERT INTO sessions VALUES (
-      'codex:install:legacy-session', 'codex', 'legacy-session', 'install',
-      'legacy-project', 1, '2026-07-14T00:00:00.000Z', NULL
-    );
+    PRAGMA foreign_keys=OFF;
+    DROP TABLE notification_outbox;
+    DROP TABLE reviewer_job_events;
+    ALTER TABLE reviewer_jobs DROP COLUMN reviewer_provider;
+    DELETE FROM schema_migrations WHERE version=8;
+    INSERT OR IGNORE INTO schema_migrations VALUES (7, '2026-07-14T00:00:00.000Z');
+    PRAGMA foreign_keys=ON;
   `);
   legacy.close();
+
   const migrated = openStore({ paths });
   assert.equal(migrated.capability.schemaVersion, 8);
-  assert.doesNotThrow(() => migrated.listNotifications({ sessionUid: "codex:install:legacy-session" }));
+  assert.equal(migrated.listSessionEvents("legacy-project")[0].event_uid, captured.event_uid);
+  assert.equal(migrated.getReviewerJob(job.job_id).job_id, job.job_id);
+  assert.equal(migrated.hasDelivery("legacy-application"), true);
   migrated.close();
+
+  const reopened = openStore({ paths });
+  assert.equal(reopened.capability.schemaVersion, 8);
+  reopened.close();
+
   const verify = new DatabaseSync(paths.storeFile);
-  assert.equal(verify.prepare("SELECT session_uid FROM sessions WHERE session_uid=?").get("codex:install:legacy-session").session_uid, "codex:install:legacy-session");
   assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8").get().count, 1);
+  const notificationColumns = verify.prepare("PRAGMA table_info(notification_outbox)").all().map((row) => row.name);
+  assert.equal(notificationColumns.includes("semantic_key"), true);
+  assert.equal(notificationColumns.includes("system_lease_epoch"), true);
+  assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
+  verify.close();
+});
+
+test("schema v8 upgrades a pre-fence v8 outbox without losing notifications", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-notification-v8-reopen-"));
+  const paths = pathsFor(home);
+  const seeded = openStore({ paths });
+  const captured = { ...event("pre-fence-v8-event"), session_uid: "pre-fence-v8-session", project_id: "pre-fence-v8-project" };
+  seeded.captureSessionEvent(captured);
+  seeded.submitReviewerJob({ job_id: "pre-fence-v8-job", project_id: captured.project_id, prompt_version: "v1" });
+  const original = seeded.createNotification({
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    kind: "reviewed_no_lesson",
+    jobId: "pre-fence-v8-job",
+    payload: {},
+    language: "en"
+  });
+  seeded.close();
+
+  const preFence = new DatabaseSync(paths.storeFile);
+  preFence.exec(`
+    DROP INDEX notification_outbox_semantic_idx;
+    ALTER TABLE notification_outbox DROP COLUMN system_lease_epoch;
+    ALTER TABLE notification_outbox DROP COLUMN semantic_key;
+    CREATE UNIQUE INDEX notification_outbox_semantic_idx
+      ON notification_outbox(
+        session_uid, context_epoch, kind,
+        IFNULL(job_id, ''), IFNULL(event_uid, ''), IFNULL(application_id, '')
+      );
+  `);
+  preFence.close();
+
+  const migrated = openStore({ paths });
+  const preserved = migrated.listNotifications({ jobId: "pre-fence-v8-job" });
+  assert.equal(preserved.length, 1);
+  assert.equal(preserved[0].notification_id, original.notification_id);
+  const [claim] = migrated.claimSystemNotifications({ ownerId: "pre-fence-owner", nowMs: 1_000, leaseMs: 30_000, limit: 1 });
+  assert.equal(claim.system_lease_epoch, 1);
+  assert.equal(migrated.completeSystemNotification({
+    notificationId: claim.notification_id,
+    ownerId: "pre-fence-owner",
+    leaseEpoch: claim.system_lease_epoch
+  }), true);
+  migrated.close();
+
+  const verify = new DatabaseSync(paths.storeFile);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8").get().count, 1);
+  assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
   verify.close();
 });
 
@@ -213,14 +274,47 @@ test("system lease expires and owner-fenced transitions persist", async () => {
   const leased = store.claimSystemNotifications({ ownerId: "notifier-a", nowMs: 1_000, leaseMs: 30_000, limit: 8 });
   assert.equal(leased.length, 1);
   assert.equal(store.claimSystemNotifications({ ownerId: "notifier-b", nowMs: 2_000, leaseMs: 30_000, limit: 8 }).length, 0);
-  assert.equal(store.claimSystemNotifications({ ownerId: "notifier-b", nowMs: 31_001, leaseMs: 30_000, limit: 8 }).length, 1);
-  assert.equal(store.completeSystemNotification({ notificationId: notification.notification_id, ownerId: "notifier-a", deliveredAt: "2026-07-15T00:00:00.000Z" }), false);
-  assert.equal(store.failSystemNotification({ notificationId: notification.notification_id, ownerId: "notifier-b", reasonCode: "transport_error", nowMs: 31_002 }), true);
+  const reclaimed = store.claimSystemNotifications({ ownerId: "notifier-b", nowMs: 31_001, leaseMs: 30_000, limit: 8 });
+  assert.equal(reclaimed.length, 1);
+  assert.equal(store.completeSystemNotification({ notificationId: notification.notification_id, ownerId: "notifier-a", leaseEpoch: leased[0].system_lease_epoch, deliveredAt: "2026-07-15T00:00:00.000Z" }), false);
+  assert.equal(store.failSystemNotification({ notificationId: notification.notification_id, ownerId: "notifier-b", leaseEpoch: reclaimed[0].system_lease_epoch, reasonCode: "transport_error", nowMs: 31_002 }), true);
   assert.equal(store.listNotifications({ jobId: "job-system" })[0].next_attempt_at, 151_002);
   assert.equal(store.claimSystemNotifications({ ownerId: "notifier-c", nowMs: 151_001, leaseMs: 30_000, limit: 8 }).length, 0);
-  assert.equal(store.claimSystemNotifications({ ownerId: "notifier-c", nowMs: 151_002, leaseMs: 30_000, limit: 8 }).length, 1);
-  assert.equal(store.markSystemNotificationUnsupported({ notificationId: notification.notification_id, ownerId: "notifier-c", reasonCode: "unsupported_platform" }), true);
+  const finalLease = store.claimSystemNotifications({ ownerId: "notifier-c", nowMs: 151_002, leaseMs: 30_000, limit: 8 });
+  assert.equal(finalLease.length, 1);
+  assert.equal(store.markSystemNotificationUnsupported({ notificationId: notification.notification_id, ownerId: "notifier-c", leaseEpoch: finalLease[0].system_lease_epoch, reasonCode: "unsupported_platform" }), true);
   assert.equal(store.listNotifications({ jobId: "job-system" })[0].system_state, "unsupported");
+  store.close();
+});
+
+test("system lease epoch fences stale transitions when the same owner reclaims", async () => {
+  const store = await storeFixture();
+  const captured = event("same-owner-system-lease");
+  store.captureSessionEvent(captured);
+  store.submitReviewerJob({ job_id: "same-owner-system-job", project_id: captured.project_id, prompt_version: "v1" });
+  const notifications = [
+    store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "review_completed", jobId: "same-owner-system-job", payload: { severity: "Major", lesson_count: 1 }, language: "en" }),
+    store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "reviewed_no_lesson", jobId: "same-owner-system-job", payload: {}, language: "en" }),
+    store.createNotification({ sessionUid: captured.session_uid, contextEpoch: 1, kind: "review_exhausted", jobId: "same-owner-system-job", payload: { reason_code: "reviewer_failed" }, language: "en" })
+  ];
+  const first = store.claimSystemNotifications({ ownerId: "reused-owner", nowMs: 1_000, leaseMs: 30_000, limit: 8 });
+  const second = store.claimSystemNotifications({ ownerId: "reused-owner", nowMs: 31_001, leaseMs: 30_000, limit: 8 });
+  const firstById = new Map(first.map((row) => [row.notification_id, row]));
+  const secondById = new Map(second.map((row) => [row.notification_id, row]));
+  assert.equal(first.length, 3);
+  assert.equal(second.length, 3);
+  for (const notification of notifications) {
+    assert.equal(secondById.get(notification.notification_id).system_lease_epoch, firstById.get(notification.notification_id).system_lease_epoch + 1);
+  }
+
+  const [completion, failure, unsupported] = notifications;
+  assert.equal(store.completeSystemNotification({ notificationId: completion.notification_id, ownerId: "reused-owner", leaseEpoch: firstById.get(completion.notification_id).system_lease_epoch }), false);
+  assert.equal(store.failSystemNotification({ notificationId: failure.notification_id, ownerId: "reused-owner", leaseEpoch: firstById.get(failure.notification_id).system_lease_epoch, reasonCode: "transport_error", nowMs: 31_002 }), false);
+  assert.equal(store.markSystemNotificationUnsupported({ notificationId: unsupported.notification_id, ownerId: "reused-owner", leaseEpoch: firstById.get(unsupported.notification_id).system_lease_epoch, reasonCode: "unsupported_platform" }), false);
+
+  assert.equal(store.completeSystemNotification({ notificationId: completion.notification_id, ownerId: "reused-owner", leaseEpoch: secondById.get(completion.notification_id).system_lease_epoch }), true);
+  assert.equal(store.failSystemNotification({ notificationId: failure.notification_id, ownerId: "reused-owner", leaseEpoch: secondById.get(failure.notification_id).system_lease_epoch, reasonCode: "transport_error", nowMs: 31_002 }), true);
+  assert.equal(store.markSystemNotificationUnsupported({ notificationId: unsupported.notification_id, ownerId: "reused-owner", leaseEpoch: secondById.get(unsupported.notification_id).system_lease_epoch, reasonCode: "unsupported_platform" }), true);
   store.close();
 });
 
@@ -378,6 +472,27 @@ test("an immediate event replaces stale bounded evidence in an unprompted pendin
   assert.equal(immediate.immediate, true);
   assert.deepEqual(store.getReviewerContext(immediate.job_id).queued_event_ids, ["current-correction"]);
   assert.equal(store.pendingReviewEventCount("project-immediate"), 2);
+  store.close();
+});
+
+test("bounded immediate replacement suppresses stale queue state and routes terminal state to the current session", async () => {
+  const store = await storeFixture();
+  const first = { ...event("displaced-first"), project_id: "project-displacement", session_uid: "displaced-session", redacted_text: "first correction" };
+  const second = { ...event("displaced-second"), project_id: "project-displacement", session_uid: "current-session", redacted_text: "second correction" };
+  store.captureSessionEvent(first);
+  const existing = store.submitDueReview({ projectId: first.project_id, minEntries: 1, maxEntries: 1, cooldownMs: 0, immediateEventUid: first.event_uid });
+  store.captureSessionEvent(second);
+  const replacement = store.submitDueReview({ projectId: second.project_id, minEntries: 99, maxEntries: 1, cooldownMs: 3_600_000, immediateEventUid: second.event_uid });
+  assert.equal(replacement.job_id, existing.job_id);
+  assert.deepEqual(store.getReviewerContext(existing.job_id).queued_event_ids, [second.event_uid]);
+
+  const staleQueue = store.listNotifications({ sessionUid: first.session_uid }).find((row) => row.kind === "review_queued");
+  assert.equal(staleQueue.chat_state, "suppressed");
+
+  const lease = store.claimReviewerJob(existing.job_id, "displacement-reviewer", Date.now() + 100_000, 1);
+  store.failReviewerJob(existing.job_id, "displacement-reviewer", 1, lease.lease_epoch, false, "reviewer_failed");
+  assert.equal(store.listNotifications({ sessionUid: first.session_uid }).some((row) => row.kind === "review_exhausted"), false);
+  assert.equal(store.listNotifications({ sessionUid: second.session_uid }).some((row) => row.kind === "review_exhausted"), true);
   store.close();
 });
 
@@ -583,6 +698,67 @@ test("notification creation is transaction-bound to queue review and delivery wr
   store.close();
 });
 
+test("delivery notification identity covers the complete sorted application set", async () => {
+  const store = await storeFixture();
+  const sessionUid = "delivery-batch-session";
+  const deliveries = {
+    a: { application_id: "delivery-app-a", lesson_id: "lesson-a", revision: 1 },
+    b: { application_id: "delivery-app-b", lesson_id: "lesson-b", revision: 1 },
+    c: { application_id: "delivery-app-c", lesson_id: "lesson-c", revision: 1 }
+  };
+  const first = store.recordDeliveries({ deliveries: [deliveries.b, deliveries.a], sessionUid, contextEpoch: 1, language: "en" });
+  const reordered = store.recordDeliveries({ deliveries: [deliveries.a, deliveries.b], sessionUid, contextEpoch: 1, language: "en" });
+  const expanded = store.recordDeliveries({ deliveries: [deliveries.c, deliveries.b, deliveries.a], sessionUid, contextEpoch: 1, language: "en" });
+  const overlapping = store.recordDeliveries({ deliveries: [deliveries.c, deliveries.a], sessionUid, contextEpoch: 1, language: "en" });
+
+  assert.equal(reordered.notification.notification_id, first.notification.notification_id);
+  assert.notEqual(expanded.notification.notification_id, first.notification.notification_id);
+  assert.notEqual(overlapping.notification.notification_id, first.notification.notification_id);
+  assert.notEqual(overlapping.notification.notification_id, expanded.notification.notification_id);
+  assert.equal(JSON.parse(expanded.notification.payload_json).lesson_count, 3);
+  assert.equal(store.listNotifications({ sessionUid }).filter((row) => row.kind === "lesson_delivered").length, 3);
+  store.close();
+});
+
+test("delivery writes roll back when aggregate notification validation fails", async () => {
+  const store = await storeFixture();
+  assert.throws(() => store.recordDeliveries({
+    deliveries: [{ application_id: "rollback-application", lesson_id: "rollback-lesson", revision: 1 }],
+    sessionUid: "rollback-session",
+    contextEpoch: 1,
+    language: "invalid"
+  }), /language/i);
+  assert.equal(store.hasDelivery("rollback-application"), false);
+  assert.equal(store.listNotifications({ sessionUid: "rollback-session" }).length, 0);
+  store.close();
+});
+
+test("event and terminal notification languages stay scoped to a shared job session", async () => {
+  const store = await storeFixture();
+  const zh = { ...event("language-zh"), project_id: "project-language", session_uid: "language-session-zh", redacted_text: "需要复核这个问题" };
+  const en = { ...event("language-en"), project_id: "project-language", session_uid: "language-session-en", redacted_text: "please review this issue" };
+  store.captureSessionEvent(zh);
+  store.captureSessionEvent(en);
+  const job = store.submitDueReview({ projectId: zh.project_id, minEntries: 2, maxEntries: 2, cooldownMs: 0 });
+  const zhQueue = store.createNotification({ sessionUid: zh.session_uid, contextEpoch: 1, jobId: job.job_id, eventUid: zh.event_uid, kind: "review_queued", payload: {} });
+  const enQueue = store.createNotification({ sessionUid: en.session_uid, contextEpoch: 1, jobId: job.job_id, eventUid: en.event_uid, kind: "review_queued", payload: {} });
+  assert.equal(zhQueue.language, "zh");
+  assert.equal(enQueue.language, "en");
+
+  const lease = store.claimReviewerJob(job.job_id, "language-reviewer", Date.now() + 100_000, 1);
+  store.commitReview({ jobId: job.job_id, ownerId: "language-reviewer", attempt: 1, leaseEpoch: lease.lease_epoch }, {
+    write_complete: true,
+    review_receipt_id: "language-receipt",
+    report_content_id: "language-report",
+    report_content: "The shared review completed with no durable lesson to persist.",
+    status: "reviewed_no_lesson",
+    lessons: []
+  });
+  assert.equal(store.listNotifications({ sessionUid: zh.session_uid }).find((row) => row.kind === "reviewed_no_lesson").language, "zh");
+  assert.equal(store.listNotifications({ sessionUid: en.session_uid }).find((row) => row.kind === "reviewed_no_lesson").language, "en");
+  store.close();
+});
+
 test("reviewer provider and retry exhaustion are recorded without private context", async () => {
   const store = await storeFixture();
   const feedback = { ...event("exhausted-feedback"), project_id: "project-exhausted", session_uid: "exhausted-session" };
@@ -595,6 +771,9 @@ test("reviewer provider and retry exhaustion are recorded without private contex
   const exhausted = store.failExhaustedReviewerJobs({ nowMs: Date.now(), maxAttempts: 3 });
   assert.equal(exhausted.count, 1);
   assert.deepEqual(exhausted.notificationRefs.map((row) => row.kind), ["review_exhausted"]);
+  const replay = store.failExhaustedReviewerJobs({ nowMs: Date.now(), maxAttempts: 3 });
+  assert.equal(replay.count, 0);
+  assert.deepEqual(replay.notificationRefs, []);
   const history = store.listReviewerJobEvents(due.job_id);
   assert.deepEqual(history.map((row) => row.state), ["claimed", "retry_exhausted"]);
   assert.ok(history.every((row) => row.provider === "codex"));
@@ -886,10 +1065,13 @@ test("retention GC deletes old evidence but keeps newer evidence", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-gc-"));
   const paths = pathsFor(home);
   const oldStore = openStore({ paths, now: () => new Date("2020-01-01T00:00:00.000Z") });
-  oldStore.captureSessionEvent({ ...event("old-event"), session_uid: "old-session" });
+  const oldEvent = { ...event("old-event"), session_uid: "old-session" };
+  oldStore.captureSessionEvent(oldEvent);
+  oldStore.createNotification({ sessionUid: oldEvent.session_uid, contextEpoch: 1, kind: "candidate_captured", eventUid: oldEvent.event_uid, payload: {}, language: "en" });
   const oldJob = oldStore.submitDueReview({ projectId: "project-a", minEntries: 1, cooldownMs: 0 });
   const oldLease = oldStore.claimReviewerJob(oldJob.job_id, "gc-reviewer", Date.now() + 100_000, 1);
   oldStore.commitReview({ jobId: oldJob.job_id, ownerId: "gc-reviewer", attempt: 1, leaseEpoch: oldLease.lease_epoch }, { write_complete: true, review_receipt_id: "gc-receipt", report_content_id: "gc-report", report_content: "No durable lesson was proven from this old retention fixture.", status: "reviewed_no_lesson", lessons: [] });
+  assert.equal(oldStore.listNotifications({ sessionUid: oldEvent.session_uid }).length, 2);
   oldStore.close();
   const currentStore = openStore({ paths });
   currentStore.captureSessionEvent({ ...event("new-event"), session_uid: "new-session" });
@@ -899,7 +1081,11 @@ test("retention GC deletes old evidence but keeps newer evidence", async () => {
   assert.ok(currentStore.getReportContent("gc-report"));
   assert.equal(currentStore.listSessionEvents("project-a").length, 1);
   assert.equal(currentStore.listSessionEvents("project-a")[0].event_uid, "new-event");
+  assert.equal(currentStore.listNotifications({ sessionUid: oldEvent.session_uid }).length, 0);
   currentStore.close();
+  const verify = new DatabaseSync(paths.storeFile);
+  assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
+  verify.close();
 });
 
 test("retention GC preserves old evidence that is still pending review", async () => {
