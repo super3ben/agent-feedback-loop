@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented main-chat receipt injection and authoritative transactional Stop confirmation. The current acceptance scope is the Codex vertical path; Gemini native `prompt_response` confirmation is explicitly deferred until after real Codex proof.
+Implemented and accepted the Codex main-chat receipt vertical path with real Codex desktop tasks. Gemini native `prompt_response`, Claude/Gemini expansion, native system notifications, and the audit CLI remain explicitly outside this Task 3 scope.
 
 ## RED Evidence
 
@@ -28,6 +28,9 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 - `test/cli.test.mjs`
 - `test/store.test.mjs`
 - `test/e2e-smoke.test.mjs`
+- `README.md`
+- `README-zh.md`
+- `package.json`
 - `docs/superpowers/plans/2026-07-15-background-review-observability-implementation.md`
 - `.superpowers/sdd/task-3-report.md`
 
@@ -59,10 +62,10 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 
 - Implementation: `10abc9e7e35798316696d3222c4f39c7cc1714c7`
 
-## Concerns
+## Pre-Install Concerns (Historical)
 
-- UI-level Terminal/Codex inspection is unavailable because Computer Use denies those applications. Task 3 has no L1 product/runtime acceptance claim.
-- The real `~/.agent` hook is intentionally not replaced by this partial branch. Task 7 owns atomic installed-runtime acceptance after Tasks 1-6.
+- UI-level Terminal/Codex inspection was unavailable because Computer Use denied those applications. This was later closed with the Codex app's native thread API and SQLite/runtime evidence rather than terminal emulation.
+- At this point in the implementation history, the real `~/.agent` hook had not yet been replaced. The final acceptance evidence below supersedes this pre-install boundary.
 
 ## Review Fixes
 
@@ -92,7 +95,7 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 - `git diff --check`: exit code 0 before the implementation commit.
 - Computer Use attempt against Codex: denied by host policy with `Computer Use is not allowed to use the app 'com.openai.codex' for safety reasons.`
 
-### Lifecycle Boundary
+### Historical Lifecycle Boundary
 
 - No install command targeted `/Users/sunxingda/.agent` during these review fixes.
 - The current real user runtime remains stale relative to this branch: `/Users/sunxingda/.agent/feedback-loop/current.json` reports runtime `0.7.4`, schema `7`, status `configured_unverified`.
@@ -111,3 +114,69 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 - A new ordinary Codex task (`019f65db-5414-77a1-a851-065a6e4a6123`) created no reviewer job, but incorrectly displayed a `lesson_delivered` receipt (`aee8c25f75b2d94d0956174a6740d18ff2092631ab8bc9484d53458db0eb5e37`).
 - The receipt was observed, proving hook forwarding, but it violated the required ordinary-prompt zero-receipt baseline.
 - `lesson_delivered` remains in the notification outbox for audit but now starts with `chat_state=suppressed`, so only feedback/review lifecycle states can claim the main-chat receipt channel.
+
+## 0.7.6 Real Codex Acceptance
+
+### Installed Runtime
+
+- Installed at `2026-07-15T13:38:26.568Z` under `/Users/sunxingda/.agent/feedback-loop/versions/0.7.6` with schema `8`.
+- Source and installed `src/cli.mjs` SHA-256: `b70ede1fe65a3b3676c711185aed9c48d64192772d662ae6eb625ff2ef2ab0b2`.
+- Source and installed core hook SHA-256: `bcc9003d269e9f4b9d1ac5f50dc7bcbe4c1ff37a67d83a0a66b3747eadb29dd2`.
+- Source and installed Stop hook SHA-256: `e526eb635767851bddc5fc2174d4a1128afe51f4effd3187c8f91c33f9581fd0`.
+- Computer Use against Codex was attempted and denied with `Computer Use is not allowed to use the app 'com.openai.codex' for safety reasons.` The real checks below therefore use the Codex desktop app's native task APIs plus the installed runtime's SQLite and logs.
+- The app-bundled terminal CLI was also checked separately. Its interactive prompt produced no AFL SQLite event, so it is documented as a non-equivalent host and is not used as desktop acceptance evidence.
+
+### Ordinary New Task: Zero Job And Zero Review Receipt
+
+- Codex task/session: `019f660d-a384-7050-9f2b-1e1ff5d2d4e4`.
+- Turns: `019f660d-a778-7810-978d-917d97f96658` and `019f660e-de0e-7313-936e-a26fa423a7f5`.
+- Visible replies contained no `[AFL]` line.
+- Before this new session: 0 session events, 0 reviewer jobs, and 0 review receipts for the session.
+- After two ordinary top-level turns: 4 captured session events, 0 reviewer jobs, 0 review lifecycle receipts, and 0 observed review receipts.
+- One `lesson_delivered` audit row exists with `chat_state=suppressed`; it was neither a review lifecycle receipt nor injected into the chat.
+
+### New Task: Full Correction To Observed Chain
+
+- Codex task/session: `019f6611-8925-7de0-954c-7fc2e47ee5a5`.
+- Active turn: `019f6611-8b2b-7b92-8bd0-5a1b881442ef`.
+- The assistant first emitted `开始等待。`; the user then corrected the still-running turn with `停止刚才的等待和旧路径...`.
+- Captured correction event: `codex:default:019f6611-8925-7de0-954c-7fc2e47ee5a5:generated:mrm5arht:9e679518-b0a7-45ae-b080-c7700873a309`.
+- Captured assistant referent event: `codex:default:019f6611-8925-7de0-954c-7fc2e47ee5a5:message:msg_06a3918aed255dd1016a5791d1e6f0819188b94245978d8281`.
+- Reviewer job: `b196ca55f3f7f705f68b4d9e1c5c30a9956ff23a60ab50bf3593bfe1692dff8f`.
+- Queue receipt notification: `328c344feef1473c7359a877c8dc7d595bd38ad85dba1b9dcad3eba612da6401`.
+- The parent conversation visibly emitted `[AFL] 后台反思已排队 · job=b196ca · receipt=328c34` and the exact v2 marker. Stop changed the notification from `emitted` to `observed` at `2026-07-15T13:58:13.000Z` on the active turn.
+- Runtime log records `signal=active_turn_steering immediate=1`, the notification creation/emission, reviewer start, Stop observation, and reviewer completion.
+- Reviewer job events: `claimed` at `2026-07-15T13:58:09.395Z`, then `completed` at `2026-07-15T13:58:47.840Z`. Both assigned queue events changed to `acknowledged`.
+- Terminal notification: `37c22d8599c51414b0f94a917c54e02f62c88daff8a519f499feafd6543b49f6` (`reviewed_no_lesson`).
+- Follow-up turn: `019f6613-67d5-7ae3-8e5d-b83ef5fdc480`. The parent conversation visibly emitted `[AFL] 已复核，本次未形成长期经验 · job=b196ca · receipt=37c22d`; Stop marked it `observed` at `2026-07-15T13:59:38.626Z`.
+- Final per-session counts: 6 captured events, 1 reviewer job, 2 review lifecycle receipts, and both receipts observed.
+
+### Installation-Preexisting Long-Lived Task
+
+- Codex task/session: `019f4063-223d-7b71-837c-6bab4fa49069`, created on 2026-07-08 before the 0.7.6 install.
+- Before the hot-load check, terminal notification `ea028b1f5449d6ff167c599b2f7a3f1c995cdc719a3954e687dd25b8d9d90045` for completed job `e93408b42fb84ceca771b3c1b84222a32bff9567fb7ffd936bf7ad6811272f4c` was `pending`.
+- A no-tool/no-file top-level follow-up created turn `019f6614-786b-76e0-9553-127f3984aa61` and visibly emitted `[AFL] 已复核，本次未形成长期经验 · job=e93408 · receipt=ea028b` in the parent conversation.
+- Stop marked the notification `observed` at `2026-07-15T14:01:01.006Z` and captured the assistant reply in the same native turn.
+- This proves the pre-install desktop task loaded the current user-level hook on its later turn; no restart was needed for this tested task. It does not claim that every currently running turn can replace an already-started hook process mid-turn.
+
+### Trigger Boundary Observed During Acceptance
+
+- Same-turn steering and a fresh prompt after `turn_aborted` are structural immediate-review signals. They create a job and queued receipt without invoking an LLM classifier on every ordinary prompt.
+- A correction sent only after a prior turn has completed is captured but is not structurally immediate; it remains in the batch queue until the normal review threshold/age policy is due. This is intentional token control, but it is also a product boundary: completed-turn dissatisfaction does not currently receive an immediate queued receipt.
+- Child-agent prompt/Stop payloads are bypassed before opening the store, so they cannot capture feedback, claim a parent receipt, or mark it observed. The regression tests for both child-agent boundaries passed in the 198-test suite.
+
+### Final Scope Result
+
+- Task 3 Codex vertical acceptance is complete: correction -> captured -> assigned queue -> detached reviewer -> parent-chat queue receipt -> Stop observed -> terminal parent-chat receipt -> Stop observed.
+- Native system notifications, audit CLI, Claude/Gemini expansion, and a semantic immediate classifier for already-completed-turn dissatisfaction remain paused by scope and are not claimed here.
+
+### Final Verification
+
+- Three consecutive full-suite reruns completed with `198 passed, 0 failed`; the final TAP run exited 0 in `39.7s`.
+- One earlier diagnostic TAP run reported `197 passed, 1 failed`, but its failing subtest was not retained by the tail-only command and the failure did not reproduce in the next three complete runs. This remains a recorded test-flake risk rather than being omitted from the acceptance record.
+- `sh -n templates/hooks/core-hook.sh templates/hooks/stop-hook.sh templates/hooks/trigger-rules.sh`: exit 0.
+- `node --check src/cli.mjs`: exit 0.
+- `git diff --check`: exit 0 before the report-only final update.
+- `npm pack --dry-run`: exit 0, package `agent-feedback-loop@0.7.6`, 32 files.
+- Installed runtime, core hook, and Stop hook SHA-256 values match the tracked source files exactly.
+- Independent scoped review found no remaining Critical or Important issue in the Task 3 parent-conversation boundary.
