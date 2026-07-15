@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { captureObservedSession, credentialContextTokenHashes, normalizeHookEvent, normalizeStopEvent, redactText } from "./capture.mjs";
+import { stripReceiptControlText } from "./receipt.mjs";
 
 const DEFAULT_INITIAL_TAIL_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_SCAN_BYTES = 64 * 1024 * 1024;
@@ -301,7 +302,9 @@ function parseTranscriptLines(lines, state, candidate, interruptionWindowMs) {
         state.assistantSinceLastUser = false;
         state.sensitiveTokenHashes = credentialContextTokenHashes(text);
       } else if (role === "assistant") {
-        state.assistantTail = redactText(`${state.assistantTail}${state.assistantTail ? "\n" : ""}${text}`, {
+        const semanticText = stripReceiptControlText(text);
+        if (!semanticText.trim()) continue;
+        state.assistantTail = redactText(`${state.assistantTail}${state.assistantTail ? "\n" : ""}${semanticText}`, {
           blockedTokenHashes: state.sensitiveTokenHashes
         }).text.slice(-MAX_ASSISTANT_STATE_CHARS);
         state.assistantSinceLastUser = true;

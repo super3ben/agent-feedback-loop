@@ -341,6 +341,37 @@ test("control records are not misclassified as user feedback", async () => {
   store.close();
 });
 
+test("receipt control transcript capture skips synthetic output and preserves mixed semantic output", async () => {
+  const { transcript, store, blobs, candidate } = await fixture("receipt-control");
+  const control = [
+    "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e",
+    "<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
+  ].join("\n");
+  await writeFile(transcript, [
+    turnContext("2026-07-14T12:00:00.000Z", "turn-receipt", candidate.cwd),
+    message("2026-07-14T12:00:01.000Z", "assistant", control, "msg-receipt-only", "turn-receipt"),
+    message("2026-07-14T12:00:02.000Z", "assistant", `normal answer\n${control}`, "msg-receipt-mixed", "turn-receipt")
+  ].join(""), { mode: 0o600 });
+
+  const result = await reconcileCodexTranscripts({
+    store,
+    blobs,
+    candidates: [candidate],
+    reviewMinEntries: 99,
+    launchReviewer: async () => assert.fail("receipt controls must not start a reviewer")
+  });
+
+  assert.equal(result.eventsCaptured, 1);
+  assert.equal(store.pendingReviewEventCount(candidate.cwd), 0);
+  assert.equal(store.listSessionEvents(candidate.cwd).some((event) => event.redacted_text?.includes("[AFL]")), false);
+  assert.deepEqual(
+    store.listSessionEvents(candidate.cwd).filter((event) => event.role === "assistant").map((event) => event.redacted_text),
+    ["normal answer"]
+  );
+  assert.equal(store.getTranscriptCursor("codex", transcript).offset, (await stat(transcript)).size);
+  store.close();
+});
+
 test("disabled capture skips transcript IO and oversized records produce an explicit coverage gap", async () => {
   const disabled = await fixture("disabled-before-read");
   disabled.store.setCapturePolicy({ enabled: false, revision: 2 });

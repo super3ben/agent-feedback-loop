@@ -123,6 +123,29 @@ test("detects same-turn user steering after assistant output without matching wo
   });
 });
 
+test("does not treat a receipt-only assistant transcript message as a steering referent", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-signal-receipt-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-active" } }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e\n<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
+        }]
+      }
+    })
+  ].join("\n"), "utf8");
+
+  const signal = await detectStructuralFeedbackSignal({ transcript_path: transcript, turn_id: "turn-active" });
+
+  assert.deepEqual(signal, { immediateReview: false, reason: "none" });
+});
+
 test("same-turn requirement additions before assistant output stay on the batch path", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-signal-addition-"));
   const transcript = path.join(home, "rollout.jsonl");
@@ -325,6 +348,38 @@ test("normalizes stop payloads into assistant evidence with honest completeness"
   assert.equal(claude.capture_completeness, "partial");
   assert.equal(gemini.tool_name, "write_file");
   assert.deepEqual(gemini.file_refs, ["src/a.js"]);
+});
+
+test("receipt control stop capture excludes synthetic receipt-only and preserves mixed assistant output", async () => {
+  const { store, blobs } = await fixture();
+  const projectId = "/tmp/receipt-stop-project";
+  const control = [
+    "[AFL] Review completed · severity=Major · lessons=1 · job=7e876e",
+    "<!--afl-receipt id=notification-1234567890 nonce=0123456789abcdef state=review_completed-->"
+  ].join("\n");
+  const normalized = normalizeStopEvent({
+    cli: "codex",
+    installationId: "install-receipt",
+    payload: { session_id: "receipt-stop", turn_id: "1", cwd: projectId, last_assistant_message: control }
+  });
+
+  assert.equal(normalized.redacted_text, "");
+  await captureSession({ store, blobs, event: normalized, rawText: control });
+  assert.equal(store.pendingReviewEventCount(projectId), 0);
+  assert.equal(store.listSessionEvents(projectId).some((event) => event.redacted_text?.includes("[AFL]")), false);
+
+  const mixed = normalizeStopEvent({
+    cli: "codex",
+    installationId: "install-receipt",
+    payload: {
+      session_id: "receipt-stop-mixed",
+      turn_id: "2",
+      cwd: projectId,
+      last_assistant_message: `normal answer\n${control}`
+    }
+  });
+  assert.equal(mixed.redacted_text, "normal answer");
+  store.close();
 });
 
 test("extracts a bounded redacted assistant excerpt from transcript-only stop evidence", () => {

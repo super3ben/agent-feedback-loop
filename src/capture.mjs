@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 
+import { stripReceiptControlText } from "./receipt.mjs";
+
 const SECRET_PATTERNS = [
   { name: "token", pattern: /(token|api[_-]?key|secret)\s*[=:]\s*([^\s,;]+)/gi },
   { name: "password", pattern: /(password|passwd)\s*[=:]\s*([^\s,;]+)/gi },
@@ -104,7 +106,7 @@ export async function detectStructuralFeedbackSignal(payload, {
     if (record?.type === "response_item" && record.payload?.type === "message") {
       const messageTurn = String(record.payload.internal_chat_message_metadata_passthrough?.turn_id || transcriptTurn || "");
       if (currentTurn && messageTurn === currentTurn && record.payload.role === "assistant") {
-        const assistantText = textFromValue(record.payload.content || record.payload.text || record.payload.message).trim();
+        const assistantText = stripReceiptControlText(textFromValue(record.payload.content || record.payload.text || record.payload.message)).trim();
         if (assistantText) {
           const timestamp = record.timestamp || null;
           const derivedId = createHash("sha256")
@@ -243,7 +245,7 @@ export function normalizeStopEvent({ cli, payload, installationId = "unknown", c
   const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
   const nativeTurn = String(input.turn_id || input.turnId || input.native_turn || "unknown");
   const sourceEventId = String(input.event_id || input.eventId || `stop:${nativeTurn}`);
-  const text = String(input.last_assistant_message || input.assistant_response || input.prompt_response || input.response || input.output || input.transcript_excerpt || "");
+  const text = stripReceiptControlText(input.last_assistant_message || input.assistant_response || input.prompt_response || input.response || input.output || input.transcript_excerpt || "");
   const redacted = redactText(text);
   const eventSeq = Number.parseInt(createHash("sha256").update(`stop\u0000${sourceEventId}`).digest("hex").slice(0, 8), 16) || 1;
   const projectId = input.cwd || input.project_id || `unscoped:${cli}:${createHash("sha256").update(nativeSessionId).digest("hex").slice(0, 16)}`;
