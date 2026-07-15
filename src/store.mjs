@@ -4,6 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 
 import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.mjs";
+import { containsReceiptMarker, detectReceiptLanguage, validateReceiptPayload } from "./receipt.mjs";
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 import { validateReviewQuality } from "./lessons.mjs";
@@ -157,7 +158,7 @@ function ensurePrivateDirectorySync(directory, label) {
   chmodSync(directory, 0o700);
 }
 
-export function openStore({ paths, now = () => new Date() }) {
+export function openStore({ paths, now = () => new Date(), receiptLanguage = process.env.AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE || "auto" }) {
   if (!DatabaseSync) throw new Error("transactional SQLite backend unavailable; Node.js 24.15 or newer is required");
   if (!paths?.storeFile) throw new TypeError("paths.storeFile is required");
   const dbPath = paths.storeFile;
@@ -196,6 +197,7 @@ export function openStore({ paths, now = () => new Date() }) {
     "ALTER TABLE reviewer_jobs ADD COLUMN capability_hash TEXT",
     "ALTER TABLE reviewer_jobs ADD COLUMN capability_expires_at INTEGER",
     "ALTER TABLE reviewer_jobs ADD COLUMN capability_consumed_at INTEGER",
+    "ALTER TABLE reviewer_jobs ADD COLUMN reviewer_provider TEXT",
     "ALTER TABLE lessons ADD COLUMN responsibility TEXT",
     "ALTER TABLE lessons ADD COLUMN confidence TEXT",
     "ALTER TABLE lessons ADD COLUMN method_class TEXT",
@@ -244,9 +246,283 @@ export function openStore({ paths, now = () => new Date() }) {
     return { revision, enabled };
   };
 
+  const notificationIdFor = ({ sessionUid, contextEpoch, kind, jobId, eventUid, applicationId }) => createHash("sha256")
+    .update(["notification:v1", sessionUid, contextEpoch, kind, jobId || "", eventUid || "", applicationId || ""].join("\u0000"))
+    .digest("hex");
+
+  const notificationLanguage = ({ language, jobId, eventUid, sessionUid }) => {
+    if (language !== undefined && language !== null) return detectReceiptLanguage("", language);
+    if (jobId) {
+      const inherited = db.prepare("SELECT language FROM notification_outbox WHERE job_id=? ORDER BY created_at, notification_id LIMIT 1").get(jobId);
+      if (inherited) return inherited.language;
+    }
+    const source = eventUid
+      ? db.prepare("SELECT redacted_text FROM session_events WHERE event_uid=?").get(eventUid)
+      : db.prepare("SELECT redacted_text FROM session_events WHERE session_uid=? AND role='user' ORDER BY event_seq DESC, rowid DESC LIMIT 1").get(sessionUid);
+    return detectReceiptLanguage(source?.redacted_text, receiptLanguage);
+  };
+
+  const createNotificationInTransaction = ({
+    sessionUid, contextEpoch, kind, jobId = null, eventUid = null, applicationId = null,
+    payload = {}, language
+  }) => {
+    const safePayload = validateReceiptPayload(kind, payload);
+    const safeSessionUid = ensureString(sessionUid, "sessionUid");
+    const safeContextEpoch = Math.max(1, Math.floor(Number(contextEpoch) || 1));
+    const notificationId = notificationIdFor({
+      sessionUid: safeSessionUid, contextEpoch: safeContextEpoch, kind, jobId, eventUid, applicationId
+    });
+    const resolvedLanguage = notificationLanguage({ language, jobId, eventUid, sessionUid: safeSessionUid });
+    const systemState = ["review_completed", "reviewed_no_lesson", "review_exhausted"].includes(kind) ? "pending" : "not_applicable";
+    const timestamp = nowIso(now);
+    db.prepare(`INSERT INTO notification_outbox
+      (notification_id, session_uid, context_epoch, job_id, event_uid, application_id, kind,
+       payload_json, language, system_state, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT DO NOTHING`).run(
+      notificationId, safeSessionUid, safeContextEpoch, jobId, eventUid, applicationId, kind,
+      JSON.stringify(safePayload), resolvedLanguage, systemState, systemState === "pending" ? 0 : null, timestamp, timestamp
+    );
+    if (kind === "review_queued") {
+      db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?
+        WHERE session_uid=? AND context_epoch=? AND kind='candidate_captured'
+          AND chat_state IN ('pending','emitted','emitted_unconfirmed') AND (? IS NULL OR event_uid=?)`).run(
+        timestamp, safeSessionUid, safeContextEpoch, eventUid, eventUid
+      );
+    } else if (["review_completed", "reviewed_no_lesson", "review_exhausted"].includes(kind)) {
+      db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?
+        WHERE session_uid=? AND context_epoch=? AND kind IN ('candidate_captured','review_queued')
+          AND chat_state IN ('pending','emitted_unconfirmed')
+          AND (job_id=? OR (kind='candidate_captured' AND event_uid IN (
+            SELECT event_uid FROM notification_outbox WHERE job_id=? AND kind='review_queued'
+          )) OR (kind='candidate_captured' AND event_uid IN (
+            SELECT event_uid FROM queue_events WHERE job_id=?
+          )))`).run(
+        timestamp, safeSessionUid, safeContextEpoch, jobId, jobId, jobId
+      );
+    }
+    return db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(notificationId);
+  };
+
+  const asNotificationRef = (row) => ({
+    notification_id: row.notification_id,
+    kind: row.kind,
+    session_uid: row.session_uid
+  });
+
+  const recordReviewerJobEventInTransaction = (job, state, reasonCode = null) => {
+    const jobEventId = createHash("sha256")
+      .update(["reviewer-job-event:v1", job.job_id, job.lease_epoch, state, reasonCode || ""].join("\u0000"))
+      .digest("hex");
+    db.prepare(`INSERT OR IGNORE INTO reviewer_job_events
+      (job_event_id, job_id, attempt, lease_epoch, state, provider, reason_code, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      jobEventId, job.job_id, Number(job.attempt), Number(job.lease_epoch), state,
+      job.reviewer_provider || null, reasonCode, nowIso(now)
+    );
+    return db.prepare("SELECT * FROM reviewer_job_events WHERE job_event_id=?").get(jobEventId);
+  };
+
+  const notificationSessionsForJob = (jobId) => db.prepare(`SELECT DISTINCT n.session_uid, n.context_epoch
+    FROM notification_outbox n
+    WHERE (n.job_id=? AND n.kind='review_queued')
+       OR (n.kind='candidate_captured' AND n.event_uid IN (SELECT event_uid FROM queue_events WHERE job_id=?))
+    ORDER BY n.session_uid, n.context_epoch`).all(jobId, jobId);
+
+  const createExhaustedNotificationsInTransaction = (jobId, reasonCode) => notificationSessionsForJob(jobId).map((session) =>
+    createNotificationInTransaction({
+      sessionUid: session.session_uid,
+      contextEpoch: session.context_epoch,
+      jobId,
+      kind: "review_exhausted",
+      payload: { reason_code: reasonCode }
+    })
+  );
+
+  const createQueueNotificationInTransaction = (jobId, eventUid) => {
+    const source = db.prepare("SELECT session_uid, context_epoch FROM session_events WHERE event_uid=?").get(eventUid);
+    if (!source) return [];
+    return [createNotificationInTransaction({
+      sessionUid: source.session_uid,
+      contextEpoch: source.context_epoch,
+      jobId,
+      eventUid,
+      kind: "review_queued",
+      payload: {}
+    })];
+  };
+
   return {
     path: dbPath,
     capability: { backend: "node:sqlite", schemaVersion: SCHEMA_VERSION },
+    createNotification(input) {
+      return transaction(() => createNotificationInTransaction(input));
+    },
+    listNotifications({ sessionUid, jobId } = {}) {
+      if (sessionUid !== undefined && jobId !== undefined) {
+        return db.prepare("SELECT * FROM notification_outbox WHERE session_uid=? AND job_id=? ORDER BY created_at, notification_id").all(sessionUid, jobId);
+      }
+      if (sessionUid !== undefined) return db.prepare("SELECT * FROM notification_outbox WHERE session_uid=? ORDER BY created_at, notification_id").all(sessionUid);
+      if (jobId !== undefined) return db.prepare("SELECT * FROM notification_outbox WHERE job_id=? ORDER BY created_at, notification_id").all(jobId);
+      return db.prepare("SELECT * FROM notification_outbox ORDER BY created_at, notification_id").all();
+    },
+    listReviewerJobEvents(jobId) {
+      return db.prepare("SELECT * FROM reviewer_job_events WHERE job_id=? ORDER BY created_at, rowid").all(ensureString(jobId, "jobId"));
+    },
+    setReviewerProvider({ jobId, provider }) {
+      if (!["codex", "claude", "gemini", "explicit_command", "prompt_subagent"].includes(provider)) {
+        throw new TypeError("reviewer provider is invalid");
+      }
+      return transaction(() => db.prepare(`UPDATE reviewer_jobs SET reviewer_provider=?, updated_at=?
+        WHERE job_id=? AND status IN ('pending','running')`).run(provider, nowIso(now), ensureString(jobId, "jobId")).changes === 1);
+    },
+    claimChatNotification({ sessionUid, contextEpoch, nativeTurnId }) {
+      return transaction(() => {
+        const safeSessionUid = ensureString(sessionUid, "sessionUid");
+        const safeTurnId = ensureString(nativeTurnId, "nativeTurnId");
+        const safeContextEpoch = Math.max(1, Math.floor(Number(contextEpoch) || 1));
+        const alreadyBound = db.prepare(`SELECT 1 FROM notification_outbox
+          WHERE session_uid=? AND context_epoch=? AND chat_turn_id=? LIMIT 1`).get(
+          safeSessionUid, safeContextEpoch, safeTurnId
+        );
+        if (alreadyBound) return null;
+        const row = db.prepare(`SELECT * FROM notification_outbox
+          WHERE session_uid=? AND context_epoch=?
+            AND (chat_state='pending' OR (chat_state='emitted_unconfirmed' AND chat_emit_attempts=1))
+          ORDER BY CASE kind
+            WHEN 'review_completed' THEN 0 WHEN 'reviewed_no_lesson' THEN 0 WHEN 'review_exhausted' THEN 0
+            WHEN 'review_queued' THEN 1 WHEN 'candidate_captured' THEN 2 WHEN 'lesson_delivered' THEN 3 ELSE 4 END,
+            created_at, notification_id LIMIT 1`).get(safeSessionUid, safeContextEpoch);
+        if (!row) return null;
+        const timestamp = nowIso(now);
+        const updated = db.prepare(`UPDATE notification_outbox
+          SET chat_state='emitted', chat_turn_id=?, chat_emit_attempts=chat_emit_attempts+1,
+              chat_block_attempted=0, chat_emitted_at=?, updated_at=?
+          WHERE notification_id=?
+            AND (chat_state='pending' OR (chat_state='emitted_unconfirmed' AND chat_emit_attempts=1))`).run(
+          safeTurnId, timestamp, timestamp, row.notification_id
+        );
+        if (updated.changes !== 1) return null;
+        return db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(row.notification_id);
+      });
+    },
+    confirmChatNotification({ sessionUid, contextEpoch, nativeTurnId, transcriptText }) {
+      return transaction(() => {
+        const row = db.prepare(`SELECT * FROM notification_outbox
+          WHERE session_uid=? AND context_epoch=? AND chat_turn_id=? AND chat_state='emitted'
+          ORDER BY chat_emitted_at DESC, notification_id LIMIT 1`).get(
+          ensureString(sessionUid, "sessionUid"), Math.max(1, Math.floor(Number(contextEpoch) || 1)),
+          ensureString(nativeTurnId, "nativeTurnId")
+        );
+        if (!row) return { action: "pass", notification: null };
+        const timestamp = nowIso(now);
+        if (containsReceiptMarker(transcriptText, row)) {
+          db.prepare(`UPDATE notification_outbox SET chat_state='observed', chat_observed_at=?, updated_at=?
+            WHERE notification_id=? AND chat_state='emitted' AND chat_turn_id=?`).run(
+            timestamp, timestamp, row.notification_id, nativeTurnId
+          );
+          return { action: "observed", notification: db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(row.notification_id) };
+        }
+        if (Number(row.chat_block_attempted) === 0) {
+          db.prepare(`UPDATE notification_outbox SET chat_block_attempted=1, updated_at=?
+            WHERE notification_id=? AND chat_state='emitted' AND chat_turn_id=? AND chat_block_attempted=0`).run(
+            timestamp, row.notification_id, nativeTurnId
+          );
+          return { action: "block", notification: db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(row.notification_id) };
+        }
+        db.prepare(`UPDATE notification_outbox SET chat_state='emitted_unconfirmed', updated_at=?
+          WHERE notification_id=? AND chat_state='emitted' AND chat_turn_id=? AND chat_block_attempted=1`).run(
+          timestamp, row.notification_id, nativeTurnId
+        );
+        return { action: "pass_unconfirmed", notification: db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(row.notification_id) };
+      });
+    },
+    claimSystemNotifications({ ownerId, nowMs = Date.now(), leaseMs = 120_000, limit = 8 }) {
+      return transaction(() => {
+        const safeOwnerId = ensureString(ownerId, "ownerId");
+        const safeNowMs = Number(nowMs);
+        const safeLeaseMs = Math.max(1, Math.floor(Number(leaseMs) || 120_000));
+        const safeLimit = Math.max(1, Math.min(256, Math.floor(Number(limit) || 8)));
+        if (!Number.isFinite(safeNowMs)) throw new TypeError("nowMs must be finite");
+        const rows = db.prepare(`SELECT * FROM notification_outbox
+          WHERE ((system_state IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+            OR (system_state='delivering' AND system_lease_until IS NOT NULL AND system_lease_until<=?))
+          ORDER BY COALESCE(next_attempt_at, 0), created_at, notification_id LIMIT ?`).all(safeNowMs, safeNowMs, safeLimit);
+        const claimed = [];
+        const timestamp = nowIso(now);
+        for (const row of rows) {
+          const result = db.prepare(`UPDATE notification_outbox
+            SET system_state='delivering', system_owner=?, system_lease_until=?, system_attempts=system_attempts+1,
+                system_reason_code=NULL, updated_at=?
+            WHERE notification_id=? AND (
+              (system_state IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+              OR (system_state='delivering' AND system_lease_until IS NOT NULL AND system_lease_until<=?)
+            )`).run(safeOwnerId, safeNowMs + safeLeaseMs, timestamp, row.notification_id, safeNowMs, safeNowMs);
+          if (result.changes === 1) claimed.push(db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(row.notification_id));
+        }
+        return claimed;
+      });
+    },
+    completeSystemNotification({ notificationId, ownerId, deliveredAt = nowIso(now) }) {
+      return transaction(() => db.prepare(`UPDATE notification_outbox
+        SET system_state='delivered', system_owner=NULL, system_lease_until=NULL, next_attempt_at=NULL,
+            system_reason_code=NULL, system_delivered_at=?, updated_at=?
+        WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
+        deliveredAt, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+      ).changes === 1);
+    },
+    failSystemNotification({ notificationId, ownerId, reasonCode, nowMs = Date.now() }) {
+      return transaction(() => {
+        const safeReasonCode = ensureString(reasonCode, "reasonCode");
+        if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+        const safeNowMs = Number(nowMs);
+        if (!Number.isFinite(safeNowMs)) throw new TypeError("nowMs must be finite");
+        const row = db.prepare(`SELECT system_attempts FROM notification_outbox
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).get(
+          ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+        );
+        if (!row) return false;
+        const delay = Math.min(21_600_000, 60_000 * (2 ** Math.max(0, Number(row.system_attempts) - 1)));
+        return db.prepare(`UPDATE notification_outbox
+          SET system_state='failed', system_owner=NULL, system_lease_until=NULL, next_attempt_at=?,
+              system_reason_code=?, updated_at=?
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
+          safeNowMs + delay, safeReasonCode, nowIso(now), notificationId, ownerId
+        ).changes === 1;
+      });
+    },
+    markSystemNotificationUnsupported({ notificationId, ownerId, reasonCode }) {
+      return transaction(() => {
+        const safeReasonCode = ensureString(reasonCode, "reasonCode");
+        if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+        return db.prepare(`UPDATE notification_outbox
+          SET system_state='unsupported', system_owner=NULL, system_lease_until=NULL, next_attempt_at=NULL,
+              system_reason_code=?, updated_at=?
+          WHERE notification_id=? AND system_state='delivering' AND system_owner=?`).run(
+          safeReasonCode, nowIso(now), ensureString(notificationId, "notificationId"), ensureString(ownerId, "ownerId")
+        ).changes === 1;
+      });
+    },
+    suppressPendingChatNotifications({ sessionUid, contextEpoch }) {
+      return transaction(() => db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?
+        WHERE session_uid=? AND context_epoch=? AND chat_state='pending'`).run(
+        nowIso(now), ensureString(sessionUid, "sessionUid"), Math.max(1, Math.floor(Number(contextEpoch) || 1))
+      ).changes);
+    },
+    suppressDueSystemNotifications({ nowMs = Date.now(), reasonCode }) {
+      return transaction(() => {
+        const safeReasonCode = ensureString(reasonCode, "reasonCode");
+        if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+        const safeNowMs = Number(nowMs);
+        if (!Number.isFinite(safeNowMs)) throw new TypeError("nowMs must be finite");
+        return db.prepare(`UPDATE notification_outbox
+          SET system_state='suppressed', system_owner=NULL, system_lease_until=NULL,
+              system_reason_code=?, updated_at=?
+          WHERE system_state IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at<=?)`).run(
+          safeReasonCode, nowIso(now), safeNowMs
+        ).changes;
+      });
+    },
     getCapturePolicy() { return currentPolicy(); },
     setRuntimeStatus(name, value) {
       return transaction(() => {
@@ -598,13 +874,47 @@ export function openStore({ paths, now = () => new Date() }) {
     hasDelivery(applicationId) {
       return Boolean(db.prepare("SELECT 1 FROM delivery_receipts WHERE application_id=? AND state IN ('emitted','observed')").get(applicationId));
     },
-    recordDelivery({ application_id, lesson_id, revision, session_uid, context_epoch, state, observed = false, nonce = null }) {
+    recordDeliveries({ deliveries, sessionUid, contextEpoch, language }) {
+      if (!Array.isArray(deliveries) || deliveries.length === 0) throw new TypeError("deliveries must be a non-empty array");
       return transaction(() => {
-        db.prepare(`INSERT INTO delivery_receipts(application_id, lesson_id, revision, session_uid, context_epoch, nonce, state, observed, created_at)
+        const safeSessionUid = ensureString(sessionUid, "sessionUid");
+        const safeContextEpoch = Math.max(1, Math.floor(Number(contextEpoch) || 1));
+        const timestamp = nowIso(now);
+        db.prepare(`INSERT OR IGNORE INTO sessions
+          (session_uid, cli, native_session_id, installation_id, project_id, context_epoch, started_at)
+          VALUES (?, 'unknown', NULL, 'unknown', NULL, ?, ?)`).run(safeSessionUid, safeContextEpoch, timestamp);
+        const upsert = db.prepare(`INSERT INTO delivery_receipts
+          (application_id, lesson_id, revision, session_uid, context_epoch, nonce, state, observed, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(application_id) DO UPDATE SET nonce=excluded.nonce, state=excluded.state, observed=excluded.observed`).run(
-          application_id, lesson_id, revision, session_uid, context_epoch, nonce, state, observed ? 1 : 0, nowIso(now)
-        );
+          ON CONFLICT(application_id) DO UPDATE SET nonce=excluded.nonce, state=excluded.state, observed=excluded.observed`);
+        let inserted = 0;
+        for (const delivery of deliveries) {
+          const exists = db.prepare("SELECT 1 FROM delivery_receipts WHERE application_id=?").get(delivery.application_id);
+          upsert.run(
+            ensureString(delivery.application_id, "application_id"), ensureString(delivery.lesson_id, "lesson_id"),
+            Number(delivery.revision), safeSessionUid, safeContextEpoch, delivery.nonce || null,
+            delivery.state || "emitted", delivery.observed ? 1 : 0, timestamp
+          );
+          if (!exists) inserted += 1;
+        }
+        const applicationId = [...deliveries].map((item) => String(item.application_id)).sort()[0];
+        const notification = createNotificationInTransaction({
+          sessionUid: safeSessionUid,
+          contextEpoch: safeContextEpoch,
+          applicationId,
+          kind: "lesson_delivered",
+          payload: { lesson_count: deliveries.length },
+          language
+        });
+        return { inserted, notification };
+      });
+    },
+    recordDelivery({ application_id, lesson_id, revision, session_uid, context_epoch, state, observed = false, nonce = null, language }) {
+      return this.recordDeliveries({
+        deliveries: [{ application_id, lesson_id, revision, state, observed, nonce }],
+        sessionUid: session_uid,
+        contextEpoch: context_epoch,
+        language
       });
     },
     observeDeliveryNonces({ session_uid, context_epoch, transcriptText }) {
@@ -663,7 +973,7 @@ export function openStore({ paths, now = () => new Date() }) {
           ? db.prepare("SELECT event_uid, job_id FROM queue_events WHERE event_uid=? AND project_id=? AND status='pending'").get(immediateEventUid, projectId)
           : null;
         if (immediateEventUid && !immediateEvent) {
-          return { status: "not_due", eventCount: this.pendingReviewEventCount(projectId), immediate: true, reason: "immediate_event_unavailable" };
+          return { status: "not_due", eventCount: this.pendingReviewEventCount(projectId), immediate: true, reason: "immediate_event_unavailable", notificationRefs: [] };
         }
 
         const alreadyAssigned = immediateEvent?.job_id
@@ -671,13 +981,14 @@ export function openStore({ paths, now = () => new Date() }) {
           : null;
         if (alreadyAssigned) {
           const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, alreadyAssigned.job_id).count);
-          return { job_id: alreadyAssigned.job_id, status: alreadyAssigned.status, eventCount: count, existing: true, immediate: true };
+          const notifications = createQueueNotificationInTransaction(alreadyAssigned.job_id, immediateEventUid);
+          return { job_id: alreadyAssigned.job_id, status: alreadyAssigned.status, eventCount: count, existing: true, immediate: true, notificationRefs: notifications.map(asNotificationRef) };
         }
 
         const existing = db.prepare("SELECT job_id, status, wake_attempt FROM reviewer_jobs WHERE project_id=? AND status IN ('pending','running') ORDER BY created_at DESC LIMIT 1").get(projectId);
         if (existing && !immediateEvent) {
           const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
-          return { job_id: existing.job_id, status: existing.status, eventCount: count, existing: true };
+          return { job_id: existing.job_id, status: existing.status, eventCount: count, existing: true, notificationRefs: [] };
         }
         if (existing?.status === "pending" && Number(existing.wake_attempt || 0) === 0 && immediateEvent) {
           const assigned = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
@@ -687,27 +998,29 @@ export function openStore({ paths, now = () => new Date() }) {
           }
           db.prepare("UPDATE queue_events SET job_id=? WHERE event_uid=? AND project_id=? AND status='pending' AND job_id IS NULL").run(existing.job_id, immediateEventUid, projectId);
           const count = Number(db.prepare("SELECT COUNT(*) AS count FROM queue_events WHERE project_id=? AND job_id=?").get(projectId, existing.job_id).count);
-          return { job_id: existing.job_id, status: "pending", eventCount: count, existing: true, immediate: true };
+          const notifications = createQueueNotificationInTransaction(existing.job_id, immediateEventUid);
+          return { job_id: existing.job_id, status: "pending", eventCount: count, existing: true, immediate: true, notificationRefs: notifications.map(asNotificationRef) };
         }
 
         const latest = db.prepare("SELECT created_at FROM reviewer_jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1").get(projectId);
         const oldest = db.prepare("SELECT MIN(created_at) AS created_at FROM queue_events WHERE project_id=? AND status='pending'").get(projectId);
         const count = this.pendingReviewEventCount(projectId);
         if (!oldest?.created_at || (!immediateEvent && latest?.created_at && (Date.now() - Date.parse(latest.created_at)) < cooldownMs) || (!immediateEvent && count < minEntries && (Date.now() - Date.parse(oldest.created_at)) < maxAgeMs)) {
-          return { status: "not_due", eventCount: count };
+          return { status: "not_due", eventCount: count, notificationRefs: [] };
         }
         const ids = immediateEvent
           ? db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND status='pending' AND job_id IS NULL ORDER BY CASE WHEN event_uid=? THEN 0 ELSE 1 END, created_at, event_uid LIMIT ?").all(projectId, immediateEventUid, boundedMaxEntries).map((row) => row.event_uid)
           : db.prepare("SELECT event_uid FROM queue_events WHERE project_id=? AND status='pending' AND job_id IS NULL ORDER BY created_at, event_uid LIMIT ?").all(projectId, boundedMaxEntries).map((row) => row.event_uid);
         if (ids.length === 0 || (immediateEvent && !ids.includes(immediateEventUid))) {
-          return { status: "not_due", eventCount: count, immediate: Boolean(immediateEvent), reason: "no_assignable_events" };
+          return { status: "not_due", eventCount: count, immediate: Boolean(immediateEvent), reason: "no_assignable_events", notificationRefs: [] };
         }
         const jobId = createHash("sha256").update([promptVersion, projectId, ids[0], ids.at(-1)].join("\u0000")).digest("hex");
         const timestamp = nowIso(now);
         db.prepare("INSERT INTO reviewer_jobs(job_id, project_id, prompt_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?)").run(jobId, projectId, promptVersion, timestamp, timestamp);
         const assign = db.prepare("UPDATE queue_events SET job_id=? WHERE event_uid=? AND status='pending' AND job_id IS NULL");
         for (const eventUid of ids) assign.run(jobId, eventUid);
-        return { job_id: jobId, status: "pending", eventCount: ids.length, existing: false, immediate: Boolean(immediateEvent) };
+        const notifications = immediateEvent ? createQueueNotificationInTransaction(jobId, immediateEventUid) : [];
+        return { job_id: jobId, status: "pending", eventCount: ids.length, existing: false, immediate: Boolean(immediateEvent), notificationRefs: notifications.map(asNotificationRef) };
       });
     },
     submitReviewerJob(input) {
@@ -736,20 +1049,38 @@ export function openStore({ paths, now = () => new Date() }) {
         ORDER BY j.updated_at, j.job_id LIMIT ?`).all(boundedAttempts, nowMs, nowMs, boundedLimit);
     },
     requeueExpiredReviewerJob({ jobId, nowMs = Date.now() }) {
-      return transaction(() => db.prepare(`UPDATE reviewer_jobs
-        SET status='pending', owner_id=NULL, lease_until=NULL, reason_code='lease_expired', updated_at=?
-        WHERE job_id=? AND status='running' AND lease_until IS NOT NULL AND lease_until<=?`).run(
-        nowIso(now), jobId, nowMs
-      ).changes === 1);
+      return transaction(() => {
+        const job = db.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?").get(jobId);
+        if (!job) return false;
+        const changed = db.prepare(`UPDATE reviewer_jobs
+          SET status='pending', owner_id=NULL, lease_until=NULL, reason_code='lease_expired', updated_at=?
+          WHERE job_id=? AND status='running' AND lease_until IS NOT NULL AND lease_until<=?`).run(
+          nowIso(now), jobId, nowMs
+        ).changes === 1;
+        if (changed) recordReviewerJobEventInTransaction(job, "requeued", "lease_expired");
+        return changed;
+      });
     },
     failExhaustedReviewerJobs({ nowMs = Date.now(), maxAttempts = 3 } = {}) {
       const boundedAttempts = Math.max(1, Math.floor(Number(maxAttempts) || 3));
-      return transaction(() => db.prepare(`UPDATE reviewer_jobs
-        SET status='failed', reason_code='retry_exhausted', owner_id=NULL, lease_until=NULL, updated_at=?
-        WHERE attempt>=? AND (
+      return transaction(() => {
+        const jobs = db.prepare(`SELECT * FROM reviewer_jobs WHERE attempt>=? AND (
           (status='pending' AND (next_wake_at IS NULL OR next_wake_at<=?))
           OR (status='running' AND lease_until IS NOT NULL AND lease_until<=?)
-        )`).run(nowIso(now), boundedAttempts, nowMs, nowMs).changes);
+        ) ORDER BY created_at, job_id`).all(boundedAttempts, nowMs, nowMs);
+        let count = 0;
+        const notifications = [];
+        for (const job of jobs) {
+          const changed = db.prepare(`UPDATE reviewer_jobs
+            SET status='failed', reason_code='retry_exhausted', owner_id=NULL, lease_until=NULL, updated_at=?
+            WHERE job_id=? AND status=? AND lease_epoch=?`).run(nowIso(now), job.job_id, job.status, job.lease_epoch).changes;
+          if (changed !== 1) continue;
+          count += 1;
+          recordReviewerJobEventInTransaction(job, "retry_exhausted", "retry_exhausted");
+          notifications.push(...createExhaustedNotificationsInTransaction(job.job_id, "retry_exhausted"));
+        }
+        return { count, notificationRefs: notifications.map(asNotificationRef) };
+      });
     },
     claimReviewerWake({ jobId, nowMs = Date.now(), cooldownMs = 300_000 }) {
       return transaction(() => {
@@ -1000,10 +1331,50 @@ export function openStore({ paths, now = () => new Date() }) {
         }
         db.prepare("INSERT INTO review_receipts(receipt_id, job_id, payload_json, created_at) VALUES (?, ?, ?, ?)").run(review.review_receipt_id, jobId, JSON.stringify(persistedReview), nowIso(now));
         db.prepare("INSERT INTO report_contents(content_id, job_id, content_text, created_at) VALUES (?, ?, ?, ?)").run(review.report_content_id, jobId, persistedReport, nowIso(now));
+        const notifications = [];
+        if (review.status === "reviewed") {
+          const bySession = new Map();
+          for (const lesson of review.lessons) {
+            for (const evidence of lesson.evidence_refs || []) {
+              const source = db.prepare("SELECT session_uid, context_epoch FROM session_events WHERE event_uid=?").get(evidence.feedback_event_id);
+              if (!source) continue;
+              const key = `${source.session_uid}\u0000${source.context_epoch}`;
+              const current = bySession.get(key) || { ...source, severity: lesson.severity, lessonIds: new Set() };
+              if (SEVERITY_RANK[lesson.severity] > SEVERITY_RANK[current.severity]) current.severity = lesson.severity;
+              current.lessonIds.add(lesson.lesson_id);
+              bySession.set(key, current);
+            }
+          }
+          for (const session of bySession.values()) {
+            notifications.push(createNotificationInTransaction({
+              sessionUid: session.session_uid,
+              contextEpoch: session.context_epoch,
+              jobId,
+              kind: "review_completed",
+              payload: { severity: session.severity, lesson_count: session.lessonIds.size }
+            }));
+          }
+        } else {
+          for (const session of notificationSessionsForJob(jobId)) {
+            notifications.push(createNotificationInTransaction({
+              sessionUid: session.session_uid,
+              contextEpoch: session.context_epoch,
+              jobId,
+              kind: "reviewed_no_lesson",
+              payload: {}
+            }));
+          }
+        }
         db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, reason_code=NULL, lease_until=NULL, updated_at=? WHERE job_id=?").run(review.review_receipt_id, nowIso(now), jobId);
         if (capabilityHash) db.prepare("UPDATE reviewer_jobs SET capability_consumed_at=? WHERE job_id=?").run(Date.now(), jobId);
         db.prepare("UPDATE queue_events SET status='acknowledged' WHERE job_id=?").run(jobId);
-        return { status: "completed", receipt_id: review.review_receipt_id, lessonCount: review.lessons.length };
+        recordReviewerJobEventInTransaction(job, "completed");
+        return {
+          status: "completed",
+          receipt_id: review.review_receipt_id,
+          lessonCount: review.lessons.length,
+          notificationRefs: notifications.map(asNotificationRef)
+        };
       });
     },
     getReportContent(contentId) {
@@ -1043,11 +1414,14 @@ export function openStore({ paths, now = () => new Date() }) {
       return transaction(() => {
         const job = db.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?").get(jobId);
         if (!job || (job.status !== "pending" && !(job.status === "running" && job.lease_until && job.lease_until < Date.now()))) throw new LeaseConflictError("reviewer job is not claimable");
+        if (job.status === "running") recordReviewerJobEventInTransaction(job, "requeued", "lease_expired");
         const epoch = Number(job.lease_epoch) + 1;
         const result = db.prepare(`UPDATE reviewer_jobs SET status='running', owner_id=?, attempt=?, lease_epoch=?, lease_until=?, updated_at=?
           WHERE job_id=? AND lease_epoch=?`).run(ownerId, attempt, epoch, leaseUntil, nowIso(now), jobId, job.lease_epoch);
         if (result.changes !== 1) throw new LeaseConflictError("stale reviewer lease");
-        return { ...job, owner_id: ownerId, attempt, lease_epoch: epoch, lease_until: leaseUntil, status: "running" };
+        const claimed = { ...job, owner_id: ownerId, attempt, lease_epoch: epoch, lease_until: leaseUntil, status: "running" };
+        recordReviewerJobEventInTransaction(claimed, "claimed");
+        return claimed;
       });
     },
     heartbeatReviewerJob(jobId, ownerId, attempt, leaseEpoch, leaseUntil) {
@@ -1055,12 +1429,35 @@ export function openStore({ paths, now = () => new Date() }) {
       if (result.changes !== 1) throw new LeaseConflictError("stale reviewer heartbeat");
     },
     completeReviewerJob(jobId, ownerId, attempt, leaseEpoch, receiptId) {
-      const result = db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, reason_code=NULL, lease_until=NULL, updated_at=? WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?").run(receiptId, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now());
-      if (result.changes !== 1) throw new LeaseConflictError("stale reviewer completion");
+      return transaction(() => {
+        const job = db.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?").get(jobId);
+        const result = db.prepare("UPDATE reviewer_jobs SET status='completed', receipt_id=?, reason_code=NULL, lease_until=NULL, updated_at=? WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?").run(receiptId, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now());
+        if (result.changes !== 1) throw new LeaseConflictError("stale reviewer completion");
+        recordReviewerJobEventInTransaction(job, "completed");
+        return { status: "completed", receipt_id: receiptId, notificationRefs: [] };
+      });
     },
     failReviewerJob(jobId, ownerId, attempt, leaseEpoch, retryable, reasonCode) {
-      const result = db.prepare("UPDATE reviewer_jobs SET status=?, reason_code=?, updated_at=? WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?").run(retryable ? "pending" : "failed", reasonCode, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now());
-      if (result.changes !== 1) throw new LeaseConflictError("stale reviewer failure");
+      return transaction(() => {
+        const safeReasonCode = ensureString(reasonCode, "reasonCode")
+          .toLowerCase()
+          .replace(/[^a-z0-9_]+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .slice(0, 64) || "reviewer_failed";
+        const job = db.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?").get(jobId);
+        const result = db.prepare(`UPDATE reviewer_jobs
+          SET status=?, reason_code=?, owner_id=NULL, lease_until=NULL, updated_at=?
+          WHERE job_id=? AND status='running' AND owner_id=? AND attempt=? AND lease_epoch=? AND lease_until>?`).run(
+          retryable ? "pending" : "failed", safeReasonCode, nowIso(now), jobId, ownerId, attempt, leaseEpoch, Date.now()
+        );
+        if (result.changes !== 1) throw new LeaseConflictError("stale reviewer failure");
+        recordReviewerJobEventInTransaction(job, "failed", safeReasonCode);
+        const notifications = retryable ? [] : createExhaustedNotificationsInTransaction(jobId, safeReasonCode);
+        return {
+          status: retryable ? "pending" : "failed",
+          notificationRefs: notifications.map(asNotificationRef)
+        };
+      });
     },
     close() { db.close(); }
   };

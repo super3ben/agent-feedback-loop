@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -133,9 +133,24 @@ CREATE TABLE IF NOT EXISTS reviewer_jobs (
   capability_hash TEXT,
   capability_expires_at INTEGER,
   capability_consumed_at INTEGER,
+  reviewer_provider TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reviewer_job_events (
+  job_event_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES reviewer_jobs(job_id) ON DELETE CASCADE,
+  attempt INTEGER NOT NULL,
+  lease_epoch INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN (
+    'claimed','requeued','completed','failed','retry_exhausted'
+  )),
+  provider TEXT,
+  reason_code TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS reviewer_job_events_transition_idx
+  ON reviewer_job_events(job_id, lease_epoch, state, IFNULL(reason_code, ''));
 CREATE TABLE IF NOT EXISTS review_receipts (
   receipt_id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES reviewer_jobs(job_id),
@@ -159,6 +174,48 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
   observed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notification_outbox (
+  notification_id TEXT PRIMARY KEY,
+  session_uid TEXT NOT NULL REFERENCES sessions(session_uid) ON DELETE CASCADE,
+  context_epoch INTEGER NOT NULL,
+  job_id TEXT REFERENCES reviewer_jobs(job_id) ON DELETE CASCADE,
+  event_uid TEXT REFERENCES session_events(event_uid) ON DELETE SET NULL,
+  application_id TEXT REFERENCES delivery_receipts(application_id) ON DELETE SET NULL,
+  kind TEXT NOT NULL CHECK(kind IN (
+    'candidate_captured','review_queued','review_completed','reviewed_no_lesson',
+    'review_exhausted','lesson_delivered'
+  )),
+  payload_json TEXT NOT NULL,
+  language TEXT NOT NULL CHECK(language IN ('zh','en')),
+  chat_state TEXT NOT NULL DEFAULT 'pending' CHECK(chat_state IN (
+    'pending','emitted','observed','emitted_unconfirmed','suppressed'
+  )),
+  chat_turn_id TEXT,
+  chat_emit_attempts INTEGER NOT NULL DEFAULT 0,
+  chat_block_attempted INTEGER NOT NULL DEFAULT 0,
+  chat_emitted_at TEXT,
+  chat_observed_at TEXT,
+  system_state TEXT NOT NULL DEFAULT 'not_applicable' CHECK(system_state IN (
+    'not_applicable','pending','delivering','delivered','failed','unsupported','suppressed'
+  )),
+  system_owner TEXT,
+  system_lease_until INTEGER,
+  system_attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
+  system_reason_code TEXT,
+  system_delivered_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS notification_outbox_semantic_idx
+  ON notification_outbox(
+    session_uid, context_epoch, kind,
+    IFNULL(job_id, ''), IFNULL(event_uid, ''), IFNULL(application_id, '')
+  );
+CREATE INDEX IF NOT EXISTS notification_outbox_chat_due_idx
+  ON notification_outbox(session_uid, context_epoch, chat_state, created_at);
+CREATE INDEX IF NOT EXISTS notification_outbox_system_due_idx
+  ON notification_outbox(system_state, next_attempt_at, system_lease_until);
 CREATE TABLE IF NOT EXISTS lesson_effectiveness_events (
   effectiveness_event_id TEXT PRIMARY KEY,
   lesson_id TEXT NOT NULL REFERENCES lessons(lesson_id),
