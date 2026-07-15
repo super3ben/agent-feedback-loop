@@ -7,7 +7,7 @@
 Local, severity-aware feedback memory for **Codex**, **Claude Code**, and
 **Gemini CLI**. [中文说明](README-zh.md)
 
-**Current repository version: `0.7.4`**
+**Current repository version: `0.7.5`**
 
 The plugin captures bounded conversation evidence, reviews retrospective user
 feedback in the background, compiles proven agent faults into scoped action cards,

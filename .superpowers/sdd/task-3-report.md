@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented main-chat receipt injection and authoritative transactional Stop confirmation for Codex, Claude Code, and Gemini.
+Implemented main-chat receipt injection and authoritative transactional Stop confirmation. The current acceptance scope is the Codex vertical path; Gemini native `prompt_response` confirmation is explicitly deferred until after real Codex proof.
 
 ## RED Evidence
 
@@ -98,3 +98,9 @@ Implemented main-chat receipt injection and authoritative transactional Stop con
 - The current real user runtime remains stale relative to this branch: `/Users/sunxingda/.agent/feedback-loop/current.json` reports runtime `0.7.4`, schema `7`, status `configured_unverified`.
 - Repository `templates/hooks/stop-hook.sh` SHA-256 is `e526eb635767851bddc5fc2174d4a1128afe51f4effd3187c8f91c33f9581fd0`; real installed hook SHA-256 is `fa72d35012bc5ee7793a4d7516e66eca6a9a95dfb7621b93ebe53f3ac1b216f2`.
 - Task 7 must atomically replace the real `~/.agent` runtime after the complete package is assembled, verify version/schema and installed-template hashes, and prove transactional Stop stdout forwarding from that real installed runtime before claiming L1 acceptance.
+
+### Scoped Final Review
+
+- Codex receipt confirmation, role filtering, disabled-channel suppression, one-block/two-emission fencing, native JSON, zero-injection, and v2 controls passed independent review.
+- A remaining Gemini-specific gap is known: native `AfterAgent` output arrives as `prompt_response`, while the confirmation path currently reads `last_assistant_message`. Per the vertical-first execution decision, Gemini expansion is paused until a real Codex main-chat receipt reaches `observed`.
+- This report does not claim cross-host or real-user acceptance. The next step is an atomic `0.7.5` install and true Codex session evidence.
