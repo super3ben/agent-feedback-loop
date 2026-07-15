@@ -1,5 +1,6 @@
 import os from "node:os";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, lstat, mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import { openStore } from "./store.mjs";
 import { ReviewerRunner } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { readSecureReceipt } from "./reviewer-auth.mjs";
+import { detectReceiptLanguage, renderReceiptControl, renderReceiptInstruction } from "./receipt.mjs";
 import { selectLessons } from "./selector.mjs";
 
 function optionValue(args, name, fallback = null) {
@@ -21,6 +23,25 @@ function optionValue(args, name, fallback = null) {
 
 function debugLog(message) {
   if (process.env.AGENT_FEEDBACK_LOOP_DEBUG === "1") console.error(`agent-feedback-loop: ${new Date().toISOString()} ${message}`);
+}
+
+function receiptLog(message) {
+  console.error(`agent-feedback-loop: ${new Date().toISOString()} ${message}`);
+}
+
+function logCreatedNotifications(notifications) {
+  for (const notification of notifications || []) {
+    const sessionHash = createHash("sha256").update(String(notification.session_uid)).digest("hex").slice(0, 12);
+    receiptLog(`receipt.outbox.created notification=${notification.notification_id} kind=${notification.kind} session=${sessionHash}`);
+  }
+}
+
+function stopResponse(cli, result) {
+  if (result.action !== "block") return cli === "codex" ? { continue: true } : {};
+  const reason = `Output this receipt verbatim before stopping:\n${renderReceiptControl(result.notification).text}`;
+  return cli === "gemini"
+    ? { decision: "deny", reason }
+    : { decision: "block", reason };
 }
 
 async function runRetentionMaintenance({ store, blobs }) {
@@ -55,6 +76,24 @@ async function rotateManagedLog(logFile, maxBytes = Number(process.env.AGENT_FEE
   await rm(rotated, { force: true });
   await rename(logFile, rotated);
   return true;
+}
+
+async function readOwnedFileTail(file, maxBytes = 128 * 1024) {
+  const linkInfo = await lstat(file);
+  if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) throw new Error("transcript must be a regular non-symlink file");
+  if (typeof process.getuid === "function" && linkInfo.uid !== process.getuid()) throw new Error("transcript must be owned by the current user");
+  const handle = await open(file, "r");
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.dev !== linkInfo.dev || info.ino !== linkInfo.ino) throw new Error("transcript changed while opening");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("transcript must be owned by the current user");
+    const length = Math.min(Math.max(0, Number(maxBytes) || 0), info.size);
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, Math.max(0, info.size - length));
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function openRuntimeLog(paths) {
@@ -319,6 +358,7 @@ export async function main(args) {
         reviewMaxAttempts: Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MAX_ATTEMPTS || 3),
         launchReviewer: ({ cli, jobId }) => launchDetachedReviewer({ paths, cli, jobId })
       });
+      logCreatedNotifications(result.notificationRefs);
       const maintenance = await runRetentionMaintenance({ store, blobs });
       store.setRuntimeStatus("codex_reconcile", {
         status: result.errors.length > 0 ? "completed_with_errors" : "completed",
@@ -364,16 +404,16 @@ export async function main(args) {
       let transcriptText = "";
       if (parsedPayload.transcript_path) {
         try {
-          const info = await lstat(parsedPayload.transcript_path);
-          if (info.isFile() && !info.isSymbolicLink() && info.size <= 2 * 1024 * 1024 && (typeof process.getuid !== "function" || info.uid === process.getuid())) {
-            transcriptText = (await readFile(parsedPayload.transcript_path, "utf8")).slice(-128 * 1024);
-          }
+          transcriptText = await readOwnedFileTail(parsedPayload.transcript_path);
         } catch (error) {
           debugLog(`capture.stop.transcript_unavailable reason=${error.code || "invalid"}`);
         }
       }
+      const cli = options.cli || options.args[0] || "unknown";
+      const lastAssistantMessage = String(parsedPayload.last_assistant_message || "").slice(-32 * 1024);
+      const confirmationText = [transcriptText, lastAssistantMessage].filter(Boolean).join("\n");
       const event = normalizeStopEvent({
-        cli: options.cli || options.args[0] || "unknown",
+        cli,
         payload: {
           ...parsedPayload,
           transcript_excerpt: extractTranscriptExcerpt(transcriptText),
@@ -387,10 +427,30 @@ export async function main(args) {
         await captureObservedSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
         debugLog(`capture.stop.ok event=${event.event_uid} completeness=${event.capture_completeness} excerpt_chars=${event.redacted_text?.length || 0}`);
       }
-      const observed = store.observeDeliveryNonces({ session_uid: event.session_uid, context_epoch: event.context_epoch, transcriptText });
+      let confirmation = store.confirmChatNotification({
+        sessionUid: event.session_uid,
+        contextEpoch: event.context_epoch,
+        nativeTurnId: event.native_turn_id,
+        transcriptText: confirmationText
+      });
+      if (confirmation.action === "block" && Number(confirmation.notification?.chat_emit_attempts) > 1) {
+        // A re-emission is the final delivery attempt; advance it without forcing the user through a second Stop block.
+        confirmation = store.confirmChatNotification({
+          sessionUid: event.session_uid,
+          contextEpoch: event.context_epoch,
+          nativeTurnId: event.native_turn_id,
+          transcriptText: confirmationText
+        });
+      }
+      if (confirmation.action === "observed") {
+        receiptLog(`receipt.chat.observed notification=${confirmation.notification.notification_id} count=1`);
+      } else if (confirmation.action === "pass_unconfirmed") {
+        receiptLog(`receipt.chat.unconfirmed notification=${confirmation.notification.notification_id} count=1`);
+      }
+      const observed = store.observeDeliveryNonces({ session_uid: event.session_uid, context_epoch: event.context_epoch, transcriptText: confirmationText });
       const unconfirmed = store.finalizeUnconfirmedDeliveries({ session_uid: event.session_uid, context_epoch: event.context_epoch });
       debugLog(`capture.stop.delivery observed=${observed} unconfirmed=${unconfirmed}`);
-      console.log(JSON.stringify({}));
+      console.log(JSON.stringify(stopResponse(cli, confirmation)));
     } finally {
       store.close();
     }
@@ -434,6 +494,7 @@ export async function main(args) {
           })
           : null
       });
+      logCreatedNotifications(result.notificationRefs);
       console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.complete job=${jobId || "unknown"} status=${result.status} lessons=${Number(result.lessonCount || 0)}`);
       console.log(JSON.stringify(result));
     } catch (error) {
@@ -462,6 +523,7 @@ export async function main(args) {
       if (!receiptFile) throw new Error("--receipt-file is required");
       const receipt = await readSecureReceipt(receiptFile);
       const result = store.submitPromptReview(optionValue(options.args, "--job-id"), receipt);
+      logCreatedNotifications(result.notificationRefs);
       await rm(receiptFile, { force: true });
       console.log(JSON.stringify(result, null, 2));
     } finally {
@@ -573,6 +635,18 @@ export async function main(args) {
     const captured = await captureObservedSession({ store, blobs, event, rawText: payload });
     const canonicalEventUid = captured.eventUid;
     debugLog(`hook.capture.ok event=${canonicalEventUid} duplicate=${captured.duplicate ? 1 : 0}`);
+    const receiptLanguage = detectReceiptLanguage(event.redacted_text, process.env.AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE || "auto");
+    if (signal.immediateReview) {
+      const candidate = store.createNotification({
+        sessionUid: event.session_uid,
+        contextEpoch: event.context_epoch,
+        kind: "candidate_captured",
+        eventUid: canonicalEventUid,
+        payload: {},
+        language: receiptLanguage
+      });
+      logCreatedNotifications([candidate]);
+    }
     const due = store.submitDueReview({
       projectId: event.project_id,
       minEntries: signal.immediateReview ? 1 : Number(process.env.AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES || 3),
@@ -582,6 +656,7 @@ export async function main(args) {
       promptVersion: "v1",
       immediateEventUid: signal.immediateReview ? canonicalEventUid : null
     });
+    logCreatedNotifications(due.notificationRefs);
     debugLog(`hook.signal signal=${signal.reason} immediate_review=${signal.immediateReview ? 1 : 0}`);
     debugLog(`hook.review status=${due.status} events=${due.eventCount}`);
     const injectedContexts = [];
@@ -618,9 +693,19 @@ export async function main(args) {
     }
     if (selection.cards.length > 0) {
       const nonce = selection.cards.map((card) => card.application_id).join("").slice(0, 16);
-      for (const card of selection.cards) {
-        store.recordDelivery({ application_id: card.application_id, lesson_id: card.lesson_id, revision: card.revision, session_uid: event.session_uid, context_epoch: event.context_epoch, state: "emitted", nonce });
-      }
+      const deliveryResult = store.recordDeliveries({
+        deliveries: selection.cards.map((card) => ({
+          application_id: card.application_id,
+          lesson_id: card.lesson_id,
+          revision: card.revision,
+          state: "emitted",
+          nonce
+        })),
+        sessionUid: event.session_uid,
+        contextEpoch: event.context_epoch,
+        language: receiptLanguage
+      });
+      logCreatedNotifications([deliveryResult.notification]);
       debugLog(`hook.delivery emitted=${selection.cards.length}`);
       injectedContexts.push([
         "[agent-feedback-loop memory]",
@@ -631,6 +716,20 @@ export async function main(args) {
     if (selection.hold) {
       injectedContexts.push(`[agent-feedback-loop checkpoint hold]\nstate=${selection.hold}\nThe applicable severe memory set could not be loaded as complete cards within the local absolute budget. Stop before high-risk or irreversible actions, keep the current task pending, and report that memory enforcement is checkpoint-only until a background reviewer compacts the conflicting cards.`);
       debugLog(`hook.selection.hold state=${selection.hold} absolute_budget=${selection.budgets?.absolute || 0}`);
+    }
+    if (process.env.AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS === "0") {
+      const suppressed = store.suppressPendingChatNotifications({ sessionUid: event.session_uid, contextEpoch: event.context_epoch });
+      debugLog(`hook.receipt.suppressed count=${suppressed}`);
+    } else {
+      const claimed = store.claimChatNotification({
+        sessionUid: event.session_uid,
+        contextEpoch: event.context_epoch,
+        nativeTurnId: event.native_turn_id
+      });
+      if (claimed) {
+        injectedContexts.push(renderReceiptInstruction(claimed));
+        receiptLog(`receipt.chat.emitted notification=${claimed.notification_id} count=1`);
+      }
     }
     if (injectedContexts.length > 0) {
       store.close();

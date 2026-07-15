@@ -47,6 +47,42 @@ function runWithInput(file, input, env, args = []) {
   });
 }
 
+async function bindEmittedReceipt({ home, cli, sessionId, turnId, projectId }) {
+  const paths = pathsFor(home);
+  const payload = JSON.stringify({
+    session_id: sessionId,
+    turn_id: turnId,
+    cwd: projectId,
+    prompt: "Inspect the implementation without changing behavior."
+  });
+  const args = ["--event", cli === "gemini" ? "BeforeAgent" : "UserPromptSubmit", "--cli", cli];
+  if (cli === "codex") args.push("--continue");
+  await runWithInput(paths.coreHook, payload, {
+    ...process.env,
+    HOME: home,
+    AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99"
+  }, args);
+
+  const store = openStore({ paths });
+  const [event] = store.listSessionEvents(projectId);
+  const notification = store.createNotification({
+    sessionUid: event.session_uid,
+    contextEpoch: event.context_epoch,
+    kind: "candidate_captured",
+    eventUid: event.event_uid,
+    payload: {},
+    language: "en"
+  });
+  const claimed = store.claimChatNotification({
+    sessionUid: event.session_uid,
+    contextEpoch: event.context_epoch,
+    nativeTurnId: turnId
+  });
+  store.close();
+  assert.equal(claimed.notification_id, notification.notification_id);
+  return { paths, payload, event, notification: claimed };
+}
+
 describe("agent-feedback-loop package", () => {
   it("synchronizes Codex trust after writing its managed hook block", async () => {
     const home = await tempHome();
@@ -345,7 +381,7 @@ describe("agent-feedback-loop package", () => {
     const tmp = await mkdtemp(path.join(tmpdir(), "afl-stop-"));
     const mdir = path.join(tmp, "afl-reflect");
     await mkdir(mdir, { recursive: true });
-    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+    const env = { ...process.env, HOME: home, TMPDIR: tmp, AGENT_FEEDBACK_LOOP_LEGACY_QUEUE: "1" };
     const marker = path.join(mdir, "s1.1.required");
 
     // no marker -> pass
@@ -384,7 +420,7 @@ describe("agent-feedback-loop package", () => {
     const tmp = await mkdtemp(path.join(tmpdir(), "afl-gem-"));
     const mdir = path.join(tmp, "afl-reflect");
     await mkdir(mdir, { recursive: true });
-    const env = { ...process.env, HOME: home, TMPDIR: tmp };
+    const env = { ...process.env, HOME: home, TMPDIR: tmp, AGENT_FEEDBACK_LOOP_LEGACY_QUEUE: "1" };
     const marker = path.join(mdir, "g1.1.required");
     const payload = JSON.stringify({ session_id: "g1", turn_id: 1 });
 
@@ -477,6 +513,34 @@ describe("agent-feedback-loop package", () => {
     assert.equal((await readText(queueFile)).trim().split("\n").length, 1);
   });
 
+  it("ordinary prompt remains zero-injection for every transactional host", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+
+    const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
+    const env = {
+      ...process.env,
+      HOME: home,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99",
+      AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "3600"
+    };
+    const payload = (cli) => JSON.stringify({
+      session_id: `ordinary-${cli}`,
+      turn_id: "turn-1",
+      cwd: `/tmp/ordinary-${cli}`,
+      prompt: "Please inspect the current implementation."
+    });
+
+    const codex = await runWithInput(coreHook, payload("codex"), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    const claude = await runWithInput(coreHook, payload("claude"), env, ["--event", "UserPromptSubmit", "--cli", "claude"]);
+    const gemini = await runWithInput(coreHook, payload("gemini"), env, ["--event", "BeforeAgent", "--cli", "gemini"]);
+
+    assert.deepEqual(JSON.parse(codex.stdout), { continue: true });
+    assert.deepEqual(JSON.parse(claude.stdout), {});
+    assert.deepEqual(JSON.parse(gemini.stdout), {});
+    assert.doesNotMatch(`${codex.stdout}${claude.stdout}${gemini.stdout}`, /\[AFL\]/);
+  });
+
   it("core hook review instruction targets the correct event name per CLI", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
@@ -507,7 +571,7 @@ describe("agent-feedback-loop package", () => {
     assert.match(geminiJson.hookSpecificOutput.additionalContext, /mode=background_subagent/);
   });
 
-  it("queues an immediate background review after an interrupted prior turn", async () => {
+  it("queues an immediate background review receipt after an interrupted prior turn", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const coreHook = path.join(home, ".agent", "feedback-loop", "hooks", "core-hook.sh");
@@ -521,6 +585,7 @@ describe("agent-feedback-loop package", () => {
       HOME: home,
       AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "3",
       AGENT_FEEDBACK_LOOP_REVIEW_COOLDOWN: "3600",
+      AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE: "zh",
       AGENT_FEEDBACK_LOOP_DEBUG: "1",
       AGENT_FEEDBACK_LOOP_LOG: path.join(home, "runtime.log"),
       AGENT_FEEDBACK_LOOP_CODEX_COMMAND: path.join(home, "missing-codex")
@@ -552,12 +617,65 @@ describe("agent-feedback-loop package", () => {
     assert.equal(response.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(response.hookSpecificOutput.additionalContext, /correction checkpoint/i);
     assert.match(response.hookSpecificOutput.additionalContext, /stop the superseded execution path/i);
+    assert.match(response.hookSpecificOutput.additionalContext, /\[AFL\] 后台反思已排队/);
+    assert.match(response.hookSpecificOutput.additionalContext, /<!--afl-receipt id=[^ ]+ nonce=[a-f0-9]{16} state=review_queued-->/);
+    assert.equal((response.hookSpecificOutput.additionalContext.match(/\[AFL\]/g) || []).length, 1);
     assert.doesNotMatch(response.hookSpecificOutput.additionalContext, /5[- ]why|report_content/i);
     const log = await readText(env.AGENT_FEEDBACK_LOOP_LOG);
     assert.match(log, /signal=prior_turn_interrupted immediate_review=1/);
     assert.match(log, /reviewer\.unavailable cli=codex/);
+    assert.match(log, /receipt\.chat\.emitted notification=[a-f0-9]{64} count=1/);
     const jobIds = [...log.matchAll(/background job=([a-f0-9]+)/g)].map((match) => match[1]);
     assert.equal(new Set(jobIds).size, 2);
+  });
+
+  it("disabled receipt channel suppresses pending rows and logs only opaque creation metadata", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const paths = pathsFor(home);
+    const transcript = path.join(home, "disabled-receipt-rollout.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "prior-turn" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "prior-turn", reason: "interrupted" } })
+    ].join("\n"), "utf8");
+    const logFile = path.join(home, "receipt-runtime.log");
+    const env = {
+      ...process.env,
+      HOME: home,
+      AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS: "0",
+      AGENT_FEEDBACK_LOOP_LOG: logFile,
+      AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99",
+      AGENT_FEEDBACK_LOOP_CODEX_COMMAND: path.join(home, "missing-codex")
+    };
+    const prompt = "Private correction token=do-not-log";
+    const first = await runWithInput(paths.coreHook, JSON.stringify({
+      session_id: "disabled-receipt-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/disabled-receipt",
+      transcript_path: transcript,
+      prompt
+    }), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+
+    assert.doesNotMatch(first.stdout, /\[AFL\]/);
+    const store = openStore({ paths });
+    const notifications = store.listNotifications();
+    assert.deepEqual(notifications.map((row) => row.kind).sort(), ["candidate_captured", "review_queued"]);
+    assert.ok(notifications.every((row) => row.chat_state === "suppressed"));
+    store.close();
+
+    const second = await runWithInput(paths.coreHook, JSON.stringify({
+      session_id: "disabled-receipt-session",
+      turn_id: "turn-2",
+      cwd: "/tmp/disabled-receipt",
+      prompt: "Continue normally."
+    }), { ...env, AGENT_FEEDBACK_LOOP_CHAT_RECEIPTS: "1" }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+    assert.deepEqual(JSON.parse(second.stdout), { continue: true });
+
+    const log = await readText(logFile);
+    assert.equal((log.match(/receipt\.outbox\.created/g) || []).length, 2);
+    assert.match(log, /notification=[a-f0-9]{64} kind=candidate_captured session=[a-f0-9]{12}/);
+    assert.match(log, /notification=[a-f0-9]{64} kind=review_queued session=[a-f0-9]{12}/);
+    assert.doesNotMatch(log, /Private correction|do-not-log|Background review queued|后台反思已排队/);
   });
 
   it("core hook fails open when shared trigger rules are missing", async () => {
@@ -618,7 +736,7 @@ describe("agent-feedback-loop package", () => {
     });
 
     const result = await runWithInput(BIN, payload, { ...process.env, HOME: home }, ["capture-stop", "--home", home, "--cli", "codex"]);
-    assert.deepEqual(JSON.parse(result.stdout), {});
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
 
     const store = openStore({ paths: pathsFor(home) });
     const [event] = store.listSessionEvents("/tmp/capture-stop-structural");
@@ -626,6 +744,132 @@ describe("agent-feedback-loop package", () => {
     assert.equal(event.tool_name, "apply_patch");
     assert.deepEqual(JSON.parse(event.file_refs_json), ["src/receipt.mjs"]);
     assert.deepEqual(JSON.parse(event.artifact_hashes_json), ["sha256:def456"]);
+    store.close();
+  });
+
+  it("receipt Stop blocks at most once across Codex Claude and Gemini schemas", async () => {
+    for (const cli of ["codex", "claude", "gemini"]) {
+      const home = await tempHome();
+      await install({ home, dryRun: false });
+      const fixture = await bindEmittedReceipt({
+        home,
+        cli,
+        sessionId: `receipt-stop-${cli}`,
+        turnId: "turn-1",
+        projectId: `/tmp/receipt-stop-${cli}`
+      });
+      const stopPayload = JSON.stringify({
+        session_id: `receipt-stop-${cli}`,
+        turn_id: "turn-1",
+        cwd: `/tmp/receipt-stop-${cli}`,
+        last_assistant_message: "The implementation was inspected."
+      });
+      const env = { ...process.env, HOME: home };
+      const first = await runWithInput(fixture.paths.stopHook, stopPayload, env, ["--mode", cli]);
+      const second = await runWithInput(fixture.paths.stopHook, stopPayload, env, ["--mode", cli]);
+      const expectedReason = `Output this receipt verbatim before stopping:\n${renderReceiptControl(fixture.notification).text}`;
+
+      assert.deepEqual(JSON.parse(first.stdout), cli === "gemini"
+        ? { decision: "deny", reason: expectedReason }
+        : { decision: "block", reason: expectedReason });
+      assert.deepEqual(JSON.parse(second.stdout), cli === "codex" ? { continue: true } : {});
+    }
+  });
+
+  it("receipt marker observes an emitted notification without blocking", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "receipt-marker-session",
+      turnId: "turn-1",
+      projectId: "/tmp/receipt-marker"
+    });
+    const control = renderReceiptControl(fixture.notification);
+    const result = await runWithInput(fixture.paths.stopHook, JSON.stringify({
+      session_id: "receipt-marker-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/receipt-marker",
+      last_assistant_message: `Completed.\n${control.text}`
+    }), { ...process.env, HOME: home }, ["--mode", "codex"]);
+
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+    const store = openStore({ paths: fixture.paths });
+    assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "observed");
+    store.close();
+  });
+
+  it("receipt marker is observed from the bounded tail of a large transcript", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "receipt-tail-session",
+      turnId: "turn-1",
+      projectId: "/tmp/receipt-tail"
+    });
+    const transcript = path.join(home, "large-transcript.jsonl");
+    const control = renderReceiptControl(fixture.notification);
+    await writeFile(transcript, `${"x".repeat(2 * 1024 * 1024)}\n${control.text}\n`, { mode: 0o600 });
+
+    const result = await runWithInput(fixture.paths.stopHook, JSON.stringify({
+      session_id: "receipt-tail-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/receipt-tail",
+      transcript_path: transcript,
+      last_assistant_message: "Completed without duplicating the control."
+    }), { ...process.env, HOME: home }, ["--mode", "codex"]);
+
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+    const store = openStore({ paths: fixture.paths });
+    assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "observed");
+    store.close();
+  });
+
+  it("receipt re-emission is claimed once more and never blocks a second time", async () => {
+    const home = await tempHome();
+    await install({ home, dryRun: false });
+    const fixture = await bindEmittedReceipt({
+      home,
+      cli: "codex",
+      sessionId: "receipt-reemit-session",
+      turnId: "turn-1",
+      projectId: "/tmp/receipt-reemit"
+    });
+    const env = { ...process.env, HOME: home, AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99" };
+    const firstStopPayload = JSON.stringify({
+      session_id: "receipt-reemit-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/receipt-reemit",
+      last_assistant_message: "No receipt was emitted."
+    });
+    assert.equal(JSON.parse((await runWithInput(fixture.paths.stopHook, firstStopPayload, env, ["--mode", "codex"])).stdout).decision, "block");
+    assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, firstStopPayload, env, ["--mode", "codex"])).stdout), { continue: true });
+
+    const prompt = (turnId) => JSON.stringify({
+      session_id: "receipt-reemit-session",
+      turn_id: turnId,
+      cwd: "/tmp/receipt-reemit",
+      prompt: "Continue inspecting the implementation."
+    });
+    const secondEmission = JSON.parse((await runWithInput(fixture.paths.coreHook, prompt("turn-2"), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"])).stdout);
+    assert.match(secondEmission.hookSpecificOutput.additionalContext, /\[AFL\] Feedback candidate captured/);
+    const thirdPrompt = JSON.parse((await runWithInput(fixture.paths.coreHook, prompt("turn-3"), env, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"])).stdout);
+    assert.deepEqual(thirdPrompt, { continue: true });
+
+    const reemitStopPayload = JSON.stringify({
+      session_id: "receipt-reemit-session",
+      turn_id: "turn-2",
+      cwd: "/tmp/receipt-reemit",
+      last_assistant_message: "The receipt was still not emitted."
+    });
+    assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, reemitStopPayload, env, ["--mode", "codex"])).stdout), { continue: true });
+    const store = openStore({ paths: fixture.paths });
+    const [notification] = store.listNotifications({ sessionUid: fixture.event.session_uid });
+    assert.equal(notification.chat_emit_attempts, 2);
+    assert.notEqual(notification.chat_state, "observed");
     store.close();
   });
 

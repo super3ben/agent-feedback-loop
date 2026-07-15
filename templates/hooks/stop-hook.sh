@@ -35,9 +35,6 @@ fi
 runtime_launcher="$HOME/.agent/feedback-loop/bin/afl-hook"
 legacy_mode=0
 [ -n "${AGENT_FEEDBACK_LOOP_QUEUE_DIR:-}" ] || [ "${AGENT_FEEDBACK_LOOP_LEGACY_QUEUE:-0}" = "1" ] && legacy_mode=1
-if [ "$legacy_mode" -eq 0 ] && [ -x "$runtime_launcher" ]; then
-  printf '%s' "$payload" | "$runtime_launcher" capture-stop --cli "$MODE" >/dev/null 2>>"$LOG_FILE" || true
-fi
 
 # pass = allow the agent to stop normally (no-op output per CLI schema).
 afl_pass() {
@@ -47,6 +44,16 @@ afl_pass() {
   esac
   exit 0
 }
+
+if [ "$legacy_mode" -eq 0 ]; then
+  if [ -x "$runtime_launcher" ]; then
+    if transactional_output="$(printf '%s' "$payload" | "$runtime_launcher" capture-stop --cli "$MODE" 2>>"$LOG_FILE")"; then
+      printf '%s\n' "$transactional_output"
+      exit 0
+    fi
+  fi
+  afl_pass
+fi
 
 # Without shared rules we cannot evaluate; fail open (allow stop).
 [ -r "$HOOK_DIR/trigger-rules.sh" ] || afl_pass
