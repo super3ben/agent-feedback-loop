@@ -1132,6 +1132,69 @@ test("retention GC deletes old evidence but keeps newer evidence", async () => {
   verify.close();
 });
 
+test("retention GC removes event-bound notifications before deleting multiple old events in a retained session", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-gc-event-notifications-"));
+  const paths = pathsFor(home);
+  const sessionUid = "gc-retained-session";
+  const oldStore = openStore({ paths, now: () => new Date("2020-01-01T00:00:00.000Z") });
+  for (const [index, eventUid] of ["gc-old-1", "gc-old-2", "gc-old-3"].entries()) {
+    oldStore.captureSessionEvent({
+      ...event(eventUid),
+      session_uid: sessionUid,
+      event_seq: index + 1,
+      role: "assistant"
+    });
+    oldStore.createNotification({
+      sessionUid,
+      contextEpoch: 1,
+      kind: "candidate_captured",
+      eventUid,
+      payload: {},
+      language: "en"
+    });
+  }
+  oldStore.close();
+
+  const currentStore = openStore({ paths, now: () => new Date("2024-01-01T00:00:00.000Z") });
+  currentStore.captureSessionEvent({
+    ...event("gc-retained-event"),
+    session_uid: sessionUid,
+    event_seq: 4,
+    role: "assistant"
+  });
+  const retainedNotification = currentStore.createNotification({
+    sessionUid,
+    contextEpoch: 1,
+    kind: "candidate_captured",
+    eventUid: "gc-retained-event",
+    payload: {},
+    language: "en"
+  });
+
+  const result = currentStore.gcExpired({ beforeMs: Date.parse("2021-01-01T00:00:00.000Z") });
+  assert.equal(result.eventCount, 3);
+  assert.equal(result.notificationCount, 3);
+  assert.deepEqual(
+    currentStore.listSessionEvents("project-a").map((row) => row.event_uid),
+    ["gc-retained-event"]
+  );
+  assert.deepEqual(
+    currentStore.listNotifications({ sessionUid }).map((row) => ({
+      notification_id: row.notification_id,
+      event_uid: row.event_uid
+    })),
+    [{
+      notification_id: retainedNotification.notification_id,
+      event_uid: "gc-retained-event"
+    }]
+  );
+  currentStore.close();
+
+  const verify = new DatabaseSync(paths.storeFile);
+  assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
+  verify.close();
+});
+
 test("retention GC preserves old evidence that is still pending review", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-gc-pending-"));
   const paths = pathsFor(home);

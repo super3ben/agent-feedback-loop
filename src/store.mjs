@@ -1483,7 +1483,10 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
               JOIN queue_events pending ON pending.event_uid=related.event_uid
               WHERE related.session_uid=e.session_uid AND pending.status='pending'
             )`).all(new Date(beforeMs).toISOString());
+        const deleteEventNotifications = db.prepare("DELETE FROM notification_outbox WHERE event_uid=?");
+        let notificationCount = 0;
         for (const row of events) {
+          notificationCount += deleteEventNotifications.run(row.event_uid).changes;
           db.prepare("DELETE FROM incident_events WHERE event_uid=?").run(row.event_uid);
           db.prepare("DELETE FROM queue_events WHERE event_uid=?").run(row.event_uid);
           db.prepare("DELETE FROM event_observations WHERE event_uid=?").run(row.event_uid);
@@ -1493,7 +1496,7 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         const candidates = [...new Set(events.map((row) => row.encrypted_raw_ref).filter(Boolean))];
         const stillReferenced = db.prepare("SELECT 1 FROM session_events WHERE encrypted_raw_ref=? LIMIT 1");
         const blobRefs = candidates.filter((reference) => !stillReferenced.get(reference));
-        return { eventCount: events.length, jobCount: 0, blobRefs };
+        return { eventCount: events.length, notificationCount, jobCount: 0, blobRefs };
       });
     },
     claimReviewerJob(jobId, ownerId, leaseUntil, attempt) {
