@@ -11,6 +11,7 @@ import { pathsFor } from "../src/index.mjs";
 import { containsReceiptMarker, detectReceiptLanguage, receiptNonce, renderReceiptControl, validateReceiptPayload } from "../src/receipt.mjs";
 import { selectLessons } from "../src/selector.mjs";
 import { CapturePolicyError, LeaseConflictError, RevisionConflictError, openStore } from "../src/store.mjs";
+import { seedSchemaV8ControlPlane, snapshotSchemaV8Evidence } from "./fixtures/schema-v8-control-plane.mjs";
 
 async function storeFixture() {
   const home = await mkdtemp(path.join(tmpdir(), "afl-store-"));
@@ -35,7 +36,159 @@ function event(id, revision = 1) {
   };
 }
 
-test("schema v8 migrates and deduplicates semantic notifications", async () => {
+test("schema v9 migrates v8 control-plane evidence without replaying legacy model receipts", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-control-plane-v8-"));
+  const paths = pathsFor(home);
+  await mkdir(path.dirname(paths.storeFile), { recursive: true, mode: 0o700 });
+  const legacy = new DatabaseSync(paths.storeFile);
+  seedSchemaV8ControlPlane(legacy);
+  const before = snapshotSchemaV8Evidence(legacy);
+  assert.equal(legacy.prepare(`SELECT COUNT(*) AS count FROM queue_events
+    WHERE event_uid IN ('fixture-followup-one','fixture-followup-two') AND job_id IS NOT NULL`).get().count, 2);
+  assert.equal(JSON.parse(legacy.prepare(`SELECT payload_json FROM review_receipts
+    WHERE receipt_id='fixture-receipt-commentary'`).get().payload_json).channel, "commentary_only");
+  assert.deepEqual(legacy.prepare("SELECT DISTINCT chat_state FROM notification_outbox ORDER BY chat_state").all().map((row) => row.chat_state), [
+    "emitted", "emitted_unconfirmed", "observed", "pending", "suppressed"
+  ]);
+  assert.equal(legacy.prepare(`SELECT COUNT(*) AS count FROM lessons
+    WHERE lesson_id IN ('fixture-critical-1','fixture-critical-2','fixture-critical-3','fixture-critical-4','fixture-critical-5')
+      AND severity='Critical' AND conflict_state='none'`).get().count, 5);
+  assert.ok(legacy.prepare(`SELECT length(card_json) AS size FROM lesson_revisions
+    WHERE lesson_id='fixture-critical-oversized' AND revision=1`).get().size > 48 * 1024);
+  assert.equal(legacy.prepare(`SELECT COUNT(*) AS count FROM lessons
+    WHERE family_id='fixture-safety-hold-family' AND conflict_state='safety_hold'`).get().count, 2);
+  legacy.close();
+
+  const migrationLogs = [];
+  const originalConsoleError = console.error;
+  let migrated;
+  try {
+    console.error = (...args) => migrationLogs.push(args.join(" "));
+    migrated = openStore({ paths, now: () => new Date("2026-07-16T00:00:00.000Z") });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(migrated.capability.schemaVersion, 9);
+  migrated.close();
+  assert.deepEqual(migrationLogs, ["schema.migrated from=8 to=9 deliveries=21 episodes=3"]);
+  assert.doesNotMatch(migrationLogs.join("\n"), /A normal assistant answer|请继续说明|payload/i);
+
+  let verify = new DatabaseSync(paths.storeFile);
+  assert.deepEqual(snapshotSchemaV8Evidence(verify), before);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9").get().count, 1);
+  for (const table of [
+    "notification_deliveries", "feedback_episodes", "feedback_episode_events", "memory_maintenance_jobs",
+    "memory_maintenance_inputs", "memory_maintenance_job_events", "lesson_lineage"
+  ]) {
+    assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?").get(table).count, 1, table);
+  }
+  const outboxCount = verify.prepare("SELECT COUNT(*) AS count FROM notification_outbox").get().count;
+  assert.equal(outboxCount, 7);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM notification_deliveries").get().count, outboxCount * 3);
+  for (const transport of ["audit", "system", "legacy_model_echo"]) {
+    assert.equal(
+      verify.prepare("SELECT COUNT(*) AS count FROM notification_deliveries WHERE transport=?").get(transport).count,
+      outboxCount,
+      transport
+    );
+  }
+  assert.equal(verify.prepare(`SELECT COUNT(*) AS count FROM notification_outbox n
+    LEFT JOIN notification_deliveries d ON d.notification_id=n.notification_id AND d.transport='audit'
+    WHERE d.notification_id IS NULL`).get().count, 0);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM notification_deliveries WHERE transport='audit' AND state!='audited_only'").get().count, 0);
+
+  const systemStates = new Map(verify.prepare(`SELECT notification_id, state FROM notification_deliveries
+    WHERE transport='system' ORDER BY notification_id`).all().map((row) => [row.notification_id, row.state]));
+  assert.deepEqual(Object.fromEntries(systemStates), {
+    "fixture-notification-commentary": "audited_only",
+    "fixture-notification-delivering": "delivering",
+    "fixture-notification-emitted": "pending",
+    "fixture-notification-observed": "accepted",
+    "fixture-notification-pending": "unsupported",
+    "fixture-notification-suppressed": "suppressed",
+    "fixture-notification-unconfirmed": "failed"
+  });
+  const delivering = verify.prepare(`SELECT owner_id, attempt, lease_epoch, lease_until
+    FROM notification_deliveries WHERE notification_id='fixture-notification-delivering' AND transport='system'`).get();
+  assert.deepEqual({ ...delivering }, { owner_id: "legacy-system-owner", attempt: 3, lease_epoch: 3, lease_until: 9_999_999_999_999 });
+
+  const legacyStates = new Map(verify.prepare(`SELECT notification_id, state FROM notification_deliveries
+    WHERE transport='legacy_model_echo' ORDER BY notification_id`).all().map((row) => [row.notification_id, row.state]));
+  assert.deepEqual(Object.fromEntries(legacyStates), {
+    "fixture-notification-commentary": "observed",
+    "fixture-notification-delivering": "accepted",
+    "fixture-notification-emitted": "accepted",
+    "fixture-notification-observed": "observed",
+    "fixture-notification-pending": "audited_only",
+    "fixture-notification-suppressed": "audited_only",
+    "fixture-notification-unconfirmed": "accepted"
+  });
+  assert.equal(verify.prepare(`SELECT COUNT(*) AS count FROM notification_deliveries
+    WHERE transport='legacy_model_echo' AND state IN ('pending','delivering','failed')`).get().count, 0);
+
+  const jobCount = verify.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count;
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM feedback_episodes").get().count, jobCount);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM feedback_episodes WHERE status IN ('open','ready')").get().count, 0);
+  assert.equal(verify.prepare(`SELECT COUNT(*) AS count FROM reviewer_jobs j
+    LEFT JOIN feedback_episodes e ON e.reviewer_job_id=j.job_id
+    WHERE e.episode_id IS NULL`).get().count, 0);
+  assert.equal(verify.prepare(`SELECT COUNT(*) AS count FROM queue_events q
+    LEFT JOIN feedback_episode_events e ON e.event_uid=q.event_uid
+    WHERE q.job_id IS NOT NULL AND e.event_uid IS NULL`).get().count, 0);
+  const episodeRows = verify.prepare(`SELECT episode_id, reviewer_job_id, status
+    FROM feedback_episodes ORDER BY reviewer_job_id`).all();
+  const episodeEventRows = verify.prepare(`SELECT episode_id, event_uid, relation, signal_reason
+    FROM feedback_episode_events ORDER BY event_uid`).all();
+  assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
+  verify.close();
+
+  const reopened = openStore({ paths, now: () => new Date("2026-07-16T00:01:00.000Z") });
+  reopened.close();
+  verify = new DatabaseSync(paths.storeFile);
+  assert.deepEqual(snapshotSchemaV8Evidence(verify), before);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM notification_deliveries").get().count, outboxCount * 3);
+  assert.deepEqual(verify.prepare(`SELECT episode_id, reviewer_job_id, status
+    FROM feedback_episodes ORDER BY reviewer_job_id`).all(), episodeRows);
+  assert.deepEqual(verify.prepare(`SELECT episode_id, event_uid, relation, signal_reason
+    FROM feedback_episode_events ORDER BY event_uid`).all(), episodeEventRows);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9").get().count, 1);
+  verify.close();
+});
+
+test("v8 control-plane migration rolls back every v9 table and backfill on failure", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-control-plane-rollback-"));
+  const paths = pathsFor(home);
+  await mkdir(path.dirname(paths.storeFile), { recursive: true, mode: 0o700 });
+  let legacy = new DatabaseSync(paths.storeFile);
+  seedSchemaV8ControlPlane(legacy);
+  const before = snapshotSchemaV8Evidence(legacy);
+  legacy.exec(`CREATE TRIGGER fixture_abort_schema_v9 BEFORE INSERT ON schema_migrations
+    WHEN NEW.version=9 BEGIN SELECT RAISE(ABORT, 'fixture forced schema v9 failure'); END;`);
+  legacy.close();
+
+  assert.throws(
+    () => openStore({ paths, now: () => new Date("2026-07-16T00:00:00.000Z") }),
+    /fixture forced schema v9 failure/
+  );
+
+  legacy = new DatabaseSync(paths.storeFile);
+  assert.deepEqual(snapshotSchemaV8Evidence(legacy), before);
+  assert.equal(legacy.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9").get().count, 0);
+  for (const table of [
+    "notification_deliveries", "feedback_episodes", "feedback_episode_events", "memory_maintenance_jobs",
+    "memory_maintenance_inputs", "memory_maintenance_job_events", "lesson_lineage"
+  ]) {
+    assert.equal(legacy.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?").get(table).count, 0, table);
+  }
+  legacy.exec("DROP TRIGGER fixture_abort_schema_v9");
+  legacy.close();
+
+  const recovered = openStore({ paths, now: () => new Date("2026-07-16T00:02:00.000Z") });
+  assert.equal(recovered.capability.schemaVersion, 9);
+  recovered.close();
+});
+
+test("schema v9 migrates and deduplicates semantic notifications", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-notification-schema-"));
   const paths = pathsFor(home);
   const store = openStore({ paths });
@@ -69,7 +222,7 @@ test("schema v8 migrates and deduplicates semantic notifications", async () => {
   );
   assert.equal(first.notification_id, second.notification_id);
   assert.equal(store.listNotifications({ sessionUid: captured.session_uid }).length, 1);
-  assert.equal(store.capability.schemaVersion, 8);
+  assert.equal(store.capability.schemaVersion, 9);
   store.close();
   const reopened = openStore({ paths });
   assert.equal(reopened.listNotifications({ sessionUid: captured.session_uid }).length, 1);
@@ -164,7 +317,7 @@ test("chat observation requires authoritative v2 canonical controls and bounds v
   }
 });
 
-test("schema v8 reopens a realistic v7 store idempotently with valid foreign keys", async () => {
+test("schema v9 reopens a realistic v7 store idempotently with valid foreign keys", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-notification-migrate-"));
   const paths = pathsFor(home);
   const seeded = openStore({ paths });
@@ -194,18 +347,18 @@ test("schema v8 reopens a realistic v7 store idempotently with valid foreign key
   legacy.close();
 
   const migrated = openStore({ paths });
-  assert.equal(migrated.capability.schemaVersion, 8);
+  assert.equal(migrated.capability.schemaVersion, 9);
   assert.equal(migrated.listSessionEvents("legacy-project")[0].event_uid, captured.event_uid);
   assert.equal(migrated.getReviewerJob(job.job_id).job_id, job.job_id);
   assert.equal(migrated.hasDelivery("legacy-application"), true);
   migrated.close();
 
   const reopened = openStore({ paths });
-  assert.equal(reopened.capability.schemaVersion, 8);
+  assert.equal(reopened.capability.schemaVersion, 9);
   reopened.close();
 
   const verify = new DatabaseSync(paths.storeFile);
-  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8").get().count, 1);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9").get().count, 1);
   const notificationColumns = verify.prepare("PRAGMA table_info(notification_outbox)").all().map((row) => row.name);
   assert.equal(notificationColumns.includes("semantic_key"), true);
   assert.equal(notificationColumns.includes("system_lease_epoch"), true);
@@ -213,7 +366,7 @@ test("schema v8 reopens a realistic v7 store idempotently with valid foreign key
   verify.close();
 });
 
-test("schema v8 upgrades a pre-fence v8 outbox without losing notifications", async () => {
+test("schema v9 upgrades a pre-fence v8 outbox without losing notifications", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-notification-v8-reopen-"));
   const paths = pathsFor(home);
   const seeded = openStore({ paths });
@@ -257,7 +410,7 @@ test("schema v8 upgrades a pre-fence v8 outbox without losing notifications", as
   migrated.close();
 
   const verify = new DatabaseSync(paths.storeFile);
-  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8").get().count, 1);
+  assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9").get().count, 1);
   assert.deepEqual(verify.prepare("PRAGMA foreign_key_check").all(), []);
   verify.close();
 });

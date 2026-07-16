@@ -158,6 +158,105 @@ function ensurePrivateDirectorySync(directory, label) {
   chmodSync(directory, 0o700);
 }
 
+function migrationEpisodeId(jobId) {
+  return createHash("sha256")
+    .update(`feedback-episode:migration:v1\u0000${jobId}`)
+    .digest("hex");
+}
+
+function backfillSchemaV9ControlPlane(db) {
+  let deliveries = 0;
+  deliveries += db.prepare(`INSERT OR IGNORE INTO notification_deliveries
+    (notification_id, transport, state, owner_id, attempt, lease_epoch, lease_until, next_attempt_at,
+     ack_id, reason_code, accepted_at, observed_at, created_at, updated_at)
+    SELECT notification_id, 'audit', 'audited_only', NULL, 0, 0, NULL, NULL,
+      NULL, NULL, NULL, NULL, created_at, updated_at
+    FROM notification_outbox`).run().changes;
+  deliveries += db.prepare(`INSERT OR IGNORE INTO notification_deliveries
+    (notification_id, transport, state, owner_id, attempt, lease_epoch, lease_until, next_attempt_at,
+     ack_id, reason_code, accepted_at, observed_at, created_at, updated_at)
+    SELECT notification_id, 'system',
+      CASE system_state
+        WHEN 'not_applicable' THEN 'audited_only'
+        WHEN 'pending' THEN 'pending'
+        WHEN 'delivering' THEN 'delivering'
+        WHEN 'delivered' THEN 'accepted'
+        WHEN 'failed' THEN 'failed'
+        WHEN 'unsupported' THEN 'unsupported'
+        WHEN 'suppressed' THEN 'suppressed'
+      END,
+      CASE WHEN system_state='delivering' THEN system_owner ELSE NULL END,
+      system_attempts, system_lease_epoch,
+      CASE WHEN system_state='delivering' THEN system_lease_until ELSE NULL END,
+      CASE WHEN system_state IN ('pending','failed') THEN next_attempt_at ELSE NULL END,
+      NULL,
+      CASE
+        WHEN system_reason_code IS NULL THEN NULL
+        WHEN length(system_reason_code) BETWEEN 1 AND 64
+          AND system_reason_code NOT GLOB '*[^a-z0-9_]*' THEN system_reason_code
+        ELSE 'legacy_reason_invalid'
+      END,
+      CASE WHEN system_state='delivered' THEN COALESCE(system_delivered_at, updated_at) ELSE NULL END,
+      NULL, created_at, updated_at
+    FROM notification_outbox`).run().changes;
+  deliveries += db.prepare(`INSERT OR IGNORE INTO notification_deliveries
+    (notification_id, transport, state, owner_id, attempt, lease_epoch, lease_until, next_attempt_at,
+     ack_id, reason_code, accepted_at, observed_at, created_at, updated_at)
+    SELECT notification_id, 'legacy_model_echo',
+      CASE chat_state
+        WHEN 'observed' THEN 'observed'
+        WHEN 'emitted' THEN 'accepted'
+        WHEN 'emitted_unconfirmed' THEN 'accepted'
+        WHEN 'pending' THEN 'audited_only'
+        WHEN 'suppressed' THEN 'audited_only'
+      END,
+      NULL, chat_emit_attempts, 0, NULL, NULL,
+      CASE WHEN chat_turn_id IS NULL THEN NULL ELSE substr(chat_turn_id, 1, 512) END,
+      CASE
+        WHEN chat_state='pending' THEN 'legacy_not_emitted'
+        WHEN chat_state='suppressed' THEN 'legacy_suppressed'
+        ELSE NULL
+      END,
+      CASE WHEN chat_state IN ('emitted','emitted_unconfirmed','observed')
+        THEN COALESCE(chat_emitted_at, updated_at) ELSE NULL END,
+      CASE WHEN chat_state='observed' THEN COALESCE(chat_observed_at, updated_at) ELSE NULL END,
+      created_at, updated_at
+    FROM notification_outbox`).run().changes;
+
+  const findEpisodeSource = db.prepare(`SELECT e.session_uid, e.context_epoch, e.parent_event_id
+    FROM queue_events q JOIN session_events e ON e.event_uid=q.event_uid
+    WHERE q.job_id=? ORDER BY q.created_at, e.rowid LIMIT 1`);
+  const isAssistantReferent = db.prepare("SELECT 1 FROM session_events WHERE event_uid=? AND role='assistant'");
+  const insertEpisode = db.prepare(`INSERT OR IGNORE INTO feedback_episodes
+    (episode_id, session_uid, context_epoch, project_id, root_referent_event_uid, signal_strength,
+     status, reviewer_job_id, opened_at, ready_at, closed_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'strong', ?, ?, ?, ?, ?, ?)`);
+  const findEpisode = db.prepare("SELECT episode_id FROM feedback_episodes WHERE reviewer_job_id=?");
+  const insertEpisodeEvent = db.prepare(`INSERT OR IGNORE INTO feedback_episode_events
+    (episode_id, event_uid, relation, signal_reason, created_at)
+    SELECT ?, event_uid, 'feedback', 'reconciled_context', created_at
+    FROM queue_events WHERE job_id=?`);
+  let episodes = 0;
+  for (const job of db.prepare("SELECT * FROM reviewer_jobs ORDER BY job_id").all()) {
+    const source = findEpisodeSource.get(job.job_id) || null;
+    const referentId = source?.parent_event_id && isAssistantReferent.get(source.parent_event_id)
+      ? source.parent_event_id
+      : null;
+    const status = job.status === "completed"
+      ? "reviewed"
+      : (["pending", "running"].includes(job.status) ? "assigned" : "closed");
+    const closedAt = ["reviewed", "closed"].includes(status) ? job.updated_at : null;
+    episodes += insertEpisode.run(
+      migrationEpisodeId(job.job_id), source?.session_uid || null, source?.context_epoch || null,
+      job.project_id || null, referentId, status, job.job_id, job.created_at, job.created_at,
+      closedAt, job.updated_at
+    ).changes;
+    const episode = findEpisode.get(job.job_id);
+    if (episode) insertEpisodeEvent.run(episode.episode_id, job.job_id);
+  }
+  return { deliveries, episodes };
+}
+
 export function openStore({ paths, now = () => new Date(), receiptLanguage = process.env.AGENT_FEEDBACK_LOOP_RECEIPT_LANGUAGE || "auto" }) {
   if (!DatabaseSync) throw new Error("transactional SQLite backend unavailable; Node.js 24.15 or newer is required");
   if (!paths?.storeFile) throw new TypeError("paths.storeFile is required");
@@ -172,8 +271,14 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
   const db = new DatabaseSync(dbPath);
   chmodSync(dbPath, 0o600);
   db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`);
+  let migrationDiagnostic = null;
   db.exec("BEGIN IMMEDIATE");
   try {
+    const migrationTableExists = db.prepare(`SELECT 1 FROM sqlite_master
+      WHERE type='table' AND name='schema_migrations'`).get();
+    const schemaVersionBeforeMigration = migrationTableExists
+      ? Number(db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations").get().version)
+      : 0;
     db.exec(SCHEMA_SQL);
     for (const statement of [
     "ALTER TABLE session_events ADD COLUMN redaction_manifest_json TEXT",
@@ -235,6 +340,13 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
       UPDATE reviewer_jobs SET project_id=(SELECT project_id FROM queue_events WHERE queue_events.job_id=reviewer_jobs.job_id LIMIT 1)
         WHERE project_id IS NULL AND EXISTS (SELECT 1 FROM queue_events WHERE queue_events.job_id=reviewer_jobs.job_id);`);
     db.exec("UPDATE reviewer_jobs SET reason_code=NULL, lease_until=NULL WHERE status='completed' AND (reason_code IS NOT NULL OR lease_until IS NOT NULL)");
+    if (schemaVersionBeforeMigration > 0 && schemaVersionBeforeMigration < SCHEMA_VERSION) {
+      migrationDiagnostic = {
+        from: schemaVersionBeforeMigration,
+        to: SCHEMA_VERSION,
+        ...backfillSchemaV9ControlPlane(db)
+      };
+    }
     db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, nowIso(now));
     db.prepare("INSERT OR IGNORE INTO store_meta(key, value) VALUES ('capture_policy_revision', '1'), ('capture_enabled', '1')").run();
     db.exec("COMMIT");
@@ -242,6 +354,11 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     try { db.exec("ROLLBACK"); } catch {}
     db.close();
     throw error;
+  }
+  if (migrationDiagnostic) {
+    try {
+      console.error(`schema.migrated from=${migrationDiagnostic.from} to=${migrationDiagnostic.to} deliveries=${migrationDiagnostic.deliveries} episodes=${migrationDiagnostic.episodes}`);
+    } catch {}
   }
 
   const transaction = (fn) => {

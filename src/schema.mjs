@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -213,6 +213,129 @@ CREATE INDEX IF NOT EXISTS notification_outbox_chat_due_idx
   ON notification_outbox(session_uid, context_epoch, chat_state, created_at);
 CREATE INDEX IF NOT EXISTS notification_outbox_system_due_idx
   ON notification_outbox(system_state, next_attempt_at, system_lease_until);
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+  notification_id TEXT NOT NULL REFERENCES notification_outbox(notification_id) ON DELETE CASCADE,
+  transport TEXT NOT NULL CHECK(transport IN (
+    'codex_thread','system','audit','legacy_model_echo'
+  )),
+  state TEXT NOT NULL CHECK(state IN (
+    'pending','delivering','accepted','observed','failed','unsupported','suppressed','audited_only'
+  )),
+  owner_id TEXT,
+  attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+  lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch >= 0),
+  lease_until INTEGER,
+  next_attempt_at INTEGER,
+  ack_id TEXT CHECK(ack_id IS NULL OR length(ack_id) <= 512),
+  reason_code TEXT CHECK(reason_code IS NULL OR (
+    length(reason_code) BETWEEN 1 AND 64 AND reason_code NOT GLOB '*[^a-z0-9_]*'
+  )),
+  accepted_at TEXT,
+  observed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(notification_id, transport)
+);
+CREATE INDEX IF NOT EXISTS notification_deliveries_due_idx
+  ON notification_deliveries(transport, state, next_attempt_at, lease_until);
+CREATE INDEX IF NOT EXISTS notification_deliveries_lease_idx
+  ON notification_deliveries(owner_id, lease_epoch, state);
+CREATE TABLE IF NOT EXISTS feedback_episodes (
+  episode_id TEXT PRIMARY KEY,
+  session_uid TEXT REFERENCES sessions(session_uid) ON DELETE SET NULL,
+  context_epoch INTEGER CHECK(context_epoch IS NULL OR context_epoch >= 1),
+  project_id TEXT,
+  root_referent_event_uid TEXT REFERENCES session_events(event_uid) ON DELETE SET NULL,
+  signal_strength TEXT NOT NULL CHECK(signal_strength IN ('weak','strong')),
+  status TEXT NOT NULL CHECK(status IN ('open','ready','assigned','reviewed','closed')),
+  reviewer_job_id TEXT UNIQUE REFERENCES reviewer_jobs(job_id) ON DELETE SET NULL,
+  opened_at TEXT NOT NULL,
+  ready_at TEXT,
+  closed_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS feedback_episodes_open_projection_idx
+  ON feedback_episodes(session_uid, context_epoch, IFNULL(root_referent_event_uid, ''))
+  WHERE status='open';
+CREATE INDEX IF NOT EXISTS feedback_episodes_due_idx
+  ON feedback_episodes(status, ready_at, updated_at);
+CREATE INDEX IF NOT EXISTS feedback_episodes_reviewer_idx
+  ON feedback_episodes(reviewer_job_id, status);
+CREATE TABLE IF NOT EXISTS feedback_episode_events (
+  episode_id TEXT NOT NULL REFERENCES feedback_episodes(episode_id) ON DELETE CASCADE,
+  event_uid TEXT NOT NULL UNIQUE REFERENCES session_events(event_uid) ON DELETE CASCADE,
+  relation TEXT NOT NULL CHECK(relation IN ('referent','feedback','context')),
+  signal_reason TEXT NOT NULL CHECK(signal_reason IN (
+    'active_turn_steering','turn_interrupted','explicit_feedback','reconciled_context'
+  )),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(episode_id, event_uid)
+);
+CREATE INDEX IF NOT EXISTS feedback_episode_events_episode_idx
+  ON feedback_episode_events(episode_id, created_at, event_uid);
+CREATE TABLE IF NOT EXISTS memory_maintenance_jobs (
+  maintenance_job_id TEXT PRIMARY KEY,
+  job_type TEXT NOT NULL CHECK(job_type IN ('consolidate','resize','conflict_review')),
+  project_id TEXT,
+  family_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+    'pending','running','completed','failed','retry_exhausted','needs_human_resolution'
+  )),
+  owner_id TEXT,
+  attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+  lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK(lease_epoch >= 0),
+  lease_until INTEGER,
+  next_attempt_at INTEGER,
+  reason_code TEXT CHECK(reason_code IS NULL OR (
+    length(reason_code) BETWEEN 1 AND 64 AND reason_code NOT GLOB '*[^a-z0-9_]*'
+  )),
+  input_digest TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS memory_maintenance_jobs_due_idx
+  ON memory_maintenance_jobs(status, next_attempt_at, lease_until, created_at);
+CREATE INDEX IF NOT EXISTS memory_maintenance_jobs_lease_idx
+  ON memory_maintenance_jobs(owner_id, lease_epoch, status);
+CREATE TABLE IF NOT EXISTS memory_maintenance_inputs (
+  maintenance_job_id TEXT NOT NULL REFERENCES memory_maintenance_jobs(maintenance_job_id) ON DELETE CASCADE,
+  lesson_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  card_hash TEXT NOT NULL,
+  PRIMARY KEY(maintenance_job_id, lesson_id, revision),
+  FOREIGN KEY(lesson_id, revision) REFERENCES lesson_revisions(lesson_id, revision)
+);
+CREATE TABLE IF NOT EXISTS memory_maintenance_job_events (
+  event_id TEXT PRIMARY KEY,
+  maintenance_job_id TEXT NOT NULL REFERENCES memory_maintenance_jobs(maintenance_job_id) ON DELETE CASCADE,
+  attempt INTEGER NOT NULL CHECK(attempt >= 0),
+  lease_epoch INTEGER NOT NULL CHECK(lease_epoch >= 0),
+  state TEXT NOT NULL CHECK(state IN (
+    'claimed','requeued','completed','failed','retry_exhausted','needs_human_resolution'
+  )),
+  reason_code TEXT CHECK(reason_code IS NULL OR (
+    length(reason_code) BETWEEN 1 AND 64 AND reason_code NOT GLOB '*[^a-z0-9_]*'
+  )),
+  provider TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_maintenance_job_events_transition_idx
+  ON memory_maintenance_job_events(maintenance_job_id, lease_epoch, state, IFNULL(reason_code, ''));
+CREATE TABLE IF NOT EXISTS lesson_lineage (
+  source_lesson_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK(source_revision >= 1),
+  target_lesson_id TEXT NOT NULL,
+  target_revision INTEGER NOT NULL CHECK(target_revision >= 1),
+  relation TEXT NOT NULL CHECK(relation IN ('consolidated_into','superseded_by')),
+  maintenance_job_id TEXT NOT NULL REFERENCES memory_maintenance_jobs(maintenance_job_id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(source_lesson_id, source_revision, target_lesson_id, target_revision, relation),
+  FOREIGN KEY(source_lesson_id, source_revision) REFERENCES lesson_revisions(lesson_id, revision),
+  FOREIGN KEY(target_lesson_id, target_revision) REFERENCES lesson_revisions(lesson_id, revision)
+);
+CREATE INDEX IF NOT EXISTS lesson_lineage_maintenance_idx
+  ON lesson_lineage(maintenance_job_id, relation);
 CREATE TABLE IF NOT EXISTS lesson_effectiveness_events (
   effectiveness_event_id TEXT PRIMARY KEY,
   lesson_id TEXT NOT NULL REFERENCES lessons(lesson_id),
