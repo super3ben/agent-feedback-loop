@@ -1,16 +1,23 @@
 # Subagent Progress
 
+## Completed
+
+- Task 1: complete (`6fe263c..7d6b1e3`, review spec compliant and quality approved, no findings)
+  - RED evidence: migration tests 0/2 with schema `8 !== 9` and missing rollback exception; logging test empty diagnostic
+  - GREEN evidence: implementer targeted 5/5, store/runtime 57/57, full suite 201/201; coordinator independently reran migration 5/5
+
+## Current
+
 - Change: `isolate-feedback-control-plane`
-- Plan task: `Task 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约`
+- Plan task: `Task 2：建立 notification delivery 的租约、状态与迁移兼容 API`
 - OpenSpec tasks:
-  - `1.1 固化 schema-v8 失败 fixture：commentary-only receipt、Stop re-entry、重复运维追问、5 张无冲突 severe card 和 oversized severe card。`
-  - `1.2 为 schema-v9 delivery、feedback episode、maintenance job/event/input 和 lesson lineage 编写 RED migration test，并证明 schema-v8 evidence 全部保留。`
-  - `1.3 实现 additive schema-v9 migration 与完整性约束，包括历史 legacy_model_echo 和 audited_only 映射。`
+  - `3.1 为 per-transport claim、fenced lease、accepted/observed、retry、unsupported 和 semantic idempotency 编写 RED store test。`
+  - `3.2 实现 transport-neutral notification delivery store，把 notifier/audit query 从内嵌 chat/system 列迁移出来。`
 - Phase: `implementing`
 - Review mode: `thorough`
 - Review/fix round: `0/2`
 - TDD mode: `tdd`
-- Implementer base: `d70e019883d1833af52ba21ce20455d4dddb6965`
+- Implementer base: pending checkpoint commit
 - Implementer commit: pending
 - Changed files: pending
 - RED evidence: pending

@@ -1,8 +1,8 @@
 ## 1. 基线与迁移契约
 
-- [ ] 1.1 固化 schema-v8 失败 fixture：commentary-only receipt、Stop re-entry、重复运维追问、5 张无冲突 severe card 和 oversized severe card。
-- [ ] 1.2 为 schema-v9 delivery、feedback episode、maintenance job/event/input 和 lesson lineage 编写 RED migration test，并证明 schema-v8 evidence 全部保留。
-- [ ] 1.3 实现 additive schema-v9 migration 与完整性约束，包括历史 `legacy_model_echo` 和 `audited_only` 映射。
+- [x] 1.1 固化 schema-v8 失败 fixture：commentary-only receipt、Stop re-entry、重复运维追问、5 张无冲突 severe card 和 oversized severe card。
+- [x] 1.2 为 schema-v9 delivery、feedback episode、maintenance job/event/input 和 lesson lineage 编写 RED migration test，并证明 schema-v8 evidence 全部保留。
+- [x] 1.3 实现 additive schema-v9 migration 与完整性约束，包括历史 `legacy_model_echo` 和 `audited_only` 映射。
 
 ## 2. 控制面隔离
 

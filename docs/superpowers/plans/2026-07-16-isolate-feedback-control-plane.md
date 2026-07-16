@@ -24,7 +24,7 @@ base-ref: 17f1761c1fed0465ad39aaa3c76c34a02d692c5c
 
 ## 执行进度
 
-- [ ] Task 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约
+- [x] Task 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约
 - [ ] Task 2：建立 notification delivery 的租约、状态与迁移兼容 API
 - [ ] Task 3：让所有 Stop 路径永不阻断业务回合
 - [ ] Task 4：从模型上下文移除回执与虚假维护控制指令
