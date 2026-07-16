@@ -1,117 +1,131 @@
-## 背景与现状
+## 背景
 
-0.7.6 已经具备事务型 reviewer 和 notification outbox，但跨越了两个不安全边界：
+0.7.6 把 AFL 回执放进主模型上下文，并让 Stop hook 在最终输出中找不到 marker 时阻断停止、要求再生成一轮纯回执。与此同时，所有普通用户 prompt 都可能进入队列，默认累计 3 条才创建 reviewer job。前者破坏业务回合，后者无法保证第一次明确不满立即学习。
 
-1. runtime 在 `UserPromptSubmit.additionalContext` 中注入指令，让主模型逐字复述回执；
-2. Stop hook 没看到模型生成的 marker 时返回 `decision=block`，强制再生成一轮 assistant output。
+当前分支曾尝试增加原生/系统通知 transport、feedback episode、maintenance scheduler 和数据库控制表。该方向保留了不必要的“把 reviewer 状态反馈给用户”目标，并把一个本可由短生命周期 subagent 完成的流程扩展成后台平台。本设计撤销该方向。
 
-`additionalContext` 是模型上下文，不是专用通知通道，因此无法同时保证“回执一定出现”和“业务回答绝不受影响”。commentary/final 的分离以及宿主渲染方式都不受 AFL 控制。同一种概念错误也存在于 lesson selector：本地 Top-K/Token 上限被当成非法记忆状态，注入的 hold 又声称后台 compactor 正在工作，实际却没有创建任何 compaction job。
+## 目标
 
-现有 store 仍有可复用基础：持久事件、带租约 reviewer job、不可变 lesson revision、notification outbox、delivery receipt、transcript reconciliation 和独立租约的 system notifier。本设计保留这些基础，但把状态归回正确子系统。
+- 主会话永远不等待 reviewer，也不输出 AFL 回执、状态或内部指令。
+- 一个不同的明确反馈候选被持久化后，立即尝试启动一个 detached reviewer subagent。
+- 已完成回合中的回顾性不满能够被本地候选检测发现，reviewer 是最终语义闸门。
+- 长期经验只存在于项目 `.agent/reflections/*.md`，后续 prompt 直接读取文档。
+- 小规模场景不用 RAG、常驻 scheduler、通知系统或独立 maintenance 生命周期。
+- 对“学习是否有效”的声明严格受证据约束。
 
-## 目标与非目标
+## 非目标
 
-**目标：**
-
-- 正常业务输出独立于 AFL 回执、reviewer、selector 容量与 maintenance 状态。
-- 通过能力感知的 transport 投递终态通知，不再要求主模型回显控制文本。
-- 为每个投递状态建立真实 acknowledgement 边界：queued、transport-accepted、transcript-observed、failed、unsupported 或 audited-only。
-- 把相关纠正归并为一个因果 feedback episode，并最多创建一个 immediate reviewer job。
-- 在有界容量内选择最强适用记忆，返回明确 omission diagnostics，而不是全局 hold。
-- 用持久 job、租约、重试、校验、lineage 和原子发布实现真实 memory maintenance。
-- 从 schema v8 保守迁移，不丢失 reviewer、lesson、receipt 或 audit evidence。
-
-**非目标：**
-
-- 不保证缺少直接 append API 的宿主一定能在聊天中显示内联回执。
-- 不把 app-server acknowledgement 当成用户已经看到回执的证明。
-- 不在同步 prompt/Stop hook 路径调用语言模型。
-- consolidation 期间不删除历史 lesson 或报告。
-- 不自动解决无法通过确定性安全校验的语义矛盾。
-- 不把 maintenance worker 扩展成与本问题无关的通用分布式任务框架。
+- 不保证刚触发的反思能作用于同一个 prompt；主会话不为此等待。
+- 不把任意负面词、追问或方案讨论都直接写成长期经验。
+- 不在当前规模实现向量检索、embedding、数据库全文记忆或后台 compactor。
+- 不自动修改、删除或合并历史反思文档。
+- 不支持 Windows；首期支持 macOS 与 Linux。
 
 ## 架构决策
 
-### 1. 建立 non-interference 边界
+### 1. Prompt hook 是唯一的同步入口
 
-事务型 Stop hook 只负责采集 assistant output、对账 delivery observation 和返回宿主 no-op success schema。无论 receipt、reviewer、lesson 或 maintenance 处于什么状态，都不得输出 `block` 或 `deny`。`UserPromptSubmit.additionalContext` 只允许承载真正适用的 lesson 内容，不得包含回执、维护状态声明或通用纠正指令。
+默认安装只保留 `UserPromptSubmit` 类入口。一次调用按固定顺序完成有界工作：
 
-拒绝方案：继续增强 transcript 扫描，使 Stop 能在 commentary 中找到回执。该方案仍把 model response 当成通知 transport，未来宿主格式变化仍可能阻断业务回合。
+1. 捕获当前用户事件及可用的直接 assistant referent；
+2. 排除 AFL synthetic/control traffic；
+3. 运行纯本地候选检测；
+4. 对新候选事务性插入 reviewer job，并在提交后立即 detached spawn；
+5. 解析已有反思文档，选择适用方法并作为普通上下文返回；
+6. 无论 reviewer、存储或选择失败，都及时返回主会话。
 
-### 2. 按 transport 规范化通知状态
+默认安装不注册 Stop hook。没有 receipt、hookPrompt、model nonce echo、chat/system notification 或“等待后台 reviewer”文案。主会话看到的唯一 AFL 内容只能是已经发布且与当前任务相关的经验方法。
 
-`notification_outbox` 继续作为语义事件源。原先混在一行里的 chat/system 可变列迁移到 `notification_deliveries`，主键为 `(notification_id, transport)`，初始 transport 包含 `codex_thread`、`system` 和 `audit`。每行拥有独立 leased lifecycle，并明确分开 `accepted_at` 与 `observed_at`。
+### 2. 候选识别只负责高召回，reviewer 负责最终判断
 
-Codex adapter 先探测本地 app-server 协议；只有精确解析当前 native session 后，才调用 `thread/inject_items` 追加一条有界 synthetic assistant item。JSON-RPC 成功只表示 `accepted`，不表示 `observed`。transcript reconciliation 后续看到稳定 synthetic marker 才能写 `observed`。adapter 不可用或拒绝请求时，终态通知退到 system notifier，并持续通过 `review list/show` 可审计。
+候选检测组合两类证据：
 
-Claude Code 和 Gemini 在没有通过等价能力验证前，只启用 `system` 与 `audit`。任何 adapter 都不得 fallback 到 prompt injection 或 Stop block。
+- 宿主强结构信号，例如 active-turn steering、明确 interruption/turn-aborted 或专用 feedback event；
+- 已完成回合的本地回顾性证据：存在直接 assistant referent，并同时出现多个独立特征类别，例如负面评价、向后指代、责任/因果表达、以及“本应怎样”的过程反差。
 
-默认只主动推送 reviewer 终态。candidate/queued transition 仍作为审计事件存在，从源头降低噪声并移除“prompt 时必须同步投递回执”的错误动机。
+任何单个关键词都不是授权。检测器只输出 reason codes 与分数，不输出长期结论。普通问题、被 agent 主动征求的设计校准、仅讨论 AFL 原理的中性问题和 synthetic hook 文本必须有负例测试。
 
-拒绝方案：所有宿主只用侧通道。它虽然安全，但会放弃 Codex 已提供的 append capability。能力门控可以在保持安全属性的同时，允许已验证宿主获得内联可见性。
+以下已完成回合表达必须成为正例 fixture：
 
-### 3. 引入因果 feedback episode
+> 是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西
 
-被捕获的 session event 只是 observation，不自动成为 feedback candidate。新增 `feedback_episodes`，保存 root assistant referent、session/context epoch、signal strength、lifecycle 和 reviewer job；`feedback_episode_events` 关联后续 steering/correction event。
+候选成立后立即评审，不等待后续第 2、3 条。reviewer 使用有界相邻上下文核对：是否确实评价了既有 agent 产出、未满足项是什么、责任是否属于 agent、是否存在可复用的方法变化。误报结束为 `reviewed_no_lesson`，不写文档。
 
-结构信号分类如下：
+### 3. 每个不同候选一个幂等 job，不建立 episode 平台
 
-- AFL synthetic control item：排除；
-- 普通 prompt/follow-up：仅捕获；
-- active-turn steering：弱 episode evidence，等待 turn close/debounce；
-- 宿主确认的 interruption 或显式 feedback event：强 episode evidence；
-- episode open 时、同一 causal referent 的后续纠正：合并到原 episode。
+`review_jobs` 使用稳定 source identity 去重同一次 hook 重放：`host + session_uid + context_epoch + source_event_id + referent_id`，缺少稳定 event id 时才使用规范化 payload digest。不同用户事件即使文字或 referent 相同，也分别立即评审，因为它们可能是有价值的复发证据；不跨会话按文本去重。
 
-只有强 episode 关闭或 debounce 到期时，才允许创建一次 immediate reviewer job。唯一性边界是 episode id，而不是 prompt text 或 hook invocation。已 reviewed 的 episode 不能因普通追问重新打开；只有新的 assistant referent 才能建立新 episode。
+插入 job 与 source evidence 在一个短事务中完成，事务内不启动进程。提交后使用 macOS/Linux 支持的 detached child 启动短生命周期 reviewer runner，parent `unref` 后立即返回。runner 自己 claim job、调用 reviewer、校验结果并提交终态。
 
-拒绝方案：继续增加自然语言反馈关键词。关键词无法稳定跨语言，也不能证明因果关系，仍会把“为什么 AFL 出现这个”一类运维询问变成 reviewer job。
+系统没有常驻 scheduler。spawn 失败或 worker 崩溃时，job 保持 pending 或等待租约过期；后续 prompt hook 只做一次有界 opportunistic recovery，最多重启少量 due job。初次处理仍是在候选产生时立即启动，恢复扫描不是批处理门槛。
 
-### 4. 把 selection limit 视为 ranking constraint
+### 4. Markdown 文档是长期记忆事实源
 
-Lesson selector 返回 `{cards, omissions, diagnostics}`。适用且无冲突的 lesson 按 severity、精确 scope evidence、recurrence、confidence、revision 与 lesson id 建立确定性全序，再在 card 数量和 Token 预算内贪心选择。
+reviewer 先返回结构化结果，controller 校验后再渲染为人可读 Markdown。新文档沿用现有报告形式，至少包含：
 
-超出数量、单卡过大或总预算耗尽时，记录 omission reason，并可请求 maintenance；不得清空已选卡片，也不得返回全局 hold。真正冲突的 family 只隔离自身，其他安全 lesson 继续选择。记忆指导本身不构成阻断宿主业务回合的授权。
+- `reflection_id`、`created_at`、`final_severity`、`responsibility`；
+- `method_class` 与稳定 `family_id`；
+- `facts proven by context`、`user complaint in plain language`、`root cause`；
+- `class of mistake`、`method change`、`repeated pattern evidence`；
+- source identity 的不可逆摘要，不保存额外原始 prompt 到日志或数据库。
 
-### 5. 增加真实 maintenance 状态机
+文件通过同目录临时文件、fsync 和 rename 原子发布到 `.agent/reflections/<timestamp>-<slug>.md`。只有发布完成才把 job 标记为 `published`；`reviewed_no_lesson` 不创建文件。SQLite 仅记录 document path/hash 作为控制账本，不复制正文。
 
-Schema v9 新增：
+现有 Markdown 保持可读。新 parser 优先读取规范字段；旧文档在能可靠解析 severity、class 和 method change 时直接参与选择，否则只保留为可审计历史并记录 `legacy_incomplete` omission。文档不会因再次发生而就地改写；新事件生成新文档，并用相同 `family_id` 表达复发。
 
-- `memory_maintenance_jobs`：type、family/project scope、status、owner、attempt、lease epoch/expiry、reason、input digest 与时间戳；
-- `memory_maintenance_job_events`：claimed、requeued、completed、failed、retry exhausted；
-- `memory_maintenance_inputs`：不可变 source lesson/revision 引用；
-- `lesson_lineage`：source/target lesson revision、relation、maintenance job 与时间戳；
-- `feedback_episodes`、`feedback_episode_events`；
-- `notification_deliveries`。
+### 5. 后续 prompt 直接选择文档，不建 RAG 层
 
-重复 omission、oversized card、同 family 多个 active projection 或显式 conflict 会幂等创建 maintenance job。worker 复用现有 detached-provider 启动机制，但使用 maintenance 专用输入/输出契约。发布前必须验证：card 字段完整、体积有界、覆盖全部 source、severity 不低于 source 最大值、没有无证据扩大 scope、lineage 完整。通过后在一个事务中发布 target，并把 source 标为 superseded 而非删除。
+selector 直接扫描当前项目反思目录，以受限单文件大小解析 metadata、错误类别与 `method change`。它根据项目范围、任务相关性、severity、同 family 文档数量、时间和稳定 id 建立确定性全序，选择配置的 Top-K，并把方法段落渲染成有界上下文。
 
-若 source 矛盾且确定性校验无法同时保留约束，job 结束为 `needs_human_resolution`；相关 family 继续隔离，不发布虚假 consolidation。
+超过数量或 Token 预算时只记录 `count_budget`、`token_budget`、`oversized_document` 或 `legacy_incomplete` omission。绝不返回 `memory_overflow_hold`，也不声称后台正在压缩。当前数据规模直接扫描文档；只有真实规模和延迟数据证明该方式不可接受时，才另行设计 RAG。
 
-### 6. 保守且可观察地迁移
+同一 family 的 recurrence 由文档数量和 lineage 计算，不依赖数据库里的自增计数。默认选择该 family 最新的完整方法，历史文档继续提供证据，但不重复把同类方法全部塞进上下文。
 
-Schema v8 notification row 全部保留。已有 `chat_state/system_state` 复制到 per-transport delivery，旧模型回显标记为 `legacy_model_echo`。未完成的旧 chat row 迁移为 `audited_only`，不再重放进会话；`chat_block_attempted` 作为历史审计信息保留。
+### 6. 效果状态只记录可证明事实
 
-已有 reviewer job 各自获得一个 synthetic feedback episode 便于追溯；已完成 job 保持完成，不重新调度。历史 `memory_overflow_hold` 只有在重新执行当前 selector 并确认 source revision 后，才允许创建 maintenance job。
+状态定义如下：
 
-## 风险与取舍
+- `published`：规范反思文档已经原子存在并通过 hash 校验；
+- `selected`：selector 在某次 prompt 上选择了该文档；
+- `emitted`：prompt hook 确实把对应有界经验上下文返回给宿主；
+- `recurrence_after_emission`：后来 reviewer 确认同一 family 再次发生，且该事件之前存在该 family 的 emitted 记录。
 
-- **`thread/inject_items` 被接受但桌面端未立即显示。** → 只记录 `accepted`，等待 transcript observation，并以 system/audit 补偿，不宣称用户已看到。
-- **hook 内连接 active app-server 可能死锁或命中错误 thread。** → prompt/Stop 同步进程绝不调用 native adapter；scheduler 使用精确 native session identity 和严格 timeout 异步 drain。
-- **减少 immediate job 会延迟单次纠正的学习。** → strong interruption/explicit-feedback 仍即时；weak steering 在 turn 结束后 debounce review。
-- **非阻断 selection 可能省略重要 severe card。** → severity-first 确定性排序、omission telemetry、真 enforcement gap 的 system notification 与自动 maintenance 保持可观察性。
-- **自动 consolidation 可能削弱安全指令。** → 不可变 source、severity/scope 校验、bounded output、事务发布和 `needs_human_resolution` 阻止不安全合并。
-- **schema migration 可能产生含糊 legacy delivery。** → 使用具名 legacy transport 保留事实；没有 transcript evidence 时绝不从 `accepted` 升级为 `observed`。
+`selected` 不等于 `emitted`，`emitted` 不等于模型已采用，更不等于用户行为改善。没有再次出现只能保持 `unknown`，不能自动升级为 effective。`recurrence_after_emission` 是明确的负向效果证据，后续文档必须指出原方法为何没有防住，而不是仅增加计数。
 
-## 迁移与回滚计划
+### 7. SQLite 是短期控制账本
 
-1. 增加 schema v9 表，把 delivery/episode audit data 迁移完成，但不改已安装 hook。
-2. 加入新 selector 与 episode routing，并对新库和 schema-v8 数据库副本运行 migration、unit、concurrency 与 recovery test。
-3. 增加异步 transport/maintenance worker；在 disposable task 和长期 task 上验证 Codex native delivery，再验证 fallback。
-4. 修改 prompt hook，只注入 selected lesson context；修改 Stop hook为 capture-only fail-open。
-5. 原子安装新 managed runtime，执行 `doctor --live` 与真机矩阵，证明不再产生 Stop block 或 model-echo instruction。
-6. 回滚只切换 `current.json` 到上一 runtime。schema v9 全部为 additive table，旧 runtime 会忽略；不删除迁移后的审计数据。
+新运行时只需要：job/source identity、状态、attempt、owner/lease、短期 bounded evidence、document path/hash、selected/emitted attempt 和结构化错误码。终态 job/evidence 按明确 retention 清理，Markdown 文档不随清理丢失。
 
-## 尚待真机回答的问题
+旧数据库不再作为 lesson/report/card 的读取源。一次性迁移命令必须支持 `--dry-run`、指定输出目录、按 legacy identity/hash 幂等导出和碰撞报告。真实 HOME 的迁移或 runtime 切换必须再次获得用户明确授权；旧数据库可原样保留为归档。
 
-- Codex desktop 对异步注入 assistant item 是否立即渲染，必须由 live acceptance 证明。若只 `accepted` 而未 `observed`，状态机已经定义了真实处理方式。
-- Claude Code/Gemini 在没有公开并通过等价 native append contract 前，不启用 native adapter。
+### 8. 日志、平台与安全边界
+
+运行日志只记录 opaque job/document/family id、reason code、计数、duration、lease 和退出状态，不记录 prompt、reviewer 正文、方法正文、token、socket 或绝对项目内容。
+
+detached launch、原子 rename、锁和权限在 macOS 与 Linux 分别测试。安装器必须从 managed block 中删除旧 Stop hook，而不是仅令其 no-op。任何 capture、spawn、review、parse 或 select 异常都 fail-open 到正常业务回答。
+
+## 失败与恢复
+
+- **插入 job 失败**：记录 bounded error，主会话继续；没有虚假“已排队”提示。
+- **spawn 失败**：job 保持 pending；当前主会话继续，下次 prompt 有界重试。
+- **worker 崩溃**：租约到期后由后续 prompt 回收；stale owner 不能提交。
+- **reviewer 输出不合法**：job 记录 retryable/terminal reason；不发布半成品。
+- **原子发布失败**：job 不进入 published；临时文件可安全清理。
+- **文档解析失败**：仅省略该文档并记录 reason；其他文档和主会话继续。
+- **选择为空**：正常返回，不注入控制文案。
+
+## 迁移与回滚
+
+1. 先在临时 HOME 中用历史数据库副本验证 dry-run 和幂等导出，不读取或修改真实运行库。
+2. 安装测试必须证明 managed 配置只有 prompt hook，没有 Stop、receipt、notification 或 scheduler。
+3. 在 macOS 真机与 Linux 环境分别证明：业务回答不含 AFL 控制文本，候选 job 立即启动，subagent 在主回合外完成，下一次匹配 prompt 可直接读取新文档。
+4. 只有用户再次明确批准，才迁移真实数据并原子切换 `current.json`；现有全局 hooks 在此之前保持关闭。
+5. 回滚只切回旧 runtime/config；新 Markdown 是普通文件，旧 SQLite 未被破坏。
+
+## 已否决方案
+
+- **继续让 Stop 找 receipt。** 无论扫描多准确，都仍把主模型输出当控制 transport。
+- **把 reviewer 结果通过 Codex 原生消息或系统通知投递。** 用户不需要控制噪声；独立 subagent 的价值是生成下一次可消费的文档。
+- **收集 3 条或等待 episode 关闭。** 这使第一次故障无法及时学习，违背反馈机制的目标。
+- **常驻 scheduler/maintenance worker。** 当前只有短任务和小规模 Markdown，没有足够收益支撑平台复杂度。
+- **数据库作为长期记忆或现在引入 RAG。** 文档量尚小，直接读取更透明、更可审计；规模证据出现后再设计索引。

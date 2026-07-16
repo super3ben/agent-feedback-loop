@@ -4,336 +4,428 @@ role: technical-design
 canonical_spec: openspec
 ---
 
-# Agent Feedback Loop 控制面隔离与真实记忆维护技术设计
+# Agent Feedback Loop 即时 Subagent 反思与文档记忆技术设计
 
 ## 1. 设计定位
 
-需求与验收场景以 `openspec/changes/isolate-feedback-control-plane/` 为唯一事实源。本文只回答实现方式：模块边界、数据模型、事务与租约、宿主 adapter、迁移、日志和测试策略。
+需求与验收场景以 `openspec/changes/isolate-feedback-control-plane/` 为唯一规格源。本文回答实现方式：同步边界、候选检测、detached reviewer、短期控制账本、Markdown 发布/读取、效果证据、迁移和真机验证。
 
-本次修改从已部署的 0.7.6 分支继续，保留已有 capture、reviewer、lesson、outbox 和 reconciliation 能力。核心不变量是：
+本次重设计不是对 0.7.6 做兼容性热修复。它撤销当前分支中已经证明会把系统变重、但不能增加用户价值的方向：
 
-> AFL 的任何控制面状态都不能要求主模型代为投递，也不能通过 Stop 让业务回合多生成一次。
+- 模型回显 receipt 与 Stop 补发；
+- Codex 原生消息、系统通知和 notification delivery 状态机；
+- 等待 episode 收集/关闭后才调度 reviewer；
+- 常驻 scheduler 与 memory maintenance worker；
+- SQLite lesson/card 正文与数据库长期检索。
 
-## 2. Runtime 边界
+### 1.1 不可妥协的不变量
+
+1. 主业务回答不依赖任何 AFL 状态，也不承担 AFL 控制文本的投递。
+2. 第一个不同的明确反馈候选一旦落账，就立即尝试启动独立 reviewer subagent。
+3. reviewer 完成与否不影响当前 prompt；刚产生的经验最早从发布后的下一次匹配 prompt 生效。
+4. `.agent/reflections/*.md` 是长期经验唯一事实源，SQLite 只是可清理的控制账本。
+5. 所有容量、解析、provider 和后台失败都 fail-open；不存在 `memory_overflow_hold`。
+6. 只对 macOS 与 Linux 建立受支持、可验证的进程和安装契约。
+
+## 2. 运行拓扑
 
 ```text
-用户 prompt
+UserPromptSubmit
     │
-    ▼
-UserPromptSubmit ── capture event ──► episode router ──► reviewer queue
-    │                                         │
-    │                                         └── async only
-    ├── select bounded lessons
-    └── return lesson additionalContext or host no-op
+    ├── bounded capture + synthetic filter
+    ├── local feedback candidate detector
+    │       └── new candidate transaction
+    │               └── detached spawn + immediate return
+    ├── direct scan of .agent/reflections/*.md
+    ├── deterministic Top-K method selection
+    └── host response: applicable method guidance or no-op
 
-assistant output
+detached reviewer runner (short-lived)
     │
-    ▼
-Stop ── bounded capture / transcript observation / bookkeeping
-    └── always host no-op (never block/deny)
-
-reviewer / maintenance transaction
-    │
-    ▼
-notification_outbox ──► notification_deliveries
-                           ├── codex_thread worker
-                           ├── system worker
-                           └── audit
+    ├── claim job with fenced lease
+    ├── gather bounded referent/context + reflection metadata
+    ├── invoke reviewer provider/subagent
+    ├── validate structured result
+    ├── no lesson ──► terminal row only
+    └── lesson ─────► atomic Markdown publication
 ```
 
-同步 hook 路径允许做本地、确定性、受限的 SQLite 操作；禁止调用 reviewer、maintenance provider、app-server native delivery 或操作系统 notifier。所有潜在阻塞 I/O 都进入 scheduler/worker。
+默认安装没有 AFL Stop hook。也没有 resident daemon、timer、launchd/systemd scheduler、app-server adapter 或 OS notifier。detached runner 是候选产生时启动的一次性子进程，不是后台服务。
 
-## 3. 数据模型
+## 3. 模块边界
 
-Schema 从 8 升级到 9。新表全部 additive，旧 runtime 可忽略。
+现有代码先按职责审计，不能因为已经提交就保留。目标模块边界如下；最终文件名可在实施时微调，但职责不得重新混合。
 
-### 3.1 `notification_deliveries`
+### 3.1 Prompt orchestration
 
-每条 outbox semantic event 可对应多个 transport delivery：
+`src/cli.mjs` 或独立 orchestrator 只组合以下纯/有界能力：
+
+- capture 当前 user event 和直接 assistant referent；
+- 调用 `feedback-signal` 得到 `{candidate, reasonCodes, score}`；
+- 在短事务中调用 reviewer job store；
+- 事务提交后调用 detached launcher；
+- 调用 document selector 并渲染 bounded context；
+- 无论子步骤结果如何都返回宿主的 prompt-hook schema。
+
+同步路径禁止：reviewer/provider 调用、等待 child、Stop reconciliation、native message append、系统通知、数据库 migration、文档 consolidation。
+
+### 3.2 `feedback-signal`
+
+纯函数输入是宿主结构字段、当前 user event、直接 referent 的最小 metadata，以及是否为 synthetic traffic。输出只说明“是否值得交给 reviewer”，不产生 lesson、severity 或责任结论。
+
+### 3.3 Reviewer job store
+
+复用现有 SQLite 基础时只保留 job、source observation、lease 和 publication/emission 指针。notification、episode、maintenance、长期 lesson/report/card 表不能成为新 runtime 依赖。
+
+### 3.4 Detached launcher 与 runner
+
+launcher 只负责一次 spawn attempt；runner 才拥有 job lease、provider invocation、validation 和 publication。两者通过 job id 关联，不通过 stdout 向主会话传递结果。
+
+### 3.5 Reflection document
+
+`reflection-document` 负责 canonical/legacy Markdown parse、结构校验、render、atomic publish 和 content hash。selector 与 reviewer 都通过这一层读取文档，不能各写一套解析规则。
+
+### 3.6 Selector
+
+selector 的输入是项目目录、当前任务的 bounded textual features、已发布文档与 emission history；输出是 `{guidance, selected, omissions}`。它不打开旧 lesson/card body 表。
+
+## 4. Prompt 同步路径
+
+### 4.1 顺序与事务边界
+
+一次 prompt hook 的伪流程：
 
 ```text
-notification_id       FK notification_outbox
-transport             codex_thread | system | audit | legacy_model_echo
-state                 pending | delivering | accepted | observed |
-                      failed | unsupported | suppressed | audited_only
-owner_id              nullable
-attempt               integer
-lease_epoch           integer
-lease_until           epoch milliseconds
-next_attempt_at       epoch milliseconds
-ack_id                bounded opaque string
-reason_code           bounded snake_case
-accepted_at           nullable ISO timestamp
-observed_at           nullable ISO timestamp
-created_at/updated_at ISO timestamp
-PRIMARY KEY(notification_id, transport)
+event = capture(payload)
+signal = detect(event, directReferent)
+
+BEGIN IMMEDIATE
+  source = insertSourceObservationIdempotently(event)
+  job = signal.candidate ? insertJobIfAbsent(source.identity) : null
+COMMIT
+
+if job.wasCreated:
+  attemptDetachedSpawn(job.id)       # no wait
+
+attemptBoundedRecovery(limit = 1)    # pending/expired only; no timer
+
+documents = readProjectReflections()
+selection = selectDocuments(documents, event.taskContext)
+response = renderHostContext(selection.guidance)
+recordSelectedAndEmittedTruthfully(response)
+return response
 ```
 
-状态转换：
+事务内不 spawn，避免 child 看到尚未提交的 job，也避免持锁启动进程。`attemptDetachedSpawn` 只表示发起；只有 runner 成功 claim 才证明 worker 真正开始。
+
+### 4.2 失败语义
+
+- capture/store 失败：记录 reason code，继续尝试安全的只读 document selection；仍返回主会话。
+- spawn 失败：job 维持 pending，不产生用户提示；下一次 prompt 有界恢复。
+- selection 失败：返回 no-op context；不能注入“记忆不可用”或“等待压缩”。
+- host response 构造失败：返回宿主定义的最小合法 no-op。
+
+所有同步操作都有硬 timeout/数量/字节边界。日志记录阶段、opaque id、duration 和 reason，不记录正文。
+
+## 5. 明确反馈候选检测
+
+### 5.1 结构信号
+
+可信宿主信号可直接进入 candidate：
+
+- active-turn steering/correction；
+- interruption 或 `turn_aborted`；
+- 宿主原生 explicit-feedback event。
+
+它们仍须先通过 synthetic filter。receipt、hookPrompt、AFL marker、reviewer instruction 不能触发 reviewer。
+
+### 5.2 已完成回合的回顾性证据
+
+普通 `UserPromptSubmit` 往往发生在上一轮 assistant 已完成以后，因此不能只依赖 steering。检测器要求存在直接 assistant referent，并从以下独立类别收集证据：
+
+1. **负面评价/未达标**：指出不合理、没达到要求、变复杂、仍然重复等；
+2. **向后指代**：明确指向“刚才、上面、之前、你改造这些”等既有 agent 行为；
+3. **责任或因果**：说明 agent 的选择导致结果，或用户被迫再次发现/纠正；
+4. **期望过程反差**：表达“本来应该先……、为什么没有……、等到……才……”；
+5. **明确修正要求**：要求改变已交付方案，而不是选择一个尚未决定的方案。
+
+候选门槛必须包含“既有 assistant referent + 明确不满”，再要求至少一个独立因果/过程/修正类别。实现可用可解释权重，但不能用单词命中直接授权。
+
+必须锁定的正例：
+
+> 是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西
+
+必须锁定的负例包括：
+
+- “reviewer job 是干嘛的？”
+- agent 主动问“是否按 A 方案”后，用户回答“按推荐执行”；
+- 中性讨论“以后量大了再上 RAG”；
+- 任何 receipt/hookPrompt；
+- 没有既有 assistant referent 的一般产品抱怨。
+
+### 5.3 Reviewer 仍是最终语义闸门
+
+高召回候选可能误报。runner 给 reviewer 的 bounded context 至少包含：被指向的 assistant 输出、当前用户反馈、紧邻必要事件、项目目标摘要，以及既有 reflection metadata/paths。reviewer 必须证明：
+
+- 用户评价的是已经发生的 agent 行为；
+- 存在可核对的未满足要求或错误方法；
+- 责任不是外部系统或纯偏好变化；
+- 方法变化能迁移到未来任务；
+- 是否与既有 family 相同，以及先前方法是否曾在本事件前 emitted。
+
+不能证明则返回 `reviewed_no_lesson`。candidate 数量不是 lesson 数量，误报不会污染文档库。
+
+## 6. Job identity、租约与恢复
+
+### 6.1 稳定 identity
+
+同一次 source observation 的 identity：
 
 ```text
-pending/failed ──claim──► delivering ──ack──► accepted ──reconcile──► observed
-                              │
-                              ├──retryable──► failed
-                              └──capability──► unsupported
-pending ──policy──► suppressed | audited_only
+sha256(host | session_uid | context_epoch | source_event_id | referent_id)
 ```
 
-所有 worker commit 都匹配 `(notification_id, transport, owner_id, lease_epoch, state=delivering)`。过期 owner 不能提交。`accepted` 只表示 transport 接受；只有 transcript/source observation 才能写 `observed`。
+若宿主没有稳定 event id，fallback 使用 host payload 中稳定字段的规范化 digest。identity 只用于 hook replay/reconciliation 去重；禁止跨事件、跨会话按相似文本去重，因为相似失败再次出现正是效果证据。
 
-### 3.2 `feedback_episodes` 与 `feedback_episode_events`
+### 6.2 最小持久字段
+
+概念上的 `reviewer_jobs` 需要：
 
 ```text
-feedback_episodes
-  episode_id              deterministic hash
-  session_uid/context_epoch
-  project_id
-  root_referent_event_uid nullable assistant event
-  signal_strength         weak | strong
-  status                  open | ready | assigned | reviewed | closed
-  reviewer_job_id         nullable UNIQUE
-  opened_at/ready_at/closed_at/updated_at
-  UNIQUE(session_uid, context_epoch, root_referent_event_uid, status-open projection)
-
-feedback_episode_events
-  episode_id
-  event_uid UNIQUE
-  relation                referent | feedback | context
-  signal_reason           active_turn_steering | turn_interrupted |
-                          explicit_feedback | reconciled_context
-  created_at
+job_id, source_identity UNIQUE, state
+attempt, owner_id, lease_epoch, lease_until, next_attempt_at
+source_event_ref, referent_event_ref
+created_at, claimed_at, completed_at
+result_code, error_code
+published_path, published_sha256
 ```
 
-episode id 对有 referent 的路径由 `(session_uid, context_epoch, root_referent_event_uid)` 派生；没有 referent 的 host-explicit feedback 使用稳定 source observation id。queue event 只有在 episode 进入 `ready` 时才绑定 reviewer job。
+相邻 evidence 可以继续存在 session event 表，但要有大小和保留期；长期报告正文不写进 SQLite。终态 job/evidence 的清理不能影响 Markdown。
 
-### 3.3 Maintenance 表
+### 6.3 Detached 进程契约
+
+macOS/Linux 使用 Node `spawn` 的 detached process group、`stdio: ignore`（或 runner 自有结构化日志 fd）与 `unref`。launcher 不等待 provider。runner 启动后必须先通过 owner + lease epoch claim；旧 owner 在 lease 过期后不能发布结果。
+
+没有常驻 scheduler。每个新 candidate 都即时 spawn；后续 prompt 额外恢复至多一个 due pending/expired job。worker 正常完成后直接退出。这样第一条反馈不会等第 3 条，系统空闲时也没有后台维护进程。
+
+## 7. Reviewer 输出与 Markdown 发布
+
+### 7.1 结构化 provider 输出
+
+provider 的机器契约至少包含：
 
 ```text
-memory_maintenance_jobs
-  maintenance_job_id      deterministic input digest
-  job_type                consolidate | resize | conflict_review
-  project_id/family_id
-  status                  pending | running | completed | failed |
-                          retry_exhausted | needs_human_resolution
-  owner_id/attempt/lease_epoch/lease_until
-  reason_code/input_digest
-  created_at/updated_at/completed_at
-
-memory_maintenance_inputs
-  maintenance_job_id
-  lesson_id/revision
-  card_hash
-  PRIMARY KEY(maintenance_job_id, lesson_id, revision)
-
-memory_maintenance_job_events
-  event_id
-  maintenance_job_id
-  attempt/lease_epoch
-  state                   claimed | requeued | completed | failed |
-                          retry_exhausted | needs_human_resolution
-  reason_code/provider/created_at
-
-lesson_lineage
-  source_lesson_id/source_revision
-  target_lesson_id/target_revision
-  relation                consolidated_into | superseded_by
-  maintenance_job_id/created_at
-  PRIMARY KEY(source_lesson_id, source_revision, target_lesson_id, target_revision, relation)
+outcome: lesson | no_lesson
+final_severity
+responsibility
+method_class
+family_id or proposed_family_key
+applies_when[]
+facts[]
+user_complaint
+root_cause
+class_of_mistake
+method_changes[]
+repeated_pattern_evidence[]
+recurrence_of[]
 ```
 
-Maintenance input 一经创建不可变。input digest 包含按稳定顺序排列的 lesson id、revision、card hash、job type 和 family/project scope，重复 scheduler 扫描只能命中同一 job。
+controller 校验枚举、长度、必填字段、source provenance、family 引用和内容边界。reviewer 不能直接写最终文件。
 
-### 3.4 选择 omission
+### 7.2 延续现有可读格式
 
-第一阶段不增加高基数永久表；selector 返回 bounded diagnostics，并由 store 以聚合计数记录相同 `(lesson_id, revision, task scope digest, reason)` 的 omission。达到维护阈值时创建 maintenance job。若实现中发现 doctor 需要逐次审计，再增加有 retention 的 `lesson_selection_events`，不得把敏感 card body 写日志。
+canonical Markdown 保持目前“反思报告 + metadata bullets + 具名章节”的形式，例如：
 
-## 4. 组件设计
+```markdown
+# 反思报告：<标题>
 
-### 4.1 `capture.mjs`：synthetic 识别与结构信号
+- reflection_id: <opaque id>
+- created_at: <ISO timestamp>
+- final_severity: Major
+- responsibility: agent_fault
+- method_class: <stable class>
+- family_id: <opaque/stable id>
+- applies_when: <short bounded conditions>
 
-新增统一 `classifyCapturedEvent()`：
+## facts proven by context
+...
 
-1. 验证 role/source namespace；
-2. 使用稳定 AFL marker/receipt/hook envelope 识别 synthetic control event；
-3. 提取 causal assistant referent；
-4. 只输出结构信号，不进行自然语言关键词分类。
+## user complaint in plain language
+...
 
-`active_turn_steering` 从 `immediateReview=true` 降为 weak signal。`prior_turn_interrupted` 或宿主显式 feedback 才是 strong signal。receipt stripping 继续保留，但 stripping 与 synthetic classification 分开：混合消息中的业务正文仍可作为 evidence，纯 control item 被排除。
+## root cause
+...
 
-### 4.2 新增 `episode-router.mjs`
+## class of mistake
+...
 
-该模块是纯决策层，不直接 launch worker：
+## method change
+...
 
-```js
-routeFeedbackEvent({ event, signal, referent, now })
-// => { action: "capture_only" | "episode_opened" | "episode_merged" | "episode_ready",
-//      episodeId, reason }
+## repeated pattern evidence
+...
 ```
 
-Store 在同一事务中完成 episode/event association 和 ready transition。scheduler 扫描 ready episode，幂等创建 reviewer job 并更新 `reviewer_job_id`。同一 episode 再次被 hook/reconcile 看见时只返回 existing。
+不另建长期 lesson/card 数据库。`method change` 就是后续 selector 构造 guidance 的来源；`class of mistake`、`applies_when` 和项目范围用于匹配。
 
-### 4.3 `selector.mjs`：排序、选择与诊断
+### 7.3 原子发布
 
-拆成三步纯函数：
+发布步骤：
 
-1. `rankLessons()`：计算 scope match class，并按以下 tuple 排序：
-   `(severity asc, scopeMatch desc, recurrence desc, confidence desc, revision desc, lessonId asc)`；
-2. `chooseWithinBudget()`：按序检查 prior delivery、single-card limit、severe count、absolute/normal budget；
-3. `summarizeOmissions()`：返回 bounded opaque diagnostic。
+1. 在目标目录创建权限受限的同目录临时文件；
+2. 写入并 fsync 文件；
+3. 必要时 fsync 目录；
+4. rename 到 `<timestamp>-<slug>.md`；
+5. 重新计算 hash；
+6. 用当前 lease epoch 提交 `published_path/hash`。
 
-返回结构：
+如果 stale worker 已经写出同一 identity，controller 通过 reflection id/hash 识别并复用，不能生成第二份。no-lesson 只提交 job 终态。
 
-```js
-{
-  cards,
-  omissions: [{ lesson_id, revision, family_id, reason, rank, token_cost }],
-  diagnostics: { candidate_count, selected_count, omitted_count, budgets },
-  maintenanceRequests: [{ family_id, reason, source_revisions }],
-  hold: null
-}
-```
+### 7.4 Legacy 文档
 
-`safety_hold` 不再清空所有 cards；只产生 `conflict_quarantine` omission。原调用者在 schema-v9 runtime 中永远看不到 `memory_overflow_hold`。
+现有报告不被重写。parser 兼容已有 `final_severity`、`responsibility` 和具名章节；缺 `family_id` 时可根据完整的 mistake class + method class 产生稳定 legacy family fingerprint。若连 method change 或责任都无法可靠解析，文档保留但自动选择省略为 `legacy_incomplete`。
 
-### 4.4 `notification-delivery.mjs`
+## 8. 文档直接选择
 
-新增统一 transport interface：
+### 8.1 输入和相关性
 
-```js
-probe({ session, paths })
-deliver({ notification, delivery, session, signal })
-// => { state: "accepted" | "unsupported" | "failed", ackId?, reasonCode?, retryable }
-```
+selector 扫描当前项目 `.agent/reflections/*.md`。每个文件只读取配置的最大字节数并解析所需章节，不把全报告注入主模型。匹配信号来自：
 
-Worker 流程：claim delivery → probe → deliver → fenced commit。native transport 成功后不再发送 system notification；native 不支持/最终失败时创建或激活 system delivery。所有 terminal notification 至少保留 audit delivery。
+- 当前项目 scope；
+- `applies_when`、mistake/method class 与当前 task features 的确定性 lexical overlap；
+- severity；
+- 同 family 文档数；
+- recency；
+- stable document id。
 
-### 4.5 Codex app-server adapter
+当前规模直接解析更透明。任何缓存都只能是可丢弃的文件 metadata cache，Markdown 仍是事实源。没有 embedding、向量库或数据库正文检索。
 
-实现放在独立 `codex-notification-adapter.mjs`，避免污染现有 `codex-host.mjs` 的 reviewer provider 选择。
+### 8.2 排序与预算
 
-连接通过当前 Codex CLI 的 app-server proxy/control socket，使用 JSON-RPC initialize 后调用 `thread/inject_items`。约束：
+建立完全确定的 total order 后按 family 去重，再选择 Top-K。每个入选文档只渲染 bounded `method change` 与必要触发条件。容量问题返回 omission：
 
-- thread id 必须等于 session 中已持久化的 `native_session_id`；
-- item 为单条 bounded assistant output，内容只含 renderer 生成的固定行和 synthetic marker；
-- 总请求、stdout 和 stderr 都有硬上限；
-- 连接/请求有短 timeout，异常只返回 reason code；
-- adapter 只能由 scheduler 调用，不能由 UserPromptSubmit/Stop 调用；
-- app-server ack 保存为 hash/opaque id，不记录 socket/token。
+- `count_budget`
+- `token_budget`
+- `oversized_document`
+- `legacy_incomplete`
+- `family_projection`
+- `prior_emission`
 
-真机若证明 desktop 不即时渲染 injected item，则 adapter 仍可保留为 `accepted` 的历史注入能力，但默认 user-notification policy 将切到 system transport；不能把“历史中存在”说成“用户已看到”。
+任何 omission 都不改变主会话可执行性，不创建 compaction job，不返回 hold。5 张适用严重文档、上限 4 时必须稳定选择 4 张并省略 1 张。
 
-### 4.6 Maintenance provider
+## 9. 效果证据
 
-复用 reviewer-provider 的进程隔离、timeout 和输出上限，但增加 maintenance 专用 schema：
+最小 emission ledger 只保存：document hash/path、family id、session/context/task fingerprint、selected timestamp、emitted timestamp、outcome/reason。它不保存 method body。
 
-```json
-{
-  "write_complete": true,
-  "status": "consolidated | needs_human_resolution",
-  "target": {
-    "lesson_id": "...",
-    "severity": "Critical",
-    "scope": {},
-    "card": {}
-  },
-  "source_revisions": [{"lesson_id":"...","revision":1}],
-  "reason_code": "..."
-}
-```
-
-提交事务执行确定性 validator：source 集合完全相等、card 必填字段完整、token 不超过 hard limit、severity 不低于 source 最大 severity、scope 不无证据扩张、source ids/lineage 完整。validator 不判断隐藏推理，只判断结构化结果和证据引用。
-
-## 5. Hook 改造
-
-### 5.1 Prompt hook
-
-移除：
-
-- `candidate_captured/review_queued/final receipt` 的 chat claim；
-- `renderReceiptInstruction()`；
-- generic correction checkpoint；
-- selection hold additionalContext。
-
-保留：
-
-- prompt capture；
-- episode routing；
-- eligible reviewer wake 的异步 launch；
-- bounded selected lesson context；
-- host no-op response。
-
-### 5.2 Stop hook
-
-`capture-stop` 无论 store 返回什么，都只产生各宿主 pass schema：
-
-- Codex：`{"continue":true}`；
-- Claude/Gemini：`{}`。
-
-`confirmChatNotification()` 不再参与 Stop decision。legacy JSONL mode 的阻断 backstop 从新安装模板删除；若仍保留旧兼容命令，必须显式 opt-in 且 doctor 标为 legacy/unsafe，不属于默认 runtime。
-
-## 6. 迁移策略
-
-`openStore()` 继续在 transaction 内执行 migration：
-
-1. 创建 schema-v9 表和索引；
-2. 对每个 notification 创建 audit delivery；
-3. 根据 v8 `system_state` 创建 system delivery；
-4. 根据 v8 `chat_state` 创建 `legacy_model_echo`：observed 保留 observed，已发未确认保留 accepted/failed 事实，pending 变 audited_only；
-5. 为 reviewer job 创建 migration episode，并关联原 queue event；
-6. 写 schema migration version 9；
-7. 提交后才允许 worker 扫描。
-
-迁移必须幂等。测试从真实 schema-v8 SQL 建库并复制 fixture，而不是只测 fresh schema。
-
-## 7. 日志与诊断
-
-新增结构化事件，正文只含 opaque id、计数和 reason code：
+状态边界：
 
 ```text
-hook.non_interference event=stop result=pass capture=<ok|failed>
-episode.routed episode=<id> action=<...> signal=<...>
-episode.job.assigned episode=<id> job=<id>
-selection.completed candidates=N selected=N omitted=N
-selection.omitted lesson=<id> revision=N reason=<code> rank=N tokens=N
-delivery.claimed notification=<id> transport=<name> lease=N
-delivery.accepted notification=<id> transport=<name>
-delivery.observed notification=<id> transport=<name>
-delivery.failed notification=<id> transport=<name> reason=<code>
-maintenance.created job=<id> type=<type> inputs=N reason=<code>
-maintenance.completed job=<id> target=<id> sources=N
-maintenance.human_required job=<id> reason=<code>
+published  --selector chose--> selected  --host response contained guidance--> emitted
+
+later validated same-family failure
+    + qualifying pre-event emitted record
+    = recurrence_after_emission
 ```
 
-`doctor --live` 分开显示 enabled、runnable、trusted、hook event、reviewer、notification transport 和 maintenance health，不能用单一 healthy 掩盖某层缺口。
+- published 只证明文件存在；
+- selected 只证明排序选择；
+- emitted 只证明 hook 返回了 guidance；
+- 没有 host/model adoption signal 时，不存在 observed；
+- 没有真实行为对照时，不存在 effective；
+- 没再出现保持 unknown；
+- emitted 后复发是负向证据，必须进入新报告的方法修订。
 
-## 8. 测试策略
+这解决当前真实库“有大量 emitted_unconfirmed，却从未闭合 effectiveness/recurrence”的问题：新系统不再把尝试投递包装成效果。
 
-严格执行 RED → GREEN → targeted regression → full regression。
+## 10. 旧分支代码处置
 
-### 8.1 自动化
+实施第一步必须逐 commit 审计 `7d6b1e3..9c89e00`：
 
-- Store migration：fresh v9、schema-v8 fixture、重复 migration、事务失败回滚；
-- Stop：Codex/Claude/Gemini 所有 receipt/job/hold 状态都 pass；
-- Prompt：不含 receipt/maintenance/correction control，selected lesson 仍注入；
-- Episode：普通追问 capture-only、同 referent 合并、strong signal 单 job、closed no-lesson 不重开、新 referent 新 episode；
-- Selector：5 选 4、oversized、mixed conflict、prior delivery、deterministic ordering；
-- Delivery：lease race、stale commit、native ack、timeout、unsupported、system fallback、observation；
-- Maintenance：idempotent create、lease recovery、validator、atomic publication、human resolution；
-- Installer：新模板没有 Stop backstop 或 receipt instruction，旧配置原子替换。
+- 通用且仍正确的 schema helper、fenced lease primitive、结构化日志和测试 fixture 可以保留；
+- notification delivery tables/API、Codex adapter、system fallback、Stop watchdog、episode router、maintenance job/scheduler 以及相关 CLI/doctor/documentation 必须删除或回退；
+- 不能保留“未来也许需要”的 disabled production path，因为它会继续增加 migration、health、测试和误触发面；
+- 被删除能力若未来有真实规模/产品证据，再作为独立 change 重新设计。
 
-### 8.2 真机
+## 11. 一次性旧数据导出
 
-1. 新 Codex task：普通业务问题只有正常回答，没有 AFL model receipt/Stop prompt；
-2. 长期 task：复现当前截图路径，确认同一 receipt 不再强制补发；
-3. 真实 5 张 severe、无 conflict 项目：选择 4 张并记录 omission，无 hold；
-4. native adapter：分别记录 accepted 和 transcript observed；若 UI 不显示，验证 system fallback；
-5. scheduler 连续运行至少两轮，验证 delivery/maintenance lease recovery；
-6. Claude/Gemini：能运行则实测；缺 CLI/auth/native event 时明确标记 unavailable，不用 Codex 结果替代。
+旧 DB 只作为归档输入。迁移工具必须：
 
-Computer Use 必须尝试；若 Codex app 安全策略拒绝，保留拒绝错误，并用 task API、真实 transcript、SQLite 与可见截图组合证明，不伪称 UI 已通过。
+- 接受显式 source DB 和 output directory；
+- 默认或强制先 `--dry-run`；
+- 只读打开 source；
+- 按 legacy id/content hash 幂等；
+- 把可验证完整报告转为 canonical Markdown；
+- 把缺字段、碰撞和已有文件列为报告，不猜测补全；
+- 第二次运行零重复写入。
 
-## 9. 发布与回滚
+实施和测试只使用临时 HOME 与 DB 副本。没有用户再次授权，不接触 `~/.codex/config.toml`、`~/.agent/feedback-loop/current.json` 或真实反馈库。
 
-完成自动化和真机验证前不修改受管 `current.json`。发布时创建新 version directory，完整安装后原子切换；保留 0.7.6 作为 rollback target。若 hook non-interference、migration integrity 或真实普通会话任一失败，禁止切换。
+## 12. 日志与可诊断性
 
-当前会话仍受到 0.7.6 注入的 `memory_overflow_hold`。它不阻止可回滚的设计、代码和测试，但在该约束解除或新 runtime 通过等价安全验证前，不执行全局安装与发布。
+每个阶段使用结构化 event：
+
+```text
+prompt_capture_completed
+feedback_signal_evaluated
+review_job_created | review_job_reused
+review_spawn_attempted
+review_job_claimed | review_job_recovered
+review_completed_no_lesson | reflection_published
+reflection_parse_omitted
+reflection_selected | reflection_emitted
+recurrence_after_emission
+```
+
+字段只允许 opaque ids、reason codes、计数、字节/Token 预算、attempt/lease epoch、duration 和 exit status。禁止 raw prompt、assistant output、report/method body、token、socket、credential 和不必要的绝对路径。
+
+Doctor 只检查真实运行依赖：prompt hook managed entry、Node/runtime、可写控制库、reflection directory、reviewer provider/launcher，以及“旧 AFL Stop managed entry 已移除”。它不再显示 notification/scheduler/maintenance 健康项。
+
+## 13. 测试策略
+
+### 13.1 单元与性质测试
+
+- detector 正负例、中英文表达、single-keyword false positive；
+- source identity replay 幂等与跨会话同类反馈不去重；
+- lease fencing、retry、stale submit；
+- reviewer validator、no-lesson、family recurrence；
+- canonical/legacy parse 和原子发布失败注入；
+- document Top-K 稳定性、5 选 4、oversized/token omission；
+- selected/emitted 分离与 recurrence-after-emission 时间关系；
+- 日志内容泄漏测试。
+
+### 13.2 集成测试
+
+- prompt hook 创建 job 后在 reviewer 完成前返回；
+- detached child 不继承/占用宿主 stdio，主进程退出不杀死正常 runner；
+- spawn crash 后下一 prompt 最多恢复一个 due job；
+- fresh HOME 安装只有 prompt hook；legacy managed Stop 被精确删除；
+- 文档发布后新 prompt 直接消费，无 DB lesson/card body；
+- DB export dry-run、只读与二次幂等。
+
+### 13.3 真机/真实环境
+
+macOS Codex desktop 必须用真实 UI 验证：
+
+1. 普通业务 prompt 不出现 AFL receipt/hookPrompt/status；
+2. 指定明确不满样例产生即时 detached job，而主回答正常结束；
+3. subagent 完成后出现一份规范 Markdown；
+4. 新任务的匹配 prompt 选中并 emitted 该方法；
+5. 5 张严重文档不触发 hold。
+
+Linux 环境验证安装、进程组、`unref` 生命周期、锁/租约、文件权限和 atomic rename。协议/单元通过不能替代这两层证据。
+
+## 14. 发布与回滚边界
+
+1. 当前阶段只在隔离 worktree 和临时 HOME 实施。
+2. 完成 RED→GREEN、全量回归、fresh install、macOS 真机和 Linux 验证后，仍只形成可安装候选。
+3. 必须由用户再次明确授权，才能导出真实旧数据、恢复 hooks 或切换 managed runtime。
+4. 原子切换前保留旧 `current.json` target；失败时恢复配置和版本指针。旧 DB 不被修改，新 Markdown 是独立普通文件。
+
+## 15. 设计结论
+
+该设计把 AFL 缩回两个真正创造价值的动作：
+
+1. 发现明确反馈后立即让独立 subagent 反思并生成可审计文档；
+2. 后续主会话直接读取适用文档的方法变化。
+
+其余 receipt、Stop、通知、三条聚合、scheduler、maintenance 和数据库长期记忆均不属于这条价值链，因而从当前架构中删除，而不是继续隐藏在配置后面。

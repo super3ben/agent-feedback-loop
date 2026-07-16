@@ -1,57 +1,51 @@
-## 1. 基线与迁移契约
+> 2026-07-16 重设计说明：旧 Task 1/2/3 基于 notification delivery、Stop fail-open、episode 与 maintenance scheduler，完成状态不再代表新架构已实现。以下任务全部按新规格重新验收；不兼容代码必须删除，不能因已经提交而保留。
 
-- [x] 1.1 固化 schema-v8 失败 fixture：commentary-only receipt、Stop re-entry、重复运维追问、5 张无冲突 severe card 和 oversized severe card。
-- [x] 1.2 为 schema-v9 delivery、feedback episode、maintenance job/event/input 和 lesson lineage 编写 RED migration test，并证明 schema-v8 evidence 全部保留。
-- [x] 1.3 实现 additive schema-v9 migration 与完整性约束，包括历史 `legacy_model_echo` 和 `audited_only` 映射。
+## 1. 冻结新边界与清理旧方向
 
-## 2. 控制面隔离
+- [ ] 1.1 建立失败 fixture：纯回执/Stop 重入、5 张严重记忆卡、已完成回合明确不满未即时触发、同一 hook 重放和 detached spawn 失败。
+- [ ] 1.2 审计 `7d6b1e3..9c89e00` 的 schema、notification 和 Stop 变更，列出可复用的通用 primitive 与必须删除的旧架构代码。
+- [ ] 1.3 删除或回退 receipt、hookPrompt、Stop backstop、notification transport、feedback episode、memory maintenance 与 resident scheduler 的运行路径和 schema 依赖。
 
-- [ ] 2.1 编写跨宿主 RED test，证明 transactional Stop 不因 notification、reviewer、selector 或 maintenance 状态输出 `block/deny`。
-- [ ] 2.2 把 Stop capture 重构为 bounded observation + fail-open response，从正常 transactional install 中移除 receipt backstop。
-- [ ] 2.3 编写 prompt-hook RED test，证明 model context 不含 receipt、maintenance claim 或 generic correction instruction，同时仍支持 selected lesson。
-- [ ] 2.4 从 prompt orchestration 移除 model receipt instruction，并为每个 hook outcome 增加结构化 non-interference log。
+## 2. 主会话不可干扰
 
-## 3. 宿主能力感知的通知投递
+- [ ] 2.1 编写 RED 安装/运行测试，证明默认 macOS/Linux 配置没有 AFL Stop hook，prompt 输出没有回执、reviewer 状态或维护文案。
+- [ ] 2.2 实现 prompt-only managed hook；capture、store、spawn、parse、select 任一失败都 bounded fail-open。
+- [ ] 2.3 为 synthetic AFL control text 建立统一过滤与回归测试，旧截图中的 hookPrompt 不能再成为候选或用户输出。
 
-- [x] 3.1 为 per-transport claim、fenced lease、accepted/observed、retry、unsupported 和 semantic idempotency 编写 RED store test。
-- [x] 3.2 实现 transport-neutral notification delivery store，把 notifier/audit query 从内嵌 chat/system 列迁移出来。
-- [ ] 3.3 为 Codex app-server initialize、精确 thread targeting、bounded `thread/inject_items`、ack、timeout、reject 和 unavailable 编写 RED protocol test。
-- [ ] 3.4 在 capability probe 后实现异步 Codex native adapter，并保证 synthetic marker 被 capture filter 排除且 hook 不同步依赖 adapter。
-- [ ] 3.5 终态通知采用 native-preferred/system-fallback；candidate/queued 默认只审计。
-- [ ] 3.6 更新 review audit 与结构化日志，分别显示 semantic notification、transport acceptance、transcript observation 和 fallback。
+## 3. 明确反馈立即评审
 
-## 4. Feedback Episode 路由
+- [ ] 3.1 为结构信号、普通追问、被征求设计校准、中性 AFL 问题、已完成回合回顾性不满及中英文表达编写 detector RED fixture。
+- [ ] 3.2 实现纯本地多证据 detector，并证明指定“为什么之前没有考虑、等我发现才思考”样例立即成为 candidate。
+- [ ] 3.3 实现每个不同 source candidate 的稳定 identity、事务 job 创建和 hook replay 幂等；不同会话的同类反馈不能被文本去重吞掉。
+- [ ] 3.4 实现 macOS/Linux detached reviewer launcher，候选提交后立即 spawn/unref，主 hook 不等待 reviewer 结果。
+- [ ] 3.5 实现 runner claim、fenced lease、bounded context、retry/no-lesson/publish 终态，以及后续 prompt 的小批量 opportunistic recovery。
 
-- [ ] 4.1 为普通追问、AFL 运维问题、synthetic hook prompt、同 turn 重复 steering、显式 interruption、重复 reconciliation 与新 referent 纠正编写 RED fixture。
-- [ ] 4.2 实现 feedback episode creation、event association、signal strength、debounce/close transition 和 one-job uniqueness。
-- [ ] 4.3 用 episode scheduling 取代 per-prompt immediate scheduling；没有新 causal referent 时，closed no-lesson episode 不得重开。
-- [ ] 4.4 把历史 reviewer job 迁移为 audit-only episode record，不能重新排队 terminal work。
+## 4. Markdown 反思发布
 
-## 5. 有界记忆选择
+- [ ] 4.1 定义 reviewer 结构化输出与 validator RED test，覆盖责任、事实、根因、方法类别、family id、方法变化和复发证据。
+- [ ] 4.2 实现沿用现有报告形式的 Markdown renderer 与 temp+fsync+rename 原子发布；no-lesson 不得创建文件。
+- [ ] 4.3 实现 canonical/legacy 文档 parser，完整旧文档可参与选择，不完整文档只能产生安全 omission。
+- [ ] 4.4 缩减 SQLite 为短期控制账本，证明长期正文只从 `.agent/reflections/*.md` 读取。
+- [ ] 4.5 实现历史 DB 的显式 dry-run/idempotent export，并只用临时数据库副本验证；不得迁移真实 HOME。
 
-- [ ] 5.1 编写 selector RED test：5 选 4、oversized card、conflict/non-conflict 混合 family、确定性重复排序与 prior delivery。
-- [ ] 5.2 实现 severity/scope/recurrence/confidence/revision 确定性排序及结构化 omission diagnostic。
-- [ ] 5.3 移除由数量/Token 触发的 `memory_overflow_hold`；只隔离真 conflict，并继续返回其他 eligible card。
-- [ ] 5.4 持久化 bounded omission telemetry，并为重复容量、尺寸或 conflict 条件幂等请求 maintenance。
+## 5. 文档选择与复发效果
 
-## 6. Memory Maintenance 生命周期
+- [ ] 5.1 编写直接文档选择 RED test：项目范围、相关性、severity、同 family 复发、稳定排序、5 选 4、oversized 和 Token omission。
+- [ ] 5.2 实现确定性 Top-K，移除 `memory_overflow_hold`；容量和解析问题不能阻断其他文档或业务回合。
+- [ ] 5.3 同 family 只注入最新完整方法，recurrence 从文档计算，不能依赖长期 DB 计数。
+- [ ] 5.4 分开记录 published、selected、emitted；没有宿主证据时不得声明 observed/effective。
+- [ ] 5.5 实现 `recurrence_after_emission` 判定并测试：注入后同 family 再次被 reviewer 确认必须形成负向证据。
 
-- [ ] 6.1 为 maintenance 幂等创建、fenced claim、lease recovery、retry exhaustion、stale submit rejection 与独立 health 编写 RED store test。
-- [ ] 6.2 实现 maintenance store API、scheduler recovery、detached worker launch、job event 与结构化日志。
-- [ ] 6.3 定义并测试 maintenance provider I/O contract：不可变 source revision、bounded card、source coverage、severity/scope preservation。
-- [ ] 6.4 实现 atomic consolidation publication、immutable lineage、source supersession 与 partial failure rollback。
-- [ ] 6.5 实现 `needs_human_resolution`，证明矛盾 family 保持隔离但不阻断业务回合。
+## 6. 安装、日志与文档
 
-## 7. 安装、审计与文档
+- [ ] 6.1 更新 installer/doctor，显式报告 prompt hook、detached launcher、文档目录和旧 Stop 清理状态，不显示通知/scheduler 健康项。
+- [ ] 6.2 增加只含 opaque id、reason、计数和 duration 的结构化日志；测试禁止 raw prompt/report/method 泄漏。
+- [ ] 6.3 更新中英文 README、故障排查、迁移与回滚说明，明确“当前 prompt 不等待；文档发布后下一次匹配 prompt 生效”。
 
-- [ ] 7.1 更新 doctor/live health、`review list/show` 与 memory audit，真实展示 transport、episode、selection omission 和 maintenance 状态。
-- [ ] 7.2 更新 installer template 与 managed-runtime compatibility，原子迁移已有配置且不重放历史 receipt。
-- [ ] 7.3 更新中英文文档，说明 non-interference guarantee、host capability matrix、fallback、maintenance lifecycle 与 rollback boundary。
+## 7. 验证与受控发布
 
-## 8. 验证与发布
-
-- [ ] 8.1 执行 targeted RED→GREEN、全量 Node regression、fresh install、schema-v8 copy migration 和并发 scheduler/worker recovery test。
-- [ ] 8.2 在真实 Codex desktop task 验证 native acceptance 与 transcript observation 分开记录，并覆盖普通非反馈 prompt。
-- [ ] 8.3 验证长期 Codex task 不再出现 model receipt instruction/Stop re-entry，且 5 张无冲突 severe card 不再触发 hold。
-- [ ] 8.4 尝试 Claude Code/Gemini 矩阵；native delivery 不支持时必须明确标记，并证明 system/audit fallback 不阻断业务。
-- [ ] 8.5 只有 memory checkpoint 允许高风险操作后才安装 versioned managed runtime，执行 `doctor --live` 并保留原子 `current.json` rollback target。
+- [ ] 7.1 执行每项 RED→GREEN、targeted regression、全量 Node suite、fresh HOME 安装和 crash/recovery test。
+- [ ] 7.2 在 macOS Codex 真机验证普通任务无 AFL 控制输出、明确不满立即 detached 启动、业务回答正常结束、新文档在后续会话被选中并注入。
+- [ ] 7.3 在 Linux 环境验证安装、detached 生命周期、锁/租约、原子发布和 prompt-only 配置。
+- [ ] 7.4 对历史 DB 副本执行两次 migration dry-run/export，证明幂等且旧库未修改。
+- [ ] 7.5 在用户再次明确授权前，不恢复全局 hooks、不切换 managed runtime、不迁移真实数据库。
