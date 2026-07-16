@@ -22,9 +22,26 @@ base-ref: 17f1761c1fed0465ad39aaa3c76c34a02d692c5c
 - v8 数据迁移必须保留 evidence、job、receipt 和旧投递事实，但不得重放任何历史 model receipt。
 - 本计划中的“真机”表示真实 Codex desktop/app-server/transcript/SQLite 组合证据；若 Computer Use 因安全策略不可用，必须记录限制，不得把协议 ack 当成 UI 可见。
 
+## 执行进度
+
+- [ ] Task 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约
+- [ ] Task 2：建立 notification delivery 的租约、状态与迁移兼容 API
+- [ ] Task 3：让所有 Stop 路径永不阻断业务回合
+- [ ] Task 4：从模型上下文移除回执与虚假维护控制指令
+- [ ] Task 5：以 feedback episode 替代逐 prompt reviewer 排队
+- [ ] Task 6：实现确定性 Top-K、omission 与 family 局部隔离
+- [ ] Task 7：实现可恢复的 memory maintenance store、provider 与原子发布
+- [ ] Task 8：实现 capability-aware Codex native adapter 与 system fallback
+- [ ] Task 9：把 delivery 与 maintenance 纳入 detached scheduler，且不扩大 hook 临界路径
+- [ ] Task 10：补齐 doctor、audit CLI、安装迁移与中英文文档
+- [ ] Task 11：完整自动化回归与 fresh-install 证据
+- [ ] Task 12：真实 Codex 验收、受控安装与回滚演练
+
 ---
 
-## 任务 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约
+## Task 1：冻结 schema-v8 故障 fixture 与 schema-v9 迁移契约
+
+**OpenSpec 映射：** 1.1、1.2、1.3
 
 **文件：**
 
@@ -75,7 +92,9 @@ base-ref: 17f1761c1fed0465ad39aaa3c76c34a02d692c5c
 
 ---
 
-## 任务 2：建立 notification delivery 的租约、状态与迁移兼容 API
+## Task 2：建立 notification delivery 的租约、状态与迁移兼容 API
+
+**OpenSpec 映射：** 3.1、3.2
 
 **文件：**
 
@@ -125,7 +144,9 @@ deliverNotificationBatch({ store, adapters, ownerId, nowMs, leaseMs, limit, log 
 
 ---
 
-## 任务 3：让所有 Stop 路径永不阻断业务回合
+## Task 3：让所有 Stop 路径永不阻断业务回合
+
+**OpenSpec 映射：** 2.1、2.2
 
 **文件：**
 
@@ -171,7 +192,9 @@ deliverNotificationBatch({ store, adapters, ownerId, nowMs, leaseMs, limit, log 
 
 ---
 
-## 任务 4：从模型上下文移除回执与虚假维护控制指令
+## Task 4：从模型上下文移除回执与虚假维护控制指令
+
+**OpenSpec 映射：** 2.3、2.4
 
 **文件：**
 
@@ -214,7 +237,9 @@ deliverNotificationBatch({ store, adapters, ownerId, nowMs, leaseMs, limit, log 
 
 ---
 
-## 任务 5：以 feedback episode 替代逐 prompt reviewer 排队
+## Task 5：以 feedback episode 替代逐 prompt reviewer 排队
+
+**OpenSpec 映射：** 4.1、4.2、4.3、4.4
 
 **文件：**
 
@@ -273,7 +298,9 @@ store.closeFeedbackEpisode({ episodeId, reviewerJobId, outcome })
 
 ---
 
-## 任务 6：实现确定性 Top-K、omission 与 family 局部隔离
+## Task 6：实现确定性 Top-K、omission 与 family 局部隔离
+
+**OpenSpec 映射：** 5.1、5.2、5.3、5.4
 
 **文件：**
 
@@ -324,7 +351,9 @@ store.recordSelectionOutcome({ sessionUid, contextEpoch, taskFingerprint, diagno
 
 ---
 
-## 任务 7：实现可恢复的 memory maintenance store、provider 与原子发布
+## Task 7：实现可恢复的 memory maintenance store、provider 与原子发布
+
+**OpenSpec 映射：** 6.1、6.3、6.4、6.5
 
 **文件：**
 
@@ -381,7 +410,9 @@ runMaintenanceBatch({ store, provider, ownerId, nowMs, leaseMs, limit, log })
 
 ---
 
-## 任务 8：实现 capability-aware Codex native adapter 与 system fallback
+## Task 8：实现 capability-aware Codex native adapter 与 system fallback
+
+**OpenSpec 映射：** 3.3、3.4、3.5、3.6
 
 **文件：**
 
@@ -433,7 +464,9 @@ injectCodexThreadItem({ threadId, text, syntheticMarker, ...boundedProcessOption
 
 ---
 
-## 任务 9：把 delivery 与 maintenance 纳入 detached scheduler，且不扩大 hook 临界路径
+## Task 9：把 delivery 与 maintenance 纳入 detached scheduler，且不扩大 hook 临界路径
+
+**OpenSpec 映射：** 6.2
 
 **文件：**
 
@@ -477,7 +510,9 @@ injectCodexThreadItem({ threadId, text, syntheticMarker, ...boundedProcessOption
 
 ---
 
-## 任务 10：补齐 doctor、audit CLI、安装迁移与中英文文档
+## Task 10：补齐 doctor、audit CLI、安装迁移与中英文文档
+
+**OpenSpec 映射：** 7.1、7.2、7.3
 
 **文件：**
 
@@ -523,7 +558,9 @@ injectCodexThreadItem({ threadId, text, syntheticMarker, ...boundedProcessOption
 
 ---
 
-## 任务 11：完整自动化回归与 fresh-install 证据
+## Task 11：完整自动化回归与 fresh-install 证据
+
+**OpenSpec 映射：** 8.1
 
 **文件：**
 
@@ -577,7 +614,9 @@ injectCodexThreadItem({ threadId, text, syntheticMarker, ...boundedProcessOption
 
 ---
 
-## 任务 12：真实 Codex 验收、受控安装与回滚演练
+## Task 12：真实 Codex 验收、受控安装与回滚演练
+
+**OpenSpec 映射：** 8.2、8.3、8.4、8.5
 
 **前置门禁：**
 
