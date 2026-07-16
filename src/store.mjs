@@ -695,9 +695,12 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
         return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
       });
     },
-    failNotificationDelivery({ notificationId, transport, ownerId, leaseEpoch, reasonCode, retryAt, retryable }) {
+    failNotificationDelivery({ notificationId, transport, ownerId, leaseEpoch, reasonCode, retryAt, retryable, fallbackTransport = null }) {
       const safeNotificationId = ensureString(notificationId, "notificationId");
       const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeFallbackTransport = fallbackTransport === null
+        ? null
+        : validateNotificationTransport(fallbackTransport, { claimable: true });
       const safeOwnerId = ensureString(ownerId, "ownerId");
       const safeLeaseEpoch = validateNotificationLeaseEpoch(leaseEpoch);
       const safeReasonCode = validateNotificationReasonCode(reasonCode, { required: true });
@@ -712,12 +715,26 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
           WHERE notification_id=? AND transport=? AND state='delivering' AND owner_id=? AND lease_epoch=?`).run(
           safeRetryAt, safeReasonCode, nowIso(now), safeNotificationId, safeTransport, safeOwnerId, safeLeaseEpoch
         );
-        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+        const fallback = result.changes === 1 && !retryable && safeFallbackTransport
+          ? ensureNotificationDeliveryInTransaction({
+              notificationId: safeNotificationId,
+              transport: safeFallbackTransport,
+              state: "pending"
+            })
+          : null;
+        return {
+          changed: result.changes === 1,
+          delivery: readNotificationDelivery(safeNotificationId, safeTransport),
+          fallback
+        };
       });
     },
-    markNotificationUnsupported({ notificationId, transport, ownerId, leaseEpoch, reasonCode }) {
+    markNotificationUnsupported({ notificationId, transport, ownerId, leaseEpoch, reasonCode, fallbackTransport = null }) {
       const safeNotificationId = ensureString(notificationId, "notificationId");
       const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeFallbackTransport = fallbackTransport === null
+        ? null
+        : validateNotificationTransport(fallbackTransport, { claimable: true });
       const safeOwnerId = ensureString(ownerId, "ownerId");
       const safeLeaseEpoch = validateNotificationLeaseEpoch(leaseEpoch);
       const safeReasonCode = validateNotificationReasonCode(reasonCode, { required: true });
@@ -729,7 +746,18 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
           WHERE notification_id=? AND transport=? AND state='delivering' AND owner_id=? AND lease_epoch=?`).run(
           safeReasonCode, nowIso(now), safeNotificationId, safeTransport, safeOwnerId, safeLeaseEpoch
         );
-        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+        const fallback = result.changes === 1 && safeFallbackTransport
+          ? ensureNotificationDeliveryInTransaction({
+              notificationId: safeNotificationId,
+              transport: safeFallbackTransport,
+              state: "pending"
+            })
+          : null;
+        return {
+          changed: result.changes === 1,
+          delivery: readNotificationDelivery(safeNotificationId, safeTransport),
+          fallback
+        };
       });
     },
     observeNotificationDelivery({ notificationId, transport, observationId, observedAt = nowIso(now) }) {

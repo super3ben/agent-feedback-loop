@@ -42,20 +42,24 @@ function emit(log, event, delivery, details = {}) {
   } catch {}
 }
 
-function activateSystemFallback(store, delivery, summary) {
-  if (delivery.transport !== NATIVE_TRANSPORT) return;
-  const fallback = store.ensureNotificationDelivery({
-    notificationId: delivery.notification_id,
-    transport: FALLBACK_TRANSPORT,
-    state: "pending"
+function recordMutation(summary, key, mutation, { log, delivery, ownerId, details = {} }) {
+  if (mutation?.changed) {
+    summary[key] += 1;
+    if (mutation.fallback?.changed) summary.fallbackActivated += 1;
+    emit(log, `notification.delivery.${key}`, delivery, details);
+    return true;
+  }
+  summary.stale += 1;
+  emit(log, "notification.delivery.fenced_out", delivery, {
+    ownerId,
+    targetOutcome: key,
+    reasonCode: "lease_fenced"
   });
-  if (fallback?.changed) summary.fallbackActivated += 1;
+  return false;
 }
 
-function recordMutation(summary, key, mutation) {
-  if (mutation?.changed) summary[key] += 1;
-  else summary.stale += 1;
-  return Boolean(mutation?.changed);
+function fallbackTransportFor(delivery) {
+  return delivery.transport === NATIVE_TRANSPORT ? FALLBACK_TRANSPORT : null;
 }
 
 /**
@@ -119,8 +123,12 @@ export async function deliverNotificationBatch({
         retryAt,
         retryable: true
       });
-      recordMutation(summary, "retrying", mutation);
-      emit(log, "notification.delivery.retrying", delivery, { reasonCode, retryAt, errorName: error?.name || "Error" });
+      recordMutation(summary, "retrying", mutation, {
+        log,
+        delivery,
+        ownerId,
+        details: { reasonCode, retryAt, errorName: error?.name || "Error" }
+      });
       continue;
     }
     if (!probe || probe.supported !== true) {
@@ -130,10 +138,10 @@ export async function deliverNotificationBatch({
         transport: delivery.transport,
         ownerId,
         leaseEpoch: delivery.lease_epoch,
-        reasonCode
+        reasonCode,
+        fallbackTransport: fallbackTransportFor(delivery)
       });
-      if (recordMutation(summary, "unsupported", mutation)) activateSystemFallback(store, delivery, summary);
-      emit(log, "notification.delivery.unsupported", delivery, { reasonCode });
+      recordMutation(summary, "unsupported", mutation, { log, delivery, ownerId, details: { reasonCode } });
       continue;
     }
 
@@ -151,8 +159,12 @@ export async function deliverNotificationBatch({
         leaseEpoch: delivery.lease_epoch,
         ackId: result.ackId
       });
-      recordMutation(summary, "accepted", mutation);
-      emit(log, "notification.delivery.accepted", delivery, { ackLength: result.ackId.length });
+      recordMutation(summary, "accepted", mutation, {
+        log,
+        delivery,
+        ownerId,
+        details: { ackLength: result.ackId.length }
+      });
       continue;
     }
     if (result?.status === "unsupported") {
@@ -162,10 +174,10 @@ export async function deliverNotificationBatch({
         transport: delivery.transport,
         ownerId,
         leaseEpoch: delivery.lease_epoch,
-        reasonCode
+        reasonCode,
+        fallbackTransport: fallbackTransportFor(delivery)
       });
-      if (recordMutation(summary, "unsupported", mutation)) activateSystemFallback(store, delivery, summary);
-      emit(log, "notification.delivery.unsupported", delivery, { reasonCode });
+      recordMutation(summary, "unsupported", mutation, { log, delivery, ownerId, details: { reasonCode } });
       continue;
     }
     const retryable = result?.status === "retry" || (result?.status === "failed" && result.retryable === true)
@@ -185,14 +197,18 @@ export async function deliverNotificationBatch({
       leaseEpoch: delivery.lease_epoch,
       reasonCode,
       retryAt,
-      retryable
+      retryable,
+      fallbackTransport: retryable ? null : fallbackTransportFor(delivery)
     });
     if (retryable) {
-      recordMutation(summary, "retrying", mutation);
-      emit(log, "notification.delivery.retrying", delivery, { reasonCode, retryAt, errorName: result?.errorName });
+      recordMutation(summary, "retrying", mutation, {
+        log,
+        delivery,
+        ownerId,
+        details: { reasonCode, retryAt, errorName: result?.errorName }
+      });
     } else {
-      if (recordMutation(summary, "failed", mutation)) activateSystemFallback(store, delivery, summary);
-      emit(log, "notification.delivery.failed", delivery, { reasonCode });
+      recordMutation(summary, "failed", mutation, { log, delivery, ownerId, details: { reasonCode } });
     }
   }
 

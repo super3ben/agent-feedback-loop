@@ -38,7 +38,7 @@ async function deliveryFixture(id, kind = "reviewed_no_lesson") {
     payload,
     language: "en"
   });
-  return { store, event, notification };
+  return { store, event, notification, paths };
 }
 
 test("native acceptance is idempotent and does not activate system fallback", async () => {
@@ -243,4 +243,66 @@ test("candidate and queued semantic events remain audited-only and are never dis
     fixture.store.close();
   }
   assert.equal(calls, 0);
+});
+
+test("lease recovery during adapter delivery emits only a bounded fenced-out outcome", async () => {
+  const { store, notification, paths } = await deliveryFixture("stale-adapter");
+  const competing = openStore({ paths });
+  const logs = [];
+  let resumeDelivery;
+  let signalDeliveryStarted;
+  const deliveryPaused = new Promise((resolve) => { resumeDelivery = resolve; });
+  const deliveryStarted = new Promise((resolve) => { signalDeliveryStarted = resolve; });
+  const running = deliverNotificationBatch({
+    store,
+    adapters: {
+      codex_thread: {
+        async probe() { return { supported: true }; },
+        async deliver() {
+          signalDeliveryStarted();
+          await deliveryPaused;
+          return { status: "accepted", ackId: "stale-ack" };
+        }
+      }
+    },
+    ownerId: "stale-worker",
+    nowMs: 1_000,
+    leaseMs: 10,
+    limit: 1,
+    log: (entry) => logs.push(entry)
+  });
+  await deliveryStarted;
+  const [recovered] = competing.claimNotificationDeliveries({
+    ownerId: "recovery-worker",
+    nowMs: 1_010,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["codex_thread"]
+  });
+  assert.equal(recovered.owner_id, "recovery-worker");
+  resumeDelivery();
+
+  const summary = await running;
+  assert.equal(summary.accepted, 0);
+  assert.equal(summary.stale, 1);
+  assert.equal(logs.some((entry) => entry.event === "notification.delivery.accepted"), false);
+  assert.deepEqual(logs.filter((entry) => entry.event !== "notification.delivery.claimed"), [{
+    event: "notification.delivery.fenced_out",
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    attempt: 1,
+    leaseEpoch: 1,
+    ownerId: "stale-worker",
+    targetOutcome: "accepted",
+    reasonCode: "lease_fenced"
+  }]);
+  const durable = competing.listNotificationDeliveries({
+    notificationId: notification.notification_id,
+    transport: "codex_thread"
+  })[0];
+  assert.equal(durable.state, "delivering");
+  assert.equal(durable.owner_id, "recovery-worker");
+  assert.equal(durable.lease_epoch, 2);
+  store.close();
+  competing.close();
 });

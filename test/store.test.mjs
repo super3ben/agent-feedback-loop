@@ -311,6 +311,84 @@ test("notification delivery claims are transport-scoped and stale lease epochs a
   competing.close();
 });
 
+test("native terminal transition and system fallback activation commit atomically", async () => {
+  for (const terminalState of ["unsupported", "failed"]) {
+    const home = await mkdtemp(path.join(tmpdir(), `afl-delivery-fallback-${terminalState}-`));
+    const paths = pathsFor(home);
+    const store = openStore({ paths });
+    const captured = event(`delivery-fallback-${terminalState}-event`);
+    store.captureSessionEvent(captured);
+    store.submitReviewerJob({
+      job_id: `delivery-fallback-${terminalState}-job`,
+      project_id: captured.project_id,
+      prompt_version: "v1"
+    });
+    const notification = store.createNotification({
+      sessionUid: captured.session_uid,
+      contextEpoch: 1,
+      kind: "reviewed_no_lesson",
+      jobId: `delivery-fallback-${terminalState}-job`,
+      payload: {},
+      language: "en"
+    });
+    const [lease] = store.claimNotificationDeliveries({
+      ownerId: "fallback-owner",
+      nowMs: 1_000,
+      leaseMs: 30_000,
+      limit: 1,
+      transports: ["codex_thread"]
+    });
+    const injected = new DatabaseSync(paths.storeFile);
+    injected.exec(`CREATE TRIGGER reject_system_fallback
+      BEFORE INSERT ON notification_deliveries
+      WHEN NEW.transport='system'
+      BEGIN SELECT RAISE(ABORT, 'fault injected fallback insert'); END`);
+    injected.close();
+
+    const transition = () => terminalState === "unsupported"
+      ? store.markNotificationUnsupported({
+          notificationId: notification.notification_id,
+          transport: "codex_thread",
+          ownerId: "fallback-owner",
+          leaseEpoch: lease.lease_epoch,
+          reasonCode: "native_unavailable",
+          fallbackTransport: "system"
+        })
+      : store.failNotificationDelivery({
+          notificationId: notification.notification_id,
+          transport: "codex_thread",
+          ownerId: "fallback-owner",
+          leaseEpoch: lease.lease_epoch,
+          reasonCode: "delivery_rejected",
+          retryAt: null,
+          retryable: false,
+          fallbackTransport: "system"
+        });
+    assert.throws(transition, /fault injected fallback insert/);
+    const afterFault = store.listNotificationDeliveries({
+      notificationId: notification.notification_id,
+      transport: "codex_thread"
+    })[0];
+    assert.equal(afterFault.state, "delivering");
+    assert.equal(afterFault.owner_id, "fallback-owner");
+    assert.equal(afterFault.lease_epoch, lease.lease_epoch);
+    assert.equal(store.listNotificationDeliveries({
+      notificationId: notification.notification_id,
+      transport: "system"
+    }).length, 0);
+
+    const repair = new DatabaseSync(paths.storeFile);
+    repair.exec("DROP TRIGGER reject_system_fallback");
+    repair.close();
+    const completed = transition();
+    assert.equal(completed.changed, true);
+    assert.equal(completed.delivery.state, terminalState);
+    assert.equal(completed.fallback.changed, true);
+    assert.equal(completed.fallback.delivery.state, "pending");
+    store.close();
+  }
+});
+
 test("notification acceptance keeps bounded acknowledgements separate from observation", async () => {
   const store = await storeFixture();
   const captured = event("delivery-observation-event");
