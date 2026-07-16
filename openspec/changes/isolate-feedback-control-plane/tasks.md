@@ -13,8 +13,8 @@
 
 ## 3. 宿主能力感知的通知投递
 
-- [ ] 3.1 为 per-transport claim、fenced lease、accepted/observed、retry、unsupported 和 semantic idempotency 编写 RED store test。
-- [ ] 3.2 实现 transport-neutral notification delivery store，把 notifier/audit query 从内嵌 chat/system 列迁移出来。
+- [x] 3.1 为 per-transport claim、fenced lease、accepted/observed、retry、unsupported 和 semantic idempotency 编写 RED store test。
+- [x] 3.2 实现 transport-neutral notification delivery store，把 notifier/audit query 从内嵌 chat/system 列迁移出来。
 - [ ] 3.3 为 Codex app-server initialize、精确 thread targeting、bounded `thread/inject_items`、ack、timeout、reject 和 unavailable 编写 RED protocol test。
 - [ ] 3.4 在 capability probe 后实现异步 Codex native adapter，并保证 synthetic marker 被 capture filter 排除且 hook 不同步依赖 adapter。
 - [ ] 3.5 终态通知采用 native-preferred/system-fallback；candidate/queued 默认只审计。
