@@ -32,3 +32,7 @@ AFL MUST NOT inject or emit receipt reproduction instructions, hook prompts, rev
 #### Scenario: Applicable reflection exists
 - **WHEN** document selection finds an applicable method
 - **THEN** the prompt hook may return only bounded method guidance and opaque provenance, not AFL operational state
+
+#### Scenario: A reviewer publishes during the current prompt hook
+- **WHEN** a detached reviewer atomically publishes a document at or after the current hook's fixed publication cutoff
+- **THEN** that document is excluded from the current response and can become eligible only on a later matching prompt

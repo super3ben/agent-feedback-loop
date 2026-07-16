@@ -33,6 +33,10 @@ Canonical reports MUST include stable reflection and family identity, severity, 
 - **WHEN** a later validated reflection belongs to an existing family
 - **THEN** a new immutable document records that relation instead of rewriting or deleting prior reports
 
+#### Scenario: An existing readable report predates family metadata
+- **WHEN** a legacy report has parseable severity, responsibility, mistake class, and actionable method-change or preventive-constraint sections but no explicit method or family id
+- **THEN** the parser derives deterministic legacy identities without rewriting the report, and the document remains eligible for direct selection
+
 ### Requirement: Legacy database export is explicit and idempotent
 Migration from legacy database memory SHALL be an operator-invoked export with dry-run and explicit output directory; normal runtime selection SHALL never read legacy bodies from the database.
 
