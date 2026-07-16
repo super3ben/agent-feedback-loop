@@ -32,6 +32,20 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.equal(current.schemaVersion, 9);
 });
 
+test("installed Stop templates contain capture only and no receipt backstop", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-template-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const stopHook = await readFile(paths.stopHook, "utf8");
+  const coreHook = await readFile(paths.coreHook, "utf8");
+
+  for (const template of [stopHook, coreHook]) {
+    assert.doesNotMatch(template, /backstop/i);
+    assert.doesNotMatch(template, /decision["'= :]+block/i);
+    assert.doesNotMatch(template, /Output this receipt verbatim before stopping/i);
+  }
+});
+
 test("remove-files removes runtime but preserves durable data and keys", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-uninstall-"));
   const paths = pathsFor(home);

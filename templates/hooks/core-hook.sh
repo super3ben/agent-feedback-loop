@@ -132,7 +132,7 @@ esac
 agent_feedback_queue_append "$queue_path" "$payload" "${session_id}:${prompt_text}"
 
 if agent_feedback_review_due "$queue_path"; then
-  # Review due -> mark this turn (backstop enforces completion) and inject
+  # Review due -> mark this turn for legacy completion accounting and inject
   # the single batch-review instruction.
   mkdir -p "$(agent_feedback_marker_dir)" 2>/dev/null || true
   : > "$marker_path" 2>/dev/null || true

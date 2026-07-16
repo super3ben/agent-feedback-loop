@@ -13,7 +13,7 @@ import { openStore } from "./store.mjs";
 import { ReviewerRunner } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { readSecureReceipt } from "./reviewer-auth.mjs";
-import { detectReceiptLanguage, renderReceiptControl, renderReceiptInstruction } from "./receipt.mjs";
+import { detectReceiptLanguage, renderReceiptInstruction } from "./receipt.mjs";
 import { selectLessons } from "./selector.mjs";
 
 function optionValue(args, name, fallback = null) {
@@ -50,12 +50,17 @@ function logCreatedNotifications(notifications) {
   }
 }
 
-function stopResponse(cli, result) {
-  if (result.action !== "block") return cli === "codex" ? { continue: true } : {};
-  const reason = `Output this receipt verbatim before stopping:\n${renderReceiptControl(result.notification).text}`;
-  return cli === "gemini"
-    ? { decision: "deny", reason }
-    : { decision: "block", reason };
+const STOP_FAILURE_REASONS = new Set([
+  "invalid_input", "store_unavailable", "capture_failed", "observation_failed"
+]);
+
+function stopResponse(cli) {
+  return cli === "codex" ? { continue: true } : {};
+}
+
+function logStopNonInterference(reason) {
+  const boundedReason = STOP_FAILURE_REASONS.has(reason) ? reason : "capture_failed";
+  receiptLog(`hook.non_interference event=stop result=pass capture=failed reason=${boundedReason}`);
 }
 
 async function runRetentionMaintenance({ store, blobs }) {
@@ -411,16 +416,28 @@ export async function main(args) {
       process.stdin.on("data", (chunk) => { value += chunk; });
       process.stdin.on("end", () => resolve(value));
     });
-    const parsedPayload = JSON.parse(payload || "{}");
     const cli = options.cli || options.args[0] || "unknown";
-    if (isCodexChildAgentPayload(cli, parsedPayload)) {
-      logChildAgentBypass(parsedPayload, "stop");
-      console.log(JSON.stringify(stopResponse(cli, { action: "pass", notification: null })));
-      return;
-    }
-    const paths = pathsFor(options.home);
-    const store = openStore({ paths });
+    let store = null;
+    let failureReason = null;
     try {
+      let parsedPayload;
+      try {
+        parsedPayload = JSON.parse(payload || "{}");
+      } catch {
+        failureReason = "invalid_input";
+        return;
+      }
+      if (isCodexChildAgentPayload(cli, parsedPayload)) {
+        logChildAgentBypass(parsedPayload, "stop");
+        return;
+      }
+      const paths = pathsFor(options.home);
+      try {
+        store = openStore({ paths });
+      } catch {
+        failureReason = "store_unavailable";
+        return;
+      }
       let transcriptText = "";
       if (parsedPayload.transcript_path) {
         try {
@@ -445,37 +462,53 @@ export async function main(args) {
         installationId: "default",
         capturePolicyRevision: store.getCapturePolicy().revision
       });
-      if (hasCaptureEvidence(event)) {
-        const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
-        await captureObservedSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
-        debugLog(`capture.stop.ok event=${event.event_uid} completeness=${event.capture_completeness} excerpt_chars=${event.redacted_text?.length || 0}`);
+      try {
+        if (hasCaptureEvidence(event)) {
+          const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
+          await captureObservedSession({ store, blobs, event, rawText: transcriptText ? JSON.stringify({ payload: parsedPayload, transcript_tail: transcriptText }) : payload });
+          debugLog(`capture.stop.ok event=${event.event_uid} completeness=${event.capture_completeness} excerpt_chars=${event.redacted_text?.length || 0}`);
+        }
+      } catch {
+        failureReason = "capture_failed";
+        return;
       }
-      let confirmation = store.confirmChatNotification({
-        sessionUid: event.session_uid,
-        contextEpoch: event.context_epoch,
-        nativeTurnId: event.native_turn_id,
-        transcriptText: confirmationText
-      });
-      if (confirmation.action === "block" && Number(confirmation.notification?.chat_emit_attempts) > 1) {
-        // A re-emission is the final delivery attempt; advance it without forcing the user through a second Stop block.
-        confirmation = store.confirmChatNotification({
+      try {
+        let confirmation = store.confirmChatNotification({
           sessionUid: event.session_uid,
           contextEpoch: event.context_epoch,
           nativeTurnId: event.native_turn_id,
           transcriptText: confirmationText
         });
+        if (confirmation.action === "block" && Number(confirmation.notification?.chat_emit_attempts) > 1) {
+          confirmation = store.confirmChatNotification({
+            sessionUid: event.session_uid,
+            contextEpoch: event.context_epoch,
+            nativeTurnId: event.native_turn_id,
+            transcriptText: confirmationText
+          });
+        }
+        if (confirmation.action === "observed") {
+          receiptLog(`receipt.chat.observed notification=${confirmation.notification.notification_id} count=1`);
+        } else if (confirmation.action === "pass_unconfirmed") {
+          receiptLog(`receipt.chat.unconfirmed notification=${confirmation.notification.notification_id} count=1`);
+        }
+        const observed = store.observeDeliveryNonces({ session_uid: event.session_uid, context_epoch: event.context_epoch, transcriptText: confirmationText });
+        const unconfirmed = store.finalizeUnconfirmedDeliveries({ session_uid: event.session_uid, context_epoch: event.context_epoch });
+        debugLog(`capture.stop.delivery observed=${observed} unconfirmed=${unconfirmed}`);
+      } catch {
+        failureReason = "observation_failed";
+        return;
       }
-      if (confirmation.action === "observed") {
-        receiptLog(`receipt.chat.observed notification=${confirmation.notification.notification_id} count=1`);
-      } else if (confirmation.action === "pass_unconfirmed") {
-        receiptLog(`receipt.chat.unconfirmed notification=${confirmation.notification.notification_id} count=1`);
-      }
-      const observed = store.observeDeliveryNonces({ session_uid: event.session_uid, context_epoch: event.context_epoch, transcriptText: confirmationText });
-      const unconfirmed = store.finalizeUnconfirmedDeliveries({ session_uid: event.session_uid, context_epoch: event.context_epoch });
-      debugLog(`capture.stop.delivery observed=${observed} unconfirmed=${unconfirmed}`);
-      console.log(JSON.stringify(stopResponse(cli, confirmation)));
     } finally {
-      store.close();
+      if (store) {
+        try {
+          store.close();
+        } catch {
+          failureReason ||= "store_unavailable";
+        }
+      }
+      if (failureReason) logStopNonInterference(failureReason);
+      console.log(JSON.stringify(stopResponse(cli)));
     }
     return;
   }

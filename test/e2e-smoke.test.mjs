@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,7 +8,6 @@ import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
 import { install, pathsFor } from "../src/index.mjs";
-import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -97,7 +96,7 @@ test("installed stop hook captures assistant output as reviewer evidence", async
   store.close();
 });
 
-test("installed stop hook forwards transactional receipt block stdout", async () => {
+test("installed Stop hook never forwards an internal receipt decision", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-stop-forward-"));
   await install({ home });
   const paths = pathsFor(home);
@@ -116,7 +115,7 @@ test("installed stop hook forwards transactional receipt block stdout", async ()
     data_class: "normal"
   };
   store.captureSessionEvent(event);
-  const notification = store.createNotification({
+  store.createNotification({
     sessionUid: event.session_uid,
     contextEpoch: 1,
     kind: "candidate_captured",
@@ -134,10 +133,78 @@ test("installed stop hook forwards transactional receipt block stdout", async ()
     last_assistant_message: "Completed without the receipt."
   }), { ...process.env, HOME: home, TMPDIR: home }, "codex");
 
-  assert.deepEqual(JSON.parse(result.stdout), {
-    decision: "block",
-    reason: `Output this receipt verbatim before stopping:\n${renderReceiptControl(notification).text}`
-  });
+  assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+});
+
+test("installed Stop hook fail-opens malformed capture input with bounded diagnostics", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-invalid-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const logFile = path.join(paths.dataRoot, "logs", "runtime.log");
+
+  for (const mode of ["codex", "claude", "gemini"]) {
+    const result = await runStopHook(paths.stopHook, '{"session_id":"do-not-log"', {
+      ...process.env,
+      HOME: home,
+      TMPDIR: home
+    }, mode);
+    assert.deepEqual(JSON.parse(result.stdout), mode === "codex" ? { continue: true } : {});
+  }
+
+  const log = await readFile(logFile, "utf8");
+  assert.match(log, /hook\.non_interference event=stop result=pass capture=failed reason=invalid_input/);
+  assert.doesNotMatch(log, /do-not-log|SyntaxError|Unexpected end|JSON/);
+});
+
+test("installed Stop hook fail-opens capture storage failure with bounded diagnostics", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-capture-failure-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  await rm(paths.blobRoot, { recursive: true, force: true });
+  await mkdir(path.dirname(paths.blobRoot), { recursive: true });
+  await writeFile(paths.blobRoot, "not-a-directory", { mode: 0o600 });
+
+  const result = await runStopHook(paths.stopHook, JSON.stringify({
+    session_id: "capture-failure-session",
+    turn_id: "turn-1",
+    cwd: "/tmp/capture-failure",
+    last_assistant_message: "sensitive capture payload"
+  }), { ...process.env, HOME: home, TMPDIR: home }, "codex");
+
+  assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+  const log = await readFile(path.join(paths.dataRoot, "logs", "runtime.log"), "utf8");
+  assert.match(log, /hook\.non_interference event=stop result=pass capture=failed reason=capture_failed/);
+  assert.doesNotMatch(log, /sensitive capture payload|ENOTDIR|not a directory/i);
+});
+
+test("installed Stop hook times out behind a busy SQLite writer and still passes", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-sqlite-busy-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const initialized = openStore({ paths });
+  initialized.close();
+  const lock = new DatabaseSync(paths.storeFile);
+  lock.exec("BEGIN IMMEDIATE");
+  try {
+    const result = await runStopHook(paths.stopHook, JSON.stringify({
+      session_id: "sqlite-busy-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/sqlite-busy",
+      last_assistant_message: "Done."
+    }), {
+      ...process.env,
+      HOME: home,
+      TMPDIR: home,
+      AGENT_FEEDBACK_LOOP_STOP_CAPTURE_TIMEOUT_MS: "100"
+    }, "codex");
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+  } finally {
+    lock.exec("ROLLBACK");
+    lock.close();
+  }
+  const log = await readFile(path.join(paths.dataRoot, "logs", "runtime.log"), "utf8");
+  assert.match(log, /hook\.non_interference event=stop result=pass capture=failed reason=capture_timeout/);
+  assert.doesNotMatch(log, /SQLITE_BUSY|database is locked/i);
 });
 
 test("same-turn steering starts review only after the transcript assistant referent is durable", async () => {

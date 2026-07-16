@@ -47,6 +47,10 @@ function runWithInput(file, input, env, args = []) {
   });
 }
 
+function expectedStopPass(cli) {
+  return cli === "codex" ? { continue: true } : {};
+}
+
 async function bindEmittedReceipt({ home, cli, sessionId, turnId, projectId }) {
   const paths = pathsFor(home);
   const payload = JSON.stringify({
@@ -374,7 +378,7 @@ describe("agent-feedback-loop package", () => {
     assert.doesNotMatch(queued.stderr, /不要把这句完整写进日志/);
   });
 
-  it("stop hook backstop: blocks when required-but-not-done, passes otherwise, guards loops", async () => {
+  it("Stop is non-interfering even when legacy reflection markers request a retry", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const stopHook = path.join(home, ".agent", "feedback-loop", "hooks", "stop-hook.sh");
@@ -384,36 +388,32 @@ describe("agent-feedback-loop package", () => {
     const env = { ...process.env, HOME: home, TMPDIR: tmp, AGENT_FEEDBACK_LOOP_LEGACY_QUEUE: "1" };
     const marker = path.join(mdir, "s1.1.required");
 
-    // no marker -> pass
+    // No marker is the ordinary pass path.
     const noMark = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1 }), env, ["--mode", "codex"]);
-    assert.equal(JSON.parse(noMark.stdout).continue, true);
+    assert.deepEqual(JSON.parse(noMark.stdout), { continue: true });
 
-    // required + no done marker -> block (Codex strict: no hookSpecificOutput)
+    // A stale marker must never turn Stop into a control-plane retry.
     await writeFile(marker, "");
-    const blocked = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "我把bug修了" }), env, ["--mode", "codex"]);
-    const blockedJson = JSON.parse(blocked.stdout);
-    assert.equal(blockedJson.decision, "block");
-    assert.ok(blockedJson.reason && blockedJson.reason.length > 0);
-    assert.equal(blockedJson.hookSpecificOutput, undefined);
+    const staleMarker = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "我把bug修了" }), env, ["--mode", "codex"]);
+    assert.deepEqual(JSON.parse(staleMarker.stdout), { continue: true });
 
-    // required + done marker present in reply -> pass and clean up marker
+    // Marker-like assistant text is observation data, never a Stop decision.
     await writeFile(marker, "");
     const oldMarkerOnly = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault-->" }), env, ["--mode", "codex"]);
-    assert.equal(JSON.parse(oldMarkerOnly.stdout).decision, "block");
+    assert.deepEqual(JSON.parse(oldMarkerOnly.stdout), { continue: true });
 
-    // required + done marker with background/fallback mode -> pass and clean up marker
+    // Current completion markers also pass.
     await writeFile(marker, "");
     const done = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, last_assistant_message: "ok <!--afl-reflection:done responsibility=agent_fault mode=background_subagent agent_id=abc-->" }), env, ["--mode", "codex"]);
-    assert.equal(JSON.parse(done.stdout).continue, true);
-    await assert.rejects(stat(marker));
+    assert.deepEqual(JSON.parse(done.stdout), { continue: true });
 
-    // loop guard: stop_hook_active=true -> pass even if required and not done
+    // Host loop flags cannot change the pass schema.
     await writeFile(marker, "");
     const guarded = await runWithInput(stopHook, JSON.stringify({ session_id: "s1", turn_id: 1, stop_hook_active: true, last_assistant_message: "still nothing" }), env, ["--mode", "codex"]);
-    assert.equal(JSON.parse(guarded.stdout).continue, true);
+    assert.deepEqual(JSON.parse(guarded.stdout), { continue: true });
   });
 
-  it("stop hook gemini mode denies once then passes via file counter (0.30.0 loop-guard bug workaround)", async () => {
+  it("Gemini Stop is non-interfering for every retry-marker state", async () => {
     const home = await tempHome();
     await install({ home, dryRun: false });
     const stopHook = path.join(home, ".agent", "feedback-loop", "hooks", "stop-hook.sh");
@@ -426,9 +426,9 @@ describe("agent-feedback-loop package", () => {
 
     await writeFile(marker, "");
     const first = await runWithInput(stopHook, payload, env, ["--mode", "gemini"]);
-    assert.equal(JSON.parse(first.stdout).decision, "deny");
+    assert.deepEqual(JSON.parse(first.stdout), {});
 
-    // second time: retries file exists -> pass (no infinite loop)
+    // Repeated Stop remains a host no-op.
     await writeFile(marker, "");
     const second = await runWithInput(stopHook, payload, env, ["--mode", "gemini"]);
     assert.deepEqual(JSON.parse(second.stdout), {});
@@ -801,32 +801,69 @@ describe("agent-feedback-loop package", () => {
     store.close();
   });
 
-  it("receipt Stop blocks at most once across Codex Claude and Gemini schemas", async () => {
+  it("capture-stop passes across hosts for every receipt and control-plane state", async () => {
     for (const cli of ["codex", "claude", "gemini"]) {
       const home = await tempHome();
       await install({ home, dryRun: false });
-      const fixture = await bindEmittedReceipt({
-        home,
-        cli,
-        sessionId: `receipt-stop-${cli}`,
-        turnId: "turn-1",
-        projectId: `/tmp/receipt-stop-${cli}`
-      });
-      const stopPayload = JSON.stringify({
-        session_id: `receipt-stop-${cli}`,
-        turn_id: "turn-1",
-        cwd: `/tmp/receipt-stop-${cli}`,
-        last_assistant_message: "The implementation was inspected."
-      });
       const env = { ...process.env, HOME: home };
-      const first = await runWithInput(fixture.paths.stopHook, stopPayload, env, ["--mode", cli]);
-      const second = await runWithInput(fixture.paths.stopHook, stopPayload, env, ["--mode", cli]);
-      const expectedReason = `Output this receipt verbatim before stopping:\n${renderReceiptControl(fixture.notification).text}`;
+      const paths = pathsFor(home);
+      const receiptStates = ["pending", "emitted", "emitted_unconfirmed", "observed"];
+      for (const state of receiptStates) {
+        const sessionId = `stop-${cli}-${state}`;
+        const turnId = "turn-1";
+        const projectId = `/tmp/${sessionId}`;
+        const promptPayload = JSON.stringify({ session_id: sessionId, turn_id: turnId, cwd: projectId, prompt: "Inspect the implementation." });
+        const promptArgs = ["--event", cli === "gemini" ? "BeforeAgent" : "UserPromptSubmit", "--cli", cli];
+        if (cli === "codex") promptArgs.push("--continue");
+        await runWithInput(paths.coreHook, promptPayload, { ...env, AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES: "99" }, promptArgs);
 
-      assert.deepEqual(JSON.parse(first.stdout), cli === "gemini"
-        ? { decision: "deny", reason: expectedReason }
-        : { decision: "block", reason: expectedReason });
-      assert.deepEqual(JSON.parse(second.stdout), cli === "codex" ? { continue: true } : {});
+        const store = openStore({ paths });
+        const [event] = store.listSessionEvents(projectId);
+        const notification = store.createNotification({
+          sessionUid: event.session_uid,
+          contextEpoch: event.context_epoch,
+          kind: "candidate_captured",
+          eventUid: event.event_uid,
+          payload: {},
+          language: "en"
+        });
+        if (state !== "pending") {
+          store.claimChatNotification({ sessionUid: event.session_uid, contextEpoch: event.context_epoch, nativeTurnId: turnId });
+        }
+        if (state === "emitted_unconfirmed") {
+          store.confirmChatNotification({ sessionUid: event.session_uid, contextEpoch: event.context_epoch, nativeTurnId: turnId, transcriptText: "no receipt" });
+          store.confirmChatNotification({ sessionUid: event.session_uid, contextEpoch: event.context_epoch, nativeTurnId: turnId, transcriptText: "still no receipt" });
+        } else if (state === "observed") {
+          store.confirmChatNotification({ sessionUid: event.session_uid, contextEpoch: event.context_epoch, nativeTurnId: turnId, transcriptText: renderReceiptControl(notification).text });
+        }
+        store.close();
+
+        const result = await runWithInput(paths.stopHook, JSON.stringify({
+          session_id: sessionId,
+          turn_id: turnId,
+          cwd: projectId,
+          last_assistant_message: "The implementation was inspected."
+        }), env, ["--mode", cli]);
+        assert.deepEqual(JSON.parse(result.stdout), expectedStopPass(cli), `${cli} ${state}`);
+      }
+
+      for (const runtimeState of [
+        ["reviewer_runner", "queued"],
+        ["reviewer_runner", "completed"],
+        ["selector", "omitted"],
+        ["retention_gc", "maintenance"]
+      ]) {
+        const store = openStore({ paths });
+        store.setRuntimeStatus(runtimeState[0], { status: runtimeState[1] });
+        store.close();
+        const result = await runWithInput(paths.stopHook, JSON.stringify({
+          session_id: `stop-${cli}-${runtimeState.join("-")}`,
+          turn_id: "turn-1",
+          cwd: `/tmp/stop-${cli}-runtime`,
+          last_assistant_message: "Done."
+        }), env, ["--mode", cli]);
+        assert.deepEqual(JSON.parse(result.stdout), expectedStopPass(cli), `${cli} ${runtimeState.join("/")}`);
+      }
     }
   });
 
@@ -909,7 +946,7 @@ describe("agent-feedback-loop package", () => {
       last_assistant_message: "Completed without duplicating the control."
     }), { ...process.env, HOME: home }, ["--mode", "codex"]);
 
-    assert.equal(JSON.parse(result.stdout).decision, "block");
+    assert.deepEqual(JSON.parse(result.stdout), { continue: true });
     const store = openStore({ paths: fixture.paths });
     assert.equal(store.listNotifications({ sessionUid: fixture.event.session_uid })[0].chat_state, "emitted");
     store.close();
@@ -963,7 +1000,7 @@ describe("agent-feedback-loop package", () => {
       cwd: "/tmp/receipt-reemit",
       last_assistant_message: "No receipt was emitted."
     });
-    assert.equal(JSON.parse((await runWithInput(fixture.paths.stopHook, firstStopPayload, env, ["--mode", "codex"])).stdout).decision, "block");
+    assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, firstStopPayload, env, ["--mode", "codex"])).stdout), { continue: true });
     assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, firstStopPayload, env, ["--mode", "codex"])).stdout), { continue: true });
 
     const prompt = (turnId) => JSON.stringify({
@@ -1008,7 +1045,7 @@ describe("agent-feedback-loop package", () => {
       cwd: "/tmp/receipt-disable-after-stop",
       last_assistant_message: "Completed without the receipt."
     });
-    assert.equal(JSON.parse((await runWithInput(fixture.paths.stopHook, stopPayload, enabledEnv, ["--mode", "codex"])).stdout).decision, "block");
+    assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, stopPayload, enabledEnv, ["--mode", "codex"])).stdout), { continue: true });
     assert.deepEqual(JSON.parse((await runWithInput(fixture.paths.stopHook, stopPayload, enabledEnv, ["--mode", "codex"])).stdout), { continue: true });
 
     const prompt = (turnId) => JSON.stringify({
