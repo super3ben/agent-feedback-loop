@@ -31,6 +31,13 @@ const EFFECTIVENESS_OWNERS = new Set([
   "delivery_adapter", "agent_execution", "lesson_contract", "external", "unknown"
 ]);
 const SEVERITY_RANK = Object.freeze({ Minor: 0, Major: 1, Critical: 2, Blocker: 3 });
+const NOTIFICATION_TRANSPORTS = new Set(["codex_thread", "system", "audit", "legacy_model_echo"]);
+const CLAIMABLE_NOTIFICATION_TRANSPORTS = new Set(["codex_thread", "system"]);
+const NOTIFICATION_DELIVERY_STATES = new Set([
+  "pending", "delivering", "accepted", "observed", "failed", "unsupported", "suppressed", "audited_only"
+]);
+const ENSURABLE_NOTIFICATION_DELIVERY_STATES = new Set(["pending", "failed", "unsupported", "suppressed", "audited_only"]);
+const DISPATCHED_NOTIFICATION_KINDS = new Set(["review_completed", "reviewed_no_lesson", "review_exhausted"]);
 
 function validateEffectiveness(effectiveness, { previousLesson, delivery }) {
   if (!effectiveness || typeof effectiveness !== "object") throw new TypeError("recurring lesson requires an effectiveness audit");
@@ -409,6 +416,66 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     return detectReceiptLanguage(source?.redacted_text, receiptLanguage);
   };
 
+  const validateNotificationTransport = (transport, { claimable = false } = {}) => {
+    const safeTransport = ensureString(transport, "transport");
+    const allowed = claimable ? CLAIMABLE_NOTIFICATION_TRANSPORTS : NOTIFICATION_TRANSPORTS;
+    if (!allowed.has(safeTransport)) throw new TypeError(`transport is not ${claimable ? "claimable" : "supported"}`);
+    return safeTransport;
+  };
+
+  const validateNotificationDeliveryState = (state, { ensurable = false } = {}) => {
+    const safeState = ensureString(state, "state");
+    const allowed = ensurable ? ENSURABLE_NOTIFICATION_DELIVERY_STATES : NOTIFICATION_DELIVERY_STATES;
+    if (!allowed.has(safeState)) throw new TypeError(`notification delivery state is not ${ensurable ? "ensurable" : "valid"}`);
+    return safeState;
+  };
+
+  const validateNotificationReasonCode = (reasonCode, { required = false } = {}) => {
+    if (reasonCode === undefined || reasonCode === null) {
+      if (required) throw new TypeError("reasonCode is required");
+      return null;
+    }
+    const safeReasonCode = String(reasonCode);
+    if (!/^[a-z0-9_]{1,64}$/.test(safeReasonCode)) throw new TypeError("reasonCode is invalid");
+    return safeReasonCode;
+  };
+
+  const validateNotificationLeaseEpoch = (leaseEpoch) => {
+    const safeLeaseEpoch = Math.floor(Number(leaseEpoch));
+    if (!Number.isInteger(safeLeaseEpoch) || safeLeaseEpoch < 1) throw new TypeError("leaseEpoch must be a positive integer");
+    return safeLeaseEpoch;
+  };
+
+  const readNotificationDelivery = (notificationId, transport) => {
+    const delivery = db.prepare(`SELECT * FROM notification_deliveries
+      WHERE notification_id=? AND transport=?`).get(notificationId, transport);
+    if (!delivery) return null;
+    const notification = db.prepare("SELECT * FROM notification_outbox WHERE notification_id=?").get(notificationId);
+    return {
+      ...delivery,
+      notification: notification ? { ...notification, payload: parseJsonOr(notification.payload_json, {}) } : null
+    };
+  };
+
+  const ensureNotificationDeliveryInTransaction = ({ notificationId, transport, state, reasonCode = null }) => {
+    const safeNotificationId = ensureString(notificationId, "notificationId");
+    const safeTransport = validateNotificationTransport(transport);
+    const safeState = validateNotificationDeliveryState(state, { ensurable: true });
+    const safeReasonCode = validateNotificationReasonCode(reasonCode);
+    if (safeTransport === "audit" && safeState !== "audited_only") {
+      throw new TypeError("audit transport must remain audited_only");
+    }
+    if (!db.prepare("SELECT 1 FROM notification_outbox WHERE notification_id=?").get(safeNotificationId)) return null;
+    const timestamp = nowIso(now);
+    const result = db.prepare(`INSERT OR IGNORE INTO notification_deliveries
+      (notification_id, transport, state, owner_id, attempt, lease_epoch, lease_until, next_attempt_at,
+       ack_id, reason_code, accepted_at, observed_at, created_at, updated_at)
+      VALUES (?, ?, ?, NULL, 0, 0, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)`).run(
+      safeNotificationId, safeTransport, safeState, safeReasonCode, timestamp, timestamp
+    );
+    return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+  };
+
   const createNotificationInTransaction = ({
     sessionUid, contextEpoch, kind, jobId = null, eventUid = null, applicationId = null,
     semanticKey = null, payload = {}, language
@@ -429,7 +496,7 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
     const chatState = kind === "lesson_delivered" ? "suppressed" : "pending";
     const systemState = ["review_completed", "reviewed_no_lesson", "review_exhausted"].includes(kind) ? "pending" : "not_applicable";
     const timestamp = nowIso(now);
-    db.prepare(`INSERT INTO notification_outbox
+    const inserted = db.prepare(`INSERT INTO notification_outbox
       (notification_id, session_uid, context_epoch, job_id, event_uid, application_id, semantic_key, kind,
        payload_json, language, chat_state, system_state, next_attempt_at, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -438,6 +505,14 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
       JSON.stringify(safePayload), resolvedLanguage, chatState, systemState,
       systemState === "pending" ? 0 : null, timestamp, timestamp
     );
+    if (inserted.changes === 1) {
+      ensureNotificationDeliveryInTransaction({ notificationId, transport: "audit", state: "audited_only" });
+      ensureNotificationDeliveryInTransaction({
+        notificationId,
+        transport: "codex_thread",
+        state: DISPATCHED_NOTIFICATION_KINDS.has(kind) ? "pending" : "audited_only"
+      });
+    }
     if (kind === "review_queued") {
       db.prepare(`UPDATE notification_outbox SET chat_state='suppressed', updated_at=?
         WHERE session_uid=? AND context_epoch=? AND kind='candidate_captured'
@@ -558,6 +633,146 @@ export function openStore({ paths, now = () => new Date(), receiptLanguage = pro
       if (sessionUid !== undefined) return db.prepare("SELECT * FROM notification_outbox WHERE session_uid=? ORDER BY created_at, notification_id").all(sessionUid);
       if (jobId !== undefined) return db.prepare("SELECT * FROM notification_outbox WHERE job_id=? ORDER BY created_at, notification_id").all(jobId);
       return db.prepare("SELECT * FROM notification_outbox ORDER BY created_at, notification_id").all();
+    },
+    ensureNotificationDelivery(input) {
+      return transaction(() => ensureNotificationDeliveryInTransaction(input));
+    },
+    claimNotificationDeliveries({ ownerId, nowMs = Date.now(), leaseMs = 120_000, limit = 8, transports = ["codex_thread", "system"] }) {
+      return transaction(() => {
+        const safeOwnerId = ensureString(ownerId, "ownerId");
+        const safeNowMs = Number(nowMs);
+        const safeLeaseMs = Math.max(1, Math.floor(Number(leaseMs) || 120_000));
+        const safeLimit = Math.max(1, Math.min(256, Math.floor(Number(limit) || 8)));
+        if (!Number.isFinite(safeNowMs)) throw new TypeError("nowMs must be finite");
+        if (!Array.isArray(transports)) throw new TypeError("transports must be an array");
+        const safeTransports = [...new Set(transports.map((transport) => validateNotificationTransport(transport, { claimable: true })))];
+        if (safeTransports.length === 0) return [];
+        const placeholders = safeTransports.map(() => "?").join(",");
+        const rows = db.prepare(`SELECT notification_id, transport FROM notification_deliveries
+          WHERE transport IN (${placeholders}) AND (
+            (state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+            OR (state='failed' AND next_attempt_at IS NOT NULL AND next_attempt_at<=?)
+            OR (state='delivering' AND lease_until IS NOT NULL AND lease_until<=?)
+          )
+          ORDER BY COALESCE(next_attempt_at, 0), created_at, notification_id, transport LIMIT ?`).all(
+          ...safeTransports, safeNowMs, safeNowMs, safeNowMs, safeLimit
+        );
+        const claimed = [];
+        const timestamp = nowIso(now);
+        for (const row of rows) {
+          const result = db.prepare(`UPDATE notification_deliveries
+            SET state='delivering', owner_id=?, attempt=attempt+1, lease_epoch=lease_epoch+1,
+                lease_until=?, next_attempt_at=NULL, reason_code=NULL, updated_at=?
+            WHERE notification_id=? AND transport=? AND (
+              (state='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+              OR (state='failed' AND next_attempt_at IS NOT NULL AND next_attempt_at<=?)
+              OR (state='delivering' AND lease_until IS NOT NULL AND lease_until<=?)
+            )`).run(
+            safeOwnerId, safeNowMs + safeLeaseMs, timestamp, row.notification_id, row.transport,
+            safeNowMs, safeNowMs, safeNowMs
+          );
+          if (result.changes === 1) claimed.push(readNotificationDelivery(row.notification_id, row.transport));
+        }
+        return claimed;
+      });
+    },
+    acceptNotificationDelivery({ notificationId, transport, ownerId, leaseEpoch, ackId }) {
+      const safeNotificationId = ensureString(notificationId, "notificationId");
+      const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeOwnerId = ensureString(ownerId, "ownerId");
+      const safeLeaseEpoch = validateNotificationLeaseEpoch(leaseEpoch);
+      const safeAckId = ensureString(ackId, "ackId");
+      if (safeAckId.length > 512) throw new TypeError("ackId must be at most 512 characters");
+      return transaction(() => {
+        if (!readNotificationDelivery(safeNotificationId, safeTransport)) return null;
+        const timestamp = nowIso(now);
+        const result = db.prepare(`UPDATE notification_deliveries
+          SET state='accepted', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+              ack_id=?, reason_code=NULL, accepted_at=?, updated_at=?
+          WHERE notification_id=? AND transport=? AND state='delivering' AND owner_id=? AND lease_epoch=?`).run(
+          safeAckId, timestamp, timestamp, safeNotificationId, safeTransport, safeOwnerId, safeLeaseEpoch
+        );
+        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+      });
+    },
+    failNotificationDelivery({ notificationId, transport, ownerId, leaseEpoch, reasonCode, retryAt, retryable }) {
+      const safeNotificationId = ensureString(notificationId, "notificationId");
+      const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeOwnerId = ensureString(ownerId, "ownerId");
+      const safeLeaseEpoch = validateNotificationLeaseEpoch(leaseEpoch);
+      const safeReasonCode = validateNotificationReasonCode(reasonCode, { required: true });
+      if (typeof retryable !== "boolean") throw new TypeError("retryable must be boolean");
+      const safeRetryAt = retryable ? Number(retryAt) : null;
+      if (retryable && !Number.isFinite(safeRetryAt)) throw new TypeError("retryAt must be finite for a retryable failure");
+      return transaction(() => {
+        if (!readNotificationDelivery(safeNotificationId, safeTransport)) return null;
+        const result = db.prepare(`UPDATE notification_deliveries
+          SET state='failed', owner_id=NULL, lease_until=NULL, next_attempt_at=?, ack_id=NULL,
+              reason_code=?, accepted_at=NULL, observed_at=NULL, updated_at=?
+          WHERE notification_id=? AND transport=? AND state='delivering' AND owner_id=? AND lease_epoch=?`).run(
+          safeRetryAt, safeReasonCode, nowIso(now), safeNotificationId, safeTransport, safeOwnerId, safeLeaseEpoch
+        );
+        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+      });
+    },
+    markNotificationUnsupported({ notificationId, transport, ownerId, leaseEpoch, reasonCode }) {
+      const safeNotificationId = ensureString(notificationId, "notificationId");
+      const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeOwnerId = ensureString(ownerId, "ownerId");
+      const safeLeaseEpoch = validateNotificationLeaseEpoch(leaseEpoch);
+      const safeReasonCode = validateNotificationReasonCode(reasonCode, { required: true });
+      return transaction(() => {
+        if (!readNotificationDelivery(safeNotificationId, safeTransport)) return null;
+        const result = db.prepare(`UPDATE notification_deliveries
+          SET state='unsupported', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL, ack_id=NULL,
+              reason_code=?, accepted_at=NULL, observed_at=NULL, updated_at=?
+          WHERE notification_id=? AND transport=? AND state='delivering' AND owner_id=? AND lease_epoch=?`).run(
+          safeReasonCode, nowIso(now), safeNotificationId, safeTransport, safeOwnerId, safeLeaseEpoch
+        );
+        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+      });
+    },
+    observeNotificationDelivery({ notificationId, transport, observationId, observedAt = nowIso(now) }) {
+      const safeNotificationId = ensureString(notificationId, "notificationId");
+      const safeTransport = validateNotificationTransport(transport, { claimable: true });
+      const safeObservationId = ensureString(observationId, "observationId");
+      if (safeObservationId.length > 512) throw new TypeError("observationId must be at most 512 characters");
+      const safeObservedAt = ensureString(observedAt, "observedAt");
+      if (!Number.isFinite(Date.parse(safeObservedAt))) throw new TypeError("observedAt must be an ISO timestamp");
+      return transaction(() => {
+        if (!readNotificationDelivery(safeNotificationId, safeTransport)) return null;
+        const result = db.prepare(`UPDATE notification_deliveries
+          SET state='observed', observed_at=?, updated_at=?
+          WHERE notification_id=? AND transport=? AND state='accepted'`).run(
+          safeObservedAt, nowIso(now), safeNotificationId, safeTransport
+        );
+        return { changed: result.changes === 1, delivery: readNotificationDelivery(safeNotificationId, safeTransport) };
+      });
+    },
+    listNotificationDeliveries({ notificationId, sessionUid, state, transport } = {}) {
+      const clauses = [];
+      const values = [];
+      if (notificationId !== undefined) {
+        clauses.push("d.notification_id=?");
+        values.push(ensureString(notificationId, "notificationId"));
+      }
+      if (sessionUid !== undefined) {
+        clauses.push("n.session_uid=?");
+        values.push(ensureString(sessionUid, "sessionUid"));
+      }
+      if (state !== undefined) {
+        clauses.push("d.state=?");
+        values.push(validateNotificationDeliveryState(state));
+      }
+      if (transport !== undefined) {
+        clauses.push("d.transport=?");
+        values.push(validateNotificationTransport(transport));
+      }
+      const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+      return db.prepare(`SELECT d.notification_id, d.transport FROM notification_deliveries d
+        JOIN notification_outbox n ON n.notification_id=d.notification_id${where}
+        ORDER BY d.notification_id, d.transport`).all(...values)
+        .map((row) => readNotificationDelivery(row.notification_id, row.transport));
     },
     listReviewerJobEvents(jobId) {
       return db.prepare("SELECT * FROM reviewer_job_events WHERE job_id=? ORDER BY created_at, rowid").all(ensureString(jobId, "jobId"));

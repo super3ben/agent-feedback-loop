@@ -229,6 +229,265 @@ test("schema v9 migrates and deduplicates semantic notifications", async () => {
   reopened.close();
 });
 
+test("notification delivery claims are transport-scoped and stale lease epochs are fenced", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-delivery-lease-"));
+  const paths = pathsFor(home);
+  const primary = openStore({ paths });
+  const captured = event("delivery-lease-event");
+  primary.captureSessionEvent(captured);
+  primary.submitReviewerJob({ job_id: "delivery-lease-job", project_id: captured.project_id, prompt_version: "v1" });
+  const notification = primary.createNotification({
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    kind: "reviewed_no_lesson",
+    jobId: "delivery-lease-job",
+    payload: {},
+    language: "en"
+  });
+  assert.equal(primary.ensureNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "system",
+    state: "pending"
+  }).changed, true);
+
+  const competing = openStore({ paths });
+  const [nativeLease] = primary.claimNotificationDeliveries({
+    ownerId: "native-owner-a",
+    nowMs: 1_000,
+    leaseMs: 30_000,
+    limit: 8,
+    transports: ["codex_thread"]
+  });
+  const [systemLease] = competing.claimNotificationDeliveries({
+    ownerId: "system-owner",
+    nowMs: 1_000,
+    leaseMs: 30_000,
+    limit: 8,
+    transports: ["system"]
+  });
+  assert.equal(nativeLease.transport, "codex_thread");
+  assert.equal(systemLease.transport, "system");
+  assert.equal(competing.claimNotificationDeliveries({
+    ownerId: "native-owner-b",
+    nowMs: 2_000,
+    leaseMs: 30_000,
+    limit: 8,
+    transports: ["codex_thread"]
+  }).length, 0);
+
+  const [recovered] = competing.claimNotificationDeliveries({
+    ownerId: "native-owner-b",
+    nowMs: 31_000,
+    leaseMs: 30_000,
+    limit: 8,
+    transports: ["codex_thread"]
+  });
+  assert.equal(recovered.owner_id, "native-owner-b");
+  assert.equal(recovered.lease_epoch, nativeLease.lease_epoch + 1);
+  assert.equal(primary.acceptNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    ownerId: "native-owner-a",
+    leaseEpoch: nativeLease.lease_epoch,
+    ackId: "stale-ack"
+  }).changed, false);
+  assert.equal(primary.failNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    ownerId: "native-owner-a",
+    leaseEpoch: nativeLease.lease_epoch,
+    reasonCode: "stale_owner",
+    retryAt: 90_000,
+    retryable: true
+  }).changed, false);
+  assert.equal(competing.acceptNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    ownerId: "native-owner-b",
+    leaseEpoch: recovered.lease_epoch,
+    ackId: "native-ack"
+  }).changed, true);
+  primary.close();
+  competing.close();
+});
+
+test("notification acceptance keeps bounded acknowledgements separate from observation", async () => {
+  const store = await storeFixture();
+  const captured = event("delivery-observation-event");
+  store.captureSessionEvent(captured);
+  store.submitReviewerJob({ job_id: "delivery-observation-job", project_id: captured.project_id, prompt_version: "v1" });
+  const notification = store.createNotification({
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    kind: "review_completed",
+    jobId: "delivery-observation-job",
+    payload: { severity: "Major", lesson_count: 0 },
+    language: "en"
+  });
+  const [lease] = store.claimNotificationDeliveries({
+    ownerId: "observation-owner",
+    nowMs: 1_000,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["codex_thread"]
+  });
+  assert.throws(() => store.acceptNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    ownerId: "observation-owner",
+    leaseEpoch: lease.lease_epoch,
+    ackId: "x".repeat(513)
+  }), /ackId.*512/i);
+  assert.equal(store.listNotificationDeliveries({
+    notificationId: notification.notification_id,
+    transport: "codex_thread"
+  })[0].state, "delivering");
+
+  const accepted = store.acceptNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    ownerId: "observation-owner",
+    leaseEpoch: lease.lease_epoch,
+    ackId: "x".repeat(512)
+  });
+  assert.equal(accepted.changed, true);
+  assert.equal(accepted.delivery.state, "accepted");
+  assert.equal(accepted.delivery.ack_id.length, 512);
+  assert.equal(accepted.delivery.observed_at, null);
+
+  const observed = store.observeNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    observationId: "thread-observation-1",
+    observedAt: "2026-07-16T02:00:00.000Z"
+  });
+  assert.equal(observed.changed, true);
+  assert.equal(observed.delivery.state, "observed");
+  assert.equal(observed.delivery.ack_id.length, 512);
+  assert.equal(observed.delivery.observed_at, "2026-07-16T02:00:00.000Z");
+  assert.equal(store.observeNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "codex_thread",
+    observationId: "thread-observation-1",
+    observedAt: "2026-07-16T02:00:00.000Z"
+  }).changed, false);
+  store.close();
+});
+
+test("retryable delivery failures recover while terminal failures cannot be reopened", async () => {
+  const store = await storeFixture();
+  const captured = event("delivery-retry-event");
+  store.captureSessionEvent(captured);
+  store.submitReviewerJob({ job_id: "delivery-retry-job", project_id: captured.project_id, prompt_version: "v1" });
+  const notification = store.createNotification({
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    kind: "reviewed_no_lesson",
+    jobId: "delivery-retry-job",
+    payload: {},
+    language: "en"
+  });
+  store.ensureNotificationDelivery({ notificationId: notification.notification_id, transport: "system", state: "pending" });
+  const [first] = store.claimNotificationDeliveries({
+    ownerId: "retry-owner-a",
+    nowMs: 1_000,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["system"]
+  });
+  const retry = store.failNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "system",
+    ownerId: "retry-owner-a",
+    leaseEpoch: first.lease_epoch,
+    reasonCode: "transport_error",
+    retryAt: 5_000,
+    retryable: true
+  });
+  assert.equal(retry.changed, true);
+  assert.equal(retry.delivery.state, "failed");
+  assert.equal(retry.delivery.next_attempt_at, 5_000);
+  assert.equal(store.claimNotificationDeliveries({
+    ownerId: "retry-owner-b",
+    nowMs: 4_999,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["system"]
+  }).length, 0);
+  const [recovered] = store.claimNotificationDeliveries({
+    ownerId: "retry-owner-b",
+    nowMs: 5_000,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["system"]
+  });
+  assert.equal(recovered.lease_epoch, first.lease_epoch + 1);
+
+  const terminal = store.failNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "system",
+    ownerId: "retry-owner-b",
+    leaseEpoch: recovered.lease_epoch,
+    reasonCode: "delivery_rejected",
+    retryAt: 90_000,
+    retryable: false
+  });
+  assert.equal(terminal.changed, true);
+  assert.equal(terminal.delivery.next_attempt_at, null);
+  const reopen = store.ensureNotificationDelivery({
+    notificationId: notification.notification_id,
+    transport: "system",
+    state: "pending"
+  });
+  assert.equal(reopen.changed, false);
+  assert.equal(reopen.delivery.state, "failed");
+  assert.equal(store.claimNotificationDeliveries({
+    ownerId: "retry-owner-c",
+    nowMs: 100_000,
+    leaseMs: 30_000,
+    limit: 1,
+    transports: ["system"]
+  }).length, 0);
+  store.close();
+});
+
+test("semantic notifications keep one durable delivery record per transport", async () => {
+  const store = await storeFixture();
+  const captured = event("delivery-semantic-event");
+  store.captureSessionEvent(captured);
+  store.submitReviewerJob({ job_id: "delivery-semantic-job", project_id: captured.project_id, prompt_version: "v1" });
+  const input = {
+    sessionUid: captured.session_uid,
+    contextEpoch: 1,
+    kind: "reviewed_no_lesson",
+    jobId: "delivery-semantic-job",
+    payload: {},
+    language: "en"
+  };
+  const first = store.createNotification(input);
+  const duplicate = store.createNotification(input);
+  assert.equal(first.notification_id, duplicate.notification_id);
+  assert.deepEqual(store.listNotificationDeliveries({ notificationId: first.notification_id }).map((row) => [row.transport, row.state]), [
+    ["audit", "audited_only"],
+    ["codex_thread", "pending"]
+  ]);
+  assert.equal(store.ensureNotificationDelivery({
+    notificationId: first.notification_id,
+    transport: "system",
+    state: "pending"
+  }).changed, true);
+  assert.equal(store.ensureNotificationDelivery({
+    notificationId: duplicate.notification_id,
+    transport: "system",
+    state: "pending"
+  }).changed, false);
+  assert.deepEqual(store.listNotificationDeliveries({ notificationId: first.notification_id }).map((row) => row.transport), [
+    "audit", "codex_thread", "system"
+  ]);
+  assert.equal(store.listNotificationDeliveries({ sessionUid: captured.session_uid, state: "pending" }).length, 2);
+  store.close();
+});
+
 test("receipt payload validation and markers reject unbounded content", () => {
   const payload = validateReceiptPayload("review_completed", { severity: "Critical", lesson_count: 2 });
   assert.deepEqual(payload, { severity: "Critical", lesson_count: 2 });
@@ -277,6 +536,7 @@ test("chat observation requires authoritative v2 canonical controls and bounds v
 
     if (notificationId !== notification.notification_id) {
       const db = new DatabaseSync(paths.storeFile);
+      db.prepare("DELETE FROM notification_deliveries WHERE notification_id=?").run(notification.notification_id);
       db.prepare("UPDATE notification_outbox SET notification_id=? WHERE notification_id=?").run(notificationId, notification.notification_id);
       db.close();
     }
@@ -337,6 +597,7 @@ test("schema v9 reopens a realistic v7 store idempotently with valid foreign key
   const legacy = new DatabaseSync(paths.storeFile);
   legacy.exec(`
     PRAGMA foreign_keys=OFF;
+    DROP TABLE notification_deliveries;
     DROP TABLE notification_outbox;
     DROP TABLE reviewer_job_events;
     ALTER TABLE reviewer_jobs DROP COLUMN reviewer_provider;
