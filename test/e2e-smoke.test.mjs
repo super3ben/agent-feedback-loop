@@ -38,6 +38,60 @@ function runStopHook(file, input, env, mode = "claude") {
   });
 }
 
+function runStopHookWithHardDeadline(file, input, env, mode, deadlineMs) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn(file, ["--mode", mode], { env });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ...result, stdout, stderr, elapsedMs: Date.now() - startedAt });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ timedOut: true });
+    }, deadlineMs);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => finish({ timedOut: false, code }));
+    child.stdin.end(input);
+  });
+}
+
+async function readPid(file) {
+  const text = await readFile(file, "utf8").catch(() => "");
+  const pid = Number.parseInt(text, 10);
+  return Number.isInteger(pid) ? pid : null;
+}
+
+async function processIsLive(pid) {
+  if (!pid) return false;
+  try {
+    const { stdout } = await execFileAsync("ps", ["-o", "stat=", "-p", String(pid)]);
+    const state = stdout.trim();
+    return state !== "" && !state.startsWith("Z");
+  } catch {
+    return false;
+  }
+}
+
+function killFixtureProcess(pid) {
+  if (!pid) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+}
+
 async function waitFor(check, { timeoutMs = 5_000, intervalMs = 50 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -205,6 +259,69 @@ test("installed Stop hook times out behind a busy SQLite writer and still passes
   const log = await readFile(path.join(paths.dataRoot, "logs", "runtime.log"), "utf8");
   assert.match(log, /hook\.non_interference event=stop result=pass capture=failed reason=capture_timeout/);
   assert.doesNotMatch(log, /SQLITE_BUSY|database is locked/i);
+});
+
+test("installed Stop hook kills an uncooperative process tree within a hard deadline", { timeout: 15_000 }, async () => {
+  for (const mode of ["codex", "claude", "gemini"]) {
+    const home = await mkdtemp(path.join(tmpdir(), `afl-stop-process-tree-${mode}-`));
+    await install({ home });
+    const paths = pathsFor(home);
+    const launcherPidFile = path.join(home, `${mode}-launcher.pid`);
+    const descendantPidFile = path.join(home, `${mode}-descendant.pid`);
+    const signalFile = path.join(home, `${mode}-signals.log`);
+    const descendant = path.join(home, `${mode}-descendant.mjs`);
+    await writeFile(descendant, `import { appendFileSync, writeFileSync } from "node:fs";
+writeFileSync(process.env.AFL_DESCENDANT_PID_FILE, String(process.pid));
+process.on("SIGTERM", () => appendFileSync(process.env.AFL_SIGNAL_FILE, "descendant-term\\n"));
+setInterval(() => {}, 1_000);
+`, { mode: 0o700 });
+    await writeFile(paths.runtimeLauncher, `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+spawn(process.execPath, [process.env.AFL_DESCENDANT_SCRIPT], { env: process.env, stdio: "ignore" });
+writeFileSync(process.env.AFL_LAUNCHER_PID_FILE, String(process.pid));
+process.stderr.write("raw child stderr must stay private\\n");
+process.on("SIGTERM", () => appendFileSync(process.env.AFL_SIGNAL_FILE, "launcher-term\\n"));
+setInterval(() => {}, 1_000);
+`, { mode: 0o700 });
+    await chmod(paths.runtimeLauncher, 0o700);
+
+    const result = await runStopHookWithHardDeadline(paths.stopHook, JSON.stringify({
+      session_id: `uncooperative-${mode}`,
+      turn_id: "turn-1",
+      cwd: "/tmp/uncooperative-stop",
+      last_assistant_message: "private assistant output"
+    }), {
+      ...process.env,
+      HOME: home,
+      TMPDIR: home,
+      AGENT_FEEDBACK_LOOP_STOP_CAPTURE_TIMEOUT_MS: "1000",
+      AFL_DESCENDANT_SCRIPT: descendant,
+      AFL_LAUNCHER_PID_FILE: launcherPidFile,
+      AFL_DESCENDANT_PID_FILE: descendantPidFile,
+      AFL_SIGNAL_FILE: signalFile
+    }, mode, 2_400);
+    const fixturePids = [await readPid(launcherPidFile), await readPid(descendantPidFile)];
+
+    try {
+      assert.equal(result.timedOut, false, `${mode} Stop exceeded its hard deadline`);
+      assert.equal(result.code, 0);
+      assert.deepEqual(JSON.parse(result.stdout), mode === "codex" ? { continue: true } : {});
+      assert.equal(result.stderr, "");
+      assert.ok(result.elapsedMs < 2_400, `${mode} Stop took ${result.elapsedMs}ms`);
+      const signals = await readFile(signalFile, "utf8");
+      assert.match(signals, /launcher-term/);
+      assert.match(signals, /descendant-term/);
+      for (const pid of fixturePids) {
+        await waitFor(async () => !(await processIsLive(pid)), { timeoutMs: 2_000, intervalMs: 25 });
+      }
+      const log = await readFile(path.join(paths.dataRoot, "logs", "runtime.log"), "utf8");
+      assert.match(log, /hook\.non_interference event=stop result=pass capture=failed reason=capture_timeout/);
+      assert.doesNotMatch(log, /raw child stderr|private assistant output/);
+    } finally {
+      fixturePids.forEach(killFixtureProcess);
+    }
+  }
 });
 
 test("same-turn steering starts review only after the transcript assistant referent is durable", async () => {
