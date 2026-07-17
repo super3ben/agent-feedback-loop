@@ -23,14 +23,14 @@
 - Changed files: `src/index.mjs`, `src/capture.mjs`, `src/control-schema.mjs`, `src/control-store.mjs`, `docs/verification/2026-07-16-legacy-control-plane-audit.md`, `test/runtime.test.mjs`, `test/control-store.test.mjs`
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
 - GREEN evidence: canonical blocker 4/4, omitted-context replay 1/1, identity/schema matrix 18/18, capture/control-store 61/61 and Task 1 focused 126/126; `node --check` and `git diff --check` passed. The single temporary-HOME full run was 253/254; its only unchanged legacy Stop hard-deadline fixture failed before creating the first signal file and passed an exact isolated rerun 1/1
-- Review round: `7` (fifth user-authorized exception beyond configured 2-round ceiling)
+- Review round: `8` (sixth user-authorized exception beyond configured 2-round ceiling)
 - Review package: full Task 1 range `.superpowers/sdd/review-add6b7e..9c3405c.diff`
 - Review result: fresh independent reviewer `/root/task1_canonical_identity_review` returned `CHANGES_REQUIRED` (Critical 0, Important 3, Minor 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-8.md`
 - Unresolved findings: the 15-field normalizer/signature is now unified, but the public async capture boundary remains inconsistent: public duplicate replay skips the separate immutable `encrypted_raw_ref` check; it discards the normalized snapshot and re-reads caller-mutable event fields after blob I/O; and different first-time alias keys can resolve and insert in separate transactions, producing two events under concurrency
 - Fix dispatch: `/root/task1_control_store_fix1` completed commit `aa770c6`
 - Fix round 2 dispatch: `/root/task1_control_store_fix2` completed commit `864240b5f011722172898d88523d9201a9a91d07`
 - Full-suite diagnostic: one clean run passed; prior non-exit was overlapping test/tool-session lifecycle, not reproduced as a product defect
-- Review ceiling: configured 2-round budget and the user-authorized canonical-identity implementation/re-review exception are exhausted
+- Review ceiling: configured 2-round budget is exhausted; on 2026-07-17 the user explicitly replied `继续吧`, authorizing one transaction-boundary redesign, its TDD implementation and one fresh independent re-review
 - Fix round 3 dispatch: `/root/task1_control_store_fix3` completed commit `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`
 - Exception-round closure: review-3 alias truncation and concurrent replay findings are closed; schema completeness is only partially closed and a provider-identity counterexample remains
 - Fix round 4 dispatch: `/root/task1_control_store_fix4` completed commit `44acbfd0709b2385cf818b1d792df9d66fc67926`; scope remained limited to complete xinfo schema metadata and provider identity isolation
@@ -41,7 +41,8 @@
 - Sixth-round full-suite diagnostic: changed-path suites are green; both observed full-suite failures are in unchanged transitional Stop code assigned to Task 3. Storage-failure passed isolated; the isolated hard-deadline failure produced no fixture PID/signal files, consistent with its recorded pre-readiness timing race
 - Canonical identity decision: replace the fragmented public projection, event/observation normalization, signature and duplicate equality definitions with the single body-free tuple recorded in the Task 1 plan; preserve encrypted evidence as a separate immutable storage invariant
 - Canonical identity implementation: `normalizeCaptureIdentity()` is now the single body-free tuple producer for public/direct capture, observation resolution, signatures and replay equality; report `.superpowers/sdd/task-1-report.md`
-- Next action: stop. Do not apply another local field patch. A further attempt requires an explicit user decision to redesign the public capture operation around one immutable preflight snapshot plus a serialized resolve-or-insert transaction, followed by a fresh independent review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Transaction-boundary decision: remove the public transaction-external resolve fast path; validate and freeze one capture snapshot before blob I/O; pass the resulting encrypted reference into one serialized resolve-or-insert transaction that rechecks exact replay, alias attachment and new-event insertion without rereading caller-owned input
+- Next action: update the existing Design Doc and control-plane-isolation delta spec, self-review them and obtain the required written-spec review before amending the Task 1 plan and dispatching a fresh implementer. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
