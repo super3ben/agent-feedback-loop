@@ -10,6 +10,7 @@ import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
 import { captureObservedSession, normalizeHookEvent } from "../src/capture.mjs";
+import { SCHEMA_SQL } from "../src/control-schema.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import {
   CONTROL_SCHEMA_MISMATCH,
@@ -112,6 +113,59 @@ test("runtime open rejects a same-version control schema missing identity metada
 
   assert.throws(() => openControlStore({ paths }), (error) => error?.code === CONTROL_SCHEMA_MISMATCH);
   assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
+test("runtime open rejects every malformed canonical v1 schema signature", () => {
+  const mutations = [
+    [
+      "required column",
+      ["outcome TEXT NOT NULL, reason_code TEXT, UNIQUE(document_sha256", "outcome TEXT NOT NULL, UNIQUE(document_sha256"]
+    ],
+    [
+      "column type",
+      ["sessions(session_uid TEXT PRIMARY KEY, cli TEXT NOT NULL, project_id TEXT, context_epoch INTEGER NOT NULL", "sessions(session_uid TEXT PRIMARY KEY, cli TEXT NOT NULL, project_id TEXT, context_epoch TEXT NOT NULL"]
+    ],
+    [
+      "not-null constraint",
+      ["store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)", "store_meta(key TEXT PRIMARY KEY, value TEXT)"]
+    ],
+    [
+      "default value",
+      ["attempt INTEGER NOT NULL DEFAULT 0, launch_epoch", "attempt INTEGER NOT NULL DEFAULT 1, launch_epoch"]
+    ],
+    [
+      "primary key",
+      ["store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)", "store_meta(key TEXT, value TEXT NOT NULL)"]
+    ],
+    [
+      "unique constraint",
+      ["reviewer_jobs(job_id TEXT PRIMARY KEY, source_identity TEXT NOT NULL UNIQUE", "reviewer_jobs(job_id TEXT PRIMARY KEY, source_identity TEXT NOT NULL"]
+    ],
+    [
+      "foreign key",
+      ["session_events(event_uid TEXT PRIMARY KEY, session_uid TEXT NOT NULL REFERENCES sessions(session_uid)", "session_events(event_uid TEXT PRIMARY KEY, session_uid TEXT NOT NULL"]
+    ]
+  ];
+
+  for (const [label, [original, replacement]] of mutations) {
+    const { paths } = fixture();
+    mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+    const malformedSchema = SCHEMA_SQL.replace(original, replacement);
+    assert.notEqual(malformedSchema, SCHEMA_SQL, `${label} mutation must alter the schema fixture`);
+    const database = new DatabaseSync(paths.controlDatabase);
+    database.exec(malformedSchema);
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+    database.close();
+    chmodSync(paths.controlDatabase, 0o600);
+    const before = readFileSync(paths.controlDatabase);
+
+    assert.throws(
+      () => openControlStore({ paths }),
+      (error) => error?.code === CONTROL_SCHEMA_MISMATCH,
+      `${label} mismatch must fail closed with the fixed schema error`
+    );
+    assert.deepEqual(readFileSync(paths.controlDatabase), before, `${label} mismatch must not mutate the database`);
+  }
 });
 
 test("runtime open rejects a non-private control database without changing its mode", () => {
@@ -407,6 +461,55 @@ test("control observation alias requires a unique same-turn candidate inside its
   store.close();
 });
 
+test("control observation alias checks the complete timestamp window before bounding candidates", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  for (let index = 0; index < 31; index += 1) {
+    store.captureSessionEvent(event({
+      event_uid: `older-${index}`,
+      source_identity: undefined,
+      source_event_id: `older-source-${index}`,
+      source_namespace: "prompt_hook",
+      observation_source_id: `older-source-${index}`,
+      native_turn_id: "turn-shared",
+      source_timestamp: `2026-07-17T00:${String(index).padStart(2, "0")}:00.000Z`
+    }));
+  }
+  for (const [eventUid, sourceTimestamp] of [
+    ["qualifying-before-old-limit", "2026-07-17T00:56:00.000Z"],
+    ["qualifying-after-old-limit", "2026-07-17T01:00:00.000Z"]
+  ]) {
+    store.captureSessionEvent(event({
+      event_uid: eventUid,
+      source_identity: undefined,
+      source_event_id: `${eventUid}-source`,
+      source_namespace: "prompt_hook",
+      observation_source_id: `${eventUid}-source`,
+      native_turn_id: "turn-shared",
+      source_timestamp: sourceTimestamp
+    }));
+  }
+
+  const resolved = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: "session-1",
+    contextEpoch: 1,
+    sourceNamespace: "transcript_message",
+    sourceId: "ambiguous-beyond-old-limit",
+    nativeTurnId: "turn-shared",
+    role: "user",
+    contentHash: "a".repeat(64),
+    sourceTimestamp: "2026-07-17T01:00:00.000Z"
+  });
+
+  assert.equal(resolved, null);
+  assert.equal(
+    store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE source_id=?").get("ambiguous-beyond-old-limit").count,
+    0
+  );
+  store.close();
+});
+
 test("control observation collisions reject explicit conflicting events and ambiguous aliases", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });
@@ -457,6 +560,45 @@ test("control observation collisions reject explicit conflicting events and ambi
     sourceTimestamp: first.source_timestamp
   });
   assert.equal(ambiguous, null);
+  store.close();
+});
+
+test("concurrent exact capture replay reports one new event and one duplicate", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  let initialWrites = 0;
+  let releaseInitialWrites;
+  const initialWriteBarrier = new Promise((resolve) => {
+    releaseInitialWrites = resolve;
+  });
+  const barrieredBlobs = {
+    async write(...args) {
+      if (initialWrites < 2) {
+        initialWrites += 1;
+        if (initialWrites === 2) releaseInitialWrites();
+        await initialWriteBarrier;
+      }
+      return blobs.write(...args);
+    }
+  };
+  const immutableEvent = event({
+    event_uid: "concurrent-event",
+    source_identity: undefined,
+    source_event_id: "concurrent-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "concurrent-source",
+    native_turn_id: "turn-concurrent",
+    source_timestamp: "2026-07-17T02:00:00.000Z"
+  });
+
+  const results = await Promise.all([
+    captureObservedSession({ store, blobs: barrieredBlobs, event: { ...immutableEvent }, rawText: "concurrent evidence" }),
+    captureObservedSession({ store, blobs: barrieredBlobs, event: { ...immutableEvent }, rawText: "concurrent evidence" })
+  ]);
+
+  assert.equal(initialWrites, 2);
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true]);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
   store.close();
 });
 

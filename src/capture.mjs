@@ -353,12 +353,12 @@ export async function captureSession({ store, blobs, event, rawText }) {
   event.encrypted_raw_ref = blobPath;
   // A content-addressed blob may already be referenced by an earlier event.
   // Never remove it on an index conflict; retention GC owns deletion.
-  store.captureSessionEvent(event);
+  const captureResult = store.captureSessionEvent(event);
   // GC can unlink an old zero-reference content-addressed file between the
   // initial write and the SQLite insert. Re-check after the durable reference
   // exists; a concurrent GC will now observe the reference and leave it alone.
   await blobs.write(rawContentHash, rawText);
-  return { event, blobPath };
+  return { event, blobPath, ...captureResult };
 }
 
 function isConstraintError(error) {
@@ -386,7 +386,12 @@ export async function captureObservedSession({ store, blobs, event, rawText }) {
   if (existing) return { event, eventUid: existing.event_uid, duplicate: true, observation: existing, blobPath: existing.encrypted_raw_ref || null };
   try {
     const captured = await captureSession({ store, blobs, event, rawText });
-    return { ...captured, eventUid: event.event_uid, duplicate: false, observation: null };
+    return {
+      ...captured,
+      eventUid: captured.event_uid || event.event_uid,
+      duplicate: captured.duplicate === true,
+      observation: null
+    };
   } catch (error) {
     if (!observationInput || !isConstraintError(error)) throw error;
     const raced = store.resolveEventObservation(observationInput)

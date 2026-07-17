@@ -15,3 +15,137 @@ CREATE TABLE IF NOT EXISTS reviewer_jobs(job_id TEXT PRIMARY KEY, source_identit
 CREATE TABLE IF NOT EXISTS review_job_events(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES reviewer_jobs(job_id), event_type TEXT NOT NULL, reason_code TEXT, lease_epoch INTEGER, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS reflection_emissions(id INTEGER PRIMARY KEY AUTOINCREMENT, document_path TEXT NOT NULL, document_sha256 TEXT NOT NULL, family_id TEXT NOT NULL, session_uid TEXT NOT NULL, context_epoch INTEGER NOT NULL, task_fingerprint TEXT NOT NULL, selected_at TEXT NOT NULL, emitted_at TEXT, outcome TEXT NOT NULL, reason_code TEXT, UNIQUE(document_sha256, session_uid, context_epoch, task_fingerprint));
 `;
+
+export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
+  event_observations: {
+    columns: [
+      ["observation_uid", "TEXT", 0, null, 1],
+      ["observation_key", "TEXT", 1, null, 0],
+      ["source_provider", "TEXT", 1, null, 0],
+      ["session_uid", "TEXT", 1, null, 0],
+      ["context_epoch", "INTEGER", 1, null, 0],
+      ["source_namespace", "TEXT", 1, null, 0],
+      ["source_id", "TEXT", 1, null, 0],
+      ["observed_event_uid", "TEXT", 1, null, 0],
+      ["event_uid", "TEXT", 1, null, 0],
+      ["capture_source", "TEXT", 1, null, 0],
+      ["observed_at", "TEXT", 1, null, 0]
+    ],
+    indexes: [
+      [1, "pk", 0, ["observation_uid"]],
+      [1, "u", 0, ["observation_key"]]
+    ],
+    foreignKeys: [["session_events", "event_uid", "event_uid", "NO ACTION", "NO ACTION", "NONE"]]
+  },
+  reflection_emissions: {
+    columns: [
+      ["id", "INTEGER", 0, null, 1],
+      ["document_path", "TEXT", 1, null, 0],
+      ["document_sha256", "TEXT", 1, null, 0],
+      ["family_id", "TEXT", 1, null, 0],
+      ["session_uid", "TEXT", 1, null, 0],
+      ["context_epoch", "INTEGER", 1, null, 0],
+      ["task_fingerprint", "TEXT", 1, null, 0],
+      ["selected_at", "TEXT", 1, null, 0],
+      ["emitted_at", "TEXT", 0, null, 0],
+      ["outcome", "TEXT", 1, null, 0],
+      ["reason_code", "TEXT", 0, null, 0]
+    ],
+    indexes: [[1, "u", 0, ["document_sha256", "session_uid", "context_epoch", "task_fingerprint"]]],
+    foreignKeys: []
+  },
+  review_job_events: {
+    columns: [
+      ["id", "INTEGER", 0, null, 1],
+      ["job_id", "TEXT", 1, null, 0],
+      ["event_type", "TEXT", 1, null, 0],
+      ["reason_code", "TEXT", 0, null, 0],
+      ["lease_epoch", "INTEGER", 0, null, 0],
+      ["created_at", "TEXT", 1, null, 0]
+    ],
+    indexes: [],
+    foreignKeys: [["reviewer_jobs", "job_id", "job_id", "NO ACTION", "NO ACTION", "NONE"]]
+  },
+  reviewer_jobs: {
+    columns: [
+      ["job_id", "TEXT", 0, null, 1],
+      ["source_identity", "TEXT", 1, null, 0],
+      ["source_event_uid", "TEXT", 1, null, 0],
+      ["referent_event_uid", "TEXT", 0, null, 0],
+      ["project_id", "TEXT", 0, null, 0],
+      ["state", "TEXT", 1, null, 0],
+      ["attempt", "INTEGER", 1, "0", 0],
+      ["launch_epoch", "INTEGER", 1, "0", 0],
+      ["owner_id", "TEXT", 0, null, 0],
+      ["lease_epoch", "INTEGER", 1, "0", 0],
+      ["lease_until", "TEXT", 0, null, 0],
+      ["next_attempt_at", "TEXT", 0, null, 0],
+      ["next_launch_at", "TEXT", 0, null, 0],
+      ["created_at", "TEXT", 1, null, 0],
+      ["claimed_at", "TEXT", 0, null, 0],
+      ["completed_at", "TEXT", 0, null, 0],
+      ["result_code", "TEXT", 0, null, 0],
+      ["error_code", "TEXT", 0, null, 0],
+      ["published_path", "TEXT", 0, null, 0],
+      ["published_sha256", "TEXT", 0, null, 0]
+    ],
+    indexes: [
+      [1, "pk", 0, ["job_id"]],
+      [1, "u", 0, ["source_identity"]]
+    ],
+    foreignKeys: [["session_events", "source_event_uid", "event_uid", "NO ACTION", "NO ACTION", "NONE"]]
+  },
+  schema_migrations: {
+    columns: [
+      ["version", "INTEGER", 0, null, 1],
+      ["applied_at", "TEXT", 1, null, 0]
+    ],
+    indexes: [],
+    foreignKeys: []
+  },
+  session_events: {
+    columns: [
+      ["event_uid", "TEXT", 0, null, 1],
+      ["session_uid", "TEXT", 1, null, 0],
+      ["context_epoch", "INTEGER", 1, null, 0],
+      ["source_provider", "TEXT", 1, null, 0],
+      ["source_event_id", "TEXT", 1, null, 0],
+      ["source_namespace", "TEXT", 1, null, 0],
+      ["observation_source_id", "TEXT", 1, null, 0],
+      ["source_identity", "TEXT", 1, null, 0],
+      ["role", "TEXT", 1, null, 0],
+      ["referent_event_uid", "TEXT", 0, null, 0],
+      ["native_turn_id", "TEXT", 0, null, 0],
+      ["content_hash", "TEXT", 1, null, 0],
+      ["encrypted_raw_ref", "TEXT", 0, null, 0],
+      ["completeness", "TEXT", 1, null, 0],
+      ["source_timestamp", "TEXT", 0, null, 0],
+      ["created_at", "TEXT", 1, null, 0]
+    ],
+    indexes: [
+      [1, "pk", 0, ["event_uid"]],
+      [1, "u", 0, ["source_identity"]]
+    ],
+    foreignKeys: [["sessions", "session_uid", "session_uid", "NO ACTION", "NO ACTION", "NONE"]]
+  },
+  sessions: {
+    columns: [
+      ["session_uid", "TEXT", 0, null, 1],
+      ["cli", "TEXT", 1, null, 0],
+      ["project_id", "TEXT", 0, null, 0],
+      ["context_epoch", "INTEGER", 1, null, 0],
+      ["started_at", "TEXT", 1, null, 0],
+      ["updated_at", "TEXT", 1, null, 0]
+    ],
+    indexes: [[1, "pk", 0, ["session_uid"]]],
+    foreignKeys: []
+  },
+  store_meta: {
+    columns: [
+      ["key", "TEXT", 0, null, 1],
+      ["value", "TEXT", 1, null, 0]
+    ],
+    indexes: [[1, "pk", 0, ["key"]]],
+    foreignKeys: []
+  }
+});

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-import { SCHEMA_SQL, SCHEMA_VERSION } from "./control-schema.mjs";
+import { CONTROL_SCHEMA_SIGNATURE, SCHEMA_SQL, SCHEMA_VERSION } from "./control-schema.mjs";
 
 const require = createRequire(import.meta.url);
 let DatabaseSync;
@@ -271,15 +271,6 @@ function sameObservedEvent(row, fields) {
     && sameNullable(row.source_timestamp, fields.source_timestamp);
 }
 
-function withinAliasWindow(rows, fields, now) {
-  const incomingAt = Date.parse(fields.source_timestamp || nowIso(now));
-  if (!Number.isFinite(incomingAt)) return [];
-  return rows.filter((row) => {
-    const candidateAt = Date.parse(row.source_timestamp || row.created_at || "");
-    return Number.isFinite(candidateAt) && Math.abs(incomingAt - candidateAt) <= 5 * 60 * 1000;
-  });
-}
-
 function createStore(database, now) {
   const transaction = (fn) => {
     database.exec("BEGIN IMMEDIATE");
@@ -363,19 +354,24 @@ function createStore(database, now) {
             return { observation_uid: observationUid(key), event_uid: fields.event_uid, duplicate: false };
           }
         }
+        const incomingTimestamp = fields.source_timestamp || nowIso(now);
+        if (!Number.isFinite(Date.parse(incomingTimestamp))) return null;
         const contextClause = fields.context_epoch == null ? "" : " AND e.context_epoch=?";
         const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.* FROM session_events e
           WHERE e.session_uid=? AND e.role=? AND e.content_hash=?${contextClause}
             AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
+            AND julianday(COALESCE(e.source_timestamp, e.created_at))
+              BETWEEN julianday(?) - (5.0 / 1440.0) AND julianday(?) + (5.0 / 1440.0)
             AND NOT EXISTS (SELECT 1 FROM event_observations o
               WHERE o.event_uid=e.event_uid AND o.capture_source=?)
-          ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 32`).all(
+          ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 2`).all(
           fields.session_uid, fields.role, fields.content_hash,
-          ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId, fields.capture_source
+          ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId,
+          incomingTimestamp, incomingTimestamp, fields.capture_source
         );
-        let candidates = withinAliasWindow(selectCandidates(fields.native_turn_id), fields, now);
+        let candidates = selectCandidates(fields.native_turn_id);
         if (!candidates.length && fields.native_turn_id != null) {
-          candidates = withinAliasWindow(selectCandidates(null), fields, now);
+          candidates = selectCandidates(null);
         }
         if (candidates.length !== 1) return null;
         const candidate = candidates[0];
@@ -428,20 +424,25 @@ function verifyControlSchema(database, requireSchemaVersion) {
   if (versions.length !== 1 || versions[0] !== requireSchemaVersion) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
-  const expected = [
-    "event_observations", "reflection_emissions", "review_job_events", "reviewer_jobs",
-    "schema_migrations", "session_events", "sessions", "store_meta"
-  ];
+  const expected = Object.keys(CONTROL_SCHEMA_SIGNATURE);
   if (JSON.stringify(listUserTables(database)) !== JSON.stringify(expected)) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
-  const requiredColumns = {
-    session_events: ["event_uid", "session_uid", "context_epoch", "source_provider", "source_event_id", "source_namespace", "observation_source_id", "source_identity", "native_turn_id", "content_hash", "source_timestamp"],
-    event_observations: ["observation_uid", "observation_key", "source_provider", "session_uid", "context_epoch", "source_namespace", "source_id", "observed_event_uid", "event_uid"]
-  };
-  for (const [table, columns] of Object.entries(requiredColumns)) {
-    const actual = new Set(database.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map((row) => row.name));
-    if (!columns.every((column) => actual.has(column))) {
+  for (const [table, signature] of Object.entries(CONTROL_SCHEMA_SIGNATURE)) {
+    const escapedTable = table.replaceAll("'", "''");
+    const columns = database.prepare(`PRAGMA table_info('${escapedTable}')`).all().map((row) => [
+      row.name, row.type, Number(row.notnull), row.dflt_value, Number(row.pk)
+    ]);
+    const indexes = database.prepare(`PRAGMA index_list('${escapedTable}')`).all().map((row) => {
+      const escapedIndex = row.name.replaceAll("'", "''");
+      const indexedColumns = database.prepare(`PRAGMA index_info('${escapedIndex}')`).all().map((column) => column.name);
+      return [Number(row.unique), row.origin, Number(row.partial), indexedColumns];
+    }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const foreignKeys = database.prepare(`PRAGMA foreign_key_list('${escapedTable}')`).all().map((row) => [
+      row.table, row.from, row.to, row.on_update, row.on_delete, row.match
+    ]).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+    const actual = { columns, indexes, foreignKeys };
+    if (JSON.stringify(actual) !== JSON.stringify(signature)) {
       throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
     }
   }
