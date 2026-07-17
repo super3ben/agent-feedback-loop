@@ -56,16 +56,22 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 
 ### Task 1: 并行建立轻量 control DB，不破坏旧 runtime
 
+> **当前 review 状态与本轮执行边界：** 下列历史 Step 1-5 已由 `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72..9c3405c` 的当前提交链实施，其中 `535704d` 完成了 15-field canonical identity 修订；review-8 仍以三个 Important finding 判定 Task 1 未通过，所以本 Task 总复选框保持未勾选。本轮 implementer 只执行新增 Step 6-22 的 transaction-boundary amendment，不重做 Step 1-5 的 schema、路径、安装器或审计架构，不勾选 Task 1；完成后必须交回新的独立 review gate。
+
 - [ ] **Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime**
 
-**Files:**
+**Files（历史 Step 1-5，已实施，本轮不修改）：**
 - Modify: `src/index.mjs:73-119`
-- Modify: `src/capture.mjs`
 - Create: `src/control-schema.mjs`
-- Create: `src/control-store.mjs`
 - Create: `docs/verification/2026-07-16-legacy-control-plane-audit.md`
 - Modify: `test/runtime.test.mjs`
-- Create: `test/control-store.test.mjs`
+
+**Files（本轮 Step 6-22 唯一可能修改的文件）：**
+- Modify: `src/capture.mjs:350-405`
+- Modify: `src/control-store.mjs:23-488`
+- Modify: `test/control-store.test.mjs:704-1390`
+
+现有 `EncryptedBlobStore.write(contentHash, rawText) -> Promise<string>` 已满足 content-addressed 第一次写入与 post-commit second-write；本轮不得修改 `src/crypto-store.mjs`。原有 v1 表、列、索引和 fingerprint 已足够表达原子决策；本轮不得修改 `src/control-schema.mjs`、schema version、CLI、installer、service、scheduler、RAG、Stop、notification 或 Markdown/SQLite ownership boundary。
 
 **Interfaces:**
 - Produces: `pathsFor(home).controlDatabase = <dataRoot>/store/control.sqlite3`
@@ -74,6 +80,47 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - Produces: install/upgrade-only `initializeControlStore({ paths, now })`
 - Produces: hook/runner `openControlStore({ paths, now, requireSchemaVersion = 1 })` that never creates or migrates
 - Produces: capture-compatible `assertCaptureAllowed(event)`, `captureSessionEvent(event)`, `resolveEventObservation(input)` and `getSessionEvent(eventUid)`
+- Produces: synchronous, side-effect-free `prepareCapture({ event, rawText }) -> PreparedCapture`; `PreparedCapture` is the following recursively frozen, caller-independent value, and `rawText` itself is not retained:
+
+```js
+{
+  identity: Object.freeze({
+    event_uid, source_provider, session_uid, context_epoch,
+    source_namespace, source_id, source_event_id, source_offset,
+    capture_source, native_turn_id, source_timestamp, role,
+    referent_event_uid, content_hash, completeness
+  }),
+  signature,                    // SHA-256 of only the ordered 15 identity values
+  projectId,                    // bounded string or null
+  sourceIdentity,               // derived physical source identity
+  observationKey,               // provider/session/epoch/namespace/source key
+  observationUid,               // SHA-256-derived observation id
+  suppliedEncryptedRawRef,      // bounded caller value or null
+  blobContentHash               // SHA-256 of String(rawText), separate from identity.content_hash
+}
+```
+
+- Produces: synchronous `store.resolveOrInsertCapture({ preparedCapture, authoritativeEncryptedRef }) -> CaptureResolution`, where `authoritativeEncryptedRef` is a bounded string for public blob capture and may be `null` only for the retained direct wrapper. Its exact return shape is:
+
+```js
+{
+  kind: "exact_replay" | "alias" | "new",
+  duplicate: boolean,            // false exactly for new; true for exact_replay/alias
+  eventUid: eventView.event_uid,
+  blobPath: eventView.encrypted_raw_ref,
+  eventView: Object.freeze({
+    event_uid, session_uid, source_event_id, source_identity, role,
+    referent_event_uid, content_hash, encrypted_raw_ref, completeness
+  }),
+  observation: Object.freeze({
+    observation_uid, observation_key, observed_event_uid,
+    event_uid, capture_source
+  })
+}
+```
+
+- Compatibility: `captureObservedSession()` and the control-store branch of `captureSession()` call `prepareCapture()` synchronously before the first `await`, reconcile the first blob writer result, call `resolveOrInsertCapture()` exactly once, then perform the existing second blob write after commit. They never call `resolveEventObservation()` as a transaction-external fast path and never mutate or return the caller-owned event; compatibility fields, if retained, are `event_uid = eventUid` and `event = eventView`.
+- Compatibility: `captureSessionEvent(event)` synchronously prepares the same normalized fields and calls the same atomic decision with the event's supplied `encrypted_raw_ref` as authoritative; it may retain `event_uid = eventUid` and `event = eventView` aliases. `resolveEventObservation(input)` remains only for direct callers: exact replay and explicit target/alias attachment use the same normalization/signature/key helpers, a direct non-null `encrypted_raw_ref` must equal the persisted target ref, and a null direct ref adopts the target's persisted ref. Neither method is callable from the control public path after an async blob write.
 - Consumes: existing `crypto-store.mjs` data/key roots without changing their permissions
 - Transitional rule: existing `src/schema.mjs`, `src/store.mjs` and `paths.storeFile` remain unchanged until every consumer has moved; Task 13 deletes them
 
@@ -84,6 +131,7 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - `event.capture_source` and `input.captureSource` are aliases for the same bounded field (maximum 256 characters). Normalize the supplied value once; only when it is absent derive `${provider}:${sourceNamespace}`. Reject conflicting, empty or oversized values before encrypted-blob or database side effects; never truncate them.
 - An exact replay may return `duplicate=true` only when the persisted observation key targets the same event and the complete normalized tuple matches. Any changed tuple field is `control_observation_collision`. Hook/transcript aliasing may attach a different observation key to the same event, but that observation stores and replays its own complete signature.
 - Raw text and encrypted body bytes never enter the identity/signature. `encrypted_raw_ref` remains a separate immutable storage invariant and must not be used to make two different normalized capture identities equal.
+- Canonical `identity.content_hash` identifies the normalized/redacted event content. `blobContentHash` identifies the raw evidence bytes used by content-addressed encrypted blob storage. They may legitimately differ; neither raw body, `blobContentHash` nor `encrypted_raw_ref` enters `signature`.
 
 - [ ] **Step 1: Write the fresh-schema RED tests**
 
@@ -153,6 +201,574 @@ Expected: PASS; the new control store safety tests pass and all unchanged legacy
 git add src/index.mjs src/control-schema.mjs src/control-store.mjs docs/verification/2026-07-16-legacy-control-plane-audit.md test/runtime.test.mjs test/control-store.test.mjs
 git commit -m "refactor: separate the lean reflection control store"
 ```
+
+- [ ] **Step 6: Write the prepared-capture RED test and strengthen zero-side-effect invalid cases**
+
+Add `createHash` plus `import * as controlStoreModule from "../src/control-store.mjs"` to `test/control-store.test.mjs`; keep the existing named imports for other store APIs. Then add this exact contract test so the missing export fails only this selected RED test and does not mask the later behavioral RED probes:
+
+```js
+test("prepared capture freezes the body-free identity and keeps raw blob hashing separate", () => {
+  const callerEvent = event({
+    event_uid: "prepared-event",
+    source_identity: undefined,
+    source_event_id: "prepared-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prepared-observation",
+    capture_source: "prompt_hook",
+    encrypted_raw_ref: null,
+    content_hash: "a".repeat(64)
+  });
+  const prepared = controlStoreModule.prepareCapture({
+    event: callerEvent,
+    rawText: "raw evidence with a wider payload"
+  });
+  callerEvent.capture_source = "caller-mutated";
+  callerEvent.content_hash = "b".repeat(64);
+
+  assert.equal(Object.isFrozen(prepared), true);
+  assert.equal(Object.isFrozen(prepared.identity), true);
+  assert.equal(prepared.identity.capture_source, "prompt_hook");
+  assert.equal(prepared.identity.content_hash, "a".repeat(64));
+  assert.equal(
+    prepared.blobContentHash,
+    createHash("sha256").update("raw evidence with a wider payload").digest("hex")
+  );
+  assert.notEqual(prepared.blobContentHash, prepared.identity.content_hash);
+  assert.equal("rawText" in prepared, false);
+  assert.equal("encrypted_raw_ref" in prepared.identity, false);
+});
+```
+
+Replace `invalid canonical capture identity is rejected before blob or database side effects` with this complete zero-side-effect matrix:
+
+```js
+test("invalid canonical capture identity is rejected before blob or database side effects", async () => {
+  for (const mutation of [
+    { event_uid: "" },
+    { content_hash: "" },
+    { content_hash: "a".repeat(129) },
+    { capture_source: "" },
+    { capture_source: "x".repeat(257) },
+    { capture_source: "prompt_hook", captureSource: "transcript_payload" }
+  ]) {
+    const { store } = controlCaptureFixture();
+    let blobWrites = 0;
+    const blobs = {
+      async write() {
+        blobWrites += 1;
+        return "/private/blobs/unexpected.enc";
+      }
+    };
+    const invalid = event({
+      event_uid: "invalid-canonical-event",
+      source_identity: undefined,
+      source_event_id: "invalid-canonical-source",
+      source_namespace: "prompt_hook",
+      observation_source_id: "invalid-canonical-observation",
+      encrypted_raw_ref: null,
+      ...mutation
+    });
+
+    await assert.rejects(
+      captureObservedSession({ store, blobs, event: invalid, rawText: "must not be written" }),
+      /event_uid|content_hash|capture_source|captureSource/i
+    );
+    assert.equal(blobWrites, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+    store.close();
+  }
+});
+```
+
+- [ ] **Step 7: Run the prepared-capture RED**
+
+Run:
+
+```bash
+node --test --test-name-pattern='prepared capture freezes the body-free identity|invalid canonical capture identity is rejected before blob or database side effects' test/control-store.test.mjs
+```
+
+Expected: FAIL with `controlStoreModule.prepareCapture is not a function`; the separately selected invalid cases still prove zero side effects and must not regress while the missing interface is RED.
+
+- [ ] **Step 8: Write the supplied-ref and public/direct consistency RED tests**
+
+Add a public supplied-reference mismatch test that permits the required first blob write but proves no SQLite write:
+
+```js
+test("public capture rejects a supplied encrypted ref mismatch before database resolution", async () => {
+  const { store } = controlCaptureFixture();
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      return "/private/blobs/writer-authoritative.enc";
+    }
+  };
+  const callerEvent = event({
+    event_uid: "supplied-ref-mismatch",
+    source_identity: undefined,
+    source_event_id: "supplied-ref-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "supplied-ref-observation",
+    encrypted_raw_ref: "/private/blobs/caller-supplied.enc"
+  });
+
+  await assert.rejects(
+    captureObservedSession({ store, blobs, event: callerEvent, rawText: "reference mismatch evidence" }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  assert.equal(blobWrites, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+  store.close();
+});
+```
+
+Replace the prior signature-only public/direct comparison with exact resolution assertions:
+
+```js
+test("public and direct exact replay return one persisted event and blob ref", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const canonical = event({
+    event_uid: "consistent-replay-event",
+    source_identity: undefined,
+    source_event_id: "consistent-replay-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "consistent-replay-observation",
+    source_offset: 12,
+    capture_source: "prompt_hook",
+    referent_event_uid: "consistent-replay-referent",
+    native_turn_id: "consistent-replay-turn",
+    source_timestamp: "2026-07-17T08:20:00.000Z",
+    encrypted_raw_ref: null
+  });
+  const first = await captureObservedSession({
+    store, blobs, event: { ...canonical }, rawText: "consistent raw evidence"
+  });
+  const publicReplay = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...canonical, encrypted_raw_ref: first.blobPath },
+    rawText: "consistent raw evidence"
+  });
+  const directReplay = store.captureSessionEvent({
+    ...canonical,
+    encrypted_raw_ref: first.blobPath
+  });
+
+  for (const result of [first, publicReplay, directReplay]) {
+    assert.equal(result.eventUid, canonical.event_uid);
+    assert.equal(result.event_uid, canonical.event_uid);
+    assert.equal(result.blobPath, first.blobPath);
+    assert.equal(result.eventView.encrypted_raw_ref, first.blobPath);
+    assert.equal(result.event, result.eventView);
+    assert.notEqual(result.event, canonical);
+  }
+  assert.equal(first.kind, "new");
+  assert.equal(publicReplay.kind, "exact_replay");
+  assert.equal(directReplay.kind, "exact_replay");
+  assert.deepEqual([first.duplicate, publicReplay.duplicate, directReplay.duplicate], [false, true, true]);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
+});
+```
+
+- [ ] **Step 9: Run the reference-consistency RED**
+
+Run:
+
+```bash
+node --test --test-name-pattern='public capture rejects a supplied encrypted ref mismatch|public and direct exact replay return one persisted event and blob ref' test/control-store.test.mjs
+```
+
+Expected: FAIL because the current public replay accepts a changed supplied ref and returns caller-owned `event` plus persisted `blobPath`; current direct/public returns also lack the unified `kind`, `eventUid`, `eventView`, and `blobPath` contract.
+
+- [ ] **Step 10: Write the caller-mutation barrier RED test**
+
+```js
+test("public capture uses one frozen snapshot across the blob await", async () => {
+  const { store } = controlCaptureFixture();
+  let firstWriteStartedResolve;
+  let releaseFirstWriteResolve;
+  const firstWriteStarted = new Promise((resolve) => { firstWriteStartedResolve = resolve; });
+  const releaseFirstWrite = new Promise((resolve) => { releaseFirstWriteResolve = resolve; });
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      if (blobWrites === 1) {
+        firstWriteStartedResolve();
+        await releaseFirstWrite;
+      }
+      return "/private/blobs/frozen-snapshot.enc";
+    }
+  };
+  const callerEvent = event({
+    event_uid: "frozen-event",
+    session_uid: "frozen-session",
+    project_id: "frozen-project",
+    source_identity: undefined,
+    source_event_id: "frozen-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "frozen-observation",
+    capture_source: "prompt_hook",
+    content_hash: "a".repeat(64),
+    encrypted_raw_ref: null
+  });
+  const pending = captureObservedSession({ store, blobs, event: callerEvent, rawText: "frozen raw evidence" });
+  await firstWriteStarted;
+  Object.assign(callerEvent, {
+    event_uid: "mutated-event",
+    project_id: "mutated-project",
+    capture_source: "",
+    content_hash: "b".repeat(64),
+    encrypted_raw_ref: "/private/blobs/mutated.enc"
+  });
+  releaseFirstWriteResolve();
+  const result = await pending;
+
+  assert.equal(blobWrites, 2);
+  assert.equal(result.kind, "new");
+  assert.equal(result.eventUid, "frozen-event");
+  assert.equal(result.blobPath, "/private/blobs/frozen-snapshot.enc");
+  assert.notEqual(result.event, callerEvent);
+  assert.deepEqual(store.getSessionEvent("frozen-event"), {
+    event_uid: "frozen-event",
+    session_uid: "frozen-session",
+    source_event_id: "frozen-source",
+    source_identity: '["codex","frozen-session",1,"prompt_hook","frozen-observation"]',
+    role: "user",
+    referent_event_uid: null,
+    content_hash: "a".repeat(64),
+    encrypted_raw_ref: "/private/blobs/frozen-snapshot.enc",
+    completeness: "prompt_only"
+  });
+  assert.equal(
+    store.database.prepare("SELECT project_id FROM sessions WHERE session_uid=?").get("frozen-session").project_id,
+    "frozen-project"
+  );
+  assert.equal(store.getSessionEvent("mutated-event"), null);
+  store.close();
+});
+```
+
+- [ ] **Step 11: Run the mutation-barrier RED**
+
+Run:
+
+```bash
+node --test --test-name-pattern='public capture uses one frozen snapshot across the blob await' test/control-store.test.mjs
+```
+
+Expected: FAIL on current code after the first blob write because it re-reads the now-invalid `capture_source`; the corrected path must instead succeed from the frozen values and perform the post-commit second write.
+
+- [ ] **Step 12: Write the different-alias concurrency and incompatible-storage RED tests**
+
+Add a helper inside each test that constructs two valid aliases with different event/source identities but the same provider, session, context, role, canonical content hash, native turn and timestamp. Then add these assertions:
+
+```js
+test("concurrent different first aliases resolve to one event and two observations", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  let initialWrites = 0;
+  let releaseInitialWrites;
+  const initialWriteBarrier = new Promise((resolve) => { releaseInitialWrites = resolve; });
+  const barrieredBlobs = {
+    async write(...args) {
+      if (initialWrites < 2) {
+        initialWrites += 1;
+        if (initialWrites === 2) releaseInitialWrites();
+        await initialWriteBarrier;
+      }
+      return blobs.write(...args);
+    }
+  };
+  const shared = {
+    session_uid: "different-alias-session",
+    source_identity: undefined,
+    native_turn_id: "different-alias-turn",
+    source_timestamp: "2026-07-17T09:00:00.000Z",
+    content_hash: "d".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const hook = event({
+    ...shared,
+    event_uid: "different-alias-hook-event",
+    source_event_id: "different-alias-hook-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "different-alias-hook-observation",
+    capture_source: "prompt_hook"
+  });
+  const transcript = event({
+    ...shared,
+    event_uid: "different-alias-transcript-event",
+    source_event_id: "different-alias-transcript-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "different-alias-transcript-observation",
+    capture_source: "transcript_payload"
+  });
+
+  const results = await Promise.all([
+    captureObservedSession({ store, blobs: barrieredBlobs, event: hook, rawText: "shared raw evidence" }),
+    captureObservedSession({ store, blobs: barrieredBlobs, event: transcript, rawText: "shared raw evidence" })
+  ]);
+
+  assert.equal(initialWrites, 2);
+  assert.deepEqual(results.map((result) => result.kind).sort(), ["alias", "new"]);
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true]);
+  assert.equal(new Set(results.map((result) => result.eventUid)).size, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  assert.deepEqual(
+    store.database.prepare(`SELECT observed_event_uid FROM event_observations
+      ORDER BY observed_event_uid`).all().map((row) => row.observed_event_uid),
+    ["different-alias-hook-event", "different-alias-transcript-event"]
+  );
+  store.close();
+});
+
+test("public capture inserts a new event for an alias with incompatible encrypted storage", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const shared = {
+    session_uid: "incompatible-alias-session",
+    source_identity: undefined,
+    native_turn_id: "incompatible-alias-turn",
+    source_timestamp: "2026-07-17T09:10:00.000Z",
+    content_hash: "e".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const first = await captureObservedSession({
+    store,
+    blobs,
+    event: event({
+      ...shared,
+      event_uid: "incompatible-hook-event",
+      source_event_id: "incompatible-hook-source",
+      source_namespace: "prompt_hook",
+      observation_source_id: "incompatible-hook-observation",
+      capture_source: "prompt_hook"
+    }),
+    rawText: "raw evidence A"
+  });
+  const second = await captureObservedSession({
+    store,
+    blobs,
+    event: event({
+      ...shared,
+      event_uid: "incompatible-transcript-event",
+      source_event_id: "incompatible-transcript-source",
+      source_namespace: "transcript_message",
+      observation_source_id: "incompatible-transcript-observation",
+      capture_source: "transcript_payload"
+    }),
+    rawText: "raw evidence B"
+  });
+
+  assert.equal(first.kind, "new");
+  assert.equal(second.kind, "new");
+  assert.equal(second.duplicate, false);
+  assert.notEqual(second.eventUid, first.eventUid);
+  assert.notEqual(second.blobPath, first.blobPath);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+```
+
+- [ ] **Step 13: Run the alias transaction RED**
+
+Run:
+
+```bash
+node --test --test-name-pattern='concurrent different first aliases resolve to one event and two observations|public capture inserts a new event for an alias with incompatible encrypted storage' test/control-store.test.mjs
+```
+
+Expected: FAIL because current public resolution occurs before the blob await and event insert transaction: concurrent aliases produce two `new` events, while the sequential incompatible-ref alias can attach to the old event without enforcing the separate storage invariant.
+
+- [ ] **Step 14: Implement the minimal synchronous prepared-capture value**
+
+In `src/control-store.mjs`, reuse `eventFields()`, `captureIdentitySignature()`, `observationKey()` and `observationUid()`; do not add a second normalizer. Implement the exported public preflight with this exact data flow:
+
+```js
+export function prepareCapture({ event, rawText }) {
+  const fields = eventFields(event);                 // all validation first
+  const identity = Object.freeze({ ...fields.identity });
+  return Object.freeze({
+    identity,
+    signature: captureIdentitySignature(identity),
+    projectId: fields.project_id,
+    sourceIdentity: fields.source_identity,
+    observationKey: fields.observation_key,
+    observationUid: fields.observation_uid,
+    suppliedEncryptedRawRef: fields.encrypted_raw_ref,
+    blobContentHash: createHash("sha256").update(String(rawText)).digest("hex")
+  });
+}
+```
+
+The function must execute before any `await`, blob call, SQLite statement or log call. It creates no reference back to `event`; it freezes both object levels. Keep `identity.content_hash` and `blobContentHash` independent, and never add raw/body/ref fields to `CAPTURE_IDENTITY_FIELDS` or `captureIdentitySignature()`.
+
+- [ ] **Step 15: Implement exact replay and UID/source conflict phases in one write transaction**
+
+Add `store.resolveOrInsertCapture({ preparedCapture, authoritativeEncryptedRef })` and one result projector. Validate the bounded authoritative ref before opening the transaction, then execute this exact prefix inside one existing `transaction()`/`BEGIN IMMEDIATE`:
+
+```text
+SELECT observation joined to session_events WHERE observation_key = ?
+IF exact observation exists:
+  require observation_signature = preparedCapture.signature
+  require observed_event_uid = preparedCapture.identity.event_uid
+  require observation provider/session/context/namespace/source/capture_source binding
+  require persisted event provider/session/context/role/content/native-turn/timestamp/completeness binding
+  require persisted encrypted_raw_ref = authoritativeEncryptedRef
+  otherwise throw control_observation_collision
+  return result(kind = exact_replay) from persisted event and observation rows
+
+SELECT session_events WHERE event_uid = preparedCapture.identity.event_uid
+SELECT session_events WHERE source_identity = preparedCapture.sourceIdentity
+IF either row exists after exact replay was not proven: throw control_observation_collision
+
+SELECT sessions WHERE session_uid = preparedCapture.identity.session_uid
+IF the persisted cli/provider differs: throw control_observation_collision
+```
+
+Do not return an observation merely because its key exists. The result projector always derives `eventUid`, `blobPath`, `eventView`, and `observation` from the same persisted/just-inserted rows; it never receives the caller event.
+
+- [ ] **Step 16: Implement the complete alias recheck and new insert phases in that same transaction**
+
+Continue inside the same transaction and preserve the current provider/session/context/role/content/native-turn/timestamp semantics with the full five-minute window. Re-run the candidate SQL only while holding the write transaction; do not accept a pre-transaction candidate or truncate before all predicates:
+
+```sql
+SELECT e.*
+FROM session_events e
+WHERE e.session_uid = ?
+  AND e.source_provider = ?
+  AND e.role = ?
+  AND e.content_hash = ?
+  AND e.context_epoch = ?
+  AND COALESCE(e.native_turn_id, '') = COALESCE(?, '')
+  AND julianday(COALESCE(e.source_timestamp, e.created_at))
+      BETWEEN julianday(?) - (5.0 / 1440.0)
+          AND julianday(?) + (5.0 / 1440.0)
+ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid
+LIMIT 2;
+```
+
+If the exact native-turn query returns zero and the incoming native turn is non-null, execute the same fully bounded query with stored `native_turn_id IS NULL`, matching the existing fallback. Then finish in this exact order:
+
+```text
+IF exactly one candidate AND candidate.encrypted_raw_ref = authoritativeEncryptedRef:
+  INSERT event_observations using the incoming observation key/signature,
+         observed_event_uid = incoming identity.event_uid,
+         event_uid = candidate.event_uid
+  return result(kind = alias) from candidate plus inserted observation
+ELSE:
+  INSERT/UPDATE the same-provider session metadata
+  INSERT session_events with incoming UID/source identity and authoritativeEncryptedRef
+  INSERT event_observations bound to the new event
+  return result(kind = new) from the inserted rows
+COMMIT
+```
+
+Zero candidates, more than one candidate, or one ref-incompatible candidate all take the `new` branch. Do not overwrite an existing event/ref, change schema/version, put blob I/O inside the transaction, or add a mutex/service/scheduler.
+
+- [ ] **Step 17: Route the public adapter and direct compatibility APIs through the single decision point**
+
+Replace the control-store branch of both public capture exports with this exact order; retain a bounded legacy-store compatibility branch only until Task 13, and never select it when `store.resolveOrInsertCapture` exists:
+
+```js
+const preparedCapture = prepareCapture({ event, rawText });       // synchronous
+const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText); // outside SQLite
+if (preparedCapture.suppliedEncryptedRawRef !== null
+    && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
+  throw new ControlStoreError("control_observation_collision", "control observation collision");
+}
+const resolution = store.resolveOrInsertCapture({
+  preparedCapture,
+  authoritativeEncryptedRef: writerRef
+});
+await blobs.write(preparedCapture.blobContentHash, rawText);       // after COMMIT
+return {
+  ...resolution,
+  event_uid: resolution.eventUid,
+  event: resolution.eventView
+};
+```
+
+Delete the control-store public path's initial `resolveEventObservation()`, constraint-catch re-resolve, mutation of `event.encrypted_raw_ref`, and return of caller-owned `event`. On SQLite failure, do not perform the second write and do not delete the first content-addressed blob; retention GC owns deletion.
+
+Implement `captureSessionEvent(event)` as a synchronous wrapper around the same internal prepared fields and `resolveOrInsertCapture()`, using supplied `encrypted_raw_ref` as authoritative and returning the same compatibility aliases. Keep `resolveEventObservation(input)` direct-only: add snake/camel encrypted-ref normalization, compare a supplied non-null ref with the persisted target, use the target persisted ref when the input ref is null, and preserve current exact/explicit-target/unique-alias/null/ambiguous return behavior. Do not call it from either control public capture export.
+
+- [ ] **Step 18: Run the amendment GREEN tests**
+
+Run:
+
+```bash
+node --test --test-name-pattern='prepared capture freezes the body-free identity|invalid canonical capture identity is rejected before blob or database side effects|public capture rejects a supplied encrypted ref mismatch|public and direct exact replay return one persisted event and blob ref|public capture uses one frozen snapshot across the blob await|concurrent different first aliases resolve to one event and two observations|public capture inserts a new event for an alias with incompatible encrypted storage' test/control-store.test.mjs
+```
+
+Expected: PASS; invalid input performs 0 blob/DB writes, supplied-ref mismatch performs 1 blob write and 0 DB writes, successful public captures perform 2 blob writes, and all result pointers agree with one committed event.
+
+- [ ] **Step 19: Run exact/provider/session/context/schema concurrency regressions**
+
+Run:
+
+```bash
+node --test --test-name-pattern='control observation replay preserves an omitted optional context epoch|control observation alias checks the complete timestamp window before bounding candidates|control observation exact-turn alias never crosses provider identity|control observation null-turn fallback never crosses provider identity|public control capture keeps one immutable provider per session UID|runtime open rejects every malformed canonical v1 schema signature|runtime open rejects undeclared generated columns|runtime open rejects noncanonical unique index collation|runtime open rejects undeclared CHECK constraints|runtime open rejects undeclared user triggers|runtime open rejects undeclared user views|concurrent exact capture replay reports one new event and one duplicate' test/control-store.test.mjs
+```
+
+Expected: PASS; provider/session/context/window behavior, non-migrating schema fingerprint checks, and exact same-key concurrency remain unchanged.
+
+- [ ] **Step 20: Run the focused Task 1 and transitional legacy regression**
+
+Run:
+
+```bash
+node --test test/control-store.test.mjs test/runtime.test.mjs test/capture.test.mjs test/store.test.mjs
+```
+
+Expected: PASS. The control public path is atomic; the still-transitional legacy store/capture suite remains green without changing `src/store.mjs`, and no Task 2-15 interface is changed.
+
+- [ ] **Step 21: Run one temporary-HOME full suite and static checks**
+
+Run the full package exactly once with a disposable HOME:
+
+```bash
+temp_home="$(mktemp -d "${TMPDIR:-/tmp}/afl-task1-transaction.XXXXXX")"
+HOME="$temp_home" npm test
+test_status=$?
+rm -rf "$temp_home"
+test "$test_status" -eq 0
+```
+
+Expected: PASS. If and only if the sole failure is the baseline `installed Stop hook kills an uncooperative process tree within a hard deadline`, run this exact isolated check:
+
+```bash
+node --test --test-name-pattern='installed Stop hook kills an uncooperative process tree within a hard deadline' test/e2e-smoke.test.mjs
+```
+
+Expected: PASS on the isolated rerun, matching the recorded pre-existing transitional Stop timing noise; any other failure blocks the commit.
+
+Then run:
+
+```bash
+node --check src/capture.mjs
+node --check src/control-store.mjs
+git diff --check
+```
+
+Expected: all three commands exit 0 with no output. Confirm `git diff --name-only` contains only `src/capture.mjs`, `src/control-store.mjs`, and `test/control-store.test.mjs`; confirm `git diff -- src/control-schema.mjs src/crypto-store.mjs src/index.mjs src/cli.mjs` is empty.
+
+- [ ] **Step 22: Commit only the transaction-boundary amendment**
+
+```bash
+git add src/capture.mjs src/control-store.mjs test/control-store.test.mjs
+git commit -m "fix: make public capture resolution atomic"
+```
+
+Do not mark Task 1 complete in this plan. Record the implementation commit in the coordination artifact and dispatch a fresh Task 1 review covering all three review-8 findings as one transaction-boundary correction.
 
 ### Task 2: 实现即时 candidate job 与 fenced lease 控制 API
 
