@@ -58,7 +58,8 @@
 - Risk signals: cross-module, SQL/security, concurrency/lock, public API, and diff over 200; no schema migration and no implementer concerns
 - Review round: `9` (the single fresh independent transaction-boundary re-review explicitly authorized after review-8)
 - Review package: `.superpowers/sdd/review-add6b7e..da19db1.diff` covers the complete Task 1 implementation range from `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` through `da19db100c9b4c52abe0a19c712b4d691267aed4`
-- Next action: dispatch one fresh independent thorough reviewer to verify spec compliance and code quality from the brief, implementation report, and full-range diff package. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Review dispatch: fresh independent reviewer `/root/task1_atomic_public_capture_review` is verifying spec compliance and code quality from the brief, implementation report, and full-range diff package; it must not repeat the implementer's suite
+- Next action: process the review-9 verdict. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
