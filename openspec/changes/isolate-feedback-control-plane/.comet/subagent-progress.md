@@ -74,7 +74,9 @@
 - Fix GREEN evidence: the focused writer-ref regression passed 1/1; Task 1/legacy four-file coverage passed 135/135; `node --check src/capture.mjs`, diff check, and two-file scope check passed
 - Fix behavior: public capture rejects null, undefined, empty, non-string, and over-4096 writer refs after exactly one attempted first write and before resolver/SQLite/second-write effects; direct nullable-ref compatibility is unchanged
 - Review round: `10` (the single fresh independent re-review authorized after review-9)
-- Next action: generate the full Task 1 review package through `9fb6cd6` and dispatch one fresh independent thorough reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Review package: `.superpowers/sdd/review-add6b7e..9fb6cd6.diff` covers the full Task 1 range from `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` through the bounded fix `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`
+- Re-review dispatch: fresh independent reviewer `/root/task1_public_writer_ref_rereview` is verifying complete Task 1 spec compliance and code quality; it must not repeat the reported suites
+- Next action: process the review-10 verdict. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
