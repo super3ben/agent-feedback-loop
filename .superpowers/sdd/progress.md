@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | blocked | `4a1791a`, `aa770c6`, `864240b` | CHANGES_REQUIRED after 2/2 thorough rounds; 3 Important remain | targeted 39/39, focused 103/103, full 232/232; novel probes failed |
+| 1. Lean control DB | implementing (user-authorized review exception) | `4a1791a`, `aa770c6`, `864240b` | third targeted fix/re-review pending | targeted 39/39, focused 103/103, full 232/232; three final novel probes RED |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -31,3 +31,4 @@
 - Every task receives a fresh spec-and-quality reviewer; Critical/Important findings are fixed and re-reviewed before checkoff.
 - Real Codex desktop installation/visibility remains a later user-authorized verify activity, separate from temporary-HOME build proof.
 - Task 1 is blocked at the configured review ceiling on three concrete contract gaps: over-limit alias ambiguity, incomplete schema fingerprinting, and concurrent replay duplicate-result propagation. No task checkbox or OpenSpec item was marked complete.
+- On 2026-07-17 the user explicitly replied `继续`, authorizing one third-round exception limited to those three gaps; the task remains unchecked until a fresh reviewer approves it.
