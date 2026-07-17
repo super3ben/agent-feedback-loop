@@ -44,7 +44,8 @@
 - Transaction-boundary decision: remove the public transaction-external resolve fast path; validate and freeze one capture snapshot before blob I/O; pass the resulting encrypted reference into one serialized resolve-or-insert transaction that rechecks exact replay, alias attachment and new-event insertion without rereading caller-owned input
 - Design amendment: fresh architecture agent `/root/task1_capture_transaction_design` completed commit `e1732a87aaab7102435d8a74b25991d413a040d7`; the existing Design Doc and control-plane-isolation delta spec now define frozen preflight, transaction-external blob I/O and one serialized resolve-or-insert decision
 - Design validation: no placeholders or unresolved ambiguities found in self-review; `openspec validate isolate-feedback-control-plane --strict` and `git diff --check e1732a8^..e1732a8` pass
-- Next action: wait for the required user review of the written specification. After approval, amend the Task 1 plan/brief, then dispatch a fresh TDD implementer and one fresh independent reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Written-spec review: user explicitly replied `确认`; the frozen-snapshot and atomic resolve-or-insert design is approved for implementation
+- Next action: amend only Task 1 of the existing Superpowers plan with exact interfaces, RED/GREEN commands and the three review-8 probes; self-review the plan, regenerate the Task 1 brief, then dispatch a fresh TDD implementer and one fresh independent reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
