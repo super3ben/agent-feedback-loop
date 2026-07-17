@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | canonical identity implementation awaiting review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d` | fresh full Task 1 review pending | canonical blocker 4/4, omitted-context 1/1, identity/schema 18/18, capture/control 61/61, focused 126/126; full 253/254 with exact legacy Stop fixture isolated 1/1 |
+| 1. Lean control DB | blocked after canonical identity review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d` | `CHANGES_REQUIRED` (0 Critical, 3 Important, 0 Minor) | 15-field tuple is unified; public blob-ref invariant, immutable async snapshot and atomic different-alias resolve-or-insert remain open; focused 126/126, full 253/254 with exact legacy Stop fixture isolated 1/1 |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
