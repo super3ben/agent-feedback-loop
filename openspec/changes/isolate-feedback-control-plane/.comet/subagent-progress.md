@@ -51,6 +51,8 @@
 - Dispatch constraints: TDD; only `src/capture.mjs`, `src/control-store.mjs`, and `test/control-store.test.mjs`; disposable HOME/DB; no schema/crypto/installer/plan/progress changes and no live hooks/runtime state
 - Amendment RED evidence: four focused RED groups failed for the intended gaps: missing `prepareCapture`; public supplied-ref mismatch/unified result absent; caller mutation after blob await changed validation/persistence; different-alias and incompatible-storage paths lacked the atomic `kind` contract
 - Fixture reconciliation: Step 19 exposed old fixtures that supplied fake public refs or used compatible direct aliases to seed rows. The approved production contract governs; fixture-only changes must set non-ref-testing public inputs to `null` and give every timestamp-window seed a distinct non-null ref so the original 31-outside/2-inside ambiguity proof remains intact
+- Interim GREEN evidence: after fixture-only reconciliation, Step 19 passed 12/12 and the four-file Task 1/legacy regression passed 133/133; an initial disposable-HOME package run passed 261/261 in 23.20s
+- Final-suite correction: self-review then added in-scope RED/GREEN coverage for direct resolve ref reconcile/adopt, non-caller-owned control `captureSession` results, and null-timestamp exact replay, with production changes. Therefore the earlier 261/261 run is diagnostic only; one explicit final-code disposable-HOME rerun is required and must be reported separately
 - Next action: persist the implementer's RED/GREEN/commit evidence, then dispatch one fresh independent thorough reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
