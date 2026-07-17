@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | blocked after user-authorized exception | `4a1791a`, `aa770c6`, `864240b`, `9e62862` | CHANGES_REQUIRED; 2 Important remain | exception targeted 3/3, focused 107/107, full 235/235; two new novel probes RED |
+| 1. Lean control DB | implementing (fourth-round user exception) | `4a1791a`, `aa770c6`, `864240b`, `9e62862` | second exception fix/re-review pending | prior targeted 3/3, focused 107/107, full 235/235; xinfo/provider novel probes RED |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -33,3 +33,4 @@
 - Task 1 is blocked at the configured review ceiling on three concrete contract gaps: over-limit alias ambiguity, incomplete schema fingerprinting, and concurrent replay duplicate-result propagation. No task checkbox or OpenSpec item was marked complete.
 - On 2026-07-17 the user explicitly replied `继续`, authorizing one third-round exception limited to those three gaps; the task remains unchecked until a fresh reviewer approves it.
 - The exception review closed alias truncation and duplicate-result propagation but found two Task 1 blockers: incomplete generated-column/index-collation schema inspection and missing provider isolation in alias/explicit-target identity. A fourth round requires a new explicit user decision.
+- The user replied `继续` again on 2026-07-17, authorizing a fourth-round exception limited to those two blockers; no task is checked until a fresh reviewer approves.
