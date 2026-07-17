@@ -16,9 +16,25 @@ CREATE TABLE IF NOT EXISTS review_job_events(id INTEGER PRIMARY KEY AUTOINCREMEN
 CREATE TABLE IF NOT EXISTS reflection_emissions(id INTEGER PRIMARY KEY AUTOINCREMENT, document_path TEXT NOT NULL, document_sha256 TEXT NOT NULL, family_id TEXT NOT NULL, session_uid TEXT NOT NULL, context_epoch INTEGER NOT NULL, task_fingerprint TEXT NOT NULL, selected_at TEXT NOT NULL, emitted_at TEXT, outcome TEXT NOT NULL, reason_code TEXT, UNIQUE(document_sha256, session_uid, context_epoch, task_fingerprint));
 `;
 
+function ordinaryColumns(...columns) {
+  return columns.map((column) => [...column, 0]);
+}
+
+function canonicalUniqueIndex(origin, columns) {
+  return [
+    1,
+    origin,
+    0,
+    [
+      ...columns.map(([cid, name], seqno) => [seqno, cid, name, 0, "BINARY", 1]),
+      [columns.length, -1, null, 0, "BINARY", 0]
+    ]
+  ];
+}
+
 export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
   event_observations: {
-    columns: [
+    columns: ordinaryColumns(
       ["observation_uid", "TEXT", 0, null, 1],
       ["observation_key", "TEXT", 1, null, 0],
       ["source_provider", "TEXT", 1, null, 0],
@@ -30,15 +46,15 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["event_uid", "TEXT", 1, null, 0],
       ["capture_source", "TEXT", 1, null, 0],
       ["observed_at", "TEXT", 1, null, 0]
-    ],
+    ),
     indexes: [
-      [1, "pk", 0, ["observation_uid"]],
-      [1, "u", 0, ["observation_key"]]
+      canonicalUniqueIndex("pk", [[0, "observation_uid"]]),
+      canonicalUniqueIndex("u", [[1, "observation_key"]])
     ],
     foreignKeys: [["session_events", "event_uid", "event_uid", "NO ACTION", "NO ACTION", "NONE"]]
   },
   reflection_emissions: {
-    columns: [
+    columns: ordinaryColumns(
       ["id", "INTEGER", 0, null, 1],
       ["document_path", "TEXT", 1, null, 0],
       ["document_sha256", "TEXT", 1, null, 0],
@@ -50,24 +66,29 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["emitted_at", "TEXT", 0, null, 0],
       ["outcome", "TEXT", 1, null, 0],
       ["reason_code", "TEXT", 0, null, 0]
-    ],
-    indexes: [[1, "u", 0, ["document_sha256", "session_uid", "context_epoch", "task_fingerprint"]]],
+    ),
+    indexes: [canonicalUniqueIndex("u", [
+      [2, "document_sha256"],
+      [4, "session_uid"],
+      [5, "context_epoch"],
+      [6, "task_fingerprint"]
+    ])],
     foreignKeys: []
   },
   review_job_events: {
-    columns: [
+    columns: ordinaryColumns(
       ["id", "INTEGER", 0, null, 1],
       ["job_id", "TEXT", 1, null, 0],
       ["event_type", "TEXT", 1, null, 0],
       ["reason_code", "TEXT", 0, null, 0],
       ["lease_epoch", "INTEGER", 0, null, 0],
       ["created_at", "TEXT", 1, null, 0]
-    ],
+    ),
     indexes: [],
     foreignKeys: [["reviewer_jobs", "job_id", "job_id", "NO ACTION", "NO ACTION", "NONE"]]
   },
   reviewer_jobs: {
-    columns: [
+    columns: ordinaryColumns(
       ["job_id", "TEXT", 0, null, 1],
       ["source_identity", "TEXT", 1, null, 0],
       ["source_event_uid", "TEXT", 1, null, 0],
@@ -88,23 +109,23 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["error_code", "TEXT", 0, null, 0],
       ["published_path", "TEXT", 0, null, 0],
       ["published_sha256", "TEXT", 0, null, 0]
-    ],
+    ),
     indexes: [
-      [1, "pk", 0, ["job_id"]],
-      [1, "u", 0, ["source_identity"]]
+      canonicalUniqueIndex("pk", [[0, "job_id"]]),
+      canonicalUniqueIndex("u", [[1, "source_identity"]])
     ],
     foreignKeys: [["session_events", "source_event_uid", "event_uid", "NO ACTION", "NO ACTION", "NONE"]]
   },
   schema_migrations: {
-    columns: [
+    columns: ordinaryColumns(
       ["version", "INTEGER", 0, null, 1],
       ["applied_at", "TEXT", 1, null, 0]
-    ],
+    ),
     indexes: [],
     foreignKeys: []
   },
   session_events: {
-    columns: [
+    columns: ordinaryColumns(
       ["event_uid", "TEXT", 0, null, 1],
       ["session_uid", "TEXT", 1, null, 0],
       ["context_epoch", "INTEGER", 1, null, 0],
@@ -121,31 +142,31 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["completeness", "TEXT", 1, null, 0],
       ["source_timestamp", "TEXT", 0, null, 0],
       ["created_at", "TEXT", 1, null, 0]
-    ],
+    ),
     indexes: [
-      [1, "pk", 0, ["event_uid"]],
-      [1, "u", 0, ["source_identity"]]
+      canonicalUniqueIndex("pk", [[0, "event_uid"]]),
+      canonicalUniqueIndex("u", [[7, "source_identity"]])
     ],
     foreignKeys: [["sessions", "session_uid", "session_uid", "NO ACTION", "NO ACTION", "NONE"]]
   },
   sessions: {
-    columns: [
+    columns: ordinaryColumns(
       ["session_uid", "TEXT", 0, null, 1],
       ["cli", "TEXT", 1, null, 0],
       ["project_id", "TEXT", 0, null, 0],
       ["context_epoch", "INTEGER", 1, null, 0],
       ["started_at", "TEXT", 1, null, 0],
       ["updated_at", "TEXT", 1, null, 0]
-    ],
-    indexes: [[1, "pk", 0, ["session_uid"]]],
+    ),
+    indexes: [canonicalUniqueIndex("pk", [[0, "session_uid"]])],
     foreignKeys: []
   },
   store_meta: {
-    columns: [
+    columns: ordinaryColumns(
       ["key", "TEXT", 0, null, 1],
       ["value", "TEXT", 1, null, 0]
-    ],
-    indexes: [[1, "pk", 0, ["key"]]],
+    ),
+    indexes: [canonicalUniqueIndex("pk", [[0, "key"]])],
     foreignKeys: []
   }
 });

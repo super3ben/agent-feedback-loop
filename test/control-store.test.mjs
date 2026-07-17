@@ -168,6 +168,47 @@ test("runtime open rejects every malformed canonical v1 schema signature", () =>
   }
 });
 
+test("runtime open rejects undeclared generated columns", () => {
+  const { paths } = fixture();
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  const database = new DatabaseSync(paths.controlDatabase);
+  database.exec(SCHEMA_SQL);
+  database.exec("ALTER TABLE store_meta ADD COLUMN shadow TEXT GENERATED ALWAYS AS (value) VIRTUAL");
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.close();
+  chmodSync(paths.controlDatabase, 0o600);
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(
+    () => openControlStore({ paths }),
+    (error) => error?.code === CONTROL_SCHEMA_MISMATCH
+  );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
+test("runtime open rejects noncanonical unique index collation", () => {
+  const { paths } = fixture();
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  const replacement = "reviewer_jobs(job_id TEXT PRIMARY KEY, source_identity TEXT COLLATE NOCASE NOT NULL UNIQUE";
+  const schema = SCHEMA_SQL.replace(
+    "reviewer_jobs(job_id TEXT PRIMARY KEY, source_identity TEXT NOT NULL UNIQUE",
+    replacement
+  );
+  assert.notEqual(schema, SCHEMA_SQL, "collation mutation must alter the schema fixture");
+  const database = new DatabaseSync(paths.controlDatabase);
+  database.exec(schema);
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.close();
+  chmodSync(paths.controlDatabase, 0o600);
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(
+    () => openControlStore({ paths }),
+    (error) => error?.code === CONTROL_SCHEMA_MISMATCH
+  );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
 test("runtime open rejects a non-private control database without changing its mode", () => {
   const { paths } = fixture();
   const initialized = initializeControlStore({ paths });
@@ -506,6 +547,148 @@ test("control observation alias checks the complete timestamp window before boun
   assert.equal(
     store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE source_id=?").get("ambiguous-beyond-old-limit").count,
     0
+  );
+  store.close();
+});
+
+test("control observation exact-turn alias never crosses provider identity", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const claudeEvent = event({
+    event_uid: "claude-exact-turn",
+    cli: "claude",
+    source_identity: undefined,
+    source_event_id: "claude-exact-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "claude-exact-source",
+    native_turn_id: "shared-turn",
+    source_timestamp: "2026-07-17T03:00:00.000Z"
+  });
+  store.captureSessionEvent(claudeEvent);
+
+  const resolved = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: claudeEvent.session_uid,
+    contextEpoch: claudeEvent.context_epoch,
+    sourceNamespace: "transcript_exact",
+    sourceId: "codex-exact-source",
+    nativeTurnId: claudeEvent.native_turn_id,
+    role: claudeEvent.role,
+    contentHash: claudeEvent.content_hash,
+    sourceTimestamp: "2026-07-17T03:01:00.000Z"
+  });
+
+  assert.equal(resolved, null);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE source_provider='codex'").get().count, 0);
+  store.close();
+});
+
+test("control observation null-turn fallback never crosses provider identity", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const claudeEvent = event({
+    event_uid: "claude-null-turn",
+    cli: "claude",
+    source_identity: undefined,
+    source_event_id: "claude-null-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "claude-null-source",
+    native_turn_id: null,
+    source_timestamp: "2026-07-17T03:00:00.000Z"
+  });
+  store.captureSessionEvent(claudeEvent);
+
+  const resolved = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: claudeEvent.session_uid,
+    contextEpoch: claudeEvent.context_epoch,
+    sourceNamespace: "transcript_fallback",
+    sourceId: "codex-fallback-source",
+    nativeTurnId: "codex-turn-with-null-fallback",
+    role: claudeEvent.role,
+    contentHash: claudeEvent.content_hash,
+    sourceTimestamp: "2026-07-17T03:01:00.000Z"
+  });
+
+  assert.equal(resolved, null);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE source_provider='codex'").get().count, 0);
+  store.close();
+});
+
+test("control observation explicit target rejects a different provider", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const claudeEvent = event({
+    event_uid: "claude-explicit-target",
+    cli: "claude",
+    source_identity: undefined,
+    source_event_id: "claude-explicit-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "claude-explicit-source",
+    native_turn_id: "shared-turn",
+    source_timestamp: "2026-07-17T03:00:00.000Z"
+  });
+  store.captureSessionEvent(claudeEvent);
+
+  assert.throws(
+    () => store.resolveEventObservation({
+      provider: "codex",
+      sessionUid: claudeEvent.session_uid,
+      contextEpoch: claudeEvent.context_epoch,
+      sourceNamespace: "transcript_explicit",
+      sourceId: "codex-explicit-source",
+      eventUid: claudeEvent.event_uid,
+      nativeTurnId: claudeEvent.native_turn_id,
+      role: claudeEvent.role,
+      contentHash: claudeEvent.content_hash,
+      sourceTimestamp: claudeEvent.source_timestamp
+    }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE source_provider='codex'").get().count, 0);
+  store.close();
+});
+
+test("control observation replay rejects an existing cross-provider target", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const claudeEvent = event({
+    event_uid: "claude-existing-target",
+    cli: "claude",
+    source_identity: undefined,
+    source_event_id: "claude-existing-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "claude-existing-source",
+    native_turn_id: "shared-turn",
+    source_timestamp: "2026-07-17T03:00:00.000Z"
+  });
+  store.captureSessionEvent(claudeEvent);
+  const sourceNamespace = "transcript_existing";
+  const sourceId = "codex-existing-source";
+  const observationKey = JSON.stringify(["codex", claudeEvent.session_uid, claudeEvent.context_epoch, sourceNamespace, sourceId]);
+  store.database.prepare(`INSERT INTO event_observations
+    (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+     source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    "legacy-cross-provider-observation", observationKey, "codex", claudeEvent.session_uid,
+    claudeEvent.context_epoch, sourceNamespace, sourceId, claudeEvent.event_uid,
+    claudeEvent.event_uid, "codex:transcript_existing", "2026-07-17T03:01:00.000Z"
+  );
+
+  assert.throws(
+    () => store.resolveEventObservation({
+      provider: "codex",
+      sessionUid: claudeEvent.session_uid,
+      contextEpoch: claudeEvent.context_epoch,
+      sourceNamespace,
+      sourceId,
+      eventUid: claudeEvent.event_uid,
+      nativeTurnId: claudeEvent.native_turn_id,
+      role: claudeEvent.role,
+      contentHash: claudeEvent.content_hash,
+      sourceTimestamp: claudeEvent.source_timestamp
+    }),
+    (error) => error?.code === "control_observation_collision"
   );
   store.close();
 });

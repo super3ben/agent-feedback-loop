@@ -265,6 +265,7 @@ function sameObservedEvent(row, fields) {
   return (!fields.event_uid || row.observed_event_uid === fields.event_uid)
     && row.session_uid === fields.session_uid
     && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
+    && row.source_provider === fields.source_provider
     && row.role === fields.role
     && row.content_hash === fields.content_hash
     && sameNullable(row.native_turn_id, fields.native_turn_id)
@@ -358,14 +359,14 @@ function createStore(database, now) {
         if (!Number.isFinite(Date.parse(incomingTimestamp))) return null;
         const contextClause = fields.context_epoch == null ? "" : " AND e.context_epoch=?";
         const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.* FROM session_events e
-          WHERE e.session_uid=? AND e.role=? AND e.content_hash=?${contextClause}
+          WHERE e.session_uid=? AND e.source_provider=? AND e.role=? AND e.content_hash=?${contextClause}
             AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
             AND julianday(COALESCE(e.source_timestamp, e.created_at))
               BETWEEN julianday(?) - (5.0 / 1440.0) AND julianday(?) + (5.0 / 1440.0)
             AND NOT EXISTS (SELECT 1 FROM event_observations o
               WHERE o.event_uid=e.event_uid AND o.capture_source=?)
           ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 2`).all(
-          fields.session_uid, fields.role, fields.content_hash,
+          fields.session_uid, fields.source_provider, fields.role, fields.content_hash,
           ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId,
           incomingTimestamp, incomingTimestamp, fields.capture_source
         );
@@ -430,12 +431,14 @@ function verifyControlSchema(database, requireSchemaVersion) {
   }
   for (const [table, signature] of Object.entries(CONTROL_SCHEMA_SIGNATURE)) {
     const escapedTable = table.replaceAll("'", "''");
-    const columns = database.prepare(`PRAGMA table_info('${escapedTable}')`).all().map((row) => [
-      row.name, row.type, Number(row.notnull), row.dflt_value, Number(row.pk)
+    const columns = database.prepare(`PRAGMA table_xinfo('${escapedTable}')`).all().map((row) => [
+      row.name, row.type, Number(row.notnull), row.dflt_value, Number(row.pk), Number(row.hidden)
     ]);
     const indexes = database.prepare(`PRAGMA index_list('${escapedTable}')`).all().map((row) => {
       const escapedIndex = row.name.replaceAll("'", "''");
-      const indexedColumns = database.prepare(`PRAGMA index_info('${escapedIndex}')`).all().map((column) => column.name);
+      const indexedColumns = database.prepare(`PRAGMA index_xinfo('${escapedIndex}')`).all().map((column) => [
+        Number(column.seqno), Number(column.cid), column.name, Number(column.desc), column.coll, Number(column.key)
+      ]);
       return [Number(row.unique), row.origin, Number(row.partial), indexedColumns];
     }).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
     const foreignKeys = database.prepare(`PRAGMA foreign_key_list('${escapedTable}')`).all().map((row) => [
