@@ -81,7 +81,8 @@ function assertNoSymlinkPathComponents(target, anchor) {
   const relative = path.relative(root, resolved);
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw unavailable();
   const rootInfo = lstatSync(root);
-  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw unavailable();
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || (rootInfo.mode & 0o022) !== 0) throw unavailable();
+  assertOwned(rootInfo, "control home");
   let current = root;
   for (const component of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
@@ -92,17 +93,20 @@ function assertNoSymlinkPathComponents(target, anchor) {
       if (error.code === "ENOENT") throw unavailable();
       throw error;
     }
-    if (info.isSymbolicLink() || !info.isDirectory()) throw unavailable();
+    if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o022) !== 0) throw unavailable();
+    assertOwned(info, "control path component");
   }
 }
 
 function assertControlDatabasePath(paths) {
-  if (!paths?.dataRoot || !paths?.controlDatabase) throw new TypeError("paths.dataRoot and paths.controlDatabase are required");
+  if (!paths?.home || !paths?.dataRoot || !paths?.controlDatabase) throw new TypeError("paths.home, paths.dataRoot and paths.controlDatabase are required");
+  const home = path.resolve(paths.home);
   const dataRoot = path.resolve(paths.dataRoot);
+  if (dataRoot !== path.join(home, ".agent", "feedback-loop-data")) throw unavailable();
   const storeRoot = path.join(dataRoot, "store");
   const expected = path.join(storeRoot, "control.sqlite3");
   if (path.resolve(paths.controlDatabase) !== expected) throw unavailable();
-  assertNoSymlinkPathComponents(dataRoot, paths.home || path.dirname(dataRoot));
+  assertNoSymlinkPathComponents(storeRoot, home);
   assertExistingPrivateDirectory(dataRoot, "data root");
   assertExistingPrivateDirectory(storeRoot, "control store directory");
   assertExistingPrivateDatabase(expected);
@@ -120,12 +124,24 @@ function assertOptionalString(value, field, maxLength = 4096) {
   return assertString(value, field, maxLength);
 }
 
-function observationKey(provider, sourceNamespace, sourceId) {
-  return `${provider}\u0000${sourceNamespace}\u0000${sourceId}`;
+function observationKey(provider, sessionUid, contextEpoch, sourceNamespace, sourceId) {
+  return JSON.stringify([provider, sessionUid, contextEpoch, sourceNamespace, sourceId]);
 }
 
 function observationUid(key) {
   return `observation:${createHash("sha256").update(key).digest("hex")}`;
+}
+
+function assertOptionalEpoch(value, field) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONTEXT_EPOCH) {
+    throw new TypeError(`${field} must be a bounded positive integer`);
+  }
+  return value;
+}
+
+function collision() {
+  return new ControlStoreError("control_observation_collision", "control observation collision");
 }
 
 function eventFields(event) {
@@ -137,61 +153,131 @@ function eventFields(event) {
     throw new TypeError("context_epoch must be a bounded positive integer");
   }
   const cli = assertString(event.cli, "cli", 64);
-  const sourceNamespace = assertString(event.source_namespace || "hook", "source_namespace", 128);
-  const sourceId = assertString(event.observation_source_id || event.source_event_id, "source_event_id", 1024);
-  const key = observationKey(cli, sourceNamespace, sourceId);
+  const sessionUid = assertString(event.session_uid, "session_uid", 512);
+  const sourceEventId = assertString(event.source_event_id, "source_event_id", 1024);
+  const sourceNamespace = event.source_namespace == null
+    ? "hook"
+    : assertString(event.source_namespace, "source_namespace", 128);
+  const sourceId = event.observation_source_id == null
+    ? sourceEventId
+    : assertString(event.observation_source_id, "observation_source_id", 1024);
+  const suppliedCompleteness = event.completeness == null
+    ? null
+    : assertString(event.completeness, "completeness", 64);
+  const suppliedCaptureCompleteness = event.capture_completeness == null
+    ? null
+    : assertString(event.capture_completeness, "capture_completeness", 64);
+  const completeness = suppliedCompleteness ?? assertString(suppliedCaptureCompleteness, "capture_completeness", 64);
+  const key = observationKey(cli, sessionUid, event.context_epoch, sourceNamespace, sourceId);
+  if (event.source_identity != null && assertString(event.source_identity, "source_identity", 2048) !== key) throw collision();
   return {
     event_uid: assertString(event.event_uid, "event_uid", 512),
-    session_uid: assertString(event.session_uid, "session_uid", 512),
+    session_uid: sessionUid,
     cli,
     project_id: assertOptionalString(event.project_id, "project_id", 1024),
     context_epoch: event.context_epoch,
-    source_event_id: assertString(event.source_event_id, "source_event_id", 1024),
-    source_identity: assertOptionalString(event.source_identity, "source_identity", 2048) || key,
+    source_event_id: sourceEventId,
+    source_identity: key,
     observation_key: key,
     observation_uid: observationUid(key),
+    source_provider: cli,
+    source_namespace: sourceNamespace,
+    observation_source_id: sourceId,
     observation_capture_source: `${cli}:${sourceNamespace}`,
     role: assertString(event.role, "role", 64),
     referent_event_uid: assertOptionalString(event.referent_event_uid, "referent_event_uid", 512),
+    native_turn_id: assertOptionalString(event.native_turn_id ?? event.native_turn, "native_turn_id", 512),
     content_hash: assertString(event.content_hash, "content_hash", 128),
     encrypted_raw_ref: assertOptionalString(event.encrypted_raw_ref, "encrypted_raw_ref", 4096),
-    completeness: assertString(event.completeness || event.capture_completeness, "completeness", 64)
+    completeness,
+    source_timestamp: assertOptionalString(event.source_timestamp, "source_timestamp", 128)
   };
 }
 
 function observationFields(input) {
   if (!input || typeof input !== "object") throw new TypeError("observation input must be an object");
-  if (input.observation_key !== undefined || input.event_uid !== undefined) {
-    return {
-      observation_key: assertString(input.observation_key, "observation_key", 2048),
-      observation_uid: assertString(input.observation_uid, "observation_uid", 512),
-      event_uid: assertOptionalString(input.event_uid, "event_uid", 512),
-      capture_source: assertString(input.capture_source, "capture_source", 256),
-      session_uid: null,
-      role: null,
-      content_hash: null
-    };
-  }
   const provider = assertString(input.provider, "provider", 64);
+  const sessionUid = assertString(input.sessionUid, "sessionUid", 512);
+  const contextEpoch = assertOptionalEpoch(input.contextEpoch ?? input.context_epoch, "contextEpoch");
   const sourceNamespace = assertString(input.sourceNamespace, "sourceNamespace", 128);
   const sourceId = assertString(input.sourceId, "sourceId", 1024);
-  const key = observationKey(provider, sourceNamespace, sourceId);
+  const key = contextEpoch == null ? null : observationKey(provider, sessionUid, contextEpoch, sourceNamespace, sourceId);
   return {
     observation_key: key,
-    observation_uid: observationUid(key),
-    event_uid: null,
-    capture_source: `${provider}:${sourceNamespace}`,
-    session_uid: assertString(input.sessionUid, "sessionUid", 512),
+    observation_uid: key == null ? null : observationUid(key),
+    event_uid: assertOptionalString(input.eventUid ?? input.event_uid, "eventUid", 512),
+    capture_source: input.captureSource == null ? `${provider}:${sourceNamespace}` : assertString(input.captureSource, "captureSource", 256),
+    source_provider: provider,
+    session_uid: sessionUid,
+    context_epoch: contextEpoch,
+    source_namespace: sourceNamespace,
+    source_id: sourceId,
+    native_turn_id: assertOptionalString(input.nativeTurnId ?? input.native_turn_id, "nativeTurnId", 512),
+    source_timestamp: assertOptionalString(input.sourceTimestamp ?? input.source_timestamp, "sourceTimestamp", 128),
     role: assertString(input.role, "role", 64),
     content_hash: assertString(input.contentHash, "contentHash", 128)
   };
 }
 
-function eventObservation(database, key) {
-  return database.prepare(`SELECT o.observation_uid, o.event_uid, o.capture_source,
-      e.encrypted_raw_ref, e.session_uid, e.role, e.content_hash
+function eventObservations(database, fields) {
+  const where = fields.context_epoch == null ? "" : " AND o.context_epoch=?";
+  return database.prepare(`SELECT o.observation_uid, o.observed_event_uid, o.event_uid, o.capture_source, o.source_provider,
+      o.session_uid AS observation_session_uid, o.context_epoch AS observation_context_epoch,
+      o.source_namespace AS observation_source_namespace, o.source_id AS observation_source_id,
+      e.encrypted_raw_ref, e.session_uid, e.context_epoch, e.source_provider, e.source_namespace,
+      e.observation_source_id, e.source_identity, e.role, e.native_turn_id, e.content_hash,
+      e.source_timestamp, e.completeness
     FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
-    WHERE o.observation_key=?`).get(key) || null;
+    WHERE o.source_provider=? AND o.session_uid=? AND o.source_namespace=? AND o.source_id=?${where}`).all(
+    fields.source_provider, fields.session_uid, fields.source_namespace, fields.source_id,
+    ...(fields.context_epoch == null ? [] : [fields.context_epoch])
+  );
+}
+
+function eventObservation(database, fields) {
+  const rows = eventObservations(database, fields);
+  if (rows.length > 1) throw collision();
+  return rows[0] || null;
+}
+
+function sameNullable(left, right) {
+  return (left ?? null) === (right ?? null);
+}
+
+function sameEvent(row, fields) {
+  return row.event_uid === fields.event_uid
+    && row.session_uid === fields.session_uid
+    && Number(row.context_epoch) === fields.context_epoch
+    && row.source_provider === fields.source_provider
+    && row.source_namespace === fields.source_namespace
+    && row.observation_source_id === fields.observation_source_id
+    && row.source_identity === fields.source_identity
+    && row.role === fields.role
+    && row.content_hash === fields.content_hash
+    && sameNullable(row.native_turn_id, fields.native_turn_id)
+    && sameNullable(row.source_timestamp, fields.source_timestamp)
+    && sameNullable(row.referent_event_uid, fields.referent_event_uid)
+    && sameNullable(row.completeness, fields.completeness)
+    && sameNullable(row.encrypted_raw_ref, fields.encrypted_raw_ref);
+}
+
+function sameObservedEvent(row, fields) {
+  return (!fields.event_uid || row.observed_event_uid === fields.event_uid)
+    && row.session_uid === fields.session_uid
+    && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
+    && row.role === fields.role
+    && row.content_hash === fields.content_hash
+    && sameNullable(row.native_turn_id, fields.native_turn_id)
+    && sameNullable(row.source_timestamp, fields.source_timestamp);
+}
+
+function withinAliasWindow(rows, fields, now) {
+  const incomingAt = Date.parse(fields.source_timestamp || nowIso(now));
+  if (!Number.isFinite(incomingAt)) return [];
+  return rows.filter((row) => {
+    const candidateAt = Date.parse(row.source_timestamp || row.created_at || "");
+    return Number.isFinite(candidateAt) && Math.abs(incomingAt - candidateAt) <= 5 * 60 * 1000;
+  });
 }
 
 function createStore(database, now) {
@@ -215,13 +301,13 @@ function createStore(database, now) {
     captureSessionEvent(event) {
       const fields = eventFields(event);
       return transaction(() => {
-        const byUid = database.prepare("SELECT event_uid, source_identity FROM session_events WHERE event_uid=?").get(fields.event_uid);
-        const byIdentity = database.prepare("SELECT event_uid, source_identity FROM session_events WHERE source_identity=?").get(fields.source_identity);
+        const byUid = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
+        const byIdentity = database.prepare("SELECT * FROM session_events WHERE source_identity=?").get(fields.source_identity);
         if (byUid || byIdentity) {
-          if (byUid?.event_uid === byIdentity?.event_uid && byUid.source_identity === fields.source_identity) {
+          if (byUid?.event_uid === byIdentity?.event_uid && sameEvent(byUid, fields)) {
             return { event_uid: byUid.event_uid, duplicate: true };
           }
-          throw new ControlStoreError("control_identity_collision", "control identity collision");
+          throw collision();
         }
         const timestamp = nowIso(now);
         database.prepare(`INSERT INTO sessions
@@ -233,18 +319,22 @@ function createStore(database, now) {
           fields.session_uid, fields.cli, fields.project_id, fields.context_epoch, timestamp, timestamp
         );
         database.prepare(`INSERT INTO session_events
-          (event_uid, session_uid, source_event_id, source_identity, role, referent_event_uid,
-           content_hash, encrypted_raw_ref, completeness, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          fields.event_uid, fields.session_uid, fields.source_event_id, fields.source_identity,
-          fields.role, fields.referent_event_uid, fields.content_hash, fields.encrypted_raw_ref,
-          fields.completeness, timestamp
+          (event_uid, session_uid, context_epoch, source_provider, source_event_id, source_namespace,
+           observation_source_id, source_identity, role, referent_event_uid, native_turn_id,
+           content_hash, encrypted_raw_ref, completeness, source_timestamp, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          fields.event_uid, fields.session_uid, fields.context_epoch, fields.source_provider,
+          fields.source_event_id, fields.source_namespace, fields.observation_source_id,
+          fields.source_identity, fields.role, fields.referent_event_uid, fields.native_turn_id,
+          fields.content_hash, fields.encrypted_raw_ref, fields.completeness, fields.source_timestamp, timestamp
         );
         database.prepare(`INSERT INTO event_observations
-          (observation_uid, observation_key, event_uid, capture_source, observed_at)
-          VALUES (?, ?, ?, ?, ?)`).run(
-          fields.observation_uid, fields.observation_key, fields.event_uid,
-          fields.observation_capture_source, timestamp
+          (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+           source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          fields.observation_uid, fields.observation_key, fields.source_provider, fields.session_uid,
+          fields.context_epoch, fields.source_namespace, fields.observation_source_id,
+          fields.event_uid, fields.event_uid, fields.observation_capture_source, timestamp
         );
         return { event_uid: fields.event_uid, duplicate: false };
       });
@@ -252,41 +342,64 @@ function createStore(database, now) {
     resolveEventObservation(input) {
       const fields = observationFields(input);
       return transaction(() => {
-        const existing = eventObservation(database, fields.observation_key);
-        if (existing) return { ...existing, duplicate: true };
-        if (fields.event_uid) {
-          if (!database.prepare("SELECT 1 FROM session_events WHERE event_uid=?").get(fields.event_uid)) {
-            throw new TypeError("event_uid must reference a captured session event");
-          }
-          database.prepare(`INSERT INTO event_observations
-            (observation_uid, observation_key, event_uid, capture_source, observed_at)
-            VALUES (?, ?, ?, ?, ?)`).run(
-            fields.observation_uid, fields.observation_key, fields.event_uid, fields.capture_source, nowIso(now)
-          );
-          return { observation_uid: fields.observation_uid, event_uid: fields.event_uid, duplicate: false };
+        const existing = eventObservation(database, fields);
+        if (existing) {
+          if (!sameObservedEvent(existing, fields)) throw collision();
+          return { ...existing, duplicate: true };
         }
-        const candidates = database.prepare(`SELECT e.event_uid FROM session_events e
-          WHERE e.session_uid=? AND e.role=? AND e.content_hash=?
+        if (fields.event_uid) {
+          const target = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
+          if (target) {
+            if (!sameObservedEvent({ ...target, observed_event_uid: target.event_uid }, fields)) throw collision();
+            const contextEpoch = fields.context_epoch ?? Number(target.context_epoch);
+            const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
+            database.prepare(`INSERT INTO event_observations
+              (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+               source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+              observationUid(key), key, fields.source_provider, fields.session_uid, contextEpoch,
+              fields.source_namespace, fields.source_id, fields.event_uid, fields.event_uid, fields.capture_source, nowIso(now)
+            );
+            return { observation_uid: observationUid(key), event_uid: fields.event_uid, duplicate: false };
+          }
+        }
+        const contextClause = fields.context_epoch == null ? "" : " AND e.context_epoch=?";
+        const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.* FROM session_events e
+          WHERE e.session_uid=? AND e.role=? AND e.content_hash=?${contextClause}
+            AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
             AND NOT EXISTS (SELECT 1 FROM event_observations o
               WHERE o.event_uid=e.event_uid AND o.capture_source=?)
-          ORDER BY e.created_at, e.event_uid LIMIT 2`).all(
-          fields.session_uid, fields.role, fields.content_hash, fields.capture_source
+          ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 32`).all(
+          fields.session_uid, fields.role, fields.content_hash,
+          ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId, fields.capture_source
         );
+        let candidates = withinAliasWindow(selectCandidates(fields.native_turn_id), fields, now);
+        if (!candidates.length && fields.native_turn_id != null) {
+          candidates = withinAliasWindow(selectCandidates(null), fields, now);
+        }
         if (candidates.length !== 1) return null;
-        const eventUid = candidates[0].event_uid;
+        const candidate = candidates[0];
+        const contextEpoch = Number(candidate.context_epoch);
+        const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
         database.prepare(`INSERT INTO event_observations
-          (observation_uid, observation_key, event_uid, capture_source, observed_at)
-          VALUES (?, ?, ?, ?, ?)`).run(
-          fields.observation_uid, fields.observation_key, eventUid, fields.capture_source, nowIso(now)
+          (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+           source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          observationUid(key), key, fields.source_provider, fields.session_uid, contextEpoch,
+          fields.source_namespace, fields.source_id, fields.event_uid || candidate.event_uid,
+          candidate.event_uid, fields.capture_source, nowIso(now)
         );
-        return { ...eventObservation(database, fields.observation_key), duplicate: false };
+        return { ...eventObservation(database, { ...fields, context_epoch: contextEpoch }), duplicate: false };
       });
     },
     getEventObservation(provider, sourceNamespace, sourceId) {
-      return eventObservation(
-        database,
-        observationKey(assertString(provider, "provider", 64), assertString(sourceNamespace, "sourceNamespace", 128), assertString(sourceId, "sourceId", 1024))
+      const rows = database.prepare(`SELECT o.observation_uid, o.event_uid, o.capture_source,
+          e.encrypted_raw_ref, e.session_uid, e.role, e.content_hash
+        FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
+        WHERE o.source_provider=? AND o.source_namespace=? AND o.source_id=?`).all(
+        assertString(provider, "provider", 64), assertString(sourceNamespace, "sourceNamespace", 128), assertString(sourceId, "sourceId", 1024)
       );
+      return rows.length === 1 ? rows[0] : null;
     },
     getSessionEvent(eventUid) {
       const row = database.prepare(`SELECT event_uid, session_uid, source_event_id, source_identity, role,
@@ -321,6 +434,16 @@ function verifyControlSchema(database, requireSchemaVersion) {
   ];
   if (JSON.stringify(listUserTables(database)) !== JSON.stringify(expected)) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
+  }
+  const requiredColumns = {
+    session_events: ["event_uid", "session_uid", "context_epoch", "source_provider", "source_event_id", "source_namespace", "observation_source_id", "source_identity", "native_turn_id", "content_hash", "source_timestamp"],
+    event_observations: ["observation_uid", "observation_key", "source_provider", "session_uid", "context_epoch", "source_namespace", "source_id", "observed_event_uid", "event_uid"]
+  };
+  for (const [table, columns] of Object.entries(requiredColumns)) {
+    const actual = new Set(database.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map((row) => row.name));
+    if (!columns.every((column) => actual.has(column))) {
+      throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
+    }
   }
 }
 

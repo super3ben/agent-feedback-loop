@@ -375,6 +375,8 @@ export async function captureObservedSession({ store, blobs, event, rawText }) {
     sourceId,
     sourceOffset: event.source_offset,
     sessionUid: event.session_uid,
+    contextEpoch: event.context_epoch,
+    eventUid: event.event_uid,
     nativeTurnId: event.native_turn_id || event.native_turn || null,
     role: event.role,
     contentHash: event.content_hash,

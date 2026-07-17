@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,7 +43,6 @@ function event(overrides = {}) {
     project_id: "project-1",
     context_epoch: 1,
     source_event_id: "source-1",
-    source_identity: "identity-1",
     role: "user",
     referent_event_uid: null,
     content_hash: "a".repeat(64),
@@ -96,6 +96,21 @@ test("runtime open rejects a mismatched schema without changing the database", (
     () => openControlStore({ paths }),
     (error) => error?.code === CONTROL_SCHEMA_MISMATCH
   );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
+test("runtime open rejects a same-version control schema missing identity metadata", () => {
+  const { paths } = fixture();
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  const database = new DatabaseSync(paths.controlDatabase);
+  for (const table of ALLOWED_CONTROL_TABLES) database.exec(`CREATE TABLE ${table}(id TEXT)`);
+  database.exec("DROP TABLE schema_migrations; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);");
+  database.exec("INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-07-17T00:00:00.000Z')");
+  database.close();
+  chmodSync(paths.controlDatabase, 0o600);
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(() => openControlStore({ paths }), (error) => error?.code === CONTROL_SCHEMA_MISMATCH);
   assert.deepEqual(readFileSync(paths.controlDatabase), before);
 });
 
@@ -182,6 +197,15 @@ test("runtime open fail-closes every control path redirect without filesystem re
     const { paths } = fixture();
     const initialized = initializeControlStore({ paths });
     initialized.close();
+    const agentRoot = path.dirname(paths.dataRoot);
+    chmodSync(agentRoot, 0o777);
+    expectUnavailable(paths, [agentRoot]);
+    assert.equal(statSync(agentRoot).mode & 0o777, 0o777);
+  }
+  {
+    const { paths } = fixture();
+    const initialized = initializeControlStore({ paths });
+    initialized.close();
     const escaped = { ...paths, controlDatabase: path.join(paths.dataRoot, "control.sqlite3") };
     expectUnavailable(escaped, [paths.controlDatabase]);
   }
@@ -222,16 +246,28 @@ test("captures bounded event metadata and resolves duplicate observations", () =
   const captured = store.captureSessionEvent(event());
   const duplicate = store.captureSessionEvent(event());
   const observation = store.resolveEventObservation({
-    observation_uid: "observation-1",
-    observation_key: "codex:hook:source-1",
-    event_uid: "event-1",
-    capture_source: "prompt_hook"
+    provider: "codex",
+    sessionUid: "session-1",
+    contextEpoch: 1,
+    sourceNamespace: "transcript_message",
+    sourceId: "transcript-1",
+    eventUid: "event-1",
+    nativeTurnId: null,
+    role: "user",
+    contentHash: "a".repeat(64),
+    sourceTimestamp: null
   });
   const repeatedObservation = store.resolveEventObservation({
-    observation_uid: "observation-2",
-    observation_key: "codex:hook:source-1",
-    event_uid: "event-1",
-    capture_source: "prompt_hook"
+    provider: "codex",
+    sessionUid: "session-1",
+    contextEpoch: 1,
+    sourceNamespace: "transcript_message",
+    sourceId: "transcript-1",
+    eventUid: "event-1",
+    nativeTurnId: null,
+    role: "user",
+    contentHash: "a".repeat(64),
+    sourceTimestamp: null
   });
 
   assert.equal(captured.duplicate, false);
@@ -242,7 +278,7 @@ test("captures bounded event metadata and resolves duplicate observations", () =
     event_uid: "event-1",
     session_uid: "session-1",
     source_event_id: "source-1",
-    source_identity: "identity-1",
+    source_identity: '["codex","session-1",1,"hook","source-1"]',
     role: "user",
     referent_event_uid: null,
     content_hash: "a".repeat(64),
@@ -274,6 +310,153 @@ test("control capture rejects lossy identifier coercion and non-integral epochs"
   ]) {
     assert.throws(() => store.assertCaptureAllowed(invalid), /bounded|integer|string/i);
   }
+  for (const field of ["source_namespace", "observation_source_id", "completeness", "capture_completeness"]) {
+    for (const invalid of ["", false, 0, { value: field }]) {
+      assert.throws(
+        () => store.assertCaptureAllowed(event({ [field]: invalid })),
+        /bounded|non-empty|string/i,
+        `${field} should reject ${JSON.stringify(invalid)}`
+      );
+    }
+  }
+  store.close();
+});
+
+test("control observations bind host source ids to session epoch and immutable event content", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const first = event({
+    event_uid: "event-session-a",
+    session_uid: "session-a",
+    source_event_id: "reused-host-id",
+    source_identity: undefined,
+    source_namespace: "prompt_hook",
+    observation_source_id: "reused-host-id",
+    native_turn_id: "turn-1",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const secondSession = event({
+    ...first,
+    event_uid: "event-session-b",
+    session_uid: "session-b"
+  });
+  assert.equal(store.captureSessionEvent(first).duplicate, false);
+  assert.equal(store.captureSessionEvent(secondSession).duplicate, false);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
+
+  assert.throws(
+    () => store.captureSessionEvent({ ...first, content_hash: "b".repeat(64) }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  assert.equal(store.getSessionEvent(first.event_uid).content_hash, first.content_hash);
+  store.close();
+});
+
+test("control observation alias requires a unique same-turn candidate inside its timestamp window", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "canonical",
+    source_identity: undefined,
+    source_event_id: "prompt-1",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prompt-1",
+    native_turn_id: "turn-1",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  store.captureSessionEvent(canonical);
+
+  const positive = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_alt",
+    sourceId: "transcript-positive",
+    nativeTurnId: "turn-1",
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: "2026-07-17T00:04:00.000Z"
+  });
+  assert.equal(positive.event_uid, canonical.event_uid);
+
+  const crossTurn = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_outside_window",
+    sourceId: "transcript-cross-turn",
+    nativeTurnId: "turn-2",
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: "2026-07-17T00:04:00.000Z"
+  });
+  assert.equal(crossTurn, null);
+
+  const outsideWindow = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_message",
+    sourceId: "transcript-outside-window",
+    nativeTurnId: null,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: "2026-07-17T00:06:00.000Z"
+  });
+  assert.equal(outsideWindow, null);
+  store.close();
+});
+
+test("control observation collisions reject explicit conflicting events and ambiguous aliases", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const first = event({
+    event_uid: "first",
+    source_identity: undefined,
+    source_event_id: "source-first",
+    source_namespace: "prompt_hook",
+    observation_source_id: "shared-source",
+    native_turn_id: "turn-1",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const second = event({
+    ...first,
+    event_uid: "second",
+    source_event_id: "source-second",
+    observation_source_id: "second-source",
+    native_turn_id: "turn-2"
+  });
+  store.captureSessionEvent(first);
+  store.captureSessionEvent(second);
+
+  assert.throws(
+    () => store.resolveEventObservation({
+      provider: "codex",
+      sessionUid: first.session_uid,
+      contextEpoch: first.context_epoch,
+      sourceNamespace: "prompt_hook",
+      sourceId: "shared-source",
+      eventUid: second.event_uid,
+      nativeTurnId: first.native_turn_id,
+      role: first.role,
+      contentHash: first.content_hash,
+      sourceTimestamp: first.source_timestamp
+    }),
+    (error) => error?.code === "control_observation_collision"
+  );
+
+  const ambiguous = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: first.session_uid,
+    contextEpoch: first.context_epoch,
+    sourceNamespace: "transcript_message",
+    sourceId: "ambiguous-same-text",
+    nativeTurnId: null,
+    role: first.role,
+    contentHash: first.content_hash,
+    sourceTimestamp: first.source_timestamp
+  });
+  assert.equal(ambiguous, null);
   store.close();
 });
 
@@ -322,7 +505,7 @@ test("control store captures normalized hooks, replays observations, and rejects
     /constraint|collision/i
   );
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
-  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('session_events') WHERE name LIKE '%text%' OR name IN ('report', 'card', 'lesson')").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('session_events') WHERE (name LIKE '%text%' AND name != 'context_epoch') OR name IN ('report', 'card', 'lesson')").get().count, 0);
   assert.doesNotMatch(readFileSync(paths.controlDatabase, "utf8"), /control-unique-redacted-text/);
   store.close();
 });
