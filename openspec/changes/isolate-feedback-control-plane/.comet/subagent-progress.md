@@ -16,7 +16,7 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `task-review`
+- Stage: `blocked`
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`
@@ -76,7 +76,13 @@
 - Review round: `10` (the single fresh independent re-review authorized after review-9)
 - Review package: `.superpowers/sdd/review-add6b7e..9fb6cd6.diff` covers the full Task 1 range from `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` through the bounded fix `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`
 - Re-review dispatch: fresh independent reviewer `/root/task1_public_writer_ref_rereview` is verifying complete Task 1 spec compliance and code quality; it must not repeat the reported suites
-- Next action: process the review-10 verdict. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Review result: `/root/task1_public_writer_ref_rereview` returned `CHANGES_REQUIRED` (Critical 0, Important 2, Minor 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-10.md`
+- Closed finding: the bounded public writer-result guard is correct, rejects all invalid values before resolver/SQLite/second write, and preserves caller-supplied mismatch plus direct nullable-ref compatibility
+- Unresolved finding 1: alias attachment omits `completeness`, while exact replay requires persisted target completeness. A different-completeness alias can be committed as 1 event/2 observations but its identical replay deterministically collides
+- Unresolved finding 2: `firstDefined()` silently chooses precedence for conflicting snake/camel aliases across most canonical identity fields. The approved fail-closed identity-alias contract is enforced only for capture source/encrypted ref, not event/content/session/provider/etc. aliases
+- Root-cause synthesis: signature generation is unified, but canonical alias reading and alias-target compatibility are not yet single shared invariants. The next correction must add one conflict-validating alias reader and make alias attachment use a target-compatibility predicate coherent with exact replay, not append isolated field patches
+- Review ceiling: the single bounded review-9 fix plus fresh review-10 explicitly authorized by the user has been consumed; no review-10 fix agent is authorized yet
+- Next action: wait for explicit user authorization of one identity-coherence TDD fix plus one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
