@@ -16,10 +16,10 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `implementing`
+- Stage: `task-review`
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
-- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`
+- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`
 - Changed files: `src/index.mjs`, `src/capture.mjs`, `src/control-schema.mjs`, `src/control-store.mjs`, `docs/verification/2026-07-16-legacy-control-plane-audit.md`, `test/runtime.test.mjs`, `test/control-store.test.mjs`
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
 - GREEN evidence: canonical blocker 4/4, omitted-context replay 1/1, identity/schema matrix 18/18, capture/control-store 61/61 and Task 1 focused 126/126; `node --check` and `git diff --check` passed. The single temporary-HOME full run was 253/254; its only unchanged legacy Stop hard-deadline fixture failed before creating the first signal file and passed an exact isolated rerun 1/1
@@ -53,7 +53,12 @@
 - Fixture reconciliation: Step 19 exposed old fixtures that supplied fake public refs or used compatible direct aliases to seed rows. The approved production contract governs; fixture-only changes must set non-ref-testing public inputs to `null` and give every timestamp-window seed a distinct non-null ref so the original 31-outside/2-inside ambiguity proof remains intact
 - Interim GREEN evidence: after fixture-only reconciliation, Step 19 passed 12/12 and the four-file Task 1/legacy regression passed 133/133; an initial disposable-HOME package run passed 261/261 in 23.20s
 - Final-suite correction: self-review then added in-scope RED/GREEN coverage for direct resolve ref reconcile/adopt, non-caller-owned control `captureSession` results, and null-timestamp exact replay, with production changes. Therefore the earlier 261/261 run is diagnostic only; one explicit final-code disposable-HOME rerun is required and must be reported separately
-- Next action: persist the implementer's RED/GREEN/commit evidence, then dispatch one fresh independent thorough reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Amendment implementation result: `/root/task1_atomic_public_capture` returned `DONE`; commit `da19db100c9b4c52abe0a19c712b4d691267aed4` changes only `src/capture.mjs`, `src/control-store.mjs`, and `test/control-store.test.mjs`; report appended at `.superpowers/sdd/task-1-report.md`
+- Final GREEN evidence: Step 18 7/7, Step 19 12/12, four-file Task 1/legacy regression 134/134, and final disposable-HOME package 262/262 in 22.320s; syntax, diff, and scope checks passed
+- Risk signals: cross-module, SQL/security, concurrency/lock, public API, and diff over 200; no schema migration and no implementer concerns
+- Review round: `9` (the single fresh independent transaction-boundary re-review explicitly authorized after review-8)
+- Review package: `.superpowers/sdd/review-add6b7e..da19db1.diff` covers the complete Task 1 implementation range from `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` through `da19db100c9b4c52abe0a19c712b4d691267aed4`
+- Next action: dispatch one fresh independent thorough reviewer to verify spec compliance and code quality from the brief, implementation report, and full-range diff package. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
