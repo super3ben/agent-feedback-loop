@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | transaction-boundary implementation dispatch pending | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`; design `e1732a8`; plan `c6f984f` | next independent review authorized after implementation | User approved frozen preflight snapshot plus one serialized resolve-or-insert transaction; amended Task 1 plan passed conflict/scope self-review |
+| 1. Lean control DB | atomic public capture implementation in progress (`/root/task1_atomic_public_capture`) | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`; design `e1732a8`; plan `c6f984f` | next independent review authorized after implementation | Fresh TDD implementer limited to Task 1 Steps 6-22 and three source/test files |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
