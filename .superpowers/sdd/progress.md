@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | blocked after fifth-round review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda` | `CHANGES_REQUIRED` (0 Critical, 2 Important, 1 Minor) | alias/schema matrix 11/11, control-store 28/28, focused 118/118, coordinator clean full 246/246; public identity probes RED |
+| 1. Lean control DB | implementing (sixth-round user exception) | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda` | sixth targeted fix/re-review authorized | prior full 246/246; public event/session identity and VIEW probes RED |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -37,3 +37,4 @@
 - Review 5 confirmed the fourth-round xinfo/provider fixes but found two different blockers: identical same-provider alias replays collide, and undeclared `CHECK`/trigger semantics are not covered by the schema fingerprint. A fifth targeted fix/re-review requires a new explicit user decision.
 - The user replied `继续` on 2026-07-17, authorizing a fifth-round exception limited to those two deterministic blockers; no task is checked until a fresh reviewer approves.
 - Review 6 confirmed the fifth-round alias/CHECK/trigger fixes but found two identity blockers: public duplicate replay omits persisted immutable referent/source/completeness fields, and a shared session UID can rewrite its provider. Undeclared VIEW acceptance is Minor. A sixth targeted fix/re-review requires a new explicit user decision.
+- The user replied `继续` on 2026-07-17, authorizing a sixth-round exception for both identity blockers and the adjacent canonical-schema VIEW gap; no task is checked until a fresh reviewer approves.
