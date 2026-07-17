@@ -56,6 +56,8 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 
 ### Task 1: 并行建立轻量 control DB，不破坏旧 runtime
 
+- [ ] **Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime**
+
 **Files:**
 - Modify: `src/index.mjs:73-119`
 - Create: `src/control-schema.mjs`
@@ -145,6 +147,8 @@ git commit -m "refactor: separate the lean reflection control store"
 
 ### Task 2: 实现即时 candidate job 与 fenced lease 控制 API
 
+- [ ] **Task 2 complete: 实现即时 candidate job 与 fenced lease 控制 API**
+
 **Files:**
 - Modify: `src/control-store.mjs`
 - Modify: `test/control-store.test.mjs`
@@ -219,6 +223,8 @@ git commit -m "feat: add immediate reviewer job control"
 
 ### Task 3: 删除 Stop、notification、reconcile 与会话控制入口
 
+- [ ] **Task 3 complete: 删除 Stop、notification、reconcile 与会话控制入口**
+
 **Files:**
 - Modify: `src/index.mjs:20-675`
 - Modify: `src/cli.mjs:1-635`
@@ -290,6 +296,8 @@ git commit -m "refactor: remove the conversation control plane"
 ```
 
 ### Task 4: 增加可解释的明确反馈候选分类器
+
+- [ ] **Task 4 complete: 增加可解释的明确反馈候选分类器**
 
 **Files:**
 - Create: `src/feedback-signal.mjs`
@@ -372,6 +380,8 @@ git commit -m "feat: detect explicit retrospective feedback"
 
 ### Task 5: 让 prompt capture 事务创建一个即时 job
 
+- [ ] **Task 5 complete: 让 prompt capture 事务创建一个即时 job**
+
 **Files:**
 - Modify: `src/capture.mjs:248-374`
 - Modify: `src/cli.mjs:635-805`
@@ -453,6 +463,8 @@ git commit -m "feat: queue explicit feedback immediately"
 
 ### Task 6: 实现 macOS/Linux detached reviewer 与 prompt-time recovery
 
+- [ ] **Task 6 complete: 实现 macOS/Linux detached reviewer 与 prompt-time recovery**
+
 **Files:**
 - Create: `src/reviewer-launcher.mjs`
 - Create: `test/reviewer-launcher.test.mjs`
@@ -526,6 +538,8 @@ git commit -m "feat: add the detached reviewer launcher"
 
 ### Task 7: 先定义结构化 reviewer result，保持旧 runtime 全绿
 
+- [ ] **Task 7 complete: 先定义结构化 reviewer result，保持旧 runtime 全绿**
+
 **Files:**
 - Create: `src/reviewer-result.mjs`
 - Create: `src/reviewer-result-file.mjs`
@@ -589,6 +603,8 @@ git commit -m "feat: define validated reviewer results"
 ```
 
 ### Task 8: 建立 canonical/legacy Markdown 文档层与原子发布
+
+- [ ] **Task 8 complete: 建立 canonical/legacy Markdown 文档层与原子发布**
 
 **Files:**
 - Create: `src/reflection-document.mjs`
@@ -683,6 +699,8 @@ git commit -m "feat: publish reflection documents atomically"
 
 ### Task 9: 让 reviewer runner 只提交 no-lesson 或 published 文档终态
 
+- [ ] **Task 9 complete: 让 reviewer runner 只提交 no-lesson 或 published 文档终态**
+
 **Files:**
 - Modify: `src/reviewer-provider.mjs`
 - Modify: `src/reviewer-runner.mjs`
@@ -771,6 +789,8 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 
 ### Task 10: 用 Markdown 文档实现确定性 Top-K 与 omission
 
+- [ ] **Task 10 complete: 用 Markdown 文档实现确定性 Top-K 与 omission**
+
 **Files:**
 - Replace: `src/selector.mjs`
 - Modify: `src/cli.mjs`
@@ -845,6 +865,8 @@ git commit -m "feat: select guidance directly from reflection documents"
 
 ### Task 11: 分离 selected、emitted 与复发负向证据
 
+- [ ] **Task 11 complete: 分离 selected、emitted 与复发负向证据**
+
 **Files:**
 - Modify: `src/control-store.mjs`
 - Modify: `src/cli.mjs`
@@ -907,6 +929,8 @@ git commit -m "feat: audit reflection emission and recurrence honestly"
 
 ### Task 12: 实现旧数据库的显式只读 Markdown 导出
 
+- [ ] **Task 12 complete: 实现旧数据库的显式只读 Markdown 导出**
+
 **Files:**
 - Create: `src/legacy-export.mjs`
 - Modify: `src/cli.mjs`
@@ -962,6 +986,8 @@ git commit -m "feat: export legacy reflections without mutating the database"
 ```
 
 ### Task 13: 删除迁移期旧 store/schema/receipt，证明运行图已收敛
+
+- [ ] **Task 13 complete: 删除迁移期旧 store/schema/receipt，证明运行图已收敛**
 
 **Files:**
 - Modify: `src/capture.mjs`
@@ -1035,6 +1061,8 @@ git commit -m "refactor: remove the legacy feedback runtime"
 
 ### Task 14: 收敛 doctor、日志、安装文档和包内容
 
+- [ ] **Task 14 complete: 收敛 doctor、日志、安装文档和包内容**
+
 **Files:**
 - Modify: `src/index.mjs:560-680`
 - Modify: `src/cli.mjs`
@@ -1105,6 +1133,8 @@ git commit -m "docs: describe the immediate reflection pipeline"
 ```
 
 ### Task 15: 完成端到端、macOS 和 Linux 候选发布验证
+
+- [ ] **Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证**
 
 **Files:**
 - Modify: `test/e2e-smoke.test.mjs`

@@ -1,24 +1,32 @@
-# Background Review Observability SDD Ledger
+# Immediate Subagent Reflection SDD Ledger
 
-- Branch: `codex/background-review-observability`
-- Merge base: `3416d18f2fb7d0db0a20ef4d817ac60a4f589eb8`
-- Plan: `docs/superpowers/plans/2026-07-15-background-review-observability-implementation.md`
-- Baseline: `npm test` - 153 passed, 0 failed
+- Branch: `codex/isolate-feedback-control-plane`
+- Plan: `docs/superpowers/plans/2026-07-16-immediate-subagent-reflection.md`
+- Baseline: 216 tests, 215 passed; one obsolete Stop timing test failed once and passed on isolated rerun
+- Review policy: fresh thorough reviewer after every task, then a final full review
+- Safety boundary: temporary HOME/DB copies only; real hooks, runtime pointer and database stay untouched
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Schema v8 notification outbox and state machine | complete | `ef26297`, `2caf297`, `02f98a0`, `9705425` | approved; no Critical/Important | `npm test` 170/170 |
-| 2. Deterministic receipt renderer and synthetic exclusion | complete | `11b6bd7`, `036b58c`, `1b5fcc2`, `f0295b1`, `b282d19` | approved; no Critical/Important | Task 2 125/125; full 186/186 |
-| 3. Main-chat injection and Stop confirmation | in progress | pending | pending | pending |
-| 4. Leased native system notifications | pending | pending | pending | pending |
-| 5. Review audit CLI | pending | pending | pending | pending |
-| 6. Version, documentation, and packaging | pending | pending | pending | pending |
-| 7. Installed runtime and true-machine acceptance | pending | pending | pending | pending |
-| Final branch review and publication | pending | pending | pending | pending |
+| 1. Lean control DB | implementing | pending | pending | pending |
+| 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
+| 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
+| 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
+| 5. Prompt capture creates immediate job | pending | pending | pending | pending |
+| 6. macOS/Linux detached launcher | pending | pending | pending | pending |
+| 7. Reviewer result contract | pending | pending | pending | pending |
+| 8. Canonical/legacy Markdown documents | pending | pending | pending | pending |
+| 9. Reviewer runner terminal outcomes | pending | pending | pending | pending |
+| 10. Deterministic Markdown Top-K | pending | pending | pending | pending |
+| 11. Selected/emitted/recurrence evidence | pending | pending | pending | pending |
+| 12. Read-only legacy export | pending | pending | pending | pending |
+| 13. Delete transitional legacy runtime | pending | pending | pending | pending |
+| 14. Doctor/logs/docs/package | pending | pending | pending | pending |
+| 15. End-to-end macOS/Linux build proof | pending | pending | pending | pending |
+| Final branch review | pending | pending | pending | pending |
 
 ## Notes
 
-- Each implementation task requires observed RED, GREEN, a fresh task review, and fixes for all Critical/Important findings.
-- Runtime closure requires installed-host evidence; configuration and unit tests alone are insufficient.
-- Task 1 required three fix/re-review loops before approval; final review package ended at `0d0fe73`.
-- Task 2 required protocol hardening through exact-line v2 nonces and byte-preserving stripping; final review package ended at `08a3d85`.
+- Every implementation or fix agent must report an observed RED command and failure summary before GREEN evidence.
+- Every task receives a fresh spec-and-quality reviewer; Critical/Important findings are fixed and re-reviewed before checkoff.
+- Real Codex desktop installation/visibility remains a later user-authorized verify activity, separate from temporary-HOME build proof.
