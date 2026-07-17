@@ -626,6 +626,40 @@ test("control observation null-turn fallback replay is idempotent", () => {
   store.close();
 });
 
+test("control observation replay preserves an omitted optional context epoch", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "canonical-null-context-replay",
+    source_identity: undefined,
+    source_event_id: "prompt-null-context-replay",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prompt-null-context-replay",
+    native_turn_id: "turn-null-context-replay",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const observation = {
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    sourceNamespace: "transcript_null_context_replay",
+    sourceId: "transcript-null-context-replay",
+    nativeTurnId: canonical.native_turn_id,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: canonical.source_timestamp
+  };
+  store.captureSessionEvent(canonical);
+
+  const first = store.resolveEventObservation(observation);
+  const replay = store.resolveEventObservation(observation);
+
+  assert.equal(first.event_uid, canonical.event_uid);
+  assert.equal(first.duplicate, false);
+  assert.equal(replay.event_uid, canonical.event_uid);
+  assert.equal(replay.duplicate, true);
+  store.close();
+});
+
 test("control observation alias replay rejects changed immutable input", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });
@@ -748,6 +782,184 @@ test("public control capture replay rejects changed bounded event identity", asy
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
   store.close();
+});
+
+test("public control capture treats capture source as bounded canonical identity", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const canonical = event({
+    event_uid: "public-capture-source-event",
+    source_identity: undefined,
+    source_event_id: "public-capture-source-event",
+    source_namespace: "prompt_hook",
+    observation_source_id: "public-capture-source-observation",
+    capture_source: "prompt_hook",
+    source_offset: 4,
+    native_turn_id: "public-capture-source-turn",
+    source_timestamp: "2026-07-17T08:00:00.000Z"
+  });
+
+  const first = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...canonical },
+    rawText: "public capture source evidence"
+  });
+
+  assert.equal(first.duplicate, false);
+  await assert.rejects(
+    captureObservedSession({
+      store,
+      blobs,
+      event: { ...canonical, capture_source: "transcript_payload" },
+      rawText: "public capture source evidence"
+    }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  await assert.rejects(
+    captureObservedSession({
+      store,
+      blobs,
+      event: { ...canonical, capture_source: "x".repeat(257) },
+      rawText: "public capture source evidence"
+    }),
+    /capture_source.*bounded non-empty string/i
+  );
+  assert.deepEqual(
+    { ...store.database.prepare(`SELECT capture_source FROM event_observations
+      WHERE source_id=?`).get(canonical.observation_source_id) },
+    { capture_source: canonical.capture_source }
+  );
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
+});
+
+test("direct control capture replay compares the complete canonical identity", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "direct-canonical-event",
+    source_identity: undefined,
+    source_event_id: "direct-source-one",
+    source_namespace: "prompt_hook",
+    observation_source_id: "direct-observation-one",
+    source_offset: 8,
+    capture_source: "prompt_hook",
+    native_turn_id: "direct-canonical-turn",
+    source_timestamp: "2026-07-17T08:10:00.000Z"
+  });
+
+  assert.equal(store.captureSessionEvent({ ...canonical }).duplicate, false);
+  assert.equal(store.captureSessionEvent({ ...canonical }).duplicate, true);
+  for (const mutation of [
+    { source_event_id: "direct-source-two" },
+    { source_offset: 9 },
+    { capture_source: "transcript_payload" }
+  ]) {
+    assert.throws(
+      () => store.captureSessionEvent({ ...canonical, ...mutation }),
+      (error) => error?.code === "control_observation_collision"
+    );
+  }
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
+});
+
+test("public and direct control capture persist the same normalized replay identity", async () => {
+  const publicFixture = controlCaptureFixture();
+  const directFixture = fixture();
+  const directStore = initializeControlStore({ paths: directFixture.paths });
+  const canonical = event({
+    event_uid: "shared-normalized-event",
+    source_identity: undefined,
+    source_event_id: "shared-normalized-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "shared-normalized-observation",
+    source_offset: 12,
+    capture_source: "prompt_hook",
+    referent_event_uid: "shared-normalized-referent",
+    native_turn_id: "shared-normalized-turn",
+    source_timestamp: "2026-07-17T08:20:00.000Z"
+  });
+
+  const publicFirst = await captureObservedSession({
+    store: publicFixture.store,
+    blobs: publicFixture.blobs,
+    event: { ...canonical },
+    rawText: "body bytes stay outside identity"
+  });
+  const publicReplay = await captureObservedSession({
+    store: publicFixture.store,
+    blobs: publicFixture.blobs,
+    event: { ...canonical },
+    rawText: "body bytes stay outside identity"
+  });
+  const directFirst = directStore.captureSessionEvent({
+    ...canonical,
+    encrypted_raw_ref: "/private/blobs/direct-shared-normalized.enc"
+  });
+  const directReplay = directStore.captureSessionEvent({
+    ...canonical,
+    encrypted_raw_ref: "/private/blobs/direct-shared-normalized.enc"
+  });
+  const publicObservation = publicFixture.store.database.prepare(`SELECT observation_signature, capture_source
+    FROM event_observations WHERE source_id=?`).get(canonical.observation_source_id);
+  const directObservation = directStore.database.prepare(`SELECT observation_signature, capture_source
+    FROM event_observations WHERE source_id=?`).get(canonical.observation_source_id);
+
+  assert.deepEqual({
+    publicDuplicate: [publicFirst.duplicate, publicReplay.duplicate],
+    directDuplicate: [directFirst.duplicate, directReplay.duplicate],
+    publicSignature: publicObservation.observation_signature,
+    directSignature: directObservation.observation_signature,
+    publicCaptureSource: publicObservation.capture_source,
+    directCaptureSource: directObservation.capture_source
+  }, {
+    publicDuplicate: [false, true],
+    directDuplicate: [false, true],
+    publicSignature: directObservation.observation_signature,
+    directSignature: directObservation.observation_signature,
+    publicCaptureSource: canonical.capture_source,
+    directCaptureSource: canonical.capture_source
+  });
+  publicFixture.store.close();
+  directStore.close();
+});
+
+test("invalid canonical capture identity is rejected before blob or database side effects", async () => {
+  for (const mutation of [
+    { capture_source: "" },
+    { capture_source: "x".repeat(257) },
+    { capture_source: "prompt_hook", captureSource: "transcript_payload" }
+  ]) {
+    const { store } = controlCaptureFixture();
+    let blobWrites = 0;
+    const blobs = {
+      async write() {
+        blobWrites += 1;
+        return "/private/blobs/unexpected.enc";
+      }
+    };
+    const invalid = event({
+      event_uid: "invalid-canonical-event",
+      source_identity: undefined,
+      source_event_id: "invalid-canonical-source",
+      source_namespace: "prompt_hook",
+      observation_source_id: "invalid-canonical-observation",
+      ...mutation
+    });
+
+    await assert.rejects(
+      captureObservedSession({ store, blobs, event: invalid, rawText: "must not be written" }),
+      /capture_source|captureSource/i
+    );
+    assert.equal(blobWrites, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+    store.close();
+  }
 });
 
 test("control observation alias checks the complete timestamp window before bounding candidates", () => {

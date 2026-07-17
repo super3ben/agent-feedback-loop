@@ -20,6 +20,23 @@ try {
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const MAX_CONTEXT_EPOCH = 2_147_483_647;
+const CAPTURE_IDENTITY_FIELDS = Object.freeze([
+  "event_uid",
+  "source_provider",
+  "session_uid",
+  "context_epoch",
+  "source_namespace",
+  "source_id",
+  "source_event_id",
+  "source_offset",
+  "capture_source",
+  "native_turn_id",
+  "source_timestamp",
+  "role",
+  "referent_event_uid",
+  "content_hash",
+  "completeness"
+]);
 export const CONTROL_STORE_UNAVAILABLE = "control_store_unavailable";
 export const CONTROL_SCHEMA_MISMATCH = "control_schema_mismatch";
 
@@ -137,23 +154,9 @@ function observationUid(key) {
   return `observation:${createHash("sha256").update(key).digest("hex")}`;
 }
 
-function observationSignature(fields) {
+function captureIdentitySignature(identity) {
   return createHash("sha256").update(JSON.stringify([
-    fields.event_uid ?? null,
-    fields.capture_source ?? fields.observation_capture_source,
-    fields.source_provider,
-    fields.session_uid,
-    fields.context_epoch,
-    fields.source_namespace,
-    fields.source_id ?? fields.observation_source_id,
-    fields.native_turn_id,
-    fields.source_timestamp,
-    fields.role,
-    fields.content_hash,
-    fields.source_event_id ?? null,
-    fields.referent_event_uid ?? null,
-    fields.completeness ?? null,
-    fields.source_offset ?? null
+    ...CAPTURE_IDENTITY_FIELDS.map((field) => identity[field])
   ])).digest("hex");
 }
 
@@ -177,89 +180,131 @@ function collision() {
   return new ControlStoreError("control_observation_collision", "control observation collision");
 }
 
-function eventFields(event) {
-  if (!event || typeof event !== "object") throw new TypeError("event must be an object");
-  for (const field of ["raw_text", "rawText", "report", "card", "lesson"]) {
-    if (event[field] !== undefined && event[field] !== null) throw new TypeError(`raw text field is not allowed: ${field}`);
+function firstDefined(input, fields) {
+  for (const field of fields) {
+    if (input[field] !== null && input[field] !== undefined) return input[field];
   }
-  if (!Number.isSafeInteger(event.context_epoch) || event.context_epoch < 1 || event.context_epoch > MAX_CONTEXT_EPOCH) {
-    throw new TypeError("context_epoch must be a bounded positive integer");
-  }
-  const cli = assertString(event.cli, "cli", 64);
-  const sessionUid = assertString(event.session_uid, "session_uid", 512);
-  const sourceEventId = assertString(event.source_event_id, "source_event_id", 1024);
-  const sourceNamespace = event.source_namespace == null
-    ? "hook"
-    : assertString(event.source_namespace, "source_namespace", 128);
-  const sourceId = event.observation_source_id == null
-    ? sourceEventId
-    : assertString(event.observation_source_id, "observation_source_id", 1024);
-  const suppliedCompleteness = event.completeness == null
-    ? null
-    : assertString(event.completeness, "completeness", 64);
-  const suppliedCaptureCompleteness = event.capture_completeness == null
-    ? null
-    : assertString(event.capture_completeness, "capture_completeness", 64);
-  const completeness = suppliedCompleteness ?? assertString(suppliedCaptureCompleteness, "capture_completeness", 64);
-  const key = observationKey(cli, sessionUid, event.context_epoch, sourceNamespace, sourceId);
-  if (event.source_identity != null && assertString(event.source_identity, "source_identity", 2048) !== key) throw collision();
-  return {
-    event_uid: assertString(event.event_uid, "event_uid", 512),
-    session_uid: sessionUid,
-    cli,
-    project_id: assertOptionalString(event.project_id, "project_id", 1024),
-    context_epoch: event.context_epoch,
-    source_event_id: sourceEventId,
-    source_identity: key,
-    observation_key: key,
-    observation_uid: observationUid(key),
-    source_provider: cli,
-    source_namespace: sourceNamespace,
-    observation_source_id: sourceId,
-    observation_capture_source: `${cli}:${sourceNamespace}`,
-    source_offset: assertOptionalSourceOffset(event.source_offset, "source_offset"),
-    role: assertString(event.role, "role", 64),
-    referent_event_uid: assertOptionalString(event.referent_event_uid, "referent_event_uid", 512),
-    native_turn_id: assertOptionalString(event.native_turn_id ?? event.native_turn, "native_turn_id", 512),
-    content_hash: assertString(event.content_hash, "content_hash", 128),
-    encrypted_raw_ref: assertOptionalString(event.encrypted_raw_ref, "encrypted_raw_ref", 4096),
-    completeness,
-    source_timestamp: assertOptionalString(event.source_timestamp, "source_timestamp", 128)
-  };
+  return null;
 }
 
-function observationFields(input) {
-  if (!input || typeof input !== "object") throw new TypeError("observation input must be an object");
-  const provider = assertString(input.provider, "provider", 64);
-  const sessionUid = assertString(input.sessionUid, "sessionUid", 512);
-  const contextEpoch = assertOptionalEpoch(input.contextEpoch ?? input.context_epoch, "contextEpoch");
-  const sourceNamespace = assertString(input.sourceNamespace, "sourceNamespace", 128);
-  const sourceId = assertString(input.sourceId, "sourceId", 1024);
-  const key = contextEpoch == null ? null : observationKey(provider, sessionUid, contextEpoch, sourceNamespace, sourceId);
-  return {
-    observation_key: key,
-    observation_uid: key == null ? null : observationUid(key),
-    event_uid: assertOptionalString(input.eventUid ?? input.event_uid, "eventUid", 512),
-    capture_source: input.captureSource == null ? `${provider}:${sourceNamespace}` : assertString(input.captureSource, "captureSource", 256),
+function normalizedCaptureSource(input, provider, sourceNamespace) {
+  const snakeValue = input.capture_source;
+  const camelValue = input.captureSource;
+  const snake = snakeValue == null ? null : assertString(snakeValue, "capture_source", 256);
+  const camel = camelValue == null ? null : assertString(camelValue, "captureSource", 256);
+  if (snake !== null && camel !== null && snake !== camel) {
+    throw new TypeError("capture_source and captureSource must identify the same capture source");
+  }
+  return snake ?? camel ?? `${provider}:${sourceNamespace}`;
+}
+
+function normalizedCompleteness(input) {
+  const completeness = input.completeness == null
+    ? null
+    : assertString(input.completeness, "completeness", 64);
+  const captureCompleteness = input.capture_completeness == null
+    ? null
+    : assertString(input.capture_completeness, "capture_completeness", 64);
+  return completeness ?? captureCompleteness;
+}
+
+export function normalizeCaptureIdentity(input, { requireEventIdentity = false } = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("capture identity input must be an object");
+  }
+  const provider = assertString(firstDefined(input, ["source_provider", "provider", "cli"]), "source_provider", 64);
+  const sessionUid = assertString(firstDefined(input, ["session_uid", "sessionUid"]), "session_uid", 512);
+  const contextEpochValue = firstDefined(input, ["context_epoch", "contextEpoch"]);
+  const contextEpoch = assertOptionalEpoch(contextEpochValue, "context_epoch");
+  if (requireEventIdentity && contextEpoch === null) {
+    throw new TypeError("context_epoch must be a bounded positive integer");
+  }
+  const sourceEventValue = firstDefined(input, ["source_event_id", "sourceEventId"]);
+  const sourceEventId = requireEventIdentity
+    ? assertString(sourceEventValue, "source_event_id", 1024)
+    : assertOptionalString(sourceEventValue, "source_event_id", 1024);
+  const sourceNamespaceValue = firstDefined(input, ["source_namespace", "sourceNamespace"]);
+  const sourceNamespace = sourceNamespaceValue == null && requireEventIdentity
+    ? "hook"
+    : assertString(sourceNamespaceValue, "source_namespace", 128);
+  const sourceIdValue = firstDefined(input, ["source_id", "sourceId", "observation_source_id"]);
+  const sourceId = sourceIdValue == null && requireEventIdentity
+    ? sourceEventId
+    : assertString(sourceIdValue, "source_id", 1024);
+  const eventUidValue = firstDefined(input, ["event_uid", "eventUid"]);
+  const completenessValue = normalizedCompleteness(input);
+  const identity = {
+    event_uid: requireEventIdentity
+      ? assertString(eventUidValue, "event_uid", 512)
+      : assertOptionalString(eventUidValue, "event_uid", 512),
     source_provider: provider,
     session_uid: sessionUid,
     context_epoch: contextEpoch,
     source_namespace: sourceNamespace,
     source_id: sourceId,
-    source_event_id: assertOptionalString(input.sourceEventId ?? input.source_event_id, "sourceEventId", 1024),
-    source_offset: assertOptionalSourceOffset(input.sourceOffset ?? input.source_offset, "sourceOffset"),
-    referent_event_uid: assertOptionalString(input.referentEventUid ?? input.referent_event_uid, "referentEventUid", 512),
-    completeness: assertOptionalString(input.completeness, "completeness", 64),
-    native_turn_id: assertOptionalString(input.nativeTurnId ?? input.native_turn_id, "nativeTurnId", 512),
-    source_timestamp: assertOptionalString(input.sourceTimestamp ?? input.source_timestamp, "sourceTimestamp", 128),
+    source_event_id: sourceEventId,
+    source_offset: assertOptionalSourceOffset(firstDefined(input, ["source_offset", "sourceOffset"]), "source_offset"),
+    capture_source: normalizedCaptureSource(input, provider, sourceNamespace),
+    native_turn_id: assertOptionalString(firstDefined(input, ["native_turn_id", "nativeTurnId", "native_turn"]), "native_turn_id", 512),
+    source_timestamp: assertOptionalString(firstDefined(input, ["source_timestamp", "sourceTimestamp"]), "source_timestamp", 128),
     role: assertString(input.role, "role", 64),
-    content_hash: assertString(input.contentHash, "contentHash", 128)
+    referent_event_uid: assertOptionalString(firstDefined(input, ["referent_event_uid", "referentEventUid"]), "referent_event_uid", 512),
+    content_hash: assertString(firstDefined(input, ["content_hash", "contentHash"]), "content_hash", 128),
+    completeness: requireEventIdentity
+      ? assertString(completenessValue, "completeness", 64)
+      : assertOptionalString(completenessValue, "completeness", 64)
+  };
+  return Object.freeze(identity);
+}
+
+function eventFields(event) {
+  if (!event || typeof event !== "object") throw new TypeError("event must be an object");
+  for (const field of ["raw_text", "rawText", "report", "card", "lesson"]) {
+    if (event[field] !== undefined && event[field] !== null) throw new TypeError(`raw text field is not allowed: ${field}`);
+  }
+  const identity = normalizeCaptureIdentity(event, { requireEventIdentity: true });
+  const key = observationKey(
+    identity.source_provider,
+    identity.session_uid,
+    identity.context_epoch,
+    identity.source_namespace,
+    identity.source_id
+  );
+  if (event.source_identity != null && assertString(event.source_identity, "source_identity", 2048) !== key) throw collision();
+  return {
+    identity,
+    ...identity,
+    cli: identity.source_provider,
+    project_id: assertOptionalString(event.project_id, "project_id", 1024),
+    source_identity: key,
+    observation_key: key,
+    observation_uid: observationUid(key),
+    observation_source_id: identity.source_id,
+    encrypted_raw_ref: assertOptionalString(event.encrypted_raw_ref, "encrypted_raw_ref", 4096)
+  };
+}
+
+function observationFields(input) {
+  const identity = normalizeCaptureIdentity(input);
+  const key = identity.context_epoch == null ? null : observationKey(
+    identity.source_provider,
+    identity.session_uid,
+    identity.context_epoch,
+    identity.source_namespace,
+    identity.source_id
+  );
+  return {
+    identity,
+    ...identity,
+    observation_key: key,
+    observation_uid: key == null ? null : observationUid(key)
   };
 }
 
 function eventObservations(database, fields) {
   const where = fields.context_epoch == null ? "" : " AND o.context_epoch=?";
-  return database.prepare(`SELECT o.observation_uid, o.observation_signature, o.observed_event_uid, o.event_uid, o.capture_source,
+  return database.prepare(`SELECT o.observation_uid, o.observation_key, o.observation_signature,
+      o.observed_event_uid, o.event_uid, o.capture_source,
       o.source_provider AS observation_source_provider,
       o.session_uid AS observation_session_uid, o.context_epoch AS observation_context_epoch,
       o.source_namespace AS observation_source_namespace, o.source_id AS observation_source_id,
@@ -279,29 +324,20 @@ function eventObservation(database, fields) {
   return rows[0] || null;
 }
 
-function sameNullable(left, right) {
-  return (left ?? null) === (right ?? null);
-}
-
-function sameEvent(row, fields) {
-  return row.event_uid === fields.event_uid
-    && row.session_uid === fields.session_uid
-    && Number(row.context_epoch) === fields.context_epoch
-    && row.source_provider === fields.source_provider
-    && row.source_namespace === fields.source_namespace
-    && row.observation_source_id === fields.observation_source_id
-    && row.source_identity === fields.source_identity
-    && row.role === fields.role
-    && row.content_hash === fields.content_hash
-    && sameNullable(row.native_turn_id, fields.native_turn_id)
-    && sameNullable(row.source_timestamp, fields.source_timestamp)
-    && sameNullable(row.referent_event_uid, fields.referent_event_uid)
-    && sameNullable(row.completeness, fields.completeness)
-    && sameNullable(row.encrypted_raw_ref, fields.encrypted_raw_ref);
+function sameEncryptedRawRef(row, fields) {
+  return (row.encrypted_raw_ref ?? null) === fields.encrypted_raw_ref;
 }
 
 function sameObservedEvent(row, fields) {
-  return row.observation_signature === observationSignature(fields)
+  const boundKey = observationKey(
+    fields.source_provider,
+    fields.session_uid,
+    Number(row.observation_context_epoch),
+    fields.source_namespace,
+    fields.source_id
+  );
+  return row.observation_key === boundKey
+    && row.observation_signature === captureIdentitySignature(fields.identity)
     && (!fields.event_uid || row.observed_event_uid === fields.event_uid)
     && row.observation_source_provider === fields.source_provider
     && row.observation_session_uid === fields.session_uid
@@ -323,8 +359,8 @@ function sameObservationTarget(row, fields) {
     && row.source_provider === fields.source_provider
     && row.role === fields.role
     && row.content_hash === fields.content_hash
-    && sameNullable(row.native_turn_id, fields.native_turn_id)
-    && sameNullable(row.source_timestamp, fields.source_timestamp);
+    && (row.native_turn_id ?? null) === fields.native_turn_id
+    && (row.source_timestamp ?? null) === fields.source_timestamp;
 }
 
 function createStore(database, now) {
@@ -351,7 +387,15 @@ function createStore(database, now) {
         const byUid = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
         const byIdentity = database.prepare("SELECT * FROM session_events WHERE source_identity=?").get(fields.source_identity);
         if (byUid || byIdentity) {
-          if (byUid?.event_uid === byIdentity?.event_uid && sameEvent(byUid, fields)) {
+          const observation = database.prepare(`SELECT observation_key, observation_signature,
+            observed_event_uid, event_uid, capture_source FROM event_observations
+            WHERE observation_key=?`).get(fields.observation_key);
+          if (byUid?.event_uid === byIdentity?.event_uid
+              && observation?.event_uid === byUid.event_uid
+              && observation.observed_event_uid === fields.event_uid
+              && observation.capture_source === fields.capture_source
+              && observation.observation_signature === captureIdentitySignature(fields.identity)
+              && sameEncryptedRawRef(byUid, fields)) {
             return { event_uid: byUid.event_uid, duplicate: true };
           }
           throw collision();
@@ -381,9 +425,9 @@ function createStore(database, now) {
           (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
            source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          fields.observation_uid, fields.observation_key, observationSignature(fields), fields.source_provider, fields.session_uid,
+          fields.observation_uid, fields.observation_key, captureIdentitySignature(fields.identity), fields.source_provider, fields.session_uid,
           fields.context_epoch, fields.source_namespace, fields.observation_source_id,
-          fields.event_uid, fields.event_uid, fields.observation_capture_source, timestamp
+          fields.event_uid, fields.event_uid, fields.capture_source, timestamp
         );
         return { event_uid: fields.event_uid, duplicate: false };
       });
@@ -406,7 +450,7 @@ function createStore(database, now) {
               (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
                source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-              observationUid(key), key, observationSignature(fields), fields.source_provider, fields.session_uid, contextEpoch,
+              observationUid(key), key, captureIdentitySignature(fields.identity), fields.source_provider, fields.session_uid, contextEpoch,
               fields.source_namespace, fields.source_id, fields.event_uid, fields.event_uid, fields.capture_source, nowIso(now)
             );
             return { observation_uid: observationUid(key), event_uid: fields.event_uid, duplicate: false };
@@ -420,12 +464,10 @@ function createStore(database, now) {
             AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
             AND julianday(COALESCE(e.source_timestamp, e.created_at))
               BETWEEN julianday(?) - (5.0 / 1440.0) AND julianday(?) + (5.0 / 1440.0)
-            AND NOT EXISTS (SELECT 1 FROM event_observations o
-              WHERE o.event_uid=e.event_uid AND o.capture_source=?)
           ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 2`).all(
           fields.session_uid, fields.source_provider, fields.role, fields.content_hash,
           ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId,
-          incomingTimestamp, incomingTimestamp, fields.capture_source
+          incomingTimestamp, incomingTimestamp
         );
         let candidates = selectCandidates(fields.native_turn_id);
         if (!candidates.length && fields.native_turn_id != null) {
@@ -439,7 +481,7 @@ function createStore(database, now) {
           (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
            source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          observationUid(key), key, observationSignature(fields), fields.source_provider, fields.session_uid, contextEpoch,
+          observationUid(key), key, captureIdentitySignature(fields.identity), fields.source_provider, fields.session_uid, contextEpoch,
           fields.source_namespace, fields.source_id, fields.event_uid || candidate.event_uid,
           candidate.event_uid, fields.capture_source, nowIso(now)
         );

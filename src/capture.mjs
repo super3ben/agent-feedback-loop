@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 
+import { normalizeCaptureIdentity } from "./control-store.mjs";
 import { stripReceiptControlText } from "./receipt.mjs";
 
 const SECRET_PATTERNS = [
@@ -367,25 +368,25 @@ function isConstraintError(error) {
 }
 
 export async function captureObservedSession({ store, blobs, event, rawText }) {
+  const identity = normalizeCaptureIdentity(event, { requireEventIdentity: true });
   store.assertCaptureAllowed(event);
-  const sourceId = event.observation_source_id || event.source_event_id;
-  const observationInput = sourceId ? {
-    provider: event.cli || "unknown",
-    sourceNamespace: event.source_namespace || "hook",
-    sourceId,
-    sourceEventId: event.source_event_id,
-    sourceOffset: event.source_offset,
-    sessionUid: event.session_uid,
-    contextEpoch: event.context_epoch,
-    eventUid: event.event_uid,
-    referentEventUid: event.referent_event_uid,
-    completeness: event.completeness ?? event.capture_completeness,
-    nativeTurnId: event.native_turn_id || event.native_turn || null,
-    role: event.role,
-    contentHash: event.content_hash,
-    sourceTimestamp: event.source_timestamp || null
-  } : null;
-  const existing = observationInput ? store.resolveEventObservation(observationInput) : null;
+  const observationInput = {
+    ...identity,
+    provider: identity.source_provider,
+    sourceNamespace: identity.source_namespace,
+    sourceId: identity.source_id,
+    sourceEventId: identity.source_event_id,
+    sourceOffset: identity.source_offset,
+    captureSource: identity.capture_source,
+    sessionUid: identity.session_uid,
+    contextEpoch: identity.context_epoch,
+    eventUid: identity.event_uid,
+    referentEventUid: identity.referent_event_uid,
+    nativeTurnId: identity.native_turn_id,
+    contentHash: identity.content_hash,
+    sourceTimestamp: identity.source_timestamp
+  };
+  const existing = store.resolveEventObservation(observationInput);
   if (existing) return { event, eventUid: existing.event_uid, duplicate: true, observation: existing, blobPath: existing.encrypted_raw_ref || null };
   try {
     const captured = await captureSession({ store, blobs, event, rawText });
@@ -396,9 +397,8 @@ export async function captureObservedSession({ store, blobs, event, rawText }) {
       observation: null
     };
   } catch (error) {
-    if (!observationInput || !isConstraintError(error)) throw error;
-    const raced = store.resolveEventObservation(observationInput)
-      || store.getEventObservation(observationInput.provider, observationInput.sourceNamespace, observationInput.sourceId);
+    if (!isConstraintError(error)) throw error;
+    const raced = store.resolveEventObservation(observationInput);
     if (!raced) throw error;
     return { event, eventUid: raced.event_uid, duplicate: true, observation: raced, blobPath: raced.encrypted_raw_ref || null };
   }
