@@ -249,6 +249,20 @@ test("runtime open rejects undeclared user triggers", () => {
   assert.deepEqual(readFileSync(paths.controlDatabase), before);
 });
 
+test("runtime open rejects undeclared user views", () => {
+  const { paths } = fixture();
+  const initialized = initializeControlStore({ paths });
+  initialized.database.exec("CREATE VIEW session_projection AS SELECT session_uid, cli FROM sessions");
+  initialized.close();
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(
+    () => openControlStore({ paths }),
+    (error) => error?.code === CONTROL_SCHEMA_MISMATCH
+  );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
 test("runtime open rejects a non-private control database without changing its mode", () => {
   const { paths } = fixture();
   const initialized = initializeControlStore({ paths });
@@ -642,13 +656,97 @@ test("control observation alias replay rejects changed immutable input", () => {
     { nativeTurnId: "different-turn" },
     { sourceTimestamp: "2026-07-17T00:03:00.000Z" },
     { role: "assistant" },
-    { contentHash: "b".repeat(64) }
+    { contentHash: "b".repeat(64) },
+    { captureSource: "codex:different_capture_source" }
   ]) {
     assert.throws(
       () => store.resolveEventObservation({ ...observation, ...mutation }),
       (error) => error?.code === "control_observation_collision"
     );
   }
+  store.close();
+});
+
+test("public control capture replay rejects changed bounded event identity", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const immutableEvent = event({
+    event_uid: "public-identity-event",
+    source_identity: undefined,
+    source_event_id: "public-source-one",
+    source_namespace: "prompt_hook",
+    observation_source_id: "public-observation-one",
+    source_offset: 100,
+    referent_event_uid: "assistant-one",
+    native_turn_id: "turn-public-identity",
+    source_timestamp: "2026-07-17T04:00:00.000Z"
+  });
+
+  const first = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...immutableEvent },
+    rawText: "bounded public identity"
+  });
+  const replay = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...immutableEvent },
+    rawText: "bounded public identity"
+  });
+
+  assert.equal(first.duplicate, false);
+  assert.equal(replay.duplicate, true);
+  const outcomes = [];
+  for (const [label, mutation] of [
+    ["referent", { referent_event_uid: "assistant-two" }],
+    ["source event", { source_event_id: "public-source-two" }],
+    ["completeness", { completeness: "partial" }],
+    ["source offset", { source_offset: 101 }],
+    ["invalid source offset", { source_offset: "100" }]
+  ]) {
+    try {
+      const result = await captureObservedSession({
+        store,
+        blobs,
+        event: { ...immutableEvent, ...mutation },
+        rawText: "bounded public identity"
+      });
+      outcomes.push([label, result.duplicate ? "duplicate" : "new"]);
+    } catch (error) {
+      outcomes.push([
+        label,
+        error?.code || (/source_offset.*bounded non-negative integer/i.test(error?.message || "")
+          ? "invalid_source_offset"
+          : error?.message)
+      ]);
+    }
+  }
+  assert.deepEqual(outcomes, [
+    ["referent", "control_observation_collision"],
+    ["source event", "control_observation_collision"],
+    ["completeness", "control_observation_collision"],
+    ["source offset", "control_observation_collision"],
+    ["invalid source offset", "invalid_source_offset"]
+  ]);
+  assert.deepEqual(store.getSessionEvent(immutableEvent.event_uid), {
+    event_uid: immutableEvent.event_uid,
+    session_uid: immutableEvent.session_uid,
+    source_event_id: immutableEvent.source_event_id,
+    source_identity: JSON.stringify([
+      immutableEvent.cli,
+      immutableEvent.session_uid,
+      immutableEvent.context_epoch,
+      immutableEvent.source_namespace,
+      immutableEvent.observation_source_id
+    ]),
+    role: immutableEvent.role,
+    referent_event_uid: immutableEvent.referent_event_uid,
+    content_hash: immutableEvent.content_hash,
+    encrypted_raw_ref: first.blobPath,
+    completeness: immutableEvent.completeness
+  });
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
   store.close();
 });
 
@@ -840,6 +938,91 @@ test("control observation replay rejects an existing cross-provider target", () 
     }),
     (error) => error?.code === "control_observation_collision"
   );
+  store.close();
+});
+
+test("public control capture keeps one immutable provider per session UID", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const sharedSession = "shared-public-session";
+  const first = event({
+    event_uid: "shared-codex-one",
+    session_uid: sharedSession,
+    cli: "codex",
+    project_id: "project-one",
+    context_epoch: 1,
+    source_identity: undefined,
+    source_event_id: "shared-codex-source-one",
+    source_namespace: "prompt_hook",
+    observation_source_id: "shared-codex-source-one"
+  });
+  const sameProviderUpdate = event({
+    ...first,
+    event_uid: "shared-codex-two",
+    project_id: "project-two",
+    context_epoch: 2,
+    source_event_id: "shared-codex-source-two",
+    observation_source_id: "shared-codex-source-two",
+    content_hash: "b".repeat(64)
+  });
+  const crossProvider = event({
+    ...sameProviderUpdate,
+    event_uid: "shared-claude-three",
+    cli: "claude",
+    project_id: "project-three",
+    context_epoch: 3,
+    source_event_id: "shared-claude-source-three",
+    observation_source_id: "shared-claude-source-three",
+    content_hash: "c".repeat(64)
+  });
+
+  const firstResult = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...first },
+    rawText: "first same-provider event"
+  });
+  const updateResult = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...sameProviderUpdate },
+    rawText: "second same-provider event"
+  });
+  let crossProviderOutcome;
+  try {
+    const result = await captureObservedSession({
+      store,
+      blobs,
+      event: { ...crossProvider },
+      rawText: "cross-provider event"
+    });
+    crossProviderOutcome = result.duplicate ? "duplicate" : "new";
+  } catch (error) {
+    crossProviderOutcome = error?.code || error?.message;
+  }
+
+  assert.deepEqual({
+    firstDuplicate: firstResult.duplicate,
+    updateDuplicate: updateResult.duplicate,
+    crossProviderOutcome,
+    session: { ...store.database.prepare(`SELECT session_uid, cli, project_id, context_epoch
+      FROM sessions WHERE session_uid=?`).get(sharedSession) },
+    events: store.database.prepare(`SELECT event_uid, source_provider FROM session_events
+      WHERE session_uid=? ORDER BY event_uid`).all(sharedSession).map((row) => ({ ...row }))
+  }, {
+    firstDuplicate: false,
+    updateDuplicate: false,
+    crossProviderOutcome: "control_observation_collision",
+    session: {
+      session_uid: sharedSession,
+      cli: "codex",
+      project_id: "project-two",
+      context_epoch: 2
+    },
+    events: [
+      { event_uid: "shared-codex-one", source_provider: "codex" },
+      { event_uid: "shared-codex-two", source_provider: "codex" }
+    ]
+  });
   store.close();
 });
 

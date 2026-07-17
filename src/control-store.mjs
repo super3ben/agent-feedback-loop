@@ -149,7 +149,11 @@ function observationSignature(fields) {
     fields.native_turn_id,
     fields.source_timestamp,
     fields.role,
-    fields.content_hash
+    fields.content_hash,
+    fields.source_event_id ?? null,
+    fields.referent_event_uid ?? null,
+    fields.completeness ?? null,
+    fields.source_offset ?? null
   ])).digest("hex");
 }
 
@@ -157,6 +161,14 @@ function assertOptionalEpoch(value, field) {
   if (value === null || value === undefined) return null;
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONTEXT_EPOCH) {
     throw new TypeError(`${field} must be a bounded positive integer`);
+  }
+  return value;
+}
+
+function assertOptionalSourceOffset(value, field) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a bounded non-negative integer`);
   }
   return value;
 }
@@ -205,6 +217,7 @@ function eventFields(event) {
     source_namespace: sourceNamespace,
     observation_source_id: sourceId,
     observation_capture_source: `${cli}:${sourceNamespace}`,
+    source_offset: assertOptionalSourceOffset(event.source_offset, "source_offset"),
     role: assertString(event.role, "role", 64),
     referent_event_uid: assertOptionalString(event.referent_event_uid, "referent_event_uid", 512),
     native_turn_id: assertOptionalString(event.native_turn_id ?? event.native_turn, "native_turn_id", 512),
@@ -233,6 +246,10 @@ function observationFields(input) {
     context_epoch: contextEpoch,
     source_namespace: sourceNamespace,
     source_id: sourceId,
+    source_event_id: assertOptionalString(input.sourceEventId ?? input.source_event_id, "sourceEventId", 1024),
+    source_offset: assertOptionalSourceOffset(input.sourceOffset ?? input.source_offset, "sourceOffset"),
+    referent_event_uid: assertOptionalString(input.referentEventUid ?? input.referent_event_uid, "referentEventUid", 512),
+    completeness: assertOptionalString(input.completeness, "completeness", 64),
     native_turn_id: assertOptionalString(input.nativeTurnId ?? input.native_turn_id, "nativeTurnId", 512),
     source_timestamp: assertOptionalString(input.sourceTimestamp ?? input.source_timestamp, "sourceTimestamp", 128),
     role: assertString(input.role, "role", 64),
@@ -339,13 +356,15 @@ function createStore(database, now) {
           }
           throw collision();
         }
+        const existingSession = database.prepare("SELECT cli FROM sessions WHERE session_uid=?").get(fields.session_uid);
+        if (existingSession && existingSession.cli !== fields.cli) throw collision();
         const timestamp = nowIso(now);
         database.prepare(`INSERT INTO sessions
           (session_uid, cli, project_id, context_epoch, started_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(session_uid) DO UPDATE SET
-            cli=excluded.cli, project_id=excluded.project_id,
-            context_epoch=excluded.context_epoch, updated_at=excluded.updated_at`).run(
+            project_id=excluded.project_id, context_epoch=excluded.context_epoch,
+            updated_at=excluded.updated_at`).run(
           fields.session_uid, fields.cli, fields.project_id, fields.context_epoch, timestamp, timestamp
         );
         database.prepare(`INSERT INTO session_events
@@ -468,7 +487,7 @@ function verifyControlSchema(database, requireSchemaVersion) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
   const schemaObjects = database.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_schema
-    WHERE type IN ('table', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+    WHERE type IN ('table', 'trigger', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
   const expectedSchemaObjects = Object.entries(CONTROL_SCHEMA_SQL_SIGNATURE).map(([name, sql]) => ({
     type: "table",
     name,
