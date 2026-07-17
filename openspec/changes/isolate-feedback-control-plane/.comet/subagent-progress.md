@@ -67,7 +67,9 @@
 - Verified root cause: `capturePreparedControlSession()` accepts a null/undefined `blobs.write()` result and passes it to `resolveOrInsertCapture()`, whose nullable branch intentionally exists only for direct `captureSessionEvent()`; the public/direct boundary, not the transaction or schema, is the failing component
 - Dirty-worktree attribution: the only pre-dispatch dirty file is `.superpowers/sdd/task-1-report.md`, an in-scope append-only implementation handoff already recorded by the prior agent; it must be preserved and appended, not overwritten or committed with source
 - Fix scope: add one public writer-result bounded-string guard and one deterministic regression proving one first write, zero SQLite rows, no second write, and rejection; no control-store/schema/crypto/installer/plan/OpenSpec/runtime-state change
-- Next action: dispatch one fresh TDD fix agent, persist its RED/GREEN/commit evidence, then dispatch one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Fix base: `43a4441013691ec91eee752f52bf862c181590c1`
+- Fix dispatch: fresh agent `/root/task1_public_writer_ref_fix` is executing the review-9 finding with TDD; allowed files are only `src/capture.mjs` and `test/control-store.test.mjs`, and direct nullable-ref compatibility is frozen
+- Next action: persist its RED/GREEN/commit evidence, then dispatch one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 

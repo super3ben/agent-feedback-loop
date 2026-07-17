@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | review-9 bounded fix authorized; dispatch pending | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`; design `e1732a8`; plan `c6f984f` | fresh fix re-review authorized | User authorized one public null-writer guard plus focused regression and one fresh re-review; no broader Task 1 redesign |
+| 1. Lean control DB | review-9 bounded fix in progress (`/root/task1_public_writer_ref_fix`) | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`; design `e1732a8`; plan `c6f984f` | fresh fix re-review authorized | TDD fix limited to public bounded writer-ref guard and regression; direct nullable path unchanged |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
