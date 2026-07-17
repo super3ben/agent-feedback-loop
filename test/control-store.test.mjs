@@ -209,6 +209,46 @@ test("runtime open rejects noncanonical unique index collation", () => {
   assert.deepEqual(readFileSync(paths.controlDatabase), before);
 });
 
+test("runtime open rejects undeclared CHECK constraints", () => {
+  const { paths } = fixture();
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  const schema = SCHEMA_SQL.replace(
+    "cli TEXT NOT NULL, project_id TEXT",
+    "cli TEXT NOT NULL CHECK(cli='claude'), project_id TEXT"
+  );
+  assert.notEqual(schema, SCHEMA_SQL, "CHECK mutation must alter the schema fixture");
+  const database = new DatabaseSync(paths.controlDatabase);
+  database.exec(schema);
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.close();
+  chmodSync(paths.controlDatabase, 0o600);
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(
+    () => openControlStore({ paths }),
+    (error) => error?.code === CONTROL_SCHEMA_MISMATCH
+  );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
+test("runtime open rejects undeclared user triggers", () => {
+  const { paths } = fixture();
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  const database = new DatabaseSync(paths.controlDatabase);
+  database.exec(SCHEMA_SQL);
+  database.exec("CREATE TRIGGER reject_sessions BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'blocked'); END");
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.close();
+  chmodSync(paths.controlDatabase, 0o600);
+  const before = readFileSync(paths.controlDatabase);
+
+  assert.throws(
+    () => openControlStore({ paths }),
+    (error) => error?.code === CONTROL_SCHEMA_MISMATCH
+  );
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+});
+
 test("runtime open rejects a non-private control database without changing its mode", () => {
   const { paths } = fixture();
   const initialized = initializeControlStore({ paths });
@@ -502,6 +542,116 @@ test("control observation alias requires a unique same-turn candidate inside its
   store.close();
 });
 
+test("control observation exact-turn alias replay is idempotent", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "canonical-exact-replay",
+    source_identity: undefined,
+    source_event_id: "prompt-exact-replay",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prompt-exact-replay",
+    native_turn_id: "turn-exact-replay",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const observation = {
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_exact_replay",
+    sourceId: "transcript-exact-replay",
+    nativeTurnId: canonical.native_turn_id,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: "2026-07-17T00:04:00.000Z"
+  };
+  store.captureSessionEvent(canonical);
+
+  const first = store.resolveEventObservation(observation);
+  const replay = store.resolveEventObservation(observation);
+
+  assert.equal(first.event_uid, canonical.event_uid);
+  assert.equal(first.duplicate, false);
+  assert.equal(replay.event_uid, canonical.event_uid);
+  assert.equal(replay.duplicate, true);
+  store.close();
+});
+
+test("control observation null-turn fallback replay is idempotent", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "canonical-null-replay",
+    source_identity: undefined,
+    source_event_id: "prompt-null-replay",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prompt-null-replay",
+    native_turn_id: null,
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const observation = {
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_null_replay",
+    sourceId: "transcript-null-replay",
+    nativeTurnId: "turn-null-fallback",
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: canonical.source_timestamp
+  };
+  store.captureSessionEvent(canonical);
+
+  const first = store.resolveEventObservation(observation);
+  const replay = store.resolveEventObservation(observation);
+
+  assert.equal(first.event_uid, canonical.event_uid);
+  assert.equal(first.duplicate, false);
+  assert.equal(replay.event_uid, canonical.event_uid);
+  assert.equal(replay.duplicate, true);
+  store.close();
+});
+
+test("control observation alias replay rejects changed immutable input", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "canonical-replay-collision",
+    source_identity: undefined,
+    source_event_id: "prompt-replay-collision",
+    source_namespace: "prompt_hook",
+    observation_source_id: "prompt-replay-collision",
+    native_turn_id: "turn-replay-collision",
+    source_timestamp: "2026-07-17T00:00:00.000Z"
+  });
+  const observation = {
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_replay_collision",
+    sourceId: "transcript-replay-collision",
+    nativeTurnId: canonical.native_turn_id,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: "2026-07-17T00:04:00.000Z"
+  };
+  store.captureSessionEvent(canonical);
+  store.resolveEventObservation(observation);
+
+  for (const mutation of [
+    { nativeTurnId: "different-turn" },
+    { sourceTimestamp: "2026-07-17T00:03:00.000Z" },
+    { role: "assistant" },
+    { contentHash: "b".repeat(64) }
+  ]) {
+    assert.throws(
+      () => store.resolveEventObservation({ ...observation, ...mutation }),
+      (error) => error?.code === "control_observation_collision"
+    );
+  }
+  store.close();
+});
+
 test("control observation alias checks the complete timestamp window before bounding candidates", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });
@@ -667,10 +817,10 @@ test("control observation replay rejects an existing cross-provider target", () 
   const sourceId = "codex-existing-source";
   const observationKey = JSON.stringify(["codex", claudeEvent.session_uid, claudeEvent.context_epoch, sourceNamespace, sourceId]);
   store.database.prepare(`INSERT INTO event_observations
-    (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+    (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
      source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-    "legacy-cross-provider-observation", observationKey, "codex", claudeEvent.session_uid,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    "legacy-cross-provider-observation", observationKey, "legacy-cross-provider-signature", "codex", claudeEvent.session_uid,
     claudeEvent.context_epoch, sourceNamespace, sourceId, claudeEvent.event_uid,
     claudeEvent.event_uid, "codex:transcript_existing", "2026-07-17T03:01:00.000Z"
   );

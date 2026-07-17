@@ -3,7 +3,12 @@ import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
-import { CONTROL_SCHEMA_SIGNATURE, SCHEMA_SQL, SCHEMA_VERSION } from "./control-schema.mjs";
+import {
+  CONTROL_SCHEMA_SIGNATURE,
+  CONTROL_SCHEMA_SQL_SIGNATURE,
+  SCHEMA_SQL,
+  SCHEMA_VERSION
+} from "./control-schema.mjs";
 
 const require = createRequire(import.meta.url);
 let DatabaseSync;
@@ -132,6 +137,22 @@ function observationUid(key) {
   return `observation:${createHash("sha256").update(key).digest("hex")}`;
 }
 
+function observationSignature(fields) {
+  return createHash("sha256").update(JSON.stringify([
+    fields.event_uid ?? null,
+    fields.capture_source ?? fields.observation_capture_source,
+    fields.source_provider,
+    fields.session_uid,
+    fields.context_epoch,
+    fields.source_namespace,
+    fields.source_id ?? fields.observation_source_id,
+    fields.native_turn_id,
+    fields.source_timestamp,
+    fields.role,
+    fields.content_hash
+  ])).digest("hex");
+}
+
 function assertOptionalEpoch(value, field) {
   if (value === null || value === undefined) return null;
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_CONTEXT_EPOCH) {
@@ -221,11 +242,12 @@ function observationFields(input) {
 
 function eventObservations(database, fields) {
   const where = fields.context_epoch == null ? "" : " AND o.context_epoch=?";
-  return database.prepare(`SELECT o.observation_uid, o.observed_event_uid, o.event_uid, o.capture_source, o.source_provider,
+  return database.prepare(`SELECT o.observation_uid, o.observation_signature, o.observed_event_uid, o.event_uid, o.capture_source,
+      o.source_provider AS observation_source_provider,
       o.session_uid AS observation_session_uid, o.context_epoch AS observation_context_epoch,
       o.source_namespace AS observation_source_namespace, o.source_id AS observation_source_id,
       e.encrypted_raw_ref, e.session_uid, e.context_epoch, e.source_provider, e.source_namespace,
-      e.observation_source_id, e.source_identity, e.role, e.native_turn_id, e.content_hash,
+      e.observation_source_id AS event_observation_source_id, e.source_identity, e.role, e.native_turn_id, e.content_hash,
       e.source_timestamp, e.completeness
     FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
     WHERE o.source_provider=? AND o.session_uid=? AND o.source_namespace=? AND o.source_id=?${where}`).all(
@@ -262,6 +284,22 @@ function sameEvent(row, fields) {
 }
 
 function sameObservedEvent(row, fields) {
+  return row.observation_signature === observationSignature(fields)
+    && (!fields.event_uid || row.observed_event_uid === fields.event_uid)
+    && row.observation_source_provider === fields.source_provider
+    && row.observation_session_uid === fields.session_uid
+    && (fields.context_epoch == null || Number(row.observation_context_epoch) === fields.context_epoch)
+    && row.observation_source_namespace === fields.source_namespace
+    && row.observation_source_id === fields.source_id
+    && row.capture_source === fields.capture_source
+    && row.session_uid === fields.session_uid
+    && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
+    && row.source_provider === fields.source_provider
+    && row.role === fields.role
+    && row.content_hash === fields.content_hash;
+}
+
+function sameObservationTarget(row, fields) {
   return (!fields.event_uid || row.observed_event_uid === fields.event_uid)
     && row.session_uid === fields.session_uid
     && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
@@ -321,10 +359,10 @@ function createStore(database, now) {
           fields.content_hash, fields.encrypted_raw_ref, fields.completeness, fields.source_timestamp, timestamp
         );
         database.prepare(`INSERT INTO event_observations
-          (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+          (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
            source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          fields.observation_uid, fields.observation_key, fields.source_provider, fields.session_uid,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          fields.observation_uid, fields.observation_key, observationSignature(fields), fields.source_provider, fields.session_uid,
           fields.context_epoch, fields.source_namespace, fields.observation_source_id,
           fields.event_uid, fields.event_uid, fields.observation_capture_source, timestamp
         );
@@ -342,14 +380,14 @@ function createStore(database, now) {
         if (fields.event_uid) {
           const target = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
           if (target) {
-            if (!sameObservedEvent({ ...target, observed_event_uid: target.event_uid }, fields)) throw collision();
+            if (!sameObservationTarget({ ...target, observed_event_uid: target.event_uid }, fields)) throw collision();
             const contextEpoch = fields.context_epoch ?? Number(target.context_epoch);
             const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
             database.prepare(`INSERT INTO event_observations
-              (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+              (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
                source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-              observationUid(key), key, fields.source_provider, fields.session_uid, contextEpoch,
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+              observationUid(key), key, observationSignature(fields), fields.source_provider, fields.session_uid, contextEpoch,
               fields.source_namespace, fields.source_id, fields.event_uid, fields.event_uid, fields.capture_source, nowIso(now)
             );
             return { observation_uid: observationUid(key), event_uid: fields.event_uid, duplicate: false };
@@ -379,10 +417,10 @@ function createStore(database, now) {
         const contextEpoch = Number(candidate.context_epoch);
         const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
         database.prepare(`INSERT INTO event_observations
-          (observation_uid, observation_key, source_provider, session_uid, context_epoch,
+          (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
            source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          observationUid(key), key, fields.source_provider, fields.session_uid, contextEpoch,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          observationUid(key), key, observationSignature(fields), fields.source_provider, fields.session_uid, contextEpoch,
           fields.source_namespace, fields.source_id, fields.event_uid || candidate.event_uid,
           candidate.event_uid, fields.capture_source, nowIso(now)
         );
@@ -427,6 +465,17 @@ function verifyControlSchema(database, requireSchemaVersion) {
   }
   const expected = Object.keys(CONTROL_SCHEMA_SIGNATURE);
   if (JSON.stringify(listUserTables(database)) !== JSON.stringify(expected)) {
+    throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
+  }
+  const schemaObjects = database.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_schema
+    WHERE type IN ('table', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
+  const expectedSchemaObjects = Object.entries(CONTROL_SCHEMA_SQL_SIGNATURE).map(([name, sql]) => ({
+    type: "table",
+    name,
+    tbl_name: name,
+    sql
+  })).sort((left, right) => left.name.localeCompare(right.name));
+  if (JSON.stringify(schemaObjects) !== JSON.stringify(expectedSchemaObjects)) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
   for (const [table, signature] of Object.entries(CONTROL_SCHEMA_SIGNATURE)) {
