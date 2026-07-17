@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | transaction redesign authorized; written spec amendment pending review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d` | next independent review authorized after implementation | 15-field tuple remains binding; next design freezes one preflight snapshot and serializes exact replay, alias attachment and insertion in one resolve-or-insert transaction |
+| 1. Lean control DB | written transaction-boundary spec committed; awaiting user review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`; design `e1732a8` | next independent review authorized after implementation | Design Doc/delta spec now freeze one preflight snapshot and serialize exact replay, alias attachment and insertion in one resolve-or-insert transaction; OpenSpec strict passes |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
