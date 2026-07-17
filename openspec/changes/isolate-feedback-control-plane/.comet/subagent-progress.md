@@ -42,6 +42,7 @@
 - Canonical identity decision: replace the fragmented public projection, event/observation normalization, signature and duplicate equality definitions with the single body-free tuple recorded in the Task 1 plan; preserve encrypted evidence as a separate immutable storage invariant
 - Canonical identity implementation: `normalizeCaptureIdentity()` is now the single body-free tuple producer for public/direct capture, observation resolution, signatures and replay equality; report `.superpowers/sdd/task-1-report.md`
 - Transaction-boundary decision: remove the public transaction-external resolve fast path; validate and freeze one capture snapshot before blob I/O; pass the resulting encrypted reference into one serialized resolve-or-insert transaction that rechecks exact replay, alias attachment and new-event insertion without rereading caller-owned input
+- Design amendment dispatch: fresh architecture agent `/root/task1_capture_transaction_design` is updating only the existing Design Doc and control-plane-isolation delta spec; implementation remains blocked until the written spec is reviewed
 - Next action: update the existing Design Doc and control-plane-isolation delta spec, self-review them and obtain the required written-spec review before amending the Task 1 plan and dispatching a fresh implementer. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
