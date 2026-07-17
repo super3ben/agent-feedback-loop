@@ -16,17 +16,17 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `implementing`
+- Stage: `blocked`
 - Dispatch: implementer `/root/task1_lean_control_store` completed
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
-- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`
+- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`
 - Changed files: `src/index.mjs`, `src/capture.mjs`, `src/control-schema.mjs`, `src/control-store.mjs`, `docs/verification/2026-07-16-legacy-control-plane-audit.md`, `test/runtime.test.mjs`, `test/control-store.test.mjs`
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
-- GREEN evidence: fifth-round alias/schema regressions and preserved collisions 11/11; complete control-store suite 28/28; required storage/capture regression 118/118; coordinator clean single-process `npm test` passed 246/246 in 51.193 s; `node --check` and `git diff --check` passed
+- GREEN evidence: sixth-round identity/schema preservation matrix 15/15; capture/control-store 56/56; required storage/capture regression 121/121; `node --check` and `git diff --check` passed. Full `npm test` remained load-sensitive only in legacy Stop tests: implementer 248/249, coordinator 247/249; isolated storage-failure 1/1, hard-deadline fixture failed before creating launcher/descendant PID or signal files
 - Review round: `6` (fourth user-authorized exception beyond configured 2-round ceiling)
-- Review package: fifth-round final full range `.superpowers/sdd/isolate-feedback-control-plane-review-task1-v2-fifth-final.diff`
-- Review result: fifth-round independent reviewer `/root/task1_control_store_fifth_review` returned `CHANGES_REQUIRED` (Critical 0, Important 2, Minor 1); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-6.md`
-- Unresolved findings: public capture replay signature/fast path omits persisted immutable referent/source/completeness metadata; a new cross-provider event can reuse one session UID and overwrite `sessions.cli`; undeclared user VIEW acceptance is recorded as Minor
+- Review package: sixth-round final full range `.superpowers/sdd/isolate-feedback-control-plane-review-task1-v2-sixth-final.diff`
+- Review result: sixth-round independent reviewer `/root/task1_control_store_sixth_review` returned `CHANGES_REQUIRED` (Critical 0, Important 1, Minor 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-7.md`
+- Unresolved findings: capture identity has multiple competing definitions. Public projection drops `event.capture_source`; direct `captureSessionEvent()` duplicate replay bypasses persisted observation signature, so changed capture source/source event/source offset can still return `duplicate=true`
 - Fix dispatch: `/root/task1_control_store_fix1` completed commit `aa770c6`
 - Fix round 2 dispatch: `/root/task1_control_store_fix2` completed commit `864240b5f011722172898d88523d9201a9a91d07`
 - Full-suite diagnostic: one clean run passed; prior non-exit was overlapping test/tool-session lifecycle, not reproduced as a product defect
@@ -37,8 +37,9 @@
 - Fourth-round full-suite diagnostic: the implementer's load-sensitive 239/241 run was not reproduced; with no concurrent test processes, the coordinator reran `npm test` once and passed 241/241 in 50.055 s
 - Fix round 5 dispatch: `/root/task1_control_store_fix5` completed commit `5053ddaf21b18ece0de9714873dfc37ed7b66e37`; report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-fix-5-report.md`
 - Fifth-round full-suite diagnostic: the implementer's load-sensitive run passed 245/246 with one investigated legacy Stop polling timeout; after the subagent and all other test processes exited, the coordinator's clean `npm test` passed 246/246 in 51.193 s
-- Fix round 6 dispatch: preparing a fresh agent; scope is limited to complete public replay identity, immutable session provider, and rejection of undeclared user VIEW objects
-- Next action: sixth-round RED/GREEN fix followed by one fresh reviewer; Task 1 and all mapped OpenSpec tasks remain unchecked until approval
+- Fix round 6 dispatch: `/root/task1_control_store_fix6` completed commit `d11cb8a503eb3f54e94bf40b9714d57d451aa834`; report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-fix-6-report.md`
+- Sixth-round full-suite diagnostic: changed-path suites are green; both observed full-suite failures are in unchanged transitional Stop code assigned to Task 3. Storage-failure passed isolated; the isolated hard-deadline failure produced no fixture PID/signal files, consistent with its recorded pre-readiness timing race
+- Next action: configured review budget plus sixth user-authorized exception are exhausted. Do not add another field-level patch; require a new explicit user decision before a canonical capture-identity refactor and fresh re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
