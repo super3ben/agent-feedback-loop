@@ -16,25 +16,26 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `implementing`
+- Stage: `blocked`
 - Dispatch: implementer `/root/task1_lean_control_store` completed
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
-- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`
+- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`
 - Changed files: `src/index.mjs`, `src/capture.mjs`, `src/control-schema.mjs`, `src/control-store.mjs`, `docs/verification/2026-07-16-legacy-control-plane-audit.md`, `test/runtime.test.mjs`, `test/control-store.test.mjs`
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
-- GREEN evidence: exception-round novel regressions 3/3; required storage/capture regression 107/107; one non-overlapping `npm test` passed 235/235 in 22.67 s; `git diff --check` passed
+- GREEN evidence: fourth-round xinfo regressions 2/2 and provider-isolation regressions 4/4; complete control-store suite 23/23; required storage/capture regression 113/113; coordinator clean single-process `npm test` passed 241/241 in 50.055 s; `git diff --check` passed
 - Review round: `4` (second user-authorized exception beyond configured 2-round ceiling)
-- Review package: exception final full range `.superpowers/sdd/isolate-feedback-control-plane-review-task1-v2-exception-final.diff`
-- Review result: final `CHANGES_REQUIRED` from `/root/task1_control_store_exception_review` (Critical 0, Important 2, Minor 0)
-- Unresolved findings: schema inspection must use complete `table_xinfo`/`index_xinfo` metadata so generated columns and UNIQUE collation cannot pass; alias candidate and explicit-target paths must isolate/validate `source_provider` to prevent cross-CLI binding
+- Review package: fourth-round final full range `.superpowers/sdd/isolate-feedback-control-plane-review-task1-v2-fourth-final.diff`
+- Review result: fourth-round independent reviewer `/root/task1_control_store_fourth_review` returned `CHANGES_REQUIRED` (Critical 0, Important 2, Minor 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-5.md`
+- Unresolved findings: accepted same-provider exact-turn/null-turn aliases are not replay-idempotent; same-version databases with undeclared `CHECK` constraints or triggers pass schema verification and can change/fail canonical runtime writes
 - Fix dispatch: `/root/task1_control_store_fix1` completed commit `aa770c6`
 - Fix round 2 dispatch: `/root/task1_control_store_fix2` completed commit `864240b5f011722172898d88523d9201a9a91d07`
 - Full-suite diagnostic: one clean run passed; prior non-exit was overlapping test/tool-session lifecycle, not reproduced as a product defect
 - Review ceiling: configured 2-round budget was exhausted; user explicitly replied `继续` twice on 2026-07-17, authorizing targeted third and fourth fix/re-review exceptions
 - Fix round 3 dispatch: `/root/task1_control_store_fix3` completed commit `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`
 - Exception-round closure: review-3 alias truncation and concurrent replay findings are closed; schema completeness is only partially closed and a provider-identity counterexample remains
-- Fix round 4 dispatch: preparing a fresh agent; scope is limited to complete xinfo schema metadata and provider identity isolation
-- Next action: fourth-round RED/GREEN fix followed by one fresh reviewer; Task 1 and all mapped OpenSpec tasks remain unchecked until approval
+- Fix round 4 dispatch: `/root/task1_control_store_fix4` completed commit `44acbfd0709b2385cf818b1d792df9d66fc67926`; scope remained limited to complete xinfo schema metadata and provider identity isolation
+- Fourth-round full-suite diagnostic: the implementer's load-sensitive 239/241 run was not reproduced; with no concurrent test processes, the coordinator reran `npm test` once and passed 241/241 in 50.055 s
+- Next action: configured review budget plus four user-authorized rounds are exhausted; require a new explicit user decision before a fifth targeted fix/re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
