@@ -208,6 +208,15 @@ function normalizedCompleteness(input) {
   return completeness ?? captureCompleteness;
 }
 
+function normalizedEncryptedRawRef(input) {
+  const snakeValue = input.encrypted_raw_ref;
+  const camelValue = input.encryptedRawRef;
+  const snake = snakeValue == null ? null : assertString(snakeValue, "encrypted_raw_ref", 4096);
+  const camel = camelValue == null ? null : assertString(camelValue, "encryptedRawRef", 4096);
+  if (snake !== null && camel !== null && snake !== camel) throw collision();
+  return snake ?? camel;
+}
+
 export function normalizeCaptureIdentity(input, { requireEventIdentity = false } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("capture identity input must be an object");
@@ -280,8 +289,23 @@ function eventFields(event) {
     observation_key: key,
     observation_uid: observationUid(key),
     observation_source_id: identity.source_id,
-    encrypted_raw_ref: assertOptionalString(event.encrypted_raw_ref, "encrypted_raw_ref", 4096)
+    encrypted_raw_ref: normalizedEncryptedRawRef(event)
   };
+}
+
+export function prepareCapture({ event, rawText }) {
+  const fields = eventFields(event);
+  const identity = Object.freeze({ ...fields.identity });
+  return Object.freeze({
+    identity,
+    signature: captureIdentitySignature(identity),
+    projectId: fields.project_id,
+    sourceIdentity: fields.source_identity,
+    observationKey: fields.observation_key,
+    observationUid: fields.observation_uid,
+    suppliedEncryptedRawRef: fields.encrypted_raw_ref,
+    blobContentHash: createHash("sha256").update(String(rawText)).digest("hex")
+  });
 }
 
 function observationFields(input) {
@@ -296,21 +320,23 @@ function observationFields(input) {
   return {
     identity,
     ...identity,
+    signature: captureIdentitySignature(identity),
     observation_key: key,
-    observation_uid: key == null ? null : observationUid(key)
+    observation_uid: key == null ? null : observationUid(key),
+    encrypted_raw_ref: normalizedEncryptedRawRef(input)
   };
 }
 
 function eventObservations(database, fields) {
   const where = fields.context_epoch == null ? "" : " AND o.context_epoch=?";
   return database.prepare(`SELECT o.observation_uid, o.observation_key, o.observation_signature,
-      o.observed_event_uid, o.event_uid, o.capture_source,
+      o.observed_event_uid, o.event_uid, o.capture_source, o.observed_at,
       o.source_provider AS observation_source_provider,
       o.session_uid AS observation_session_uid, o.context_epoch AS observation_context_epoch,
       o.source_namespace AS observation_source_namespace, o.source_id AS observation_source_id,
       e.encrypted_raw_ref, e.session_uid, e.context_epoch, e.source_provider, e.source_namespace,
       e.observation_source_id AS event_observation_source_id, e.source_identity, e.role, e.native_turn_id, e.content_hash,
-      e.source_timestamp, e.completeness
+      e.source_timestamp, e.completeness, e.created_at
     FROM event_observations o JOIN session_events e ON e.event_uid=o.event_uid
     WHERE o.source_provider=? AND o.session_uid=? AND o.source_namespace=? AND o.source_id=?${where}`).all(
     fields.source_provider, fields.session_uid, fields.source_namespace, fields.source_id,
@@ -337,7 +363,7 @@ function sameObservedEvent(row, fields) {
     fields.source_id
   );
   return row.observation_key === boundKey
-    && row.observation_signature === captureIdentitySignature(fields.identity)
+    && row.observation_signature === (fields.signature ?? captureIdentitySignature(fields.identity))
     && (!fields.event_uid || row.observed_event_uid === fields.event_uid)
     && row.observation_source_provider === fields.source_provider
     && row.observation_session_uid === fields.session_uid
@@ -352,6 +378,23 @@ function sameObservedEvent(row, fields) {
     && row.content_hash === fields.content_hash;
 }
 
+function samePreparedEventBinding(row, fields) {
+  const incomingTimestampValue = fields.source_timestamp ?? row.observed_at;
+  const persistedTimestampValue = row.source_timestamp ?? row.created_at;
+  const incomingTimestamp = Date.parse(incomingTimestampValue);
+  const persistedTimestamp = Date.parse(persistedTimestampValue);
+  const timestampMatches = persistedTimestampValue === incomingTimestampValue
+    || (Number.isFinite(incomingTimestamp)
+      && Number.isFinite(persistedTimestamp)
+      && Math.abs(incomingTimestamp - persistedTimestamp) <= 5 * 60 * 1000);
+  const nativeTurnMatches = (row.native_turn_id ?? null) === fields.native_turn_id
+    || (row.native_turn_id == null && fields.native_turn_id != null);
+  return sameObservedEvent(row, fields)
+    && nativeTurnMatches
+    && timestampMatches
+    && row.completeness === fields.completeness;
+}
+
 function sameObservationTarget(row, fields) {
   return (!fields.event_uid || row.observed_event_uid === fields.event_uid)
     && row.session_uid === fields.session_uid
@@ -361,6 +404,80 @@ function sameObservationTarget(row, fields) {
     && row.content_hash === fields.content_hash
     && (row.native_turn_id ?? null) === fields.native_turn_id
     && (row.source_timestamp ?? null) === fields.source_timestamp;
+}
+
+function requireCompatibleDirectRef(row, fields) {
+  if (fields.encrypted_raw_ref !== null && !sameEncryptedRawRef(row, fields)) throw collision();
+}
+
+function captureFields(preparedCapture, authoritativeEncryptedRef) {
+  if (!preparedCapture || !Object.isFrozen(preparedCapture)
+      || !preparedCapture.identity || !Object.isFrozen(preparedCapture.identity)) {
+    throw new TypeError("preparedCapture must be a frozen prepared capture");
+  }
+  const identity = preparedCapture.identity;
+  const key = observationKey(
+    identity.source_provider,
+    identity.session_uid,
+    identity.context_epoch,
+    identity.source_namespace,
+    identity.source_id
+  );
+  if (preparedCapture.signature !== captureIdentitySignature(identity)
+      || preparedCapture.sourceIdentity !== key
+      || preparedCapture.observationKey !== key
+      || preparedCapture.observationUid !== observationUid(key)) {
+    throw collision();
+  }
+  return {
+    identity,
+    ...identity,
+    signature: preparedCapture.signature,
+    cli: identity.source_provider,
+    project_id: assertOptionalString(preparedCapture.projectId, "projectId", 1024),
+    source_identity: preparedCapture.sourceIdentity,
+    observation_key: preparedCapture.observationKey,
+    observation_uid: preparedCapture.observationUid,
+    observation_source_id: identity.source_id,
+    encrypted_raw_ref: authoritativeEncryptedRef
+  };
+}
+
+function captureResolution(kind, eventRow, observationRow) {
+  const eventView = Object.freeze({
+    event_uid: eventRow.event_uid,
+    session_uid: eventRow.session_uid,
+    source_event_id: eventRow.source_event_id,
+    source_identity: eventRow.source_identity,
+    role: eventRow.role,
+    referent_event_uid: eventRow.referent_event_uid ?? null,
+    content_hash: eventRow.content_hash,
+    encrypted_raw_ref: eventRow.encrypted_raw_ref ?? null,
+    completeness: eventRow.completeness
+  });
+  const observation = Object.freeze({
+    observation_uid: observationRow.observation_uid,
+    observation_key: observationRow.observation_key,
+    observed_event_uid: observationRow.observed_event_uid,
+    event_uid: observationRow.event_uid,
+    capture_source: observationRow.capture_source
+  });
+  return {
+    kind,
+    duplicate: kind !== "new",
+    eventUid: eventView.event_uid,
+    blobPath: eventView.encrypted_raw_ref,
+    eventView,
+    observation
+  };
+}
+
+function withCaptureAliases(resolution) {
+  return {
+    ...resolution,
+    event_uid: resolution.eventUid,
+    event: resolution.eventView
+  };
 }
 
 function createStore(database, now) {
@@ -376,61 +493,104 @@ function createStore(database, now) {
     }
   };
 
+  const insertObservation = (fields, eventUid, timestamp) => {
+    database.prepare(`INSERT INTO event_observations
+      (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
+       source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      fields.observation_uid, fields.observation_key, fields.signature,
+      fields.source_provider, fields.session_uid, fields.context_epoch,
+      fields.source_namespace, fields.observation_source_id,
+      fields.event_uid, eventUid, fields.capture_source, timestamp
+    );
+    return database.prepare("SELECT * FROM event_observations WHERE observation_key=?").get(fields.observation_key);
+  };
+
+  const resolveOrInsertCapture = ({ preparedCapture, authoritativeEncryptedRef }) => {
+    const authoritativeRef = authoritativeEncryptedRef == null
+      ? null
+      : assertString(authoritativeEncryptedRef, "authoritativeEncryptedRef", 4096);
+    const fields = captureFields(preparedCapture, authoritativeRef);
+    return transaction(() => {
+      const existingObservation = eventObservation(database, fields);
+      if (existingObservation) {
+        if (!samePreparedEventBinding(existingObservation, fields)
+            || !sameEncryptedRawRef(existingObservation, fields)) {
+          throw collision();
+        }
+        const eventRow = database.prepare("SELECT * FROM session_events WHERE event_uid=?")
+          .get(existingObservation.event_uid);
+        return captureResolution("exact_replay", eventRow, existingObservation);
+      }
+
+      const byUid = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
+      const byIdentity = database.prepare("SELECT * FROM session_events WHERE source_identity=?").get(fields.source_identity);
+      if (byUid || byIdentity) throw collision();
+
+      const existingSession = database.prepare("SELECT cli FROM sessions WHERE session_uid=?").get(fields.session_uid);
+      if (existingSession && existingSession.cli !== fields.cli) throw collision();
+
+      const timestamp = nowIso(now);
+      const incomingTimestamp = fields.source_timestamp || timestamp;
+      const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.*
+        FROM session_events e
+        WHERE e.session_uid = ?
+          AND e.source_provider = ?
+          AND e.role = ?
+          AND e.content_hash = ?
+          AND e.context_epoch = ?
+          AND COALESCE(e.native_turn_id, '') = COALESCE(?, '')
+          AND julianday(COALESCE(e.source_timestamp, e.created_at))
+              BETWEEN julianday(?) - (5.0 / 1440.0)
+                  AND julianday(?) + (5.0 / 1440.0)
+        ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid
+        LIMIT 2`).all(
+        fields.session_uid, fields.source_provider, fields.role, fields.content_hash,
+        fields.context_epoch, nativeTurnId, incomingTimestamp, incomingTimestamp
+      );
+      let candidates = selectCandidates(fields.native_turn_id);
+      if (!candidates.length && fields.native_turn_id != null) candidates = selectCandidates(null);
+      if (candidates.length === 1 && sameEncryptedRawRef(candidates[0], fields)) {
+        const observation = insertObservation(fields, candidates[0].event_uid, timestamp);
+        return captureResolution("alias", candidates[0], observation);
+      }
+
+      database.prepare(`INSERT INTO sessions
+        (session_uid, cli, project_id, context_epoch, started_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_uid) DO UPDATE SET
+          project_id=excluded.project_id, context_epoch=excluded.context_epoch,
+          updated_at=excluded.updated_at`).run(
+        fields.session_uid, fields.cli, fields.project_id, fields.context_epoch, timestamp, timestamp
+      );
+      database.prepare(`INSERT INTO session_events
+        (event_uid, session_uid, context_epoch, source_provider, source_event_id, source_namespace,
+         observation_source_id, source_identity, role, referent_event_uid, native_turn_id,
+         content_hash, encrypted_raw_ref, completeness, source_timestamp, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        fields.event_uid, fields.session_uid, fields.context_epoch, fields.source_provider,
+        fields.source_event_id, fields.source_namespace, fields.observation_source_id,
+        fields.source_identity, fields.role, fields.referent_event_uid, fields.native_turn_id,
+        fields.content_hash, fields.encrypted_raw_ref, fields.completeness, fields.source_timestamp, timestamp
+      );
+      const eventRow = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
+      const observation = insertObservation(fields, fields.event_uid, timestamp);
+      return captureResolution("new", eventRow, observation);
+    });
+  };
+
   return {
     database,
     assertCaptureAllowed(event) {
       return eventFields(event);
     },
+    resolveOrInsertCapture,
     captureSessionEvent(event) {
-      const fields = eventFields(event);
-      return transaction(() => {
-        const byUid = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
-        const byIdentity = database.prepare("SELECT * FROM session_events WHERE source_identity=?").get(fields.source_identity);
-        if (byUid || byIdentity) {
-          const observation = database.prepare(`SELECT observation_key, observation_signature,
-            observed_event_uid, event_uid, capture_source FROM event_observations
-            WHERE observation_key=?`).get(fields.observation_key);
-          if (byUid?.event_uid === byIdentity?.event_uid
-              && observation?.event_uid === byUid.event_uid
-              && observation.observed_event_uid === fields.event_uid
-              && observation.capture_source === fields.capture_source
-              && observation.observation_signature === captureIdentitySignature(fields.identity)
-              && sameEncryptedRawRef(byUid, fields)) {
-            return { event_uid: byUid.event_uid, duplicate: true };
-          }
-          throw collision();
-        }
-        const existingSession = database.prepare("SELECT cli FROM sessions WHERE session_uid=?").get(fields.session_uid);
-        if (existingSession && existingSession.cli !== fields.cli) throw collision();
-        const timestamp = nowIso(now);
-        database.prepare(`INSERT INTO sessions
-          (session_uid, cli, project_id, context_epoch, started_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(session_uid) DO UPDATE SET
-            project_id=excluded.project_id, context_epoch=excluded.context_epoch,
-            updated_at=excluded.updated_at`).run(
-          fields.session_uid, fields.cli, fields.project_id, fields.context_epoch, timestamp, timestamp
-        );
-        database.prepare(`INSERT INTO session_events
-          (event_uid, session_uid, context_epoch, source_provider, source_event_id, source_namespace,
-           observation_source_id, source_identity, role, referent_event_uid, native_turn_id,
-           content_hash, encrypted_raw_ref, completeness, source_timestamp, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          fields.event_uid, fields.session_uid, fields.context_epoch, fields.source_provider,
-          fields.source_event_id, fields.source_namespace, fields.observation_source_id,
-          fields.source_identity, fields.role, fields.referent_event_uid, fields.native_turn_id,
-          fields.content_hash, fields.encrypted_raw_ref, fields.completeness, fields.source_timestamp, timestamp
-        );
-        database.prepare(`INSERT INTO event_observations
-          (observation_uid, observation_key, observation_signature, source_provider, session_uid, context_epoch,
-           source_namespace, source_id, observed_event_uid, event_uid, capture_source, observed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-          fields.observation_uid, fields.observation_key, captureIdentitySignature(fields.identity), fields.source_provider, fields.session_uid,
-          fields.context_epoch, fields.source_namespace, fields.observation_source_id,
-          fields.event_uid, fields.event_uid, fields.capture_source, timestamp
-        );
-        return { event_uid: fields.event_uid, duplicate: false };
-      });
+      const preparedCapture = prepareCapture({ event, rawText: "" });
+      return withCaptureAliases(resolveOrInsertCapture({
+        preparedCapture,
+        authoritativeEncryptedRef: preparedCapture.suppliedEncryptedRawRef
+      }));
     },
     resolveEventObservation(input) {
       const fields = observationFields(input);
@@ -438,12 +598,14 @@ function createStore(database, now) {
         const existing = eventObservation(database, fields);
         if (existing) {
           if (!sameObservedEvent(existing, fields)) throw collision();
+          requireCompatibleDirectRef(existing, fields);
           return { ...existing, duplicate: true };
         }
         if (fields.event_uid) {
           const target = database.prepare("SELECT * FROM session_events WHERE event_uid=?").get(fields.event_uid);
           if (target) {
             if (!sameObservationTarget({ ...target, observed_event_uid: target.event_uid }, fields)) throw collision();
+            requireCompatibleDirectRef(target, fields);
             const contextEpoch = fields.context_epoch ?? Number(target.context_epoch);
             const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
             database.prepare(`INSERT INTO event_observations
@@ -453,7 +615,10 @@ function createStore(database, now) {
               observationUid(key), key, captureIdentitySignature(fields.identity), fields.source_provider, fields.session_uid, contextEpoch,
               fields.source_namespace, fields.source_id, fields.event_uid, fields.event_uid, fields.capture_source, nowIso(now)
             );
-            return { observation_uid: observationUid(key), event_uid: fields.event_uid, duplicate: false };
+            return {
+              ...eventObservation(database, { ...fields, context_epoch: contextEpoch }),
+              duplicate: false
+            };
           }
         }
         const incomingTimestamp = fields.source_timestamp || nowIso(now);
@@ -475,6 +640,7 @@ function createStore(database, now) {
         }
         if (candidates.length !== 1) return null;
         const candidate = candidates[0];
+        requireCompatibleDirectRef(candidate, fields);
         const contextEpoch = Number(candidate.context_epoch);
         const key = observationKey(fields.source_provider, fields.session_uid, contextEpoch, fields.source_namespace, fields.source_id);
         database.prepare(`INSERT INTO event_observations

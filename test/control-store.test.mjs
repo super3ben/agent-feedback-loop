@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -9,9 +10,10 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { captureObservedSession, normalizeHookEvent } from "../src/capture.mjs";
+import { captureObservedSession, captureSession, normalizeHookEvent } from "../src/capture.mjs";
 import { SCHEMA_SQL } from "../src/control-schema.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
+import * as controlStoreModule from "../src/control-store.mjs";
 import {
   CONTROL_SCHEMA_MISMATCH,
   CONTROL_STORE_UNAVAILABLE,
@@ -437,6 +439,49 @@ test("captures bounded event metadata and resolves duplicate observations", () =
   store.close();
 });
 
+test("direct observation resolution enforces and adopts the persisted encrypted ref", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "direct-ref-event",
+    source_identity: undefined,
+    source_event_id: "direct-ref-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "direct-ref-observation",
+    native_turn_id: "direct-ref-turn",
+    source_timestamp: "2026-07-17T00:00:00.000Z",
+    encrypted_raw_ref: "/private/blobs/direct-ref.enc"
+  });
+  store.captureSessionEvent(canonical);
+  const observation = {
+    provider: canonical.cli,
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_message",
+    eventUid: canonical.event_uid,
+    nativeTurnId: canonical.native_turn_id,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: canonical.source_timestamp
+  };
+
+  assert.throws(
+    () => store.resolveEventObservation({
+      ...observation,
+      sourceId: "direct-ref-mismatch",
+      encryptedRawRef: "/private/blobs/different.enc"
+    }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  const adopted = store.resolveEventObservation({
+    ...observation,
+    sourceId: "direct-ref-adopted"
+  });
+  assert.equal(adopted.encrypted_raw_ref, canonical.encrypted_raw_ref);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+
 test("capture rejects raw text fields instead of storing them", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });
@@ -712,7 +757,8 @@ test("public control capture replay rejects changed bounded event identity", asy
     source_offset: 100,
     referent_event_uid: "assistant-one",
     native_turn_id: "turn-public-identity",
-    source_timestamp: "2026-07-17T04:00:00.000Z"
+    source_timestamp: "2026-07-17T04:00:00.000Z",
+    encrypted_raw_ref: null
   });
 
   const first = await captureObservedSession({
@@ -795,7 +841,8 @@ test("public control capture treats capture source as bounded canonical identity
     capture_source: "prompt_hook",
     source_offset: 4,
     native_turn_id: "public-capture-source-turn",
-    source_timestamp: "2026-07-17T08:00:00.000Z"
+    source_timestamp: "2026-07-17T08:00:00.000Z",
+    encrypted_raw_ref: null
   });
 
   const first = await captureObservedSession({
@@ -866,69 +913,147 @@ test("direct control capture replay compares the complete canonical identity", (
   store.close();
 });
 
-test("public and direct control capture persist the same normalized replay identity", async () => {
-  const publicFixture = controlCaptureFixture();
-  const directFixture = fixture();
-  const directStore = initializeControlStore({ paths: directFixture.paths });
-  const canonical = event({
-    event_uid: "shared-normalized-event",
+test("prepared capture freezes the body-free identity and keeps raw blob hashing separate", () => {
+  const callerEvent = event({
+    event_uid: "prepared-event",
     source_identity: undefined,
-    source_event_id: "shared-normalized-source",
+    source_event_id: "prepared-source",
     source_namespace: "prompt_hook",
-    observation_source_id: "shared-normalized-observation",
+    observation_source_id: "prepared-observation",
+    capture_source: "prompt_hook",
+    encrypted_raw_ref: null,
+    content_hash: "a".repeat(64)
+  });
+  const prepared = controlStoreModule.prepareCapture({
+    event: callerEvent,
+    rawText: "raw evidence with a wider payload"
+  });
+  callerEvent.capture_source = "caller-mutated";
+  callerEvent.content_hash = "b".repeat(64);
+
+  assert.equal(Object.isFrozen(prepared), true);
+  assert.equal(Object.isFrozen(prepared.identity), true);
+  assert.equal(prepared.identity.capture_source, "prompt_hook");
+  assert.equal(prepared.identity.content_hash, "a".repeat(64));
+  assert.equal(
+    prepared.blobContentHash,
+    createHash("sha256").update("raw evidence with a wider payload").digest("hex")
+  );
+  assert.notEqual(prepared.blobContentHash, prepared.identity.content_hash);
+  assert.equal("rawText" in prepared, false);
+  assert.equal("encrypted_raw_ref" in prepared.identity, false);
+});
+
+test("public capture rejects a supplied encrypted ref mismatch before database resolution", async () => {
+  const { store } = controlCaptureFixture();
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      return "/private/blobs/writer-authoritative.enc";
+    }
+  };
+  const callerEvent = event({
+    event_uid: "supplied-ref-mismatch",
+    source_identity: undefined,
+    source_event_id: "supplied-ref-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "supplied-ref-observation",
+    encrypted_raw_ref: "/private/blobs/caller-supplied.enc"
+  });
+
+  await assert.rejects(
+    captureObservedSession({ store, blobs, event: callerEvent, rawText: "reference mismatch evidence" }),
+    (error) => error?.code === "control_observation_collision"
+  );
+  assert.equal(blobWrites, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+  store.close();
+});
+
+test("control captureSession returns the frozen atomic event view", async () => {
+  const { store } = controlCaptureFixture();
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      return "/private/blobs/control-capture-session.enc";
+    }
+  };
+  const callerEvent = event({
+    event_uid: "control-capture-session-event",
+    source_identity: undefined,
+    source_event_id: "control-capture-session-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "control-capture-session-observation",
+    encrypted_raw_ref: null
+  });
+
+  const result = await captureSession({ store, blobs, event: callerEvent, rawText: "control capture evidence" });
+
+  assert.equal(blobWrites, 2);
+  assert.equal(result.kind, "new");
+  assert.equal(result.eventUid, callerEvent.event_uid);
+  assert.equal(result.event, result.eventView);
+  assert.notEqual(result.event, callerEvent);
+  assert.equal(result.eventView.encrypted_raw_ref, "/private/blobs/control-capture-session.enc");
+  assert.equal(callerEvent.encrypted_raw_ref, null);
+  store.close();
+});
+
+test("public and direct exact replay return one persisted event and blob ref", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const canonical = event({
+    event_uid: "consistent-replay-event",
+    source_identity: undefined,
+    source_event_id: "consistent-replay-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "consistent-replay-observation",
     source_offset: 12,
     capture_source: "prompt_hook",
-    referent_event_uid: "shared-normalized-referent",
-    native_turn_id: "shared-normalized-turn",
-    source_timestamp: "2026-07-17T08:20:00.000Z"
+    referent_event_uid: "consistent-replay-referent",
+    native_turn_id: "consistent-replay-turn",
+    source_timestamp: "2026-07-17T08:20:00.000Z",
+    encrypted_raw_ref: null
   });
-
-  const publicFirst = await captureObservedSession({
-    store: publicFixture.store,
-    blobs: publicFixture.blobs,
-    event: { ...canonical },
-    rawText: "body bytes stay outside identity"
+  const first = await captureObservedSession({
+    store, blobs, event: { ...canonical }, rawText: "consistent raw evidence"
   });
   const publicReplay = await captureObservedSession({
-    store: publicFixture.store,
-    blobs: publicFixture.blobs,
-    event: { ...canonical },
-    rawText: "body bytes stay outside identity"
+    store,
+    blobs,
+    event: { ...canonical, encrypted_raw_ref: first.blobPath },
+    rawText: "consistent raw evidence"
   });
-  const directFirst = directStore.captureSessionEvent({
+  const directReplay = store.captureSessionEvent({
     ...canonical,
-    encrypted_raw_ref: "/private/blobs/direct-shared-normalized.enc"
+    encrypted_raw_ref: first.blobPath
   });
-  const directReplay = directStore.captureSessionEvent({
-    ...canonical,
-    encrypted_raw_ref: "/private/blobs/direct-shared-normalized.enc"
-  });
-  const publicObservation = publicFixture.store.database.prepare(`SELECT observation_signature, capture_source
-    FROM event_observations WHERE source_id=?`).get(canonical.observation_source_id);
-  const directObservation = directStore.database.prepare(`SELECT observation_signature, capture_source
-    FROM event_observations WHERE source_id=?`).get(canonical.observation_source_id);
 
-  assert.deepEqual({
-    publicDuplicate: [publicFirst.duplicate, publicReplay.duplicate],
-    directDuplicate: [directFirst.duplicate, directReplay.duplicate],
-    publicSignature: publicObservation.observation_signature,
-    directSignature: directObservation.observation_signature,
-    publicCaptureSource: publicObservation.capture_source,
-    directCaptureSource: directObservation.capture_source
-  }, {
-    publicDuplicate: [false, true],
-    directDuplicate: [false, true],
-    publicSignature: directObservation.observation_signature,
-    directSignature: directObservation.observation_signature,
-    publicCaptureSource: canonical.capture_source,
-    directCaptureSource: canonical.capture_source
-  });
-  publicFixture.store.close();
-  directStore.close();
+  for (const result of [first, publicReplay, directReplay]) {
+    assert.equal(result.eventUid, canonical.event_uid);
+    assert.equal(result.event_uid, canonical.event_uid);
+    assert.equal(result.blobPath, first.blobPath);
+    assert.equal(result.eventView.encrypted_raw_ref, first.blobPath);
+    assert.equal(result.event, result.eventView);
+    assert.notEqual(result.event, canonical);
+  }
+  assert.equal(first.kind, "new");
+  assert.equal(publicReplay.kind, "exact_replay");
+  assert.equal(directReplay.kind, "exact_replay");
+  assert.deepEqual([first.duplicate, publicReplay.duplicate, directReplay.duplicate], [false, true, true]);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
 });
 
 test("invalid canonical capture identity is rejected before blob or database side effects", async () => {
   for (const mutation of [
+    { event_uid: "" },
+    { content_hash: "" },
+    { content_hash: "a".repeat(129) },
     { capture_source: "" },
     { capture_source: "x".repeat(257) },
     { capture_source: "prompt_hook", captureSource: "transcript_payload" }
@@ -947,12 +1072,13 @@ test("invalid canonical capture identity is rejected before blob or database sid
       source_event_id: "invalid-canonical-source",
       source_namespace: "prompt_hook",
       observation_source_id: "invalid-canonical-observation",
+      encrypted_raw_ref: null,
       ...mutation
     });
 
     await assert.rejects(
       captureObservedSession({ store, blobs, event: invalid, rawText: "must not be written" }),
-      /capture_source|captureSource/i
+      /event_uid|content_hash|capture_source|captureSource/i
     );
     assert.equal(blobWrites, 0);
     assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
@@ -960,6 +1086,71 @@ test("invalid canonical capture identity is rejected before blob or database sid
     assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
     store.close();
   }
+});
+
+test("public capture uses one frozen snapshot across the blob await", async () => {
+  const { store } = controlCaptureFixture();
+  let firstWriteStartedResolve;
+  let releaseFirstWriteResolve;
+  const firstWriteStarted = new Promise((resolve) => { firstWriteStartedResolve = resolve; });
+  const releaseFirstWrite = new Promise((resolve) => { releaseFirstWriteResolve = resolve; });
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      if (blobWrites === 1) {
+        firstWriteStartedResolve();
+        await releaseFirstWrite;
+      }
+      return "/private/blobs/frozen-snapshot.enc";
+    }
+  };
+  const callerEvent = event({
+    event_uid: "frozen-event",
+    session_uid: "frozen-session",
+    project_id: "frozen-project",
+    source_identity: undefined,
+    source_event_id: "frozen-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "frozen-observation",
+    capture_source: "prompt_hook",
+    content_hash: "a".repeat(64),
+    encrypted_raw_ref: null
+  });
+  const pending = captureObservedSession({ store, blobs, event: callerEvent, rawText: "frozen raw evidence" });
+  await firstWriteStarted;
+  Object.assign(callerEvent, {
+    event_uid: "mutated-event",
+    project_id: "mutated-project",
+    capture_source: "",
+    content_hash: "b".repeat(64),
+    encrypted_raw_ref: "/private/blobs/mutated.enc"
+  });
+  releaseFirstWriteResolve();
+  const result = await pending;
+
+  assert.equal(blobWrites, 2);
+  assert.equal(result.kind, "new");
+  assert.equal(result.eventUid, "frozen-event");
+  assert.equal(result.blobPath, "/private/blobs/frozen-snapshot.enc");
+  assert.notEqual(result.event, callerEvent);
+  assert.deepEqual(store.getSessionEvent("frozen-event"), {
+    event_uid: "frozen-event",
+    session_uid: "frozen-session",
+    source_event_id: "frozen-source",
+    source_identity: '["codex","frozen-session",1,"prompt_hook","frozen-observation"]',
+    role: "user",
+    referent_event_uid: null,
+    content_hash: "a".repeat(64),
+    encrypted_raw_ref: "/private/blobs/frozen-snapshot.enc",
+    completeness: "prompt_only"
+  });
+  assert.equal(
+    store.database.prepare("SELECT project_id FROM sessions WHERE session_uid=?").get("frozen-session").project_id,
+    "frozen-project"
+  );
+  assert.equal(store.getSessionEvent("mutated-event"), null);
+  store.close();
 });
 
 test("control observation alias checks the complete timestamp window before bounding candidates", () => {
@@ -973,7 +1164,8 @@ test("control observation alias checks the complete timestamp window before boun
       source_namespace: "prompt_hook",
       observation_source_id: `older-source-${index}`,
       native_turn_id: "turn-shared",
-      source_timestamp: `2026-07-17T00:${String(index).padStart(2, "0")}:00.000Z`
+      source_timestamp: `2026-07-17T00:${String(index).padStart(2, "0")}:00.000Z`,
+      encrypted_raw_ref: `/private/blobs/older-${index}.enc`
     }));
   }
   for (const [eventUid, sourceTimestamp] of [
@@ -987,7 +1179,8 @@ test("control observation alias checks the complete timestamp window before boun
       source_namespace: "prompt_hook",
       observation_source_id: `${eventUid}-source`,
       native_turn_id: "turn-shared",
-      source_timestamp: sourceTimestamp
+      source_timestamp: sourceTimestamp,
+      encrypted_raw_ref: `/private/blobs/${eventUid}.enc`
     }));
   }
 
@@ -1165,7 +1358,8 @@ test("public control capture keeps one immutable provider per session UID", asyn
     source_identity: undefined,
     source_event_id: "shared-codex-source-one",
     source_namespace: "prompt_hook",
-    observation_source_id: "shared-codex-source-one"
+    observation_source_id: "shared-codex-source-one",
+    encrypted_raw_ref: null
   });
   const sameProviderUpdate = event({
     ...first,
@@ -1315,7 +1509,8 @@ test("concurrent exact capture replay reports one new event and one duplicate", 
     source_namespace: "prompt_hook",
     observation_source_id: "concurrent-source",
     native_turn_id: "turn-concurrent",
-    source_timestamp: "2026-07-17T02:00:00.000Z"
+    source_timestamp: "2026-07-17T02:00:00.000Z",
+    encrypted_raw_ref: null
   });
 
   const results = await Promise.all([
@@ -1327,6 +1522,161 @@ test("concurrent exact capture replay reports one new event and one duplicate", 
   assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true]);
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
+});
+
+test("concurrent different first aliases resolve to one event and two observations", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  let initialWrites = 0;
+  let releaseInitialWrites;
+  const initialWriteBarrier = new Promise((resolve) => { releaseInitialWrites = resolve; });
+  const barrieredBlobs = {
+    async write(...args) {
+      if (initialWrites < 2) {
+        initialWrites += 1;
+        if (initialWrites === 2) releaseInitialWrites();
+        await initialWriteBarrier;
+      }
+      return blobs.write(...args);
+    }
+  };
+  const shared = {
+    session_uid: "different-alias-session",
+    source_identity: undefined,
+    native_turn_id: "different-alias-turn",
+    source_timestamp: "2026-07-17T09:00:00.000Z",
+    content_hash: "d".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const hook = event({
+    ...shared,
+    event_uid: "different-alias-hook-event",
+    source_event_id: "different-alias-hook-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "different-alias-hook-observation",
+    capture_source: "prompt_hook"
+  });
+  const transcript = event({
+    ...shared,
+    event_uid: "different-alias-transcript-event",
+    source_event_id: "different-alias-transcript-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "different-alias-transcript-observation",
+    capture_source: "transcript_payload"
+  });
+
+  const results = await Promise.all([
+    captureObservedSession({ store, blobs: barrieredBlobs, event: hook, rawText: "shared raw evidence" }),
+    captureObservedSession({ store, blobs: barrieredBlobs, event: transcript, rawText: "shared raw evidence" })
+  ]);
+
+  assert.equal(initialWrites, 2);
+  assert.deepEqual(results.map((result) => result.kind).sort(), ["alias", "new"]);
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true]);
+  assert.equal(new Set(results.map((result) => result.eventUid)).size, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  assert.deepEqual(
+    store.database.prepare(`SELECT observed_event_uid FROM event_observations
+      ORDER BY observed_event_uid`).all().map((row) => row.observed_event_uid),
+    ["different-alias-hook-event", "different-alias-transcript-event"]
+  );
+  store.close();
+});
+
+test("public capture inserts a new event for an alias with incompatible encrypted storage", async () => {
+  const { store, blobs } = controlCaptureFixture();
+  const shared = {
+    session_uid: "incompatible-alias-session",
+    source_identity: undefined,
+    native_turn_id: "incompatible-alias-turn",
+    source_timestamp: "2026-07-17T09:10:00.000Z",
+    content_hash: "e".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const first = await captureObservedSession({
+    store,
+    blobs,
+    event: event({
+      ...shared,
+      event_uid: "incompatible-hook-event",
+      source_event_id: "incompatible-hook-source",
+      source_namespace: "prompt_hook",
+      observation_source_id: "incompatible-hook-observation",
+      capture_source: "prompt_hook"
+    }),
+    rawText: "raw evidence A"
+  });
+  const second = await captureObservedSession({
+    store,
+    blobs,
+    event: event({
+      ...shared,
+      event_uid: "incompatible-transcript-event",
+      source_event_id: "incompatible-transcript-source",
+      source_namespace: "transcript_message",
+      observation_source_id: "incompatible-transcript-observation",
+      capture_source: "transcript_payload"
+    }),
+    rawText: "raw evidence B"
+  });
+
+  assert.equal(first.kind, "new");
+  assert.equal(second.kind, "new");
+  assert.equal(second.duplicate, false);
+  assert.notEqual(second.eventUid, first.eventUid);
+  assert.notEqual(second.blobPath, first.blobPath);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+
+test("public exact replay preserves an alias with a null observation timestamp", async () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({
+    paths,
+    now: () => new Date("2026-07-17T09:20:00.000Z")
+  });
+  const blobs = {
+    async write() {
+      return "/private/blobs/null-timestamp-alias.enc";
+    }
+  };
+  const shared = {
+    session_uid: "null-timestamp-alias-session",
+    source_identity: undefined,
+    native_turn_id: "null-timestamp-alias-turn",
+    content_hash: "f".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const first = event({
+    ...shared,
+    event_uid: "null-timestamp-hook-event",
+    source_event_id: "null-timestamp-hook-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "null-timestamp-hook-observation",
+    capture_source: "prompt_hook",
+    source_timestamp: "2026-07-17T09:20:00.000Z"
+  });
+  const alias = event({
+    ...shared,
+    event_uid: "null-timestamp-transcript-event",
+    source_event_id: "null-timestamp-transcript-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "null-timestamp-transcript-observation",
+    capture_source: "transcript_payload",
+    source_timestamp: null
+  });
+
+  const firstResult = await captureObservedSession({ store, blobs, event: first, rawText: "null timestamp evidence" });
+  const aliasResult = await captureObservedSession({ store, blobs, event: alias, rawText: "null timestamp evidence" });
+  const replayResult = await captureObservedSession({ store, blobs, event: { ...alias }, rawText: "null timestamp evidence" });
+
+  assert.equal(firstResult.kind, "new");
+  assert.equal(aliasResult.kind, "alias");
+  assert.equal(replayResult.kind, "exact_replay");
+  assert.equal(aliasResult.eventUid, firstResult.eventUid);
+  assert.equal(replayResult.eventUid, firstResult.eventUid);
   store.close();
 });
 

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 
-import { normalizeCaptureIdentity } from "./control-store.mjs";
+import { ControlStoreError, normalizeCaptureIdentity, prepareCapture } from "./control-store.mjs";
 import { stripReceiptControlText } from "./receipt.mjs";
 
 const SECRET_PATTERNS = [
@@ -347,7 +347,29 @@ export function normalizeStopEvent({ cli, payload, installationId = "unknown", c
   };
 }
 
+async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText }) {
+  const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
+  if (preparedCapture.suppliedEncryptedRawRef !== null
+      && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
+    throw new ControlStoreError("control_observation_collision", "control observation collision");
+  }
+  const resolution = store.resolveOrInsertCapture({
+    preparedCapture,
+    authoritativeEncryptedRef: writerRef
+  });
+  await blobs.write(preparedCapture.blobContentHash, rawText);
+  return {
+    ...resolution,
+    event_uid: resolution.eventUid,
+    event: resolution.eventView
+  };
+}
+
 export async function captureSession({ store, blobs, event, rawText }) {
+  if (typeof store.resolveOrInsertCapture === "function") {
+    const preparedCapture = prepareCapture({ event, rawText });
+    return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
+  }
   store.assertCaptureAllowed(event);
   const rawContentHash = createHash("sha256").update(String(rawText)).digest("hex");
   const blobPath = await blobs.write(rawContentHash, rawText);
@@ -368,6 +390,10 @@ function isConstraintError(error) {
 }
 
 export async function captureObservedSession({ store, blobs, event, rawText }) {
+  if (typeof store.resolveOrInsertCapture === "function") {
+    const preparedCapture = prepareCapture({ event, rawText });
+    return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
+  }
   const identity = normalizeCaptureIdentity(event, { requireEventIdentity: true });
   store.assertCaptureAllowed(event);
   const observationInput = {
