@@ -349,6 +349,9 @@ export function normalizeStopEvent({ cli, payload, installationId = "unknown", c
 
 async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText }) {
   const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
+  if (typeof writerRef !== "string" || !writerRef || writerRef.length > 4096) {
+    throw new TypeError("authoritativeEncryptedRef must be a bounded non-empty string");
+  }
   if (preparedCapture.suppliedEncryptedRawRef !== null
       && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
     throw new ControlStoreError("control_observation_collision", "control observation collision");

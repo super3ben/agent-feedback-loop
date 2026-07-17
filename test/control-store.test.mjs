@@ -973,6 +973,53 @@ test("public capture rejects a supplied encrypted ref mismatch before database r
   store.close();
 });
 
+test("public control capture rejects invalid blob writer refs before store resolution", async () => {
+  for (const [caseName, writerRef] of [
+    ["null", null],
+    ["undefined", undefined],
+    ["empty", ""],
+    ["non-string", 42],
+    ["overlong", "/private/blobs/" + "x".repeat(4096)]
+  ]) {
+    const { store } = controlCaptureFixture();
+    let blobWrites = 0;
+    let resolveCalls = 0;
+    store.resolveOrInsertCapture = () => {
+      resolveCalls += 1;
+      throw new Error("public writer ref reached the control store");
+    };
+    const blobs = {
+      async write() {
+        blobWrites += 1;
+        return writerRef;
+      }
+    };
+
+    await assert.rejects(
+      captureObservedSession({
+        store,
+        blobs,
+        event: event({
+          event_uid: `invalid-writer-ref-${caseName}`,
+          source_identity: undefined,
+          source_event_id: `invalid-writer-source-${caseName}`,
+          source_namespace: "prompt_hook",
+          observation_source_id: `invalid-writer-observation-${caseName}`,
+          encrypted_raw_ref: null
+        }),
+        rawText: "invalid writer reference evidence"
+      }),
+      /authoritativeEncryptedRef must be a bounded non-empty string/
+    );
+    assert.equal(blobWrites, 1);
+    assert.equal(resolveCalls, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+    store.close();
+  }
+});
+
 test("control captureSession returns the frozen atomic event view", async () => {
   const { store } = controlCaptureFixture();
   let blobWrites = 0;
