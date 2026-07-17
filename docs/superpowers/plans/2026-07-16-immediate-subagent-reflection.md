@@ -60,6 +60,7 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 
 **Files:**
 - Modify: `src/index.mjs:73-119`
+- Modify: `src/capture.mjs`
 - Create: `src/control-schema.mjs`
 - Create: `src/control-store.mjs`
 - Create: `docs/verification/2026-07-16-legacy-control-plane-audit.md`
@@ -75,6 +76,14 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - Produces: capture-compatible `assertCaptureAllowed(event)`, `captureSessionEvent(event)`, `resolveEventObservation(input)` and `getSessionEvent(eventUid)`
 - Consumes: existing `crypto-store.mjs` data/key roots without changing their permissions
 - Transitional rule: existing `src/schema.mjs`, `src/store.mjs` and `paths.storeFile` remain unchanged until every consumer has moved; Task 13 deletes them
+
+**Canonical capture identity clarification (user-approved review exception):**
+
+- Public `captureObservedSession()`, direct `captureSessionEvent()`, observation resolution, persisted signatures and replay equality must all consume one shared, body-free normalized capture identity. No entry point may reconstruct a partial equality tuple of its own.
+- The normalized tuple is `(event_uid, source_provider, session_uid, context_epoch, source_namespace, source_id, source_event_id, source_offset, capture_source, native_turn_id, source_timestamp, role, referent_event_uid, content_hash, completeness)`. Optional values normalize to `null`; `source_offset` is either `null` or a bounded non-negative safe integer.
+- `event.capture_source` and `input.captureSource` are aliases for the same bounded field (maximum 256 characters). Normalize the supplied value once; only when it is absent derive `${provider}:${sourceNamespace}`. Reject conflicting, empty or oversized values before encrypted-blob or database side effects; never truncate them.
+- An exact replay may return `duplicate=true` only when the persisted observation key targets the same event and the complete normalized tuple matches. Any changed tuple field is `control_observation_collision`. Hook/transcript aliasing may attach a different observation key to the same event, but that observation stores and replays its own complete signature.
+- Raw text and encrypted body bytes never enter the identity/signature. `encrypted_raw_ref` remains a separate immutable storage invariant and must not be used to make two different normalized capture identities equal.
 
 - [ ] **Step 1: Write the fresh-schema RED tests**
 

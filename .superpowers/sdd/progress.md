@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | blocked after sixth-round review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a` | `CHANGES_REQUIRED` (0 Critical, 1 Important) | identity/schema 15/15, capture/control 56/56, focused 121/121; canonical capture identity contract still fragmented |
+| 1. Lean control DB | canonical identity refactor authorized | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a` | review 7 pending after canonical refactor | identity/schema 15/15, capture/control 56/56, focused 121/121; one shared body-free identity tuple is now the binding correction |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
