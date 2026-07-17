@@ -24,8 +24,8 @@
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
 - GREEN evidence: canonical blocker 4/4, omitted-context replay 1/1, identity/schema matrix 18/18, capture/control-store 61/61 and Task 1 focused 126/126; `node --check` and `git diff --check` passed. The single temporary-HOME full run was 253/254; its only unchanged legacy Stop hard-deadline fixture failed before creating the first signal file and passed an exact isolated rerun 1/1
 - Review round: `7` (fifth user-authorized exception beyond configured 2-round ceiling)
-- Review package: pending fresh full Task 1 package after canonical identity commit
-- Review result: pending fresh independent Task 1 review after canonical identity refactor
+- Review package: full Task 1 range `.superpowers/sdd/review-add6b7e..9c3405c.diff`
+- Review result: fresh independent reviewer `/root/task1_canonical_identity_review` dispatched; report pending at `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-8.md`
 - Unresolved findings: capture identity has multiple competing definitions. Public projection drops `event.capture_source`; direct `captureSessionEvent()` duplicate replay bypasses persisted observation signature, so changed capture source/source event/source offset can still return `duplicate=true`
 - Fix dispatch: `/root/task1_control_store_fix1` completed commit `aa770c6`
 - Fix round 2 dispatch: `/root/task1_control_store_fix2` completed commit `864240b5f011722172898d88523d9201a9a91d07`
