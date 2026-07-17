@@ -49,6 +49,8 @@
 - Plan self-review: clean; the amendment stays within `src/capture.mjs`, `src/control-store.mjs` and `test/control-store.test.mjs`, reuses schema v1 and `EncryptedBlobStore`, and adds no service, scheduler, mutex, RAG, Stop, notification or Task 2-15 behavior
 - Implementation dispatch: fresh implementer `/root/task1_atomic_public_capture` is executing Task 1 Steps 6-22 from `.superpowers/sdd/task-1-brief.md`; implementation base remains `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` for the eventual full Task 1 review package
 - Dispatch constraints: TDD; only `src/capture.mjs`, `src/control-store.mjs`, and `test/control-store.test.mjs`; disposable HOME/DB; no schema/crypto/installer/plan/progress changes and no live hooks/runtime state
+- Amendment RED evidence: four focused RED groups failed for the intended gaps: missing `prepareCapture`; public supplied-ref mismatch/unified result absent; caller mutation after blob await changed validation/persistence; different-alias and incompatible-storage paths lacked the atomic `kind` contract
+- Fixture reconciliation: Step 19 exposed old fixtures that supplied fake public refs or used compatible direct aliases to seed rows. The approved production contract governs; fixture-only changes must set non-ref-testing public inputs to `null` and give every timestamp-window seed a distinct non-null ref so the original 31-outside/2-inside ambiguity proof remains intact
 - Next action: persist the implementer's RED/GREEN/commit evidence, then dispatch one fresh independent thorough reviewer. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
