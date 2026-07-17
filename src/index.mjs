@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
 import { createCodexHost } from "./codex-host.mjs";
 import { inspectReconcileScheduler, installReconcileScheduler, removeReconcileScheduler } from "./reconcile-scheduler.mjs";
+import { initializeControlStore } from "./control-store.mjs";
 import { SCHEMA_VERSION } from "./schema.mjs";
 import { openStore } from "./store.mjs";
 
@@ -81,6 +82,7 @@ export function pathsFor(home = os.homedir()) {
   const runtimeRoot = path.join(packRoot, "versions", RUNTIME_VERSION);
   const dataRoot = path.join(home, ".agent", "feedback-loop-data");
   const keyRoot = path.join(home, ".agent", "feedback-loop-keys");
+  const legacyDatabase = path.join(dataRoot, "store", "feedback-loop.sqlite3");
   const paths = {
     home,
     packRoot,
@@ -89,7 +91,9 @@ export function pathsFor(home = os.homedir()) {
     runtimeCurrent: path.join(packRoot, "current.json"),
     dataRoot,
     keyRoot,
-    storeFile: path.join(dataRoot, "store", "feedback-loop.sqlite3"),
+    controlDatabase: path.join(dataRoot, "store", "control.sqlite3"),
+    legacyDatabase,
+    storeFile: legacyDatabase,
     blobRoot: path.join(dataRoot, "blobs", "sha256"),
     safetyProjection: path.join(dataRoot, "safety", "guard.json.mac"),
     exportsRoot: path.join(dataRoot, "exports"),
@@ -430,6 +434,10 @@ export async function install(options = {}) {
   const paths = pathsFor(home);
   const actions = [];
   await validateInstallRoots(paths, dryRun);
+  if (!dryRun) {
+    const controlStore = initializeControlStore({ paths });
+    controlStore.close();
+  }
   await writePromptPack(paths, dryRun, actions);
   await writeRuntimeLauncher(paths, dryRun, actions);
   for (const cli of CLIS) {

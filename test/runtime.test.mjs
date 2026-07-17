@@ -6,6 +6,18 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { install, pathsFor, uninstall } from "../src/index.mjs";
+import { listUserTables, openControlStore } from "../src/control-store.mjs";
+
+const ALLOWED_CONTROL_TABLES = [
+  "event_observations",
+  "reflection_emissions",
+  "review_job_events",
+  "reviewer_jobs",
+  "schema_migrations",
+  "session_events",
+  "sessions",
+  "store_meta"
+];
 
 test("paths separate versioned runtime from durable data and keys", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-runtime-"));
@@ -17,6 +29,29 @@ test("paths separate versioned runtime from durable data and keys", async () => 
   assert.notEqual(paths.runtimeRoot, paths.dataRoot);
   assert.notEqual(paths.dataRoot, paths.keyRoot);
   assert.match(paths.storeFile, /feedback-loop\.sqlite3$/);
+});
+
+test("separates the lean control database from the legacy database", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-control-paths-"));
+  const paths = pathsFor(home);
+
+  assert.match(paths.controlDatabase, /store[\\/]control\.sqlite3$/);
+  assert.match(paths.legacyDatabase, /store[\\/]feedback-loop\.sqlite3$/);
+  assert.equal(paths.legacyDatabase, paths.storeFile);
+  assert.notEqual(paths.controlDatabase, paths.legacyDatabase);
+});
+
+test("install initializes only the lean control database", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-control-install-"));
+  const paths = pathsFor(home);
+  await mkdir(path.dirname(paths.legacyDatabase), { recursive: true, mode: 0o700 });
+  await writeFile(paths.legacyDatabase, "legacy-sentinel", { mode: 0o600 });
+
+  await install({ home });
+  const controlStore = openControlStore({ paths });
+  assert.deepEqual(listUserTables(controlStore.database), ALLOWED_CONTROL_TABLES);
+  controlStore.close();
+  assert.equal(await readFile(paths.legacyDatabase, "utf8"), "legacy-sentinel");
 });
 
 test("stable launcher resolves an atomically selected versioned runtime", async () => {
