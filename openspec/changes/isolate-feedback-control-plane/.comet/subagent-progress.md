@@ -16,7 +16,7 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `task-review`
+- Stage: `blocked`
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`
@@ -59,7 +59,11 @@
 - Review round: `9` (the single fresh independent transaction-boundary re-review explicitly authorized after review-8)
 - Review package: `.superpowers/sdd/review-add6b7e..da19db1.diff` covers the complete Task 1 implementation range from `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72` through `da19db100c9b4c52abe0a19c712b4d691267aed4`
 - Review dispatch: fresh independent reviewer `/root/task1_atomic_public_capture_review` is verifying spec compliance and code quality from the brief, implementation report, and full-range diff package; it must not repeat the implementer's suite
-- Next action: process the review-9 verdict. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Review result: `/root/task1_atomic_public_capture_review` returned `CHANGES_REQUIRED` (Critical 0, Important 1, Minor 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-1-v2-review-9.md`
+- Closed findings: review-9 confirms the review-8 supplied-ref replay mismatch, caller-mutation TOCTOU, and different-alias serialization blockers are closed; canonical identity, direct compatibility, result consistency, scope, and all other Task 1 checks passed
+- Unresolved finding: public capture accepts a null/undefined first blob-writer result, enters the direct-only nullable authoritative-ref path, and can commit `encrypted_raw_ref = NULL`. Public capture must reject it after exactly one attempted first write and before SQLite/second-write side effects, with a focused regression
+- Review ceiling: the single transaction-boundary implementation plus fresh independent re-review explicitly authorized after review-8 has been consumed; no review-9 fix agent is authorized yet
+- Next action: wait for an explicit user decision on one bounded fix plus one fresh re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 

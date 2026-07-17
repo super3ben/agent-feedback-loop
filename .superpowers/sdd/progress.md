@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | atomic public capture implementation complete; review in progress | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`; design `e1732a8`; plan `c6f984f` | `/root/task1_atomic_public_capture_review` reviewing full range | Step18 7/7; Step19 12/12; focused 134/134; final disposable-HOME full suite 262/262; static/scope checks passed |
+| 1. Lean control DB | blocked by review-9 public null-writer invariant | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`; design `e1732a8`; plan `c6f984f` | CHANGES_REQUIRED: 0 Critical / 1 Important / 0 Minor | Three review-8 blockers closed; public blob writer can still return null and reach the direct-only nullable ref path; bounded fix/re-review needs explicit authorization |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -39,3 +39,4 @@
 - Review 6 confirmed the fifth-round alias/CHECK/trigger fixes but found two identity blockers: public duplicate replay omits persisted immutable referent/source/completeness fields, and a shared session UID can rewrite its provider. Undeclared VIEW acceptance is Minor. A sixth targeted fix/re-review requires a new explicit user decision.
 - The user replied `继续` on 2026-07-17, authorizing a sixth-round exception for both identity blockers and the adjacent canonical-schema VIEW gap; no task is checked until a fresh reviewer approves.
 - Review 7 closed the review-6 provider/VIEW findings but proved the identity model is still fragmented: public capture drops capture source while direct replay bypasses observation-signature checks. After repeated field-level fixes, the next attempt must unify normalization/signature/equality/replay around one canonical capture identity contract, not append another isolated field check; this requires a new explicit user decision.
+- Review 9 confirms the atomic frozen-snapshot redesign closes all three review-8 blockers, but found one new bounded Important: public capture does not reject a null/undefined blob-writer result before entering the direct-only nullable authoritative-ref path. The authorized implementation/re-review round is consumed; no fix is dispatched until the user explicitly authorizes one bounded fix and fresh re-review.
