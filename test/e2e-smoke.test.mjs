@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { install, pathsFor } from "../src/index.mjs";
 import { openControlStore } from "../src/control-store.mjs";
@@ -31,6 +32,19 @@ function runHook(file, input, env, args) {
 
 function unavailableCodexHost() {
   return { async synchronize() { return { available: false, configured: true, runnable: false, status: "unavailable" }; } };
+}
+
+async function readEventually(file, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return await readFile(file, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timed out waiting for detached fixture: ${path.basename(file)}`);
 }
 
 test("core hook returns a successful launcher response verbatim", async () => {
@@ -164,4 +178,59 @@ test("installed hook manifests preserve native timeout units", async () => {
   const gemini = JSON.parse(await readFile(path.join(home, ".gemini", "settings.json"), "utf8"));
   assert.deepEqual(claude.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks).map((hook) => hook.timeout), [5]);
   assert.deepEqual(gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks).map((hook) => hook.timeout), [5000]);
+});
+
+test("detached reviewer outlives its macOS launcher parent without leaking output", {
+  skip: process.platform !== "darwin"
+}, async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-detached-reviewer-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const fixtureCli = path.join(home, "fixture-reviewer.mjs");
+  const launcherParent = path.join(home, "launcher-parent.mjs");
+  const sentinel = path.join(home, "reviewer-finished.json");
+  const moduleUrl = pathToFileURL(path.join(ROOT, "src", "reviewer-launcher.mjs")).href;
+  const childStdout = "DETACHED_FIXTURE_STDOUT";
+  const childStderr = "DETACHED_FIXTURE_STDERR";
+
+  await writeFile(fixtureCli, `
+import { writeFile } from "node:fs/promises";
+console.log(${JSON.stringify(childStdout)});
+console.error(${JSON.stringify(childStderr)});
+await new Promise((resolve) => setTimeout(resolve, 750));
+await writeFile(process.env.AFL_REVIEW_SENTINEL, JSON.stringify({ writtenAt: Date.now() }));
+`);
+  await writeFile(launcherParent, `
+import { launchDetachedReviewer } from ${JSON.stringify(moduleUrl)};
+const result = launchDetachedReviewer({
+  platform: "darwin",
+  nodeExecutable: process.execPath,
+  cliFile: ${JSON.stringify(fixtureCli)},
+  home: ${JSON.stringify(home)},
+  jobId: "fixture-job",
+  launchEpoch: 1,
+  env: {
+    PATH: process.env.PATH,
+    HOME: ${JSON.stringify(home)},
+    TMPDIR: ${JSON.stringify(home)},
+    AFL_REVIEW_SENTINEL: ${JSON.stringify(sentinel)}
+  }
+});
+console.log(JSON.stringify({ result, returnedAt: Date.now() }));
+`);
+
+  const startedAt = Date.now();
+  const parent = await execFileAsync(process.execPath, [launcherParent], {
+    cwd: home,
+    env: { ...process.env, HOME: home, TMPDIR: home }
+  });
+  const parentExitedAt = Date.now();
+  const parentRecord = JSON.parse(parent.stdout.trim());
+
+  assert.deepEqual(parentRecord.result, { attempted: true, reason: "spawn_attempted" });
+  assert.ok(parentRecord.returnedAt >= startedAt && parentRecord.returnedAt <= parentExitedAt);
+  assert.doesNotMatch(`${parent.stdout}${parent.stderr}`, new RegExp(`${childStdout}|${childStderr}`));
+  await assert.rejects(access(sentinel), { code: "ENOENT" });
+
+  const completion = JSON.parse(await readEventually(sentinel));
+  assert.ok(completion.writtenAt > parentExitedAt);
 });
