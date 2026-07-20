@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { describe, it } from "node:test";
 
@@ -17,6 +18,67 @@ import { loadReflectionDocuments } from "../src/selector.mjs";
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
 const BIN = path.join(ROOT, "bin", "agent-feedback-loop.mjs");
+
+async function legacyCliFixture({ configuredLegacyPath = false } = {}) {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-legacy-cli-")));
+  const sourceDb = configuredLegacyPath
+    ? pathsFor(root).legacyDatabase
+    : path.join(root, "legacy.sqlite3");
+  const outputDir = path.join(root, "exports");
+  await mkdir(path.dirname(sourceDb), { recursive: true, mode: 0o700 });
+  const database = new DatabaseSync(sourceDb);
+  try {
+    database.exec(`
+      CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      CREATE TABLE review_receipts(receipt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE report_contents(content_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, content_text TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE lessons(lesson_id TEXT PRIMARY KEY, severity TEXT NOT NULL, responsibility TEXT, method_class TEXT, class_id TEXT, current_revision INTEGER NOT NULL);
+      CREATE TABLE lesson_revisions(lesson_id TEXT NOT NULL, revision INTEGER NOT NULL, card_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(lesson_id, revision));
+    `);
+    const timestamp = "2026-07-20T08:03:00.000Z";
+    const lesson = {
+      lesson_id: "cli-raw-lesson",
+      revision: 1,
+      severity: "Major",
+      responsibility: "agent_fault",
+      confidence: "high",
+      causal_chain: ["one cause", "two causes", "three causes", "four causes", "five causes"],
+      method_class: "verification-closure",
+      class_id: "cli-class",
+      generalizable: true,
+      evidence_refs: [{ feedback_event_id: "cli-event", feedback_quote: "private cli quote", referent_event_ids: ["cli-referent"] }]
+    };
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (8, ?)").run(timestamp);
+    database.prepare("INSERT INTO review_receipts(receipt_id, job_id, payload_json, created_at) VALUES (?, ?, ?, ?)").run(
+      "cli-raw-receipt", "cli-raw-job", JSON.stringify({
+        write_complete: true,
+        review_receipt_id: "cli-raw-receipt",
+        report_content_id: "cli-raw-report",
+        report_content: "private payload report",
+        status: "reviewed",
+        lessons: [lesson]
+      }), timestamp
+    );
+    database.prepare("INSERT INTO report_contents(content_id, job_id, content_text, created_at) VALUES (?, ?, ?, ?)")
+      .run("cli-raw-report", "cli-raw-job", "private persisted report body with enough substantive detail", timestamp);
+    database.prepare("INSERT INTO lessons(lesson_id, severity, responsibility, method_class, class_id, current_revision) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("cli-raw-lesson", "Major", "agent_fault", "verification-closure", "cli-class", 1);
+    database.prepare("INSERT INTO lesson_revisions(lesson_id, revision, card_json, created_at) VALUES (?, ?, ?, ?)").run(
+      "cli-raw-lesson", 1, JSON.stringify({
+        when: "when checking CLI completion",
+        must_do: "run the CLI verification",
+        must_not: "do not infer CLI success",
+        verify: "inspect the CLI output",
+        why: "the previous result was not checked",
+        exception: "none",
+        source_ids: ["cli-raw-report"]
+      }), timestamp
+    );
+  } finally {
+    database.close();
+  }
+  return { root, sourceDb: await realpath(sourceDb), outputDir };
+}
 
 async function tempHome() {
   return mkdtemp(path.join(tmpdir(), "afl-home-"));
@@ -994,6 +1056,101 @@ describe("agent-feedback-loop package", () => {
     const result = await install({ home, dryRun: true });
     assert.equal(result.dryRun, true);
     await assert.rejects(stat(path.join(home, ".agent", "feedback-loop")));
+  });
+
+  it("legacy-export emits only bounded opaque results and dry-run creates no output", async () => {
+    const fixture = await legacyCliFixture();
+    try {
+      const env = { ...process.env, HOME: fixture.root, TMPDIR: fixture.root };
+      const dryRun = await execFileAsync(BIN, [
+        "legacy-export",
+        "--source-db", fixture.sourceDb,
+        "--output-dir", fixture.outputDir,
+        "--dry-run"
+      ], { env });
+      const dryOutput = JSON.parse(dryRun.stdout);
+      assert.equal(dryOutput.status, "dry_run");
+      assert.deepEqual(dryOutput.counts, {
+        planned: 1, written: 0, skipped: 0, incomplete: 0, conflicts: 0
+      });
+      assert.deepEqual(dryOutput.items.map((item) => item.status), ["planned"]);
+      assert.ok(dryOutput.items.every((item) => /^legacy-[a-f0-9]{64}$/u.test(item.id)));
+      assert.equal(dryRun.stderr, "");
+      await assert.rejects(stat(fixture.outputDir));
+
+      const applied = await execFileAsync(BIN, [
+        "legacy-export",
+        "--source-db", fixture.sourceDb,
+        "--output-dir", fixture.outputDir,
+        "--apply"
+      ], { env });
+      const appliedOutput = JSON.parse(applied.stdout);
+      assert.equal(appliedOutput.status, "applied");
+      assert.deepEqual(appliedOutput.counts, {
+        planned: 1, written: 1, skipped: 0, incomplete: 0, conflicts: 0
+      });
+      assert.equal(applied.stderr, "");
+
+      for (const visible of [dryRun.stdout, applied.stdout]) {
+        assert.doesNotMatch(visible, /cli-raw-|private|legacy\.sqlite3|afl-legacy-cli/u);
+        assert.doesNotMatch(visible, /report|quote|completion/u);
+      }
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy-export strictly rejects duplicate, unknown, missing, and ambiguous arguments", async () => {
+    const fixture = await legacyCliFixture();
+    try {
+      const env = { ...process.env, HOME: fixture.root, TMPDIR: fixture.root };
+      const base = ["legacy-export", "--source-db", fixture.sourceDb, "--output-dir", fixture.outputDir];
+      const invalid = [
+        [...base, "--source-db", fixture.sourceDb, "--dry-run"],
+        [...base, "--output-dir", fixture.outputDir, "--dry-run"],
+        [...base, "--unknown", "value", "--dry-run"],
+        ["legacy-export", "--source-db", "--output-dir", fixture.outputDir, "--dry-run"],
+        [...base],
+        [...base, "--dry-run", "--apply"]
+      ];
+      for (const args of invalid) {
+        await assert.rejects(
+          execFileAsync(BIN, args, { env }),
+          (error) => {
+            assert.equal(error.code, 1);
+            assert.match(String(error.stderr), /legacy_export_invalid_arguments/u);
+            assert.doesNotMatch(String(error.stderr), /private|cli-raw-/u);
+            return true;
+          }
+        );
+      }
+      await assert.rejects(stat(fixture.outputDir));
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("legacy-export apply refuses the configured HOME legacy database before output creation", async () => {
+    const fixture = await legacyCliFixture({ configuredLegacyPath: true });
+    try {
+      const env = { ...process.env, HOME: fixture.root, TMPDIR: fixture.root };
+      await assert.rejects(
+        execFileAsync(BIN, [
+          "legacy-export",
+          "--source-db", fixture.sourceDb,
+          "--output-dir", fixture.outputDir,
+          "--apply"
+        ], { env }),
+        (error) => {
+          assert.equal(error.code, 1);
+          assert.equal(String(error.stderr), "live_legacy_database_refused\n");
+          return true;
+        }
+      );
+      await assert.rejects(stat(fixture.outputDir));
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it("CLI exposes no receipt or reconcile control plane", async () => {

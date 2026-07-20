@@ -14,6 +14,7 @@ import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
+import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
@@ -47,6 +48,41 @@ function parseArgs(args) {
     }
   }
   return { command, options };
+}
+
+function parseLegacyExportArgs(args) {
+  let sourceDb = null;
+  let outputDir = null;
+  let dryRun = null;
+  for (let index = 1; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--source-db" || argument === "--output-dir") {
+      const value = args[index + 1];
+      if (typeof value !== "string" || !value || value.startsWith("--")) {
+        throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
+      }
+      if ((argument === "--source-db" && sourceDb !== null)
+          || (argument === "--output-dir" && outputDir !== null)) {
+        throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
+      }
+      if (argument === "--source-db") sourceDb = value;
+      else outputDir = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--dry-run" || argument === "--apply") {
+      if (dryRun !== null) {
+        throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
+      }
+      dryRun = argument === "--dry-run";
+      continue;
+    }
+    throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
+  }
+  if (sourceDb === null || outputDir === null || dryRun === null) {
+    throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
+  }
+  return { sourceDb, outputDir, dryRun };
 }
 
 const PROMPT_INPUT_MAX_BYTES = 2 * 1024 * 1024;
@@ -392,6 +428,7 @@ Usage:
   agent-feedback-loop capture status|on|off [--home <path>]
   agent-feedback-loop gc status|run [--home <path>]
   agent-feedback-loop reviewer-context --job-id <id> [--home <path>]
+  agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
   agent-feedback-loop paths [--home <path>]
 `);
 }
@@ -404,6 +441,26 @@ function printActions(result, title) {
 }
 
 export async function main(args) {
+  if (args[0] === "legacy-export") {
+    let explicit;
+    try {
+      explicit = parseLegacyExportArgs(args);
+      const plan = await inspectLegacyExport({
+        sourceDb: explicit.sourceDb,
+        outputDir: explicit.outputDir
+      });
+      const counts = await executeLegacyExport({ plan, dryRun: explicit.dryRun });
+      console.log(JSON.stringify({
+        status: explicit.dryRun ? "dry_run" : "applied",
+        counts,
+        items: plan.items
+      }));
+      return;
+    } catch (error) {
+      const code = boundedReason(error, "legacy_export_failed");
+      throw Object.assign(new Error(code), { code });
+    }
+  }
   const { command, options } = parseArgs(args);
   if (options.help || command === "help") {
     printHelp();
