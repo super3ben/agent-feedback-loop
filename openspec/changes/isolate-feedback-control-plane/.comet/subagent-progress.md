@@ -16,7 +16,7 @@
 
 - Plan task: `Task 2 complete: 实现即时 candidate job 与 fenced lease 控制 API`
 - OpenSpec mappings: redesigned `3.3` stable candidate identity/job creation and `3.5` claim/lease/retry/context are partial; neither OpenSpec checkbox is complete in this storage-only task
-- Stage: `review-fix`
+- Stage: `task-review`
 - Task 2 base: `e7b9fa301aded09bb79c075d385e9dc2ab2e1052`
 - Task 2 allowed files: `src/control-store.mjs`, `test/control-store.test.mjs`; `.superpowers/sdd/task-2-report.md` may only receive an uncommitted append-only implementation handoff
 - Task 2 scope: immediate replay-idempotent candidate creation, bounded launch reservation/failure release, recoverable ordering, fenced claim/renew/assert/terminal transitions, bounded opaque context, retry exhaustion; no schema, scheduler, launcher, provider, notification, RAG, Markdown-body or live-state changes
@@ -29,7 +29,12 @@
 - Task 2 review 1: `/root/task2_frozen_review` returned `CHANGES_REQUIRED` (Critical 0, Important 1, backlog 0); report `.superpowers/sdd/isolate-feedback-control-plane-task-2-v2-review-1.md`
 - Review 1 finding: the existing bounded recovery flow cannot reach `claimReviewJob`'s exhaustion branch because both listing and reservation exclude attempt 3, so an expired third worker remains nonterminal forever
 - Review-fix 1 scope: one RED regression plus the smallest conditional-SQL correction that makes `listRecoverableReviewJobs` followed by `reserveReviewLaunch` atomically persist exactly one `failed/attempts_exhausted` terminal event; only `src/control-store.mjs` and `test/control-store.test.mjs`
-- Next action: bounded fix, focused/three-file regression, then one frozen re-review of the single finding and Task 2 checklist; no adjacent expansion
+- Review-fix 1 result: `/root/task2_immediate_job_control` returned `DONE_WITH_CONCERNS`; commit `06c438942af6133470266a639eebafa8fd6cc822` changes only the two owned files
+- Fix evidence: focused RED 0/1; focused GREEN 1/1; Task 2 focused 9/9; required control-store/store/capture regression 160/160; syntax and commit checks passed
+- Fix behavior: bounded listing exposes the due expired third attempt; reservation atomically clears owner/lease/retry/launch state, records `completed_at` plus `attempts_exhausted`, and inserts exactly one fenced failed event; repeated recovery cannot reopen it
+- Coordinator reprobe: disposable DB returned the attempt-3 row from listing, then reservation persisted `failed`, all four transient fields null and exactly one failed event at lease epoch 3
+- Frozen re-review package: `.superpowers/sdd/review-12275a6..06c4389.diff`
+- Next action: one fresh frozen re-review checks I1 closure and regression only, then checks Task 2 if no frozen-core regression; no new adjacent finding may expand the round
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`
