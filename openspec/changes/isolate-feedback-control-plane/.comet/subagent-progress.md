@@ -107,7 +107,9 @@
 - Timestamp architecture: optional input must be a valid timezone-bearing RFC3339 instant with at most millisecond precision, normalized once to fixed-width UTC ISO before signature/blob/SQLite work; equivalent offset aliases normalize equal. Candidate SQL and exact replay must compare the same canonical inclusive time-window bounds and must not independently parse raw timestamp text
 - Scope boundary: no schema/version/service/scheduler/hook/notification/RAG/Markdown ownership or later-task change; real hooks, HOME, runtime pointer, and feedback database remain untouched
 - Dirty-worktree attribution: `.superpowers/sdd/task-1-report.md` remains the prior agents' append-only handoff and must be preserved uncommitted
-- Next action: amend the approved Task 1 design/spec/plan with the explicit timestamp contract, validate it, then dispatch one fresh TDD implementer and one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Timestamp amendment base: `81729dea85426240554675af23050605e1e43d92`
+- Timestamp amendment dispatch: fresh architecture agent `/root/task1_timestamp_contract_spec` is updating only the Design Doc, control-plane delta spec, OpenSpec tasks and Task 1 plan with the approved canonical UTC contract and RED/GREEN gates
+- Next action: wait for the timestamp contract amendment, validate its commit/scope, then dispatch one fresh TDD implementer and one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
