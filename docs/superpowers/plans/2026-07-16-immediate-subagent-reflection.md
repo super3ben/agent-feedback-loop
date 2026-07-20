@@ -1805,12 +1805,21 @@ git commit -m "refactor: remove the legacy feedback runtime"
 - Modify: `templates/rules/feedback-loop.md`
 - Modify: `test/runtime.test.mjs`
 - Modify: `test/cli.test.mjs`
+- Modify: `test/e2e-smoke.test.mjs`
 
 **Interfaces:**
 - Produces: doctor status `promptHook`, `controlStore`, `reflectionDirectory`, `reviewerProvider`, `legacyStopRemoved`, `ready`
 - Produces: fixed structured event names from the Design Doc and bounded fields only
 - Produces: package contents with no deleted Stop/receipt/notification/reconcile artifacts
 - Produces: breaking pre-1.0 runtime version `0.8.0`, consistent in package metadata, installer paths and doctor
+
+**Frozen Task 14 preflight decisions:**
+
+- `doctor()` returns a compact `{ version, status }` contract. `status` has exactly the six declared keys: `promptHook`, `controlStore`, `reflectionDirectory`, `reviewerProvider`, `legacyStopRemoved`, and `ready`; deleted scheduler/notification/maintenance/reconciliation fields and the old parallel `healthy`/`degraded`/`clis`/`reviewers` projections do not survive. `doctor --live` keeps its bounded canary evidence inside this contract instead of restoring compatibility top-level fields. Because the existing E2E test consumes the old live shape, `test/e2e-smoke.test.mjs` is an explicit Task 14 file rather than deferring a broken contract to Task 15.
+- Keep diagnostics lean: aggregate the existing real hook/runtime/provider checks into the six status families and do not add a service, persisted health store, scheduler probe, second schema, or real-HOME test. Missing optional providers remain visible inside `reviewerProvider`; `ready` remains a boolean derived from the declared runtime dependencies, not a new state machine.
+- Structured logging stays in `src/cli.mjs` and writes one JSON object per line to stderr; prompt-path diagnostics retain the existing debug opt-in and reviewer terminal diagnostics retain their current visibility. Event values are only the fixed design event names. Reason/result values use explicit enums, opaque identifiers/hashes use strict shapes, numeric fields are bounded non-negative integers, unknown fields are omitted, and content-shaped values become fixed invalid codes or opaque SHA-256 values without emitting any source text. Do not add a log file, rotation service, transport, telemetry backend, or database table.
+- Export one runtime version constant from `src/index.mjs` and set it with `package.json` to exactly `0.8.0`; installed versioned paths/current metadata and doctor read that same constant. Do not create a package lock or compatibility alias for `0.7.6`.
+- Rewrite the English/Chinese README and installed rule to describe only the implemented prompt-only pipeline: immediate detached reviewer, immutable project Markdown, later-prompt cutoff, lean control DB, no Stop/session receipt/status output, no RAG/resident scheduler, macOS/Linux support, explicit read-only legacy export, hooks-disabled rollback, and authorization boundaries. Do not claim Task 15 Linux/live-provider/desktop acceptance before its evidence exists.
 
 - [ ] **Step 1: Write RED doctor, log-privacy and pack-content tests**
 
