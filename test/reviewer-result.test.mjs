@@ -227,6 +227,7 @@ test("existing and new family modes cannot be mixed or invent recurrence provena
 });
 
 test("obvious credentials and AFL controls are rejected without banning ordinary words", () => {
+  reject(lesson({ proposed_family_key: "sk-proj-abcdefghijklmnop" }));
   reject(lesson({ facts: ["Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"] }));
   reject(lesson({ root_cause: "password=CorrectHorseBatteryStaple42!" }));
   reject(lesson({ method_changes: ["AFL_REVIEW_CAPABILITY=capability-AbCd1234567890"] }));

@@ -144,7 +144,8 @@ export function validateReviewerResult(value, {
       name: "proposed_family_key",
       maxLength: 128,
       pattern: FAMILY_KEY_PATTERN,
-      canonical: true
+      canonical: true,
+      scan: true
     });
   } else {
     familyId = normalizedString(value.family_id, {
