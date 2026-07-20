@@ -1,215 +1,279 @@
 import { createHash } from "node:crypto";
 
-const ORDER = { Blocker: 0, Critical: 1, Major: 2, Minor: 3 };
-const CJK_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
-const DEFAULT_LIMITS = Object.freeze({ singleCardFloor: 192, singleCardHardLimit: 1600, maxCandidates: 12, maxSevereCards: 4 });
-const GENERIC_LATIN_TERMS = new Set([
-  "agent", "and", "are", "before", "current", "for", "from", "into", "says",
-  "task", "the", "then", "use", "user", "using", "was", "were", "when", "with"
-]);
+import { readReflectionCatalog } from "./reflection-document.mjs";
 
-export function estimateCardTokens(card, hostPrefix = "") {
-  const text = `${hostPrefix}\n${JSON.stringify(card)}`;
-  const cjkCount = (text.match(CJK_PATTERN) || []).length;
-  const nonCjk = text.replace(CJK_PATTERN, "");
-  // Local conservative estimate only. CJK characters are commonly close to
-  // one token, while JSON/Latin text is budgeted more tightly than chars/4.
-  return Math.ceil(cjkCount * 1.2 + Buffer.byteLength(nonCjk, "utf8") / 3 + 16);
+const HARD_LIMITS = Object.freeze({
+  maxFileBytes: 131_072,
+  maxCards: 4,
+  maxDocumentTokens: 320,
+  maxTotalTokens: 900
+});
+const SEVERITY_RANK = Object.freeze({ Major: 1, Critical: 2, Blocker: 3 });
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+const LATIN_WORD = /[\p{Script=Latin}\p{Number}]+/gu;
+const TOKEN_PART = /[A-Za-z0-9]+|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[^\s]/gu;
+const CATALOG_REASON = Object.freeze({
+  file_too_large: "oversized_document",
+  max_files_exceeded: "catalog_limit",
+  legacy_incomplete: "legacy_incomplete",
+  published_after_cutoff: "published_after_cutoff"
+});
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
-export function applicationId({ sessionUid, contextEpoch, taskFingerprint, lessonId, revision }) {
-  return createHash("sha256").update([sessionUid, contextEpoch, taskFingerprint, lessonId, revision].join("\u0000")).digest("hex");
+function normalize(value) {
+  return String(value ?? "").normalize("NFKC").toLocaleLowerCase("en-US").replace(/\s+/gu, " ").trim();
 }
 
-function relevant(lesson, projectId) {
-  return !lesson.project_id || lesson.project_id === projectId;
-}
-
-function normalizeRetrievalText(value) {
-  return String(value || "")
-    .normalize("NFKC")
-    .toLocaleLowerCase()
-    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
-    .trim();
-}
-
-function latinTerms(value) {
-  return new Set((normalizeRetrievalText(value).match(/[a-z][a-z0-9+_.-]{2,}/g) || [])
-    .filter((term) => !GENERIC_LATIN_TERMS.has(term)));
-}
-
-function cjkNgrams(value, size) {
-  const result = new Set();
-  const runs = String(value || "").normalize("NFKC").match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) || [];
-  for (const run of runs) {
-    for (let index = 0; index <= run.length - size; index += 1) result.add(run.slice(index, index + size));
-  }
-  return result;
-}
-
-function latinOverlapCount(left, right) {
-  const leftTerms = latinTerms(left);
-  const rightTerms = latinTerms(right);
-  return [...rightTerms].filter((term) => leftTerms.has(term)).length;
-}
-
-function compactRetrievalText(value) {
-  return normalizeRetrievalText(value).replace(/\s+/g, "");
-}
-
-function hasExplicitSignalMatch(prompt, signal) {
-  if (!String(prompt || "").trim() || !String(signal || "").trim()) return false;
-  const promptCompact = compactRetrievalText(prompt);
-  const signalCompact = compactRetrievalText(signal);
-  const signalHasCjk = CJK_PATTERN.test(signalCompact);
-  CJK_PATTERN.lastIndex = 0;
-  if (signalHasCjk && signalCompact.length >= 2 && promptCompact.includes(signalCompact)) return true;
-  const signalLatin = latinTerms(signal);
-  if (signalLatin.size === 0) return false;
-  return latinOverlapCount(prompt, signal) >= Math.min(2, signalLatin.size);
-}
-
-function promptMentionsScopedTool(prompt, tools) {
-  const promptNormalized = ` ${normalizeRetrievalText(prompt)} `;
-  const promptCompact = compactRetrievalText(prompt);
-  return tools.some((tool) => {
-    const normalized = normalizeRetrievalText(tool);
-    if (!normalized) return false;
-    if (CJK_PATTERN.test(normalized)) {
-      CJK_PATTERN.lastIndex = 0;
-      const compact = normalized.replace(/\s+/g, "");
-      return compact.length >= 2 && promptCompact.includes(compact);
+function textFeatures(values) {
+  const latin = new Set();
+  const cjk = new Set();
+  for (const source of Array.isArray(values) ? values : [values]) {
+    const value = normalize(source);
+    for (const token of value.match(LATIN_WORD) ?? []) latin.add(token);
+    for (const run of value.match(CJK_RUN) ?? []) {
+      const points = Array.from(run);
+      for (let index = 0; index + 1 < points.length; index += 1) {
+        cjk.add(`${points[index]}${points[index + 1]}`);
+      }
     }
-    CJK_PATTERN.lastIndex = 0;
-    return promptNormalized.includes(` ${normalized} `);
-  });
-}
-
-function hasActionConditionMatch(prompt, condition) {
-  if (!String(prompt || "").trim() || !String(condition || "").trim()) return false;
-  const promptCompact = compactRetrievalText(prompt);
-  const conditionCompact = compactRetrievalText(condition);
-  if (conditionCompact.length >= 8 && promptCompact.includes(conditionCompact)) return true;
-  if (latinOverlapCount(prompt, condition) >= 2) return true;
-  const promptCjk = cjkNgrams(prompt, 4);
-  const conditionCjk = cjkNgrams(condition, 4);
-  return [...promptCjk].some((term) => conditionCjk.has(term));
-}
-
-function pathScopeMatches(scopePaths, taskPaths) {
-  return scopePaths.some((path) => taskPaths.some((candidate) => candidate === path || candidate.startsWith(`${path}/`)));
-}
-
-function lessonOriginatesFromSession(lesson, sessionUid) {
-  if (!sessionUid) return false;
-  return (lesson.card?.source_ids || []).some((sourceId) => String(sourceId).startsWith(`${sessionUid}:`));
-}
-
-function scopeMatches(lesson, task, session) {
-  const scope = lesson.scope || {};
-  const taskPaths = Array.isArray(task.paths) ? task.paths : [];
-  const taskTools = Array.isArray(task.tools) ? task.tools : [];
-  let positiveMatch = lessonOriginatesFromSession(lesson, session?.session_uid);
-
-  if (scope.task_types?.length && task.task_type) {
-    if (!scope.task_types.includes(task.task_type)) return false;
-    positiveMatch = true;
   }
-  if (scope.paths?.length && taskPaths.length > 0) {
-    if (!pathScopeMatches(scope.paths, taskPaths)) return false;
-    positiveMatch = true;
-  }
-  if (scope.tools?.length && taskTools.length > 0) {
-    if (!scope.tools.some((tool) => taskTools.includes(tool))) return false;
-    positiveMatch = true;
-  }
-
-  const prompt = String(task.prompt || "");
-  if ((scope.signals || []).some((signal) => hasExplicitSignalMatch(prompt, signal))) positiveMatch = true;
-  if (scope.tools?.length && promptMentionsScopedTool(prompt, scope.tools)) positiveMatch = true;
-  if (lesson.card?.when && hasActionConditionMatch(prompt, lesson.card.when)) positiveMatch = true;
-
-  return lesson.severity === "Major" ? positiveMatch : true;
+  return { latin, cjk };
 }
 
-function hasTaskScope(lesson) {
-  const scope = lesson.scope || {};
-  return [scope.task_types, scope.paths, scope.tools, scope.signals].some((value) => Array.isArray(value) && value.length > 0);
+function intersectionSize(left, right) {
+  let count = 0;
+  for (const token of left.latin) if (right.latin.has(token)) count += 1;
+  for (const token of left.cjk) if (right.cjk.has(token)) count += 1;
+  return count;
 }
 
-function percentile95(values) {
-  if (values.length === 0) return DEFAULT_LIMITS.singleCardFloor;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)];
+function exactMetadataMatches(document, task) {
+  const targets = new Set([
+    ...(document.appliesWhen ?? []),
+    document.classOfMistake,
+    document.methodClass,
+    ...(document.methodChanges ?? [])
+  ].map(normalize).filter(Boolean));
+  const metadata = new Set([
+    ...(Array.isArray(task?.paths) ? task.paths : []),
+    ...(Array.isArray(task?.tools) ? task.tools : [])
+  ].map(normalize).filter(Boolean));
+  let matches = 0;
+  for (const value of metadata) if (targets.has(value)) matches += 1;
+  return matches;
 }
 
-function deriveBudgets(costs, override) {
-  const target = Math.min(
-    DEFAULT_LIMITS.singleCardHardLimit,
-    Math.max(DEFAULT_LIMITS.singleCardFloor, Math.ceil(percentile95(costs) * 1.2))
-  );
-  const absolute = Number.isFinite(override) && override > 0 ? Number(override) : target * DEFAULT_LIMITS.maxSevereCards;
+function relevanceScore(document, prompt, task) {
+  const promptFeatures = textFeatures(prompt);
+  const lexical =
+    4 * intersectionSize(promptFeatures, textFeatures(document.appliesWhen ?? []))
+    + 3 * intersectionSize(promptFeatures, textFeatures(document.classOfMistake))
+    + 2 * intersectionSize(promptFeatures, textFeatures(document.methodClass))
+    + intersectionSize(promptFeatures, textFeatures(document.methodChanges ?? []));
+  const metadata = 8 * exactMetadataMatches(document, task);
+  return Math.min(40, lexical + metadata);
+}
+
+function boundedLimit(value, fallback) {
+  return Number.isSafeInteger(value) && value > 0 ? Math.min(value, fallback) : fallback;
+}
+
+function limitsFrom(budget = {}) {
   return {
-    singleCardTarget: target,
-    singleCardHardLimit: DEFAULT_LIMITS.singleCardHardLimit,
-    normalSoft: Math.min(absolute, target * 2),
-    severeReserve: Math.min(absolute, target * DEFAULT_LIMITS.maxSevereCards),
-    absolute,
-    maxCandidates: DEFAULT_LIMITS.maxCandidates,
-    maxSevereCards: DEFAULT_LIMITS.maxSevereCards
+    maxCards: boundedLimit(budget.maxCards, HARD_LIMITS.maxCards),
+    maxDocumentTokens: boundedLimit(budget.maxDocumentTokens, HARD_LIMITS.maxDocumentTokens),
+    maxTotalTokens: boundedLimit(budget.maxTotalTokens, HARD_LIMITS.maxTotalTokens)
   };
 }
 
-function strongerFamilyProjection(left, right) {
-  const leftSeverity = ORDER[left.severity] ?? 99;
-  const rightSeverity = ORDER[right.severity] ?? 99;
-  if (leftSeverity !== rightSeverity) return rightSeverity < leftSeverity ? right : left;
-  if (Number(left.revision || 0) !== Number(right.revision || 0)) return Number(right.revision || 0) > Number(left.revision || 0) ? right : left;
-  if (right.promotion_state === "active_global" && left.promotion_state !== "active_global") return right;
-  return left;
+function documentGuidance(document) {
+  return [
+    `document_hash: ${document.documentHash}`,
+    "applies_when:",
+    ...document.appliesWhen.map((value) => `- ${value}`),
+    `class_of_mistake: ${document.classOfMistake}`,
+    "method_changes:",
+    ...document.methodChanges.map((value, index) => `${index + 1}. ${value}`)
+  ].join("\n");
 }
 
-function dedupeFamilies(lessons) {
-  const families = new Map();
-  for (const lesson of lessons) {
-    const key = lesson.family_id || `lesson:${lesson.lesson_id}`;
-    const existing = families.get(key);
-    families.set(key, existing ? strongerFamilyProjection(existing, lesson) : lesson);
+export function estimateGuidanceTokens(value) {
+  let total = 0;
+  for (const part of String(value ?? "").match(TOKEN_PART) ?? []) {
+    total += /^[A-Za-z0-9]+$/u.test(part) ? Math.ceil(part.length / 4) : 1;
   }
-  return [...families.values()];
+  return total;
 }
 
-export function selectLessons({ lessons, session, task, budget, hostPrefix = "", store = null }) {
-  const scoped = dedupeFamilies(lessons.filter((lesson) => lesson.enablement !== "disabled" && relevant(lesson, task.project_id) && scopeMatches(lesson, task, session)));
-  const candidates = scoped.filter((lesson) => lesson.severity !== "Major" || hasTaskScope(lesson));
-  const candidateCosts = candidates.map((lesson) => estimateCardTokens(lesson.card, hostPrefix));
-  const budgets = deriveBudgets(candidateCosts, Number(budget));
-  if (candidates.some((lesson) => lesson.conflict_state === "safety_hold" && (lesson.severity === "Blocker" || lesson.severity === "Critical"))) {
-    return { cards: [], hold: "safety_hold", tokenEstimate: 0, budgets };
+function stableIdentity(document) {
+  return document.documentHash || document.reflectionId || "";
+}
+
+function omission(document, reason) {
+  return { documentHash: stableIdentity(document), reason };
+}
+
+function compareNewest(left, right) {
+  const time = Date.parse(left.createdAt) - Date.parse(right.createdAt);
+  if (time !== 0) return time;
+  const leftId = left.reflectionId ?? "";
+  const rightId = right.reflectionId ?? "";
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+}
+
+function rankKey(document) {
+  return [
+    -document.relevanceScore,
+    -(SEVERITY_RANK[document.finalSeverity] ?? 0),
+    -document.familyRecurrence,
+    -Date.parse(document.createdAt),
+    document.reflectionId ?? ""
+  ];
+}
+
+function compareRank(left, right) {
+  const leftKey = rankKey(left);
+  const rightKey = rankKey(right);
+  for (let index = 0; index < leftKey.length; index += 1) {
+    if (leftKey[index] < rightKey[index]) return -1;
+    if (leftKey[index] > rightKey[index]) return 1;
   }
-  const selected = candidates
-    .filter((lesson) => lesson.conflict_state === "none" && lesson.severity !== "Minor")
-    .filter((lesson) => lesson.severity === "Blocker" || lesson.severity === "Critical" || lesson.load_policy !== "trend_only")
-    .sort((a, b) => (ORDER[a.severity] ?? 99) - (ORDER[b.severity] ?? 99))
-    .slice(0, budgets.maxCandidates);
-  const severeCount = selected.filter((lesson) => lesson.severity === "Blocker" || lesson.severity === "Critical").length;
-  if (severeCount > budgets.maxSevereCards) return { cards: [], hold: "memory_overflow_hold", tokenEstimate: 0, budgets };
-  const cards = [];
-  let tokenEstimate = 0;
-  let majorTokens = 0;
-  for (const lesson of selected) {
-    const cost = estimateCardTokens(lesson.card, hostPrefix);
-    const id = applicationId({ sessionUid: session.session_uid, contextEpoch: session.context_epoch, taskFingerprint: task.fingerprint, lessonId: lesson.lesson_id, revision: lesson.revision });
-    if (store?.hasDelivery(id)) continue;
-    const severe = lesson.severity === "Blocker" || lesson.severity === "Critical";
-    if (cost > budgets.singleCardHardLimit || tokenEstimate + cost > budgets.absolute) {
-      if (severe) return { cards: [], hold: "memory_overflow_hold", tokenEstimate: tokenEstimate + cost, budgets };
+  const leftIdentity = stableIdentity(left);
+  const rightIdentity = stableIdentity(right);
+  return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
+}
+
+function emissionMatches(prior, document, session, task) {
+  return (prior?.documentHash ?? prior?.document_hash) === document.documentHash
+    && (prior?.sessionUid ?? prior?.session_uid) === (session?.sessionUid ?? session?.session_uid)
+    && Number(prior?.contextEpoch ?? prior?.context_epoch) === Number(session?.contextEpoch ?? session?.context_epoch)
+    && (prior?.taskFingerprint ?? prior?.task_fingerprint) === (task?.fingerprint ?? task?.taskFingerprint ?? task?.task_fingerprint);
+}
+
+function completeDocument(document) {
+  return Boolean(document && typeof document === "object"
+    && typeof document.documentHash === "string"
+    && typeof document.familyId === "string"
+    && typeof document.createdAt === "string"
+    && Array.isArray(document.appliesWhen)
+    && typeof document.classOfMistake === "string"
+    && Array.isArray(document.methodChanges)
+    && document.methodChanges.length > 0);
+}
+
+export async function loadReflectionDocuments({
+  projectDir,
+  publishedBefore,
+  maxFileBytes = HARD_LIMITS.maxFileBytes
+}) {
+  const catalog = await readReflectionCatalog({
+    projectDir,
+    publishedBefore,
+    maxFileBytes: boundedLimit(maxFileBytes, HARD_LIMITS.maxFileBytes)
+  });
+  return {
+    documents: catalog.documents,
+    omissions: catalog.omissions.map((item) => ({
+      opaqueId: sha256(`catalog\u0000${item.path}`),
+      reason: CATALOG_REASON[item.omission] ?? "parse_error"
+    }))
+  };
+}
+
+export function selectReflections({
+  documents,
+  prompt,
+  session,
+  task,
+  budget,
+  priorEmissions = [],
+  publishedBefore
+}) {
+  const limits = limitsFrom(budget);
+  const cutoffMs = Date.parse(publishedBefore);
+  if (!Number.isFinite(cutoffMs)) throw new TypeError("publishedBefore must be a valid timestamp");
+  const ordered = [...(Array.isArray(documents) ? documents : [])]
+    .sort((left, right) => stableIdentity(left).localeCompare(stableIdentity(right), "en-US"));
+  const omissions = [];
+  const loaded = [];
+  for (const document of ordered) {
+    if (!completeDocument(document)) {
+      omissions.push(omission(document, document?.canonical === false ? "legacy_incomplete" : "parse_error"));
       continue;
     }
-    if (!severe && majorTokens + cost > budgets.normalSoft) continue;
-    cards.push({ ...lesson, application_id: id });
-    tokenEstimate += cost;
-    if (!severe) majorTokens += cost;
+    if (!Number.isFinite(Date.parse(document.publishedAt)) || Date.parse(document.publishedAt) >= cutoffMs) {
+      omissions.push(omission(document, "published_after_cutoff"));
+      continue;
+    }
+    loaded.push(document);
   }
-  return { cards, hold: null, tokenEstimate, budgets };
+
+  const recurrence = new Map();
+  for (const document of loaded) recurrence.set(document.familyId, (recurrence.get(document.familyId) ?? 0) + 1);
+  const applicable = [];
+  for (const document of loaded) {
+    const score = relevanceScore(document, prompt, task);
+    if (score <= 0) {
+      omissions.push(omission(document, "not_applicable"));
+      continue;
+    }
+    applicable.push({
+      ...document,
+      finalSeverity: document.severity,
+      relevanceScore: score,
+      familyRecurrence: recurrence.get(document.familyId)
+    });
+  }
+
+  const projected = new Map();
+  for (const document of applicable) {
+    const current = projected.get(document.familyId);
+    if (!current || compareNewest(document, current) > 0) {
+      if (current) omissions.push(omission(current, "family_projection"));
+      projected.set(document.familyId, document);
+    } else {
+      omissions.push(omission(document, "family_projection"));
+    }
+  }
+
+  const ranked = [];
+  for (const document of projected.values()) {
+    if (priorEmissions.some((prior) => emissionMatches(prior, document, session, task))) {
+      omissions.push(omission(document, "prior_emission"));
+      continue;
+    }
+    const guidance = documentGuidance(document);
+    const tokenEstimate = estimateGuidanceTokens(guidance);
+    if (tokenEstimate > limits.maxDocumentTokens) {
+      omissions.push(omission(document, "token_budget"));
+      continue;
+    }
+    ranked.push({ ...document, guidance, tokenEstimate });
+  }
+  ranked.sort(compareRank);
+
+  const selected = [];
+  let tokenEstimate = 0;
+  for (const document of ranked) {
+    if (selected.length >= limits.maxCards) {
+      omissions.push(omission(document, "count_budget"));
+      continue;
+    }
+    if (tokenEstimate + document.tokenEstimate > limits.maxTotalTokens) {
+      omissions.push(omission(document, "token_budget"));
+      continue;
+    }
+    selected.push(document);
+    tokenEstimate += document.tokenEstimate;
+  }
+
+  return {
+    guidance: selected.map((document) => document.guidance).join("\n\n"),
+    selected: selected.map(({ guidance: ignored, ...document }) => document),
+    omissions,
+    tokenEstimate
+  };
 }

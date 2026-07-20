@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +10,9 @@ import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
 import * as cliModule from "../src/cli.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { publishReflectionDocument } from "../src/reflection-document.mjs";
 import { recoverDueReviewers } from "../src/reviewer-launcher.mjs";
+import { loadReflectionDocuments } from "../src/selector.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -137,7 +139,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer(jobId, launchEpoch) {
         assert.equal(reviewJobCount(fixture.controlStore), 1);
@@ -149,7 +150,7 @@ describe("agent-feedback-loop package", () => {
       },
       async writeResponse(result) {
         calls.push("response");
-        assert.equal(result.operationalText, null);
+        assert.deepEqual(result, { continue: true });
         return { continue: true };
       },
       now() {
@@ -177,7 +178,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
       async writeResponse() { responses += 1; return { continue: true }; },
@@ -194,6 +194,58 @@ describe("agent-feedback-loop package", () => {
     fixture.controlStore.close();
   });
 
+  it("launcher cutoff excludes an equal-time atomic publication then admits it on the next prompt", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const projectDir = await realpath(fixture.home);
+    const reflectionModel = {
+        title: "check goals before redesign",
+        reflection_id: "reflection-000000000000000000000010",
+        created_at: "2026-07-20T07:59:58.000Z",
+        published_at: PROMPT_CUTOFF,
+        final_severity: "Critical",
+        responsibility: "agent_fault",
+        method_class: "goal_check",
+        family_id: "family-goal-check",
+        applies_when: [EXPLICIT_FEEDBACK],
+        effectiveness: "unknown",
+        source_identity_hash: "10".padStart(64, "0"),
+        facts: ["private launcher fact"],
+        user_complaint: "private launcher complaint",
+        root_cause: "private launcher cause",
+        class_of_mistake: "未先核对用户目标",
+        method_changes: ["先核对用户目标再修改架构"],
+        repeated_pattern_evidence: []
+      };
+    let publication = null;
+    const responses = [];
+    const input = {
+      payload: explicitFeedbackPayload({ cwd: projectDir }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() {
+        publication = publishReflectionDocument({ projectDir, model: reflectionModel });
+        return { attempted: true };
+      },
+      async loadDocuments(options) {
+        await publication;
+        return loadReflectionDocuments(options);
+      },
+      writeResponse: async (response) => { responses.push(response); return response; }
+    };
+
+    const current = await cliModule.handlePromptHook({ ...input, now: () => new Date(PROMPT_CUTOFF) });
+    const next = await cliModule.handlePromptHook({ ...input, now: () => new Date("2026-07-20T08:00:00.001Z") });
+
+    assert.deepEqual(responses[0], { continue: true });
+    assert.equal("hookSpecificOutput" in current.hostResponse, false);
+    assert.equal(responses[1].hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(responses[1].hookSpecificOutput.additionalContext, /document_hash: [a-f0-9]{64}/u);
+    assert.doesNotMatch(responses[1].hookSpecificOutput.additionalContext, /private launcher/u);
+    assert.deepEqual(next.hostResponse, responses[1]);
+    fixture.controlStore.close();
+  });
+
   it("same complaint in another session starts another review", async () => {
     const fixture = await promptOrchestrationFixture();
     const launches = [];
@@ -201,7 +253,6 @@ describe("agent-feedback-loop package", () => {
       payload,
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
       writeResponse: async () => ({ continue: true }),
@@ -235,7 +286,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload({ prompt: "reviewer job 是干嘛的？" }),
       cli: "codex",
       controlStore: ordinary.controlStore,
-      legacyMemoryStore: null,
       blobs: ordinary.blobs,
       launchReviewer() { throw new Error("ordinary prompt must not launch"); },
       writeResponse: async () => { ordinaryResponses += 1; return { continue: true }; },
@@ -253,7 +303,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: failedCapture.controlStore,
-      legacyMemoryStore: null,
       blobs: { async write() { throw new Error("fixture_blob_failure"); } },
       launchReviewer() { throw new Error("capture failure must not launch"); },
       writeResponse: async () => { captureFailureResponses += 1; return { continue: true }; },
@@ -277,7 +326,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: storeProxy,
-      legacyMemoryStore: null,
       blobs: failedStore.blobs,
       launchReviewer() { throw new Error("store failure must not launch"); },
       writeResponse: async () => { storeFailureResponses += 1; return { continue: true }; },
@@ -295,7 +343,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: failedLaunch.controlStore,
-      legacyMemoryStore: null,
       blobs: failedLaunch.blobs,
       launchReviewer() { throw new Error("fixture_launch_failure"); },
       writeResponse: async () => { launchFailureResponses += 1; return { continue: true }; },
@@ -315,7 +362,7 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload({ prompt: "按推荐执行" }),
       cli: "codex",
       controlStore: failedSelection.controlStore,
-      legacyMemoryStore: { selectLessons() { throw new Error("fixture_selection_failure"); } },
+      loadDocuments() { throw Object.assign(new Error("fixture_selection_failure"), { code: "catalog_failed" }); },
       blobs: failedSelection.blobs,
       launchReviewer() { throw new Error("ordinary prompt must not launch"); },
       writeResponse: async () => { selectionFailureResponses += 1; return { continue: true }; },
@@ -336,7 +383,6 @@ describe("agent-feedback-loop package", () => {
         payload: explicitFeedbackPayload(),
         cli: "codex",
         controlStore: fixture.controlStore,
-        legacyMemoryStore: null,
         blobs: fixture.blobs,
         launchReviewer: () => never,
         writeResponse: async () => ({ continue: true }),
@@ -359,7 +405,6 @@ describe("agent-feedback-loop package", () => {
       payload: explicitFeedbackPayload(),
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer: () => ({ attempted: false, reason: "spawn_failed" }),
       writeResponse: async () => ({ continue: true }),
@@ -379,7 +424,6 @@ describe("agent-feedback-loop package", () => {
       }),
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer: () => { throw new Error("neutral prompt must not create a new review"); },
       recoverReviewers() {
@@ -424,7 +468,6 @@ describe("agent-feedback-loop package", () => {
       payload,
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer() { launches += 1; },
       writeResponse: async () => ({ continue: true }),
@@ -455,7 +498,6 @@ describe("agent-feedback-loop package", () => {
       payload,
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
       writeResponse: async () => ({ continue: true }),
@@ -483,7 +525,6 @@ describe("agent-feedback-loop package", () => {
       },
       cli: "codex",
       controlStore: fixture.controlStore,
-      legacyMemoryStore: null,
       blobs: fixture.blobs,
       launchReviewer() { launches += 1; },
       writeResponse: async () => ({ continue: true }),

@@ -354,6 +354,7 @@ test("publication is private, idempotent, verified, and refuses content collisio
   const catalog = await readReflectionCatalog({ projectDir, publishedBefore: "2026-07-20T00:12:00Z" });
   assert.equal(catalog.documents.length, 1);
   assert.equal(catalog.documents[0].reflectionId, model.reflection_id);
+  assert.equal(catalog.documents[0].documentHash, sha256(await readFile(published.path)));
 });
 
 test("concurrent same-identity publishers never overwrite a conflicting target", async (t) => {

@@ -13,6 +13,7 @@ import { openStore } from "./store.mjs";
 import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
+import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
@@ -50,10 +51,23 @@ function parseArgs(args) {
 
 const PROMPT_INPUT_MAX_BYTES = 2 * 1024 * 1024;
 const REVIEW_LAUNCH_COOLDOWN_MS = 5_000;
+const PROMPT_SELECTION_LIMITS = Object.freeze({
+  maxFileBytes: 131_072,
+  maxCards: 4,
+  maxDocumentTokens: 320,
+  maxTotalTokens: 900
+});
 
 function boundedReason(error, fallback) {
   const value = String(error?.code || "").toLowerCase();
   return /^[a-z0-9_.-]{1,64}$/.test(value) ? value : fallback;
+}
+
+function boundedSelectionReason(error) {
+  const code = boundedReason(error, "");
+  if (code) return code;
+  const message = String(error?.message || "").toLowerCase();
+  return /^[a-z0-9_.-]{1,64}$/.test(message) ? message : "selection_failed";
 }
 
 function opaqueLogValue(value, fallback) {
@@ -75,6 +89,10 @@ function cutoffIso(value) {
   return parsed.toISOString();
 }
 
+function lowerOnlyLimit(value, hardLimit) {
+  return Number.isSafeInteger(value) && value > 0 ? Math.min(value, hardLimit) : hardLimit;
+}
+
 async function readPromptInput(stream = process.stdin, maxBytes = PROMPT_INPUT_MAX_BYTES) {
   let input = "";
   let bytes = 0;
@@ -91,11 +109,15 @@ export async function handlePromptHook({
   payload,
   cli,
   controlStore,
-  legacyMemoryStore = null,
   blobs,
   launchReviewer = () => {},
   recoverReviewers = () => ({ scanned: 0, attempted: 0 }),
   writeResponse = async () => null,
+  nativeResponse = { continue: true },
+  nativeHookEventName = null,
+  selectionLimits = {},
+  loadDocuments = loadReflectionDocuments,
+  selectDocuments = selectReflections,
   now = () => new Date()
 }) {
   let selectionPublishedBefore;
@@ -242,20 +264,68 @@ export async function handlePromptHook({
 
   result.selectionInput = {
     publishedBefore: selectionPublishedBefore,
-    projectId: event?.project_id ?? null,
-    sessionUid: event?.session_uid ?? null,
-    contextEpoch: event?.context_epoch ?? null
+    projectDir: event?.cwd ?? event?.project_id ?? null,
+    prompt: event?.redacted_text ?? userText,
+    session: {
+      sessionUid: event?.session_uid ?? null,
+      contextEpoch: event?.context_epoch ?? null
+    },
+    task: {
+      fingerprint: event?.task_fingerprint ?? null,
+      taskType: event?.task_type ?? null,
+      paths: event?.paths ?? [],
+      tools: [...new Set([...(event?.tools ?? []), ...(event?.tool_refs ?? []), event?.tool_name].filter(Boolean))]
+    },
+    maxFileBytes: lowerOnlyLimit(selectionLimits.maxFileBytes, PROMPT_SELECTION_LIMITS.maxFileBytes)
   };
   try {
-    if (legacyMemoryStore && typeof legacyMemoryStore.selectLessons === "function") {
-      legacyMemoryStore.selectLessons({ projectId: event?.project_id ?? null });
+    const catalog = await loadDocuments({
+      projectDir: result.selectionInput.projectDir,
+      publishedBefore: selectionPublishedBefore,
+      maxFileBytes: result.selectionInput.maxFileBytes
+    });
+    const selection = selectDocuments({
+      documents: catalog.documents,
+      prompt: result.selectionInput.prompt,
+      session: result.selectionInput.session,
+      task: result.selectionInput.task,
+      budget: {
+        maxCards: lowerOnlyLimit(selectionLimits.maxCards, PROMPT_SELECTION_LIMITS.maxCards),
+        maxDocumentTokens: lowerOnlyLimit(selectionLimits.maxDocumentTokens, PROMPT_SELECTION_LIMITS.maxDocumentTokens),
+        maxTotalTokens: lowerOnlyLimit(selectionLimits.maxTotalTokens, PROMPT_SELECTION_LIMITS.maxTotalTokens)
+      },
+      priorEmissions: [],
+      publishedBefore: selectionPublishedBefore
+    });
+    const selectionOmissions = [...catalog.omissions, ...selection.omissions];
+    for (const item of selectionOmissions.slice(0, 8)) {
+      promptDebug("selection_omission", item.reason, item.opaqueId ?? item.documentHash);
     }
+    if (selectionOmissions.length > 8) promptDebug("selection_omission", "log_limit", String(selectionOmissions.length));
+    result.guidance = selection.guidance;
+    result.selection = {
+      selectedCount: selection.selected.length,
+      omissionCount: selectionOmissions.length,
+      tokenEstimate: selection.tokenEstimate
+    };
   } catch (error) {
-    promptDebug("selection", boundedReason(error, "selection_failed"));
+    promptDebug("selection", boundedSelectionReason(error));
+    result.guidance = "";
+    result.selection = { selectedCount: 0, omissionCount: 0, tokenEstimate: 0 };
   }
 
+  const hookEventName = opaqueLogValue(
+    nativeHookEventName ?? input.hook_event_name ?? input.hookEventName,
+    "UserPromptSubmit"
+  );
+  result.nativeResponse = result.guidance
+    ? {
+        ...nativeResponse,
+        hookSpecificOutput: { hookEventName, additionalContext: result.guidance }
+      }
+    : { ...nativeResponse };
   try {
-    result.hostResponse = await writeResponse(result);
+    result.hostResponse = await writeResponse(result.nativeResponse);
   } catch (error) {
     result.hostResponse = null;
     result.reason = "response_failed";
@@ -444,13 +514,14 @@ export async function main(args) {
   }
   if (command === "hook") {
     const cli = options.cli || options.args[0] || "unknown";
+    const nativeHookEventName = optionValue(args, "--event", "UserPromptSubmit");
     const withContinue = options.args.includes("--continue");
     const nativeResponse = withContinue ? { continue: true } : {};
     let responseWritten = false;
-    const writeResponse = async () => {
-      if (!responseWritten) console.log(JSON.stringify(nativeResponse));
+    const writeResponse = async (response = nativeResponse) => {
+      if (!responseWritten) console.log(JSON.stringify(response));
       responseWritten = true;
-      return nativeResponse;
+      return response;
     };
     let rawPayload;
     let payload;
@@ -475,7 +546,6 @@ export async function main(args) {
         payload,
         cli,
         controlStore,
-        legacyMemoryStore: null,
         blobs,
         launchReviewer(jobId, launchEpoch) {
           return launchDetachedReviewer({
@@ -506,6 +576,8 @@ export async function main(args) {
           });
         },
         writeResponse,
+        nativeResponse,
+        nativeHookEventName,
         now: () => new Date()
       });
     } catch (error) {

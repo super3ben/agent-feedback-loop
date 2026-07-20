@@ -500,6 +500,7 @@ export async function readReflectionCatalog({
         omissions.push({ path: filePath, omission: parsed.omission });
         continue;
       }
+      parsed.documentHash = sha256(bytes);
       if (parsed.canonical) {
         if (Date.parse(parsed.publishedAt) >= cutoffMs) {
           omissions.push({ path: filePath, omission: "published_after_cutoff" });
