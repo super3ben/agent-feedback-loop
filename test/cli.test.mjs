@@ -10,6 +10,7 @@ import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
 import * as cliModule from "../src/cli.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { recoverDueReviewers } from "../src/reviewer-launcher.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -301,6 +302,9 @@ describe("agent-feedback-loop package", () => {
       now: () => new Date(PROMPT_CUTOFF)
     });
     assert.equal(reviewJobCount(failedLaunch.controlStore), 1);
+    const failedLaunchJob = failedLaunch.controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
+    assert.equal(failedLaunchJob.next_launch_at, null);
+    assert.equal(failedLaunchJob.error_code, "spawn_failed");
     assert.equal(launchFailureResponses, 1);
     assert.equal(launchFailureResult.operationalText, null);
     failedLaunch.controlStore.close();
@@ -346,6 +350,57 @@ describe("agent-feedback-loop package", () => {
 
     assert.equal(reviewJobCount(fixture.controlStore), 1);
     assert.equal(response.operationalText, null);
+    fixture.controlStore.close();
+  });
+
+  it("a neutral prompt synchronously recovers at most one older due review without awaiting it", async () => {
+    const fixture = await promptOrchestrationFixture();
+    await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer: () => ({ attempted: false, reason: "spawn_failed" }),
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    const due = fixture.controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
+    const launches = [];
+    let recoveries = 0;
+
+    const response = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "neutral-session",
+        event_id: "neutral-event",
+        turn_id: "neutral-turn",
+        prompt: "Please explain what this command does.",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer: () => { throw new Error("neutral prompt must not create a new review"); },
+      recoverReviewers() {
+        recoveries += 1;
+        return recoverDueReviewers({
+          store: fixture.controlStore,
+          limit: 1,
+          launchReviewer(jobId, launchEpoch) {
+            launches.push([jobId, launchEpoch]);
+            return { attempted: true, reason: "spawn_attempted" };
+          }
+        });
+      },
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    assert.equal(response.candidate, false);
+    assert.equal(recoveries, 1);
+    assert.deepEqual(launches, [[due.job_id, 2]]);
+    assert.equal(reviewJobCount(fixture.controlStore), 1);
     fixture.controlStore.close();
   });
 

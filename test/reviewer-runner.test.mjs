@@ -1,128 +1,289 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { captureObservedSession } from "../src/capture.mjs";
+import { initializeControlStore } from "../src/control-store.mjs";
+import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { pathsFor } from "../src/index.mjs";
-import { ReviewerRunner, runIsolatedReview } from "../src/reviewer-runner.mjs";
-import { openStore } from "../src/store.mjs";
+import {
+  publishReflectionDocument,
+  validateReflectionModel
+} from "../src/reflection-document.mjs";
+import { runReviewJob } from "../src/reviewer-runner.mjs";
 
-async function fixture() {
-  const home = await mkdtemp(path.join(tmpdir(), "afl-reviewer-"));
-  const paths = pathsFor(home);
-  return openStore({ paths });
+const VALID_LESSON = Object.freeze({
+  outcome: "lesson",
+  final_severity: "Major",
+  responsibility: "agent_fault",
+  method_class: "requirements_before_architecture",
+  family_id: null,
+  proposed_family_key: "requirements-before-architecture",
+  applies_when: ["changing an existing architecture"],
+  facts: ["The prior answer introduced machinery before checking the requirement."],
+  user_complaint: "The design became heavier before the requirement was checked.",
+  root_cause: "Architecture was selected before validating the smallest value path.",
+  class_of_mistake: "solution-first architecture",
+  method_changes: ["Audit requirement, prior delivery, evidence, and unmet item before changing architecture."],
+  repeated_pattern_evidence: [],
+  recurrence_of: []
+});
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
-test("reviewer runner owns the job lifecycle and rejects stale completion", async () => {
-  const store = await fixture();
-  const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
-  runner.submit({ job_id: "job-1", project_id: "project-a", prompt_version: "v1" });
-  const lease = runner.claim("job-1", "worker-a", Date.now() + 10_000, 1);
-  assert.equal(lease.lease_epoch, 1);
-  assert.throws(() => runner.complete("job-1", "worker-b", 1, 1, "receipt"), /lease|stale/i);
-  runner.complete("job-1", "worker-a", 1, lease.lease_epoch, "receipt");
-  store.close();
-});
-
-test("isolated reviewer accepts only a bounded structured receipt", async () => {
-  const result = await runIsolatedReview({
-    command: process.execPath,
-    args: ["-e", "process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r1',report_content_id:'report-1',report_content:'No durable lesson was proven from the bounded evidence.',status:'reviewed_no_lesson',lessons:[]}))"],
-    cwd: process.cwd(),
-    timeoutMs: 2_000
+async function reviewFixture(t, { initialNow = "2026-07-20T00:00:00.000Z" } = {}) {
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-home-")));
+  const projectDir = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-project-")));
+  t.after(() => Promise.all([
+    rm(home, { recursive: true, force: true }),
+    rm(projectDir, { recursive: true, force: true })
+  ]));
+  const paths = pathsFor(home);
+  let currentNow = new Date(initialNow);
+  const store = initializeControlStore({ paths, now: () => new Date(currentNow) });
+  t.after(() => store.close());
+  const blobs = new EncryptedBlobStore({
+    root: paths.blobRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
   });
-  assert.equal(result.write_complete, true);
-  assert.equal(result.review_receipt_id, "r1");
-});
-
-test("isolated reviewer rejects a nominal receipt with an empty report", async () => {
-  await assert.rejects(() => runIsolatedReview({
-    command: process.execPath,
-    args: ["-e", "process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r-empty',report_content_id:'report-empty',report_content:'',status:'reviewed_no_lesson',lessons:[]}))"],
-    cwd: process.cwd(),
-    timeoutMs: 2_000
-  }), /invalid reviewer receipt|report/i);
-});
-
-test("runJob executes a short-lived reviewer and commits its structured receipt", async () => {
-  const store = await fixture();
-  store.captureSessionEvent({ event_uid: "runner-user", session_uid: "runner-session", event_seq: 1, context_epoch: 1, project_id: "project-a", source_event_id: "runner-user", role: "user", redacted_text: "the previous answer was wrong", content_hash: "runner-user-hash", capture_policy_revision: 1, data_class: "normal", capture_source: "prompt_hook", capture_completeness: "prompt_only" });
-  store.captureSessionEvent({ event_uid: "runner-assistant", session_uid: "runner-session", event_seq: 2, context_epoch: 1, project_id: "project-a", source_event_id: "runner-assistant", role: "assistant", redacted_text: "unsupported claim", content_hash: "runner-assistant-hash", capture_policy_revision: 1, data_class: "normal", capture_source: "stop_payload", capture_completeness: "partial" });
-  const job = store.submitDueReview({ projectId: "project-a", minEntries: 1, cooldownMs: 0 });
-  const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
-  const result = await runner.runJob({
-    jobId: job.job_id,
-    ownerId: "worker-run",
-    command: process.execPath,
-    args: ["-e", "const fs=require('fs'); const c=JSON.parse(fs.readFileSync(process.env.AFL_REVIEW_CONTEXT_FILE,'utf8')); if(process.env.AFL_REVIEW_JOB_ID!==c.job.job_id||!c.events.some(e=>e.role==='assistant')||process.env.AFL_TEST_SECRET) process.exit(9); process.stdout.write(JSON.stringify({write_complete:true,review_receipt_id:'r-run',report_content_id:'report-run',report_content:'The bounded evidence did not prove a durable reusable lesson.',status:'reviewed_no_lesson',lessons:[]}))"],
-    cwd: process.cwd(),
-    timeoutMs: 2_000,
-    contextRoot: path.join(tmpdir(), "afl-review-contexts"),
-    env: { ...process.env, AFL_TEST_SECRET: "must-not-reach-reviewer" }
+  let sequence = 0;
+  const capture = async ({ role, rawText, referentEventUid = null, sourceTimestamp = null }) => {
+    sequence += 1;
+    const id = `event-${String(sequence).padStart(2, "0")}`;
+    const result = await captureObservedSession({
+      store,
+      blobs,
+      event: {
+        event_uid: id,
+        session_uid: "session-1",
+        cli: "codex",
+        project_id: projectDir,
+        context_epoch: 1,
+        source_namespace: "hook",
+        source_id: id,
+        source_event_id: id,
+        source_offset: sequence,
+        capture_source: "prompt_hook",
+        native_turn_id: `turn-${sequence}`,
+        source_timestamp: sourceTimestamp,
+        role,
+        referent_event_uid: referentEventUid,
+        content_hash: sha256(rawText),
+        completeness: "complete"
+      },
+      rawText
+    });
+    currentNow = new Date(currentNow.getTime() + 1_000);
+    return result.eventUid;
+  };
+  for (let index = 0; index < 8; index += 1) {
+    await capture({ role: index % 2 ? "assistant" : "user", rawText: `prior-${index}` });
+  }
+  const referentEventUid = await capture({
+    role: "assistant",
+    rawText: "Prior delivery included token=raw-secret and should be rechecked."
   });
-  assert.equal(result.status, "completed");
-  store.close();
+  const sourceEventUid = await capture({
+    role: "user",
+    rawText: "The previous response ignored the requirement. Authorization: Bearer raw-secret",
+    referentEventUid,
+    sourceTimestamp: "2026-07-20T08:09:10+08:00"
+  });
+  await capture({ role: "assistant", rawText: "following-1" });
+  await capture({ role: "user", rawText: "following-2" });
+  await capture({ role: "assistant", rawText: "following-3-must-not-appear" });
+  const candidate = store.createReviewCandidate({
+    sourceEventUid,
+    referentEventUid,
+    sourceIdentity: "codex:session-1:feedback-event-10",
+    projectId: projectDir
+  });
+  return {
+    home,
+    paths,
+    projectDir,
+    store,
+    blobs,
+    jobId: candidate.jobId,
+    advance(milliseconds) { currentNow = new Date(currentNow.getTime() + milliseconds); },
+    now() { return new Date(currentNow); }
+  };
+}
+
+async function reflectionFiles(projectDir) {
+  try {
+    return (await readdir(path.join(projectDir, ".agent", "reflections")))
+      .filter((name) => name.endsWith(".md"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+test("runReviewJob commits no_lesson without creating a reflection document", async (t) => {
+  const fixture = await reviewFixture(t);
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-no-lesson",
+    provider: async () => ({ outcome: "no_lesson" })
+  });
+
+  assert.deepEqual(result, { outcome: "reviewed_no_lesson", documentPath: null });
+  assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "reviewed_no_lesson");
+  assert.equal(job.published_path, null);
+  assert.equal(job.published_sha256, null);
 });
 
-test("context preparation failure returns the claimed reviewer job to pending", async () => {
-  const store = await fixture();
-  store.captureSessionEvent({ event_uid: "prep-user", session_uid: "prep-session", event_seq: 1, context_epoch: 1, project_id: "project-prep", source_event_id: "prep-user", role: "user", redacted_text: "previous output was wrong", content_hash: "prep-hash", capture_policy_revision: 1, data_class: "normal" });
-  const job = store.submitDueReview({ projectId: "project-prep", minEntries: 1, cooldownMs: 0 });
-  const blockedRoot = path.join(await mkdtemp(path.join(tmpdir(), "afl-context-blocked-")), "not-a-directory");
-  await writeFile(blockedRoot, "file", { mode: 0o600 });
-  const runner = new ReviewerRunner({ store });
-  await assert.rejects(() => runner.runJob({
-    jobId: job.job_id,
-    ownerId: "worker-prep",
-    command: process.execPath,
-    args: ["-e", "process.exit(0)"],
-    cwd: process.cwd(),
-    contextRoot: path.join(blockedRoot, "child")
-  }));
-  assert.equal(store.getReviewerJob(job.job_id).status, "pending");
-  assert.equal(store.submitDueReview({ projectId: "project-prep", minEntries: 1, cooldownMs: 0 }).status, "pending");
-  store.close();
-});
-
-test("runJob can invoke a built-in isolated provider without shelling through a main-session prompt", async () => {
-  const store = await fixture();
-  store.captureSessionEvent({ event_uid: "provider-user", session_uid: "provider-session", event_seq: 1, context_epoch: 1, project_id: "project-provider", source_event_id: "provider-user", role: "user", redacted_text: "the previous behavior was wrong", content_hash: "provider-hash", capture_policy_revision: 1, data_class: "normal" });
-  const job = store.submitDueReview({ projectId: "project-provider", minEntries: 1, cooldownMs: 0 });
-  const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
-  let called = 0;
-  const result = await runner.runJob({
-    jobId: job.job_id,
-    ownerId: "worker-provider",
-    cwd: process.cwd(),
-    timeoutMs: 2_000,
-    contextRoot: path.join(tmpdir(), "afl-provider-contexts"),
-    promptFile: "/tmp/reflection-agent.md",
-    review: async ({ contextFile, promptFile, env, timeoutMs }) => {
-      called += 1;
-      assert.equal(promptFile, "/tmp/reflection-agent.md");
-      assert.equal(env.AFL_REVIEW_JOB_ID, job.job_id);
-      assert.equal(env.AFL_REVIEW_CONTEXT_FILE, contextFile);
-      assert.equal(timeoutMs, 2_000);
-      return {
-        write_complete: true,
-        review_receipt_id: "provider-receipt",
-        report_content_id: "provider-report",
-        report_content: "No proven retrospective feedback.",
-        status: "reviewed_no_lesson",
-        lessons: []
-      };
+test("runReviewJob publishes one stable Markdown document and only updates control state", async (t) => {
+  const fixture = await reviewFixture(t);
+  let observedContext;
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-publish",
+    provider: async (context) => {
+      observedContext = context;
+      return { ...VALID_LESSON };
     }
   });
-  assert.equal(called, 1);
-  assert.equal(result.status, "completed");
-  store.close();
+
+  assert.equal(result.outcome, "published");
+  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
+  const bytes = await readFile(result.documentPath);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "published");
+  assert.equal(job.published_path, result.documentPath);
+  assert.equal(job.published_sha256, sha256(bytes));
+  assert.equal(observedContext.job.source_identity, "codex:session-1:feedback-event-10");
+  assert.equal(observedContext.source.sourceIdentity, "codex:session-1:feedback-event-10");
+  assert.equal(observedContext.source.createdAt, "2026-07-20T00:09:10.000Z");
+  assert.equal(observedContext.source.publishedAt, job.created_at);
+  assert.equal(observedContext.prior.length, 6);
+  assert.equal(observedContext.following.length, 2);
+  assert.doesNotMatch(JSON.stringify(observedContext), /raw-secret|encrypted_raw_ref|following-3-must-not-appear/i);
 });
 
-test("unsupported native mode is explicit and never falls back", async () => {
-  const store = await fixture();
-  const runner = new ReviewerRunner({ store, mode: "native_background_agent", capability: "unavailable" });
-  const result = runner.submit({ job_id: "job-2", project_id: "project-a", prompt_version: "v1" });
-  assert.deepEqual(result, { status: "pending", reason: "reviewer_unavailable" });
-  store.close();
+test("invalid provider output is retryable with the fixed provider_invalid reason", async (t) => {
+  const fixture = await reviewFixture(t);
+  await assert.rejects(
+    runReviewJob({
+      ...fixture,
+      ownerId: "owner-invalid",
+      provider: async () => ({ outcome: "lesson", invented: "body-must-not-leak" })
+    }),
+    (error) => error.code === "provider_invalid" && !error.message.includes("body-must-not-leak")
+  );
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "retryable");
+  assert.equal(job.error_code, "provider_invalid");
+  assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
+});
+
+test("an existing reflection identity with conflicting bytes is never overwritten", async (t) => {
+  const fixture = await reviewFixture(t);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  const context = fixture.store.getReviewContext({ jobId: fixture.jobId });
+  const source = {
+    sourceIdentity: job.source_identity,
+    createdAt: context.source.source_timestamp ?? context.source.created_at,
+    publishedAt: job.created_at
+  };
+  const conflictingModel = validateReflectionModel({
+    ...VALID_LESSON,
+    root_cause: "A different immutable document already owns this reflection identity."
+  }, source);
+  const conflicting = await publishReflectionDocument({ projectDir: fixture.projectDir, model: conflictingModel });
+  const before = await readFile(conflicting.path);
+
+  await assert.rejects(
+    runReviewJob({ ...fixture, ownerId: "owner-collision", provider: async () => ({ ...VALID_LESSON }) }),
+    (error) => error.code === "publication_collision"
+  );
+  assert.deepEqual(await readFile(conflicting.path), before);
+  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
+  assert.equal(fixture.store.getReviewJob(fixture.jobId).error_code, "publication_collision");
+});
+
+test("a lease expiring during provider work creates no canonical document", async (t) => {
+  const fixture = await reviewFixture(t);
+  await assert.rejects(
+    runReviewJob({
+      ...fixture,
+      ownerId: "owner-expired",
+      leaseMs: 10,
+      provider: async () => {
+        fixture.advance(11);
+        return { ...VALID_LESSON };
+      }
+    }),
+    (error) => error.code === "lease_lost"
+  );
+  assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
+});
+
+test("a stale owner cannot publish after a new owner claims the expired lease", async (t) => {
+  const fixture = await reviewFixture(t);
+  await assert.rejects(
+    runReviewJob({
+      ...fixture,
+      ownerId: "owner-stale",
+      leaseMs: 10,
+      provider: async () => {
+        fixture.advance(11);
+        const replacement = fixture.store.claimReviewJob({
+          jobId: fixture.jobId,
+          ownerId: "owner-current",
+          leaseMs: 30_000
+        });
+        assert.ok(replacement.job);
+        return { ...VALID_LESSON };
+      }
+    }),
+    (error) => error.code === "lease_lost"
+  );
+  assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
+  assert.equal(fixture.store.getReviewJob(fixture.jobId).owner_id, "owner-current");
+});
+
+test("a retry adopts identical bytes after a crash following visible publication", async (t) => {
+  const fixture = await reviewFixture(t);
+  const crashingStore = new Proxy(fixture.store, {
+    get(target, property, receiver) {
+      if (property === "completeReviewPublished") {
+        return () => { throw Object.assign(new Error("simulated process death"), { code: "simulated_crash" }); };
+      }
+      if (property === "failReviewJob") return () => { throw new Error("process died before failure bookkeeping"); };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  await assert.rejects(runReviewJob({
+    ...fixture,
+    store: crashingStore,
+    ownerId: "owner-crashed",
+    leaseMs: 10,
+    provider: async () => ({ ...VALID_LESSON })
+  }));
+  const [visibleName] = await reflectionFiles(fixture.projectDir);
+  assert.ok(visibleName);
+  const visiblePath = path.join(fixture.projectDir, ".agent", "reflections", visibleName);
+  const before = await readFile(visiblePath);
+
+  fixture.advance(30_001);
+  const retried = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-retry",
+    provider: async () => ({ ...VALID_LESSON })
+  });
+  assert.equal(retried.documentPath, visiblePath);
+  assert.deepEqual(await readFile(visiblePath), before);
+  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
+  assert.equal(fixture.store.getReviewJob(fixture.jobId).published_sha256, sha256(before));
 });

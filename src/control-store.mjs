@@ -23,6 +23,15 @@ const MAX_CONTEXT_EPOCH = 2_147_483_647;
 const MAX_REVIEW_ATTEMPTS = 3;
 const DEFAULT_REVIEW_LEASE_MS = 185_000;
 const REVIEW_RETRY_DELAYS_MS = Object.freeze([30_000, 120_000]);
+const REVIEW_FAILURE_CODES = new Set([
+  "provider_unavailable",
+  "provider_timeout",
+  "provider_invalid",
+  "context_invalid",
+  "lease_lost",
+  "publication_failed",
+  "publication_collision"
+]);
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
@@ -744,6 +753,10 @@ function createStore(database, now) {
 
   return {
     database,
+    getReviewJob(jobId) {
+      const row = getReviewJob(jobId);
+      return row ? { ...row } : null;
+    },
     createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null }) {
       const safeSourceEventUid = assertString(sourceEventUid, "sourceEventUid", 512);
       const safeReferentEventUid = assertOptionalString(referentEventUid, "referentEventUid", 512);
@@ -1015,6 +1028,9 @@ function createStore(database, now) {
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
       const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
+      if (!REVIEW_FAILURE_CODES.has(safeReasonCode)) {
+        throw new TypeError("reasonCode is not a supported review failure reason");
+      }
       const current = reviewTimestamp();
       const timestamp = current.toISOString();
       const retryAfterFirst = new Date(current.getTime() + REVIEW_RETRY_DELAYS_MS[0]).toISOString();

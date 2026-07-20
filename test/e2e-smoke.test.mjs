@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { captureObservedSession } from "../src/capture.mjs";
 import { install, pathsFor } from "../src/index.mjs";
 import { openControlStore } from "../src/control-store.mjs";
+import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -88,15 +91,71 @@ test("installed prompt hook remains bounded fail-open", async () => {
   assert.equal(result.stderr, "");
 });
 
-test("installed explicit feedback commits one job before launch transition", async () => {
+test("installed explicit feedback launches a detached reviewer and publishes no stdout control message", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-installed-feedback-"));
+  const projectPath = path.join(home, "project");
+  const fakeBin = path.join(home, "fake-bin");
+  const fakeProvider = path.join(fakeBin, "codex");
+  const providerSentinel = path.join(home, "provider-stdin.json");
+  await mkdir(projectPath, { recursive: true, mode: 0o700 });
+  await mkdir(fakeBin, { recursive: true, mode: 0o700 });
+  const projectDir = await realpath(projectPath);
+  await writeFile(fakeProvider, `#!/usr/bin/env node
+import { chmodSync, writeFileSync } from "node:fs";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const index = process.argv.indexOf("--output-last-message");
+if (index < 0 || !process.argv[index + 1]) process.exit(23);
+writeFileSync(process.argv[index + 1], JSON.stringify({ outcome: "no_lesson" }));
+chmodSync(process.argv[index + 1], 0o600);
+const jobId = /"job_id":"([^"]+)"/.exec(input)?.[1] || "unknown";
+writeFileSync(process.env.AFL_REVIEW_PROVIDER_SENTINEL + "." + jobId, JSON.stringify({
+  receivedEvidenceOnStdin: input.includes("<afl_evidence>"),
+  argvContainsEvidence: process.argv.some((value) => value.includes("previous response ignored"))
+}));
+`, { mode: 0o700 });
   await install({ home, codexHost: unavailableCodexHost() });
   const paths = pathsFor(home);
+  const controlStore = openControlStore({ paths });
+  const blobs = new EncryptedBlobStore({
+    root: paths.blobRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+  });
+  const recoverRawText = "Recover this older bounded review job.";
+  const oldCapture = await captureObservedSession({
+    store: controlStore,
+    blobs,
+    event: {
+      event_uid: "recover-source-event",
+      session_uid: "recover-session",
+      cli: "codex",
+      project_id: projectDir,
+      context_epoch: 1,
+      source_namespace: "hook",
+      source_id: "recover-source-event",
+      source_event_id: "recover-source-event",
+      source_offset: 1,
+      capture_source: "prompt_hook",
+      native_turn_id: "recover-turn",
+      source_timestamp: "2026-07-20T07:00:00.000Z",
+      role: "user",
+      referent_event_uid: null,
+      content_hash: createHash("sha256").update(recoverRawText).digest("hex"),
+      completeness: "complete"
+    },
+    rawText: recoverRawText
+  });
+  const recoverCandidate = controlStore.createReviewCandidate({
+    sourceEventUid: oldCapture.eventUid,
+    sourceIdentity: "codex:recover-session:recover-source-event",
+    projectId: projectDir
+  });
+  controlStore.close();
   const payload = JSON.stringify({
     session_id: "installed-feedback-session",
     event_id: "installed-feedback-event",
     turn_id: "installed-feedback-turn-2",
-    cwd: path.join(home, "project"),
+    cwd: projectDir,
     timestamp: "2026-07-20T08:00:00.000Z",
     prompt: EXPLICIT_FEEDBACK,
     previous_assistant_message: {
@@ -108,20 +167,39 @@ test("installed explicit feedback commits one job before launch transition", asy
     }
   });
 
-  const result = await runHook(paths.coreHook, payload, { ...process.env, HOME: home, TMPDIR: home }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
-  const controlStore = openControlStore({ paths });
-  try {
-    const job = controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
-    assert.ok(job?.job_id);
-    assert.equal(job.state, "pending");
-    assert.equal(Number(job.launch_epoch), 1);
-    assert.equal(controlStore.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
-  } finally {
-    controlStore.close();
-  }
+  const result = await runHook(paths.coreHook, payload, {
+    ...process.env,
+    HOME: home,
+    TMPDIR: home,
+    PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`,
+    AFL_REVIEW_PROVIDER_SENTINEL: providerSentinel
+  }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
   assert.deepEqual(JSON.parse(result.stdout), { continue: true });
   assert.doesNotMatch(result.stdout, /\[AFL\]|afl-receipt|hookPrompt|checkpoint|runner_transition/i);
   assert.equal(result.stderr, "");
+
+  const deadline = Date.now() + 3_000;
+  let jobs = [];
+  while (Date.now() < deadline) {
+    const currentStore = openControlStore({ paths });
+    try {
+      jobs = currentStore.database.prepare("SELECT * FROM reviewer_jobs ORDER BY created_at, job_id").all();
+    } finally {
+      currentStore.close();
+    }
+    if (jobs.length === 2 && jobs.every((job) => job.state === "reviewed_no_lesson")) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs.every((job) => job.state === "reviewed_no_lesson"), true);
+  assert.equal(jobs.every((job) => Number(job.launch_epoch) === 1), true);
+  assert.equal(jobs.every((job) => job.published_path === null && job.published_sha256 === null), true);
+  for (const job of jobs) {
+    const providerRecord = JSON.parse(await readEventually(`${providerSentinel}.${job.job_id}`));
+    assert.equal(providerRecord.receivedEvidenceOnStdin, true);
+    assert.equal(providerRecord.argvContainsEvidence, false);
+  }
+  assert.ok(jobs.some((job) => job.job_id === recoverCandidate.jobId));
 });
 
 test("parse and control-store failures return native prompt no-ops", async () => {

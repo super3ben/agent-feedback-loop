@@ -2,6 +2,7 @@ import os from "node:os";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
 import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookEvent } from "./capture.mjs";
@@ -9,8 +10,11 @@ import { openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
 import { openStore } from "./store.mjs";
-import { ReviewerRunner } from "./reviewer-runner.mjs";
+import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
+import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
+
+const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
 function optionValue(args, name, fallback = null) {
   const index = args.indexOf(name);
@@ -52,6 +56,11 @@ function boundedReason(error, fallback) {
   return /^[a-z0-9_.-]{1,64}$/.test(value) ? value : fallback;
 }
 
+function opaqueLogValue(value, fallback) {
+  const normalized = String(value ?? "");
+  return /^[a-zA-Z0-9_.:-]{1,128}$/u.test(normalized) ? normalized : fallback;
+}
+
 function promptDebug(stage, reason, opaqueId = null) {
   if (process.env.AGENT_FEEDBACK_LOOP_DEBUG !== "1") return;
   const safeStage = /^[a-z0-9_.-]{1,48}$/.test(String(stage)) ? String(stage) : "unknown";
@@ -85,6 +94,7 @@ export async function handlePromptHook({
   legacyMemoryStore = null,
   blobs,
   launchReviewer = () => {},
+  recoverReviewers = () => ({ scanned: 0, attempted: 0 }),
   writeResponse = async () => null,
   now = () => new Date()
 }) {
@@ -197,11 +207,24 @@ export async function handlePromptHook({
 
       if (candidate && reservation?.launch) {
         try {
-          const ignored = launchReviewer(candidate.jobId, reservation.launchEpoch);
-          if (ignored && typeof ignored.catch === "function") void ignored.catch(() => {});
+          const launch = launchReviewer(candidate.jobId, reservation.launchEpoch);
+          if (launch?.attempted === false) {
+            controlStore.recordReviewLaunchFailure({
+              jobId: candidate.jobId,
+              launchEpoch: reservation.launchEpoch,
+              reasonCode: boundedReason({ code: launch.reason }, "spawn_failed")
+            });
+          }
           result.launchRequested = true;
           result.reason = "launch_reserved";
         } catch (error) {
+          try {
+            controlStore.recordReviewLaunchFailure({
+              jobId: candidate.jobId,
+              launchEpoch: reservation.launchEpoch,
+              reasonCode: "spawn_failed"
+            });
+          } catch {}
           result.reason = "launch_failed";
           promptDebug("launch", boundedReason(error, "launch_failed"), candidate.jobId);
         }
@@ -209,6 +232,12 @@ export async function handlePromptHook({
         result.reason = reservation.reason;
       }
     }
+  }
+
+  try {
+    recoverReviewers();
+  } catch (error) {
+    promptDebug("recovery", boundedReason(error, "recovery_failed"), result.jobId);
   }
 
   result.selectionInput = {
@@ -316,46 +345,42 @@ export async function main(args) {
   }
   if (command === "reviewer-run") {
     const paths = pathsFor(options.home);
-    const store = openStore({ paths });
-    const runner = new ReviewerRunner({ store, mode: "isolated_cli_process" });
+    const store = openControlStore({ paths });
+    const blobs = new EncryptedBlobStore({
+      root: paths.blobRoot,
+      keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+    });
     const jobId = optionValue(options.args, "--job-id");
+    const ownerId = `reviewer-${process.pid}`;
+    const startedAt = Date.now();
+    let providerName = "unknown";
     try {
-      const provider = optionValue(options.args, "--provider");
-      const commandPath = optionValue(options.args, "--command", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND);
-      const argsJson = optionValue(options.args, "--args-json", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_ARGS_JSON || "[]");
-      if (!provider && !commandPath) throw new Error("reviewer command or provider is not configured");
-      const executable = provider ? await resolveReviewerExecutable({ cli: provider, env: process.env }) : null;
-      if (provider && !executable) throw new Error(`reviewer provider executable is unavailable: ${provider}`);
+      const storedContext = store.getReviewContext({ jobId, priorLimit: 0, followingLimit: 0 });
+      providerName = storedContext?.source?.source_provider ?? "unknown";
+      const projectDir = storedContext?.job?.project_id ?? null;
+      const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
       const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000));
-      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.start job=${jobId || "unknown"} provider=${provider || "command"}`);
-      const result = await runner.runJob({
+      const result = await runReviewJob({
         jobId,
-        ownerId: `reviewer-${process.pid}`,
-        command: commandPath,
-        args: JSON.parse(argsJson),
-        cwd: paths.dataRoot,
-        timeoutMs,
-        contextRoot: path.join(paths.dataRoot, "reviewer-contexts"),
-        promptFile: paths.promptFile,
-        review: provider
-          ? ({ contextFile, promptFile, cwd, env }) => runReviewerProvider({
-            cli: provider,
+        ownerId,
+        store,
+        blobs,
+        projectDir,
+        provider: (context) => runReviewerProvider({
+            cli: providerName,
             executable,
-            contextFile,
-            promptFile,
+            context,
+            promptFile: paths.promptFile,
             schemaFile: paths.reviewerSchema,
             policyFile: paths.geminiReviewerPolicy,
             geminiSettingsFile: paths.geminiReviewerSettings,
-            cwd,
             timeoutMs,
-            env
+            env: process.env
           })
-          : null
       });
-      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.complete job=${jobId || "unknown"} status=${result.status} lessons=${Number(result.lessonCount || 0)}`);
-      console.log(JSON.stringify(result));
+      console.error(`agent-feedback-loop: reviewer.job=${opaqueLogValue(jobId, "unknown")} provider=${opaqueLogValue(providerName, "unknown")} reason=${boundedReason({ code: result.outcome }, "reviewer_failed")} duration_ms=${Date.now() - startedAt}`);
     } catch (error) {
-      console.error(`agent-feedback-loop: ${new Date().toISOString()} reviewer.job.failed job=${jobId || "unknown"} reason=${error.code || error.name || "reviewer_failed"}`);
+      console.error(`agent-feedback-loop: reviewer.job=${opaqueLogValue(jobId, "unknown")} provider=${opaqueLogValue(providerName, "unknown")} reason=${boundedReason(error, "reviewer_failed")} duration_ms=${Date.now() - startedAt}`);
       throw error;
     } finally {
       store.close();
@@ -452,9 +477,33 @@ export async function main(args) {
         controlStore,
         legacyMemoryStore: null,
         blobs,
-        launchReviewer(jobId) {
-          promptDebug("launch", "runner_transition", jobId);
-          return { launched: false, reason: "runner_transition" };
+        launchReviewer(jobId, launchEpoch) {
+          return launchDetachedReviewer({
+            platform: process.platform,
+            nodeExecutable: process.execPath,
+            cliFile: CLI_FILE,
+            home: paths.home,
+            jobId,
+            launchEpoch,
+            env: process.env
+          });
+        },
+        recoverReviewers() {
+          return recoverDueReviewers({
+            store: controlStore,
+            limit: 1,
+            launchReviewer(jobId, launchEpoch) {
+              return launchDetachedReviewer({
+                platform: process.platform,
+                nodeExecutable: process.execPath,
+                cliFile: CLI_FILE,
+                home: paths.home,
+                jobId,
+                launchEpoch,
+                env: process.env
+              });
+            }
+          });
         },
         writeResponse,
         now: () => new Date()

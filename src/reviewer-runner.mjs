@@ -1,106 +1,288 @@
-import { chmod, lstat, mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
-import { runProcessWithInput } from "./reviewer-provider.mjs";
 
-export class ReviewerUnavailableError extends Error {}
+import {
+  publishReflectionDocument,
+  readReflectionCatalog,
+  validateReflectionModel
+} from "./reflection-document.mjs";
+import { validateReviewerResult } from "./reviewer-result.mjs";
 
-function validateReceipt(value) {
-  if (!value || typeof value !== "object" || value.write_complete !== true
-    || typeof value.review_receipt_id !== "string" || typeof value.report_content_id !== "string"
-    || typeof value.report_content !== "string" || value.report_content.trim().length < 24
-    || !["reviewed", "reviewed_no_lesson"].includes(value.status) || !Array.isArray(value.lessons)) {
-    throw new Error("invalid reviewer receipt");
+const DEFAULT_LEASE_MS = 185_000;
+const PUBLICATION_LEASE_MS = 30_000;
+const FAILURE_CODES = new Set([
+  "provider_unavailable",
+  "provider_timeout",
+  "provider_invalid",
+  "context_invalid",
+  "lease_lost",
+  "publication_failed",
+  "publication_collision"
+]);
+const EVENT_TEXT_FIELDS = ["text", "prompt", "message", "content", "output", "response"];
+const SECRET_PATTERNS = [
+  /\bauthorization\s*:\s*bearer\s+\S+/giu,
+  /\b(password|passwd|passcode|api[_ -]?key|secret|token)\s*[=:]\s*\S+/giu,
+  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{12,})\b/gu,
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/giu
+];
+
+class ReviewJobError extends Error {
+  constructor(code, cause) {
+    super(code);
+    this.name = "ReviewJobError";
+    this.code = code;
   }
-  return value;
 }
 
-function reviewerEnvironment(source = process.env) {
-  const result = {};
-  const allowed = new Set(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
-  for (const name of String(source.AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST || "").split(",").map((item) => item.trim()).filter(Boolean)) allowed.add(name);
-  for (const name of allowed) {
-    if (source[name] !== undefined) result[name] = source[name];
-  }
-  for (const [name, value] of Object.entries(source)) {
-    if (name.startsWith("AFL_REVIEW_")) result[name] = value;
-  }
-  return result;
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
-export async function runIsolatedReview({ command, args = [], cwd, timeoutMs = 30_000, env = process.env }) {
-  const { stdout } = await runProcessWithInput({ command, args, cwd, env: reviewerEnvironment(env), input: "", timeoutMs });
-  return validateReceipt(JSON.parse(stdout));
+function redactCredentials(value) {
+  let text = String(value ?? "").normalize("NFC");
+  for (const pattern of SECRET_PATTERNS) text = text.replace(pattern, "[REDACTED]");
+  return text;
 }
 
-export class ReviewerRunner {
-  constructor({ store, mode = "isolated_cli_process", capability = "supported" }) {
-    this.store = store;
-    this.mode = mode;
-    this.capability = capability;
-  }
+function boundedText(value, maxCharacters = 16_384) {
+  return Array.from(redactCredentials(value)).slice(0, maxCharacters).join("");
+}
 
-  submit(job) {
-    this.store.submitReviewerJob(job);
-    if (this.capability !== "supported") return { status: "pending", reason: "reviewer_unavailable" };
-    return { status: "pending", reason: "review_due", mode: this.mode };
+function hostText(raw) {
+  const plain = String(raw ?? "");
+  let parsed;
+  try {
+    parsed = JSON.parse(plain);
+  } catch {
+    return boundedText(plain);
   }
-
-  claim(jobId, ownerId, leaseUntil, attempt) {
-    return this.store.claimReviewerJob(jobId, ownerId, leaseUntil, attempt);
-  }
-
-  heartbeat(jobId, ownerId, attempt, leaseEpoch, leaseUntil) {
-    return this.store.heartbeatReviewerJob(jobId, ownerId, attempt, leaseEpoch, leaseUntil);
-  }
-
-  complete(jobId, ownerId, attempt, leaseEpoch, receiptId) {
-    return this.store.completeReviewerJob(jobId, ownerId, attempt, leaseEpoch, receiptId);
-  }
-
-  fail(jobId, ownerId, attempt, leaseEpoch, retryable, reasonCode) {
-    return this.store.failReviewerJob(jobId, ownerId, attempt, leaseEpoch, retryable, reasonCode);
-  }
-
-  async runJob({ jobId, ownerId, command, args = [], review = null, cwd, timeoutMs = 30_000, contextRoot = path.join(cwd, "reviewer-contexts"), promptFile = "", env = process.env }) {
-    if (this.capability !== "supported") return { status: "pending", reason: "reviewer_unavailable" };
-    const job = this.store.getReviewerJob(jobId);
-    if (!job) throw new Error(`reviewer job not found: ${jobId}`);
-    const attempt = Number(job.attempt) + 1;
-    const lease = this.claim(jobId, ownerId, Date.now() + timeoutMs + 5_000, attempt);
-    let contextFile = null;
-    try {
-      const context = this.store.getReviewerContext(jobId);
-      const serializedContext = JSON.stringify(context);
-      const maxContextBytes = Number(context.context_limits?.max_serialized_bytes || 512 * 1024);
-      if (Buffer.byteLength(serializedContext, "utf8") > maxContextBytes) {
-        const error = new Error("bounded reviewer context exceeds the absolute serialized size limit");
-        error.code = "reviewer_context_too_large";
-        throw error;
-      }
-      await mkdir(contextRoot, { recursive: true, mode: 0o700 });
-      const rootInfo = await lstat(contextRoot);
-      if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error("reviewer context root must be a real directory");
-      if (typeof process.getuid === "function" && rootInfo.uid !== process.getuid()) throw new Error("reviewer context root must be owned by the current user");
-      await chmod(contextRoot, 0o700);
-      contextFile = path.join(contextRoot, `${jobId}.${lease.lease_epoch}.json`);
-      await writeFile(contextFile, serializedContext, { mode: 0o600, flag: "wx" });
-      await chmod(contextFile, 0o600);
-      const reviewEnv = {
-        ...env,
-        AFL_REVIEW_JOB_ID: jobId,
-        AFL_REVIEW_CONTEXT_FILE: contextFile,
-        AFL_REVIEW_PROMPT_FILE: promptFile,
-        AFL_REVIEW_SUBMIT_PROTOCOL: "stdout_json_receipt"
-      };
-      const receipt = review
-        ? validateReceipt(await review({ contextFile, promptFile, cwd, timeoutMs, env: reviewerEnvironment(reviewEnv) }))
-        : await runIsolatedReview({ command, args, cwd, timeoutMs, env: reviewEnv });
-      return this.store.commitReview({ jobId, ownerId, attempt, leaseEpoch: lease.lease_epoch }, receipt);
-    } catch (error) {
-      try { this.fail(jobId, ownerId, attempt, lease.lease_epoch, true, error.code || "reviewer_failed"); } catch {}
-      throw error;
-    } finally {
-      if (contextFile) await rm(contextFile, { force: true });
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return boundedText(plain);
+  const selected = {};
+  for (const field of EVENT_TEXT_FIELDS) {
+    const value = parsed[field];
+    if (typeof value === "string") selected[field] = boundedText(value, 8_192);
+    else if (Array.isArray(value)) {
+      selected[field] = value.slice(0, 32).map((item) => {
+        if (typeof item === "string") return boundedText(item, 2_048);
+        if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+        const allowed = {};
+        for (const key of ["type", "text", "content"]) {
+          if (typeof item[key] === "string") allowed[key] = boundedText(item[key], 2_048);
+        }
+        return allowed;
+      }).filter((item) => item !== null);
     }
+  }
+  return boundedText(JSON.stringify(selected));
+}
+
+async function contextEvent(row, blobs) {
+  if (!row) return null;
+  if (!row.encrypted_raw_ref) throw new ReviewJobError("context_invalid");
+  const raw = await blobs.read(row.encrypted_raw_ref);
+  return {
+    eventUid: row.event_uid,
+    sourceProvider: row.source_provider,
+    role: row.role,
+    referentEventUid: row.referent_event_uid ?? null,
+    contentHash: row.content_hash,
+    completeness: row.completeness,
+    sourceTimestamp: row.source_timestamp ?? null,
+    createdAt: row.created_at,
+    text: hostText(raw)
+  };
+}
+
+async function catalogSummaries(projectDir, publishedBefore) {
+  const catalog = await readReflectionCatalog({ projectDir, publishedBefore });
+  return Promise.all(catalog.documents.map(async (document) => ({
+    reflectionId: document.reflectionId,
+    familyId: document.familyId,
+    methodClass: document.methodClass,
+    appliesWhen: [...document.appliesWhen],
+    sha256: sha256(await readFile(document.path))
+  })));
+}
+
+async function assertProjectBoundary(projectDir) {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    throw new ReviewJobError("context_invalid");
+  }
+  if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) {
+    throw new ReviewJobError("context_invalid");
+  }
+  const root = path.parse(projectDir).root;
+  let current = root;
+  let info = await lstat(current);
+  for (const component of path.relative(root, projectDir).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    info = await lstat(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new ReviewJobError("context_invalid");
+  }
+  if (typeof process.getuid !== "function" || info.uid !== process.getuid()) {
+    throw new ReviewJobError("context_invalid");
+  }
+}
+
+async function buildReviewContext({ store, blobs, jobId, projectDir }) {
+  const stored = store.getReviewContext({ jobId, priorLimit: 6, followingLimit: 2 });
+  if (!stored?.job || !stored.source) throw new ReviewJobError("context_invalid");
+  if (stored.job.project_id !== projectDir || stored.source.source_provider !== "codex"
+      && stored.source.source_provider !== "claude" && stored.source.source_provider !== "gemini") {
+    throw new ReviewJobError("context_invalid");
+  }
+  await assertProjectBoundary(projectDir);
+  const reflectionCatalog = await catalogSummaries(projectDir, stored.job.created_at);
+  const sourceEnvelope = {
+    sourceIdentity: stored.job.source_identity,
+    createdAt: stored.source.source_timestamp ?? stored.source.created_at,
+    publishedAt: stored.job.created_at
+  };
+  return {
+    job: {
+      job_id: stored.job.job_id,
+      source_identity: stored.job.source_identity,
+      created_at: stored.job.created_at,
+      project_id: stored.job.project_id
+    },
+    source: { ...await contextEvent(stored.source, blobs), ...sourceEnvelope },
+    referent: await contextEvent(stored.referent, blobs),
+    prior: await Promise.all(stored.prior.slice(-6).map((row) => contextEvent(row, blobs))),
+    following: await Promise.all(stored.following.slice(0, 2).map((row) => contextEvent(row, blobs))),
+    reflectionCatalog
+  };
+}
+
+function causeCode(error) {
+  let current = error;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    if (typeof current.code === "string") {
+      if (current.code === "review_lease_lost" || current.code === "lease_lost") return "lease_lost";
+      if (current.code === "publication_collision") return "publication_collision";
+    }
+    current = current.cause;
+  }
+  return null;
+}
+
+function providerFailure(error) {
+  const code = String(error?.code || "");
+  if (code === "reviewer_timeout" || code === "provider_timeout") return "provider_timeout";
+  if (["reviewer_unavailable", "provider_unavailable", "ENOENT", "EACCES"].includes(code)) {
+    return "provider_unavailable";
+  }
+  return "provider_invalid";
+}
+
+function publicationFailure(error) {
+  return causeCode(error) || "publication_failed";
+}
+
+function asFailure(error, fallback) {
+  if (error instanceof ReviewJobError && FAILURE_CODES.has(error.code)) return error;
+  return new ReviewJobError(fallback, error);
+}
+
+function recordFailure(store, { jobId, ownerId, leaseEpoch, code }) {
+  if (code === "lease_lost") return;
+  try {
+    store.failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode: code });
+  } catch {
+    // A concurrent owner or process failure owns subsequent recovery.
+  }
+}
+
+export async function runReviewJob({
+  jobId,
+  ownerId,
+  store,
+  blobs,
+  provider,
+  projectDir,
+  leaseMs = DEFAULT_LEASE_MS
+}) {
+  if (!store || !blobs || typeof provider !== "function") {
+    throw new ReviewJobError("context_invalid");
+  }
+  const claimed = store.claimReviewJob({ jobId, ownerId, leaseMs });
+  if (!claimed?.job) throw new ReviewJobError("lease_lost");
+  const leaseEpoch = claimed.leaseEpoch;
+  let context;
+  try {
+    context = await buildReviewContext({ store, blobs, jobId, projectDir });
+  } catch (error) {
+    const failure = asFailure(error, "context_invalid");
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    throw failure;
+  }
+
+  let rawResult;
+  try {
+    rawResult = await provider(context);
+  } catch (error) {
+    const failure = new ReviewJobError(providerFailure(error), error);
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    throw failure;
+  }
+
+  const allowedFamilyIds = context.reflectionCatalog.map((item) => item.familyId);
+  const recurrenceFamilyById = new Map(
+    context.reflectionCatalog.map((item) => [item.reflectionId, item.familyId])
+  );
+  let result;
+  try {
+    result = validateReviewerResult(rawResult, { allowedFamilyIds, recurrenceFamilyById });
+  } catch (error) {
+    const failure = new ReviewJobError("provider_invalid", error);
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    throw failure;
+  }
+
+  if (result.outcome === "no_lesson") {
+    try {
+      store.completeReviewNoLesson({ jobId, ownerId, leaseEpoch });
+      return { outcome: "reviewed_no_lesson", documentPath: null };
+    } catch (error) {
+      const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
+      recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+      throw failure;
+    }
+  }
+
+  let model;
+  try {
+    model = validateReflectionModel(result, {
+      sourceIdentity: context.job.source_identity,
+      createdAt: context.source.sourceTimestamp ?? context.source.createdAt,
+      publishedAt: context.job.created_at
+    });
+  } catch (error) {
+    const failure = new ReviewJobError("provider_invalid", error);
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    throw failure;
+  }
+
+  try {
+    store.renewReviewLease({ jobId, ownerId, leaseEpoch, leaseMs: PUBLICATION_LEASE_MS });
+    store.assertReviewLease({ jobId, ownerId, leaseEpoch });
+    const published = await publishReflectionDocument({
+      projectDir,
+      model,
+      beforeRename: () => store.assertReviewLease({ jobId, ownerId, leaseEpoch })
+    });
+    store.completeReviewPublished({
+      jobId,
+      ownerId,
+      leaseEpoch,
+      path: published.path,
+      sha256: published.sha256
+    });
+    return { outcome: "published", documentPath: published.path };
+  } catch (error) {
+    const failure = new ReviewJobError(publicationFailure(error), error);
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    throw failure;
   }
 }

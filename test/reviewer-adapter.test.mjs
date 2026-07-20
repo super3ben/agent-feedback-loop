@@ -3,11 +3,14 @@ import { test } from "node:test";
 
 import { detectAllReviewerAdapters, detectReviewerAdapter } from "../src/reviewer-adapter.mjs";
 
-test("reviewer adapter reports explicit and built-in providers as isolated processes", async () => {
-  const configured = await detectReviewerAdapter({ cli: "claude", command: process.execPath });
-  assert.equal(configured.available, true);
-  assert.equal(configured.mode, "isolated_cli_process");
-  assert.equal(configured.assurance, "process_lifecycle_isolated");
+test("reviewer adapter derives capability from the captured provider and ignores the legacy generic command", async () => {
+  const configured = await detectReviewerAdapter({
+    cli: "claude",
+    command: process.execPath,
+    pathValue: "",
+    env: { PATH: "" }
+  });
+  assert.equal(configured.available, false);
   const builtIn = await detectReviewerAdapter({ cli: "codex", command: null });
   assert.equal(builtIn.available, true);
   assert.equal(builtIn.mode, "isolated_cli_process");
@@ -22,8 +25,8 @@ test("all supported CLIs have an adapter capability record", async () => {
   assert.equal(Object.values(adapters).every((adapter) => ["process_lifecycle_isolated", "unavailable"].includes(adapter.assurance)), true);
 });
 
-test("a missing reviewer command is unavailable even when configured by bare name", async () => {
-  const adapter = await detectReviewerAdapter({ cli: "codex", command: "definitely-missing-afl-reviewer-command" });
+test("a missing provider executable is unavailable", async () => {
+  const adapter = await detectReviewerAdapter({ cli: "codex", pathValue: "", env: { PATH: "", AGENT_FEEDBACK_LOOP_CODEX_COMMAND: "/definitely/missing" } });
   assert.equal(adapter.available, false);
   assert.equal(adapter.assurance, "unavailable");
 });

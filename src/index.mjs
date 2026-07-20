@@ -94,7 +94,7 @@ export function pathsFor(home = os.homedir()) {
     exportsRoot: path.join(dataRoot, "exports"),
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
-    reviewerSchema: path.join(packRoot, "schemas", "reviewer-receipt.schema.json"),
+    reviewerSchema: path.join(packRoot, "schemas", "reviewer-result.schema.json"),
     geminiReviewerPolicy: path.join(packRoot, "policies", "gemini-reviewer-deny-all.toml"),
     geminiReviewerSettings: path.join(packRoot, "settings", "gemini-reviewer.json"),
     coreHook: path.join(packRoot, "hooks", "core-hook.sh"),

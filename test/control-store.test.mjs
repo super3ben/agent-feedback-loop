@@ -2520,6 +2520,12 @@ test("review failures retry after 30 and 120 seconds then exhaust at attempt thr
   });
 
   const first = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-1" });
+  assert.throws(() => fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-1",
+    leaseEpoch: first.leaseEpoch,
+    reasonCode: "provider_body_or_arbitrary_reason"
+  }), /supported review failure reason/i);
   const failedOnce = fixture.store.failReviewJob({
     jobId: candidate.jobId,
     ownerId: "owner-1",

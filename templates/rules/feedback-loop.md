@@ -6,14 +6,13 @@ must not call an LLM.
 
 ## Review Dispatch
 
-1. The runtime starts a detached, lease-fenced reviewer process with a bounded
-   `0600` context file. It auto-selects the originating Codex, Claude Code, or
-   Gemini CLI in headless mode.
-2. `AGENT_FEEDBACK_LOOP_REVIEWER_COMMAND` optionally replaces that built-in provider
-   with an operator-owned executable. It is not required for normal use.
+1. The runtime starts a detached, lease-fenced reviewer process and derives the
+   Codex, Claude Code, or Gemini provider from the captured source event.
+2. Bounded redacted evidence is supplied only on stdin. Provider output crosses a
+   private `0600` result-file boundary and must match `reviewer-result.schema.json`.
 3. The main conversation does not perform, delegate, display, or wait for the full
-   reflection. If no provider executable exists, keep the job pending and report
-   `reviewer_unavailable`; never substitute a main-agent reflection.
+   reflection. If the captured provider executable is unavailable, retry the job
+   through the bounded control-store lifecycle; never substitute a main-agent reflection.
 4. Process isolation proves a separate lifecycle and bounded handoff, not an OS,
    filesystem, or network sandbox. Provider-specific invocations disable tools or
    use read-only/plan policy where supported.
@@ -36,9 +35,10 @@ must not call an LLM.
 
 ## Persistence And Loading
 
-- The user-level transactional data root is the source of truth. Reports, lesson
-  revisions, application receipts, effectiveness events, and queue acknowledgement
-  commit atomically. Project Git is not mutated by an automatic review.
+- The control store is authoritative for the reviewer lifecycle. A successful
+  lesson is published as one immutable project-scoped Markdown document; a
+  no-lesson result creates no document. Automatic review stores no report,
+  notification, or lesson body in SQLite.
 - Only active lessons are selectable. Minor is never loaded. Major requires exact
   task/path/tool/signal scope. Critical and Blocker remain bounded by project scope
   and context epoch.
@@ -50,7 +50,7 @@ must not call an LLM.
 
 ## Completion Authority
 
-A review is complete only after a structured receipt transaction stores the report,
-lesson projection and any effectiveness event, consumes the queued evidence, and
-consumes the one-time capability. A conversation marker or Markdown file alone is not
+A review is complete only when the fenced control row reaches
+`reviewed_no_lesson`, or reaches `published` with the exact immutable document path
+and SHA-256. A conversation marker, provider output, or unfenced file alone is not
 completion authority.
