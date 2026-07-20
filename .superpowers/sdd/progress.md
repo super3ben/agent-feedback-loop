@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | blocked by review-10 identity coherence gaps | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`; design `e1732a8`; plan `c6f984f` | CHANGES_REQUIRED: 0 Critical / 2 Important / 0 Minor | Writer-ref fix approved; completeness-mismatched aliases are unreplayable and most conflicting snake/camel identity aliases are silently accepted; next fix/re-review needs explicit authorization |
+| 1. Lean control DB | implementing authorized review-10 identity-coherence fix | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`; design `e1732a8`; plan `c6f984f` | CHANGES_REQUIRED: 0 Critical / 2 Important / 0 Minor | User authorized one shared alias-invariant/target-compatibility TDD fix plus one fresh independent re-review on 2026-07-20; task remains unchecked |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -42,3 +42,4 @@
 - Review 9 confirms the atomic frozen-snapshot redesign closes all three review-8 blockers, but found one new bounded Important: public capture does not reject a null/undefined blob-writer result before entering the direct-only nullable authoritative-ref path. The authorized implementation/re-review round is consumed; no fix is dispatched until the user explicitly authorizes one bounded fix and fresh re-review.
 - The user replied `继续` after review 9, authorizing exactly one bounded fix for the public null-writer invariant and one fresh independent re-review; the direct-only nullable path remains unchanged.
 - Review 10 approves the public writer-ref fix but finds two deterministic identity-contract blockers: alias attachment can create a completeness-mismatched observation that exact replay rejects, and most snake/camel canonical identity conflicts are silently resolved by precedence. The authorized review-9 fix/re-review round is consumed; no further fix is dispatched without a new explicit user decision.
+- On 2026-07-20 the user replied `继续`, authorizing one review-10 identity-coherence fix and one fresh independent re-review. The fix must use a shared conflict-validating reader for all existing canonical alias groups and a shared replay-compatible alias-target rule with completeness applied before candidate bounding; no schema, hook, scheduler, notification, RAG, Markdown-truth, or later-task expansion is authorized.
