@@ -86,6 +86,66 @@ function parseJsonText(text) {
   return JSON.parse(unfenced);
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function projectCodexSchemaNode(node) {
+  if (!isPlainObject(node)) throw providerError("provider_invalid");
+  const projected = {};
+  if (typeof node.type === "string") projected.type = node.type;
+  else if (Array.isArray(node.type) && node.type.every((item) => typeof item === "string")) {
+    projected.type = [...node.type];
+  }
+  if (Object.hasOwn(node, "const")) projected.enum = [node.const];
+  else if (Array.isArray(node.enum)) projected.enum = [...node.enum];
+  if (isPlainObject(node.properties)) {
+    projected.properties = Object.fromEntries(
+      Object.entries(node.properties).map(([name, child]) => [name, projectCodexSchemaNode(child)])
+    );
+    projected.required = Object.keys(node.properties);
+    projected.additionalProperties = false;
+  }
+  if (isPlainObject(node.items)) projected.items = projectCodexSchemaNode(node.items);
+  if (Number.isInteger(node.minItems) && node.minItems >= 0) projected.minItems = node.minItems;
+  if (Number.isInteger(node.maxItems) && node.maxItems >= 0) projected.maxItems = node.maxItems;
+  if (Array.isArray(node.anyOf)) projected.anyOf = node.anyOf.map(projectCodexSchemaNode);
+  return projected;
+}
+
+function codexTransportSchema(schemaText) {
+  let logicalSchema;
+  try {
+    logicalSchema = JSON.parse(schemaText);
+  } catch (error) {
+    throw providerError("provider_invalid", error);
+  }
+  if (!isPlainObject(logicalSchema)
+      || !Array.isArray(logicalSchema.oneOf)
+      || logicalSchema.oneOf.length !== 2) {
+    throw providerError("provider_invalid");
+  }
+  return {
+    type: "object",
+    properties: {
+      result: {
+        anyOf: logicalSchema.oneOf.map(projectCodexSchemaNode)
+      }
+    },
+    required: ["result"],
+    additionalProperties: false
+  };
+}
+
+function unwrapCodexTransportResult(value) {
+  if (!isPlainObject(value)
+      || !Object.hasOwn(value, "result")
+      || Object.keys(value).length !== 1) {
+    throw providerError("provider_invalid");
+  }
+  return value.result;
+}
+
 function unwrapResult(value) {
   if (value && typeof value === "object" && !Array.isArray(value) && typeof value.outcome === "string") return value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -261,7 +321,9 @@ export async function runReviewerProvider({
     serializedContext,
     "</afl_evidence>",
     "",
-    "Return exactly one JSON object matching the required result schema."
+    cli === "codex"
+      ? "For Codex transport only, return exactly {\"result\": <logical-result>}; the nested value must match the logical reviewer result contract."
+      : "Return exactly one JSON object matching the required result schema."
   ].join("\n");
   if (Buffer.byteLength(input, "utf8") > MAX_INPUT_BYTES) throw providerError("provider_invalid");
   if (cli === "gemini") {
@@ -280,11 +342,21 @@ export async function runReviewerProvider({
     await chmod(privateRoot, 0o700);
     await chmod(workDir, 0o700);
     await writeFile(resultFile, "", { mode: 0o600, flag: "wx" });
+    let invocationSchemaFile = schemaFile;
+    if (cli === "codex") {
+      invocationSchemaFile = path.join(privateRoot, "reviewer-result.transport.schema.json");
+      const transportSchema = codexTransportSchema(schemaText);
+      await writeFile(invocationSchemaFile, `${JSON.stringify(transportSchema, null, 2)}\n`, {
+        mode: 0o600,
+        flag: "wx"
+      });
+      await chmod(invocationSchemaFile, 0o600);
+    }
     const invocation = buildReviewerInvocation({
       cli,
       executable,
       workDir,
-      schemaFile,
+      schemaFile: invocationSchemaFile,
       resultFile,
       schemaText: schemaText.trim(),
       policyFile
@@ -296,7 +368,8 @@ export async function runReviewerProvider({
     const output = await runProcess({ ...invocation, cwd: workDir, env: providerEnv, input, timeoutMs });
     if (cli !== "codex") await normalizeStdoutResult(output.stdout, resultFile);
     try {
-      return await readSecureReviewerResult(resultFile);
+      const secureResult = await readSecureReviewerResult(resultFile);
+      return cli === "codex" ? unwrapCodexTransportResult(secureResult) : secureResult;
     } catch (error) {
       throw providerError("provider_invalid", error);
     }

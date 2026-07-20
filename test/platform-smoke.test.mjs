@@ -182,7 +182,7 @@ const result = {
 const outputIndex = process.argv.indexOf("--output-last-message");
 if (outputIndex < 0 || !process.argv[outputIndex + 1]) process.exit(22);
 await sleep(75);
-await writeFile(process.argv[outputIndex + 1], JSON.stringify(result), { mode: 0o600 });
+await writeFile(process.argv[outputIndex + 1], JSON.stringify({ result }), { mode: 0o600 });
 await chmod(process.argv[outputIndex + 1], 0o600);
 
 function sleep(milliseconds) {
