@@ -1297,6 +1297,7 @@ git commit -m "feat: define validated reviewer results"
 - Produces: `readReflectionCatalog({ projectDir, publishedBefore, maxFileBytes = 131072, maxFiles = 256 }) -> { documents, omissions }`
 - Produces: `publishReflectionDocument({ projectDir, reflectionDir, model, beforeRename, fsImpl }) -> { path, sha256, created }`; exactly one of project/reflection directory is accepted
 - Produces: canonical metadata keys `reflection_id`, `created_at`, `published_at`, `final_severity`, `responsibility`, `method_class`, `family_id`, `applies_when`, `effectiveness`, `source_identity_hash`
+- `validateReflectionModel` 的 controller source envelope 固定为 `{ sourceIdentity, createdAt, publishedAt }`：前两项来自 durable job/source event，`publishedAt` 是调用者在 publication fence 内固定并在 crash adoption 时复用的带时区时间；文档层只校验并规范化为 UTC，不自行读取时钟或新增持久状态
 
 - [ ] **Step 1: Write RED tests for the exact readable format and legacy compatibility**
 
