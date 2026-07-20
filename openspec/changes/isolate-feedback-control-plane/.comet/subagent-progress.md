@@ -14,9 +14,9 @@
 
 ## Current task
 
-- Plan task: `Task 4 complete: 增加可解释的明确反馈候选分类器`
+- Plan task: `Task 5 complete: 让 prompt capture 事务创建一个即时 job`
 - OpenSpec mappings: redesigned `1.1`, `1.2`, `1.3`, `2.1`, `2.2`, `2.3`, and `6.1` are partial because later mapped tasks still own detector, prompt orchestration, cleanup, doctor and final verification
-- Stage: `review`
+- Stage: `preflight`
 - Task 2 base: `e7b9fa301aded09bb79c075d385e9dc2ab2e1052`
 - Task 2 allowed files: `src/control-store.mjs`, `test/control-store.test.mjs`; `.superpowers/sdd/task-2-report.md` may only receive an uncommitted append-only implementation handoff
 - Task 2 scope: immediate replay-idempotent candidate creation, bounded launch reservation/failure release, recoverable ordering, fenced claim/renew/assert/terminal transitions, bounded opaque context, retry exhaustion; no schema, scheduler, launcher, provider, notification, RAG, Markdown-body or live-state changes
@@ -66,7 +66,10 @@
 - Task 4 RED/GREEN: required completed-turn dissatisfaction failed 0/1; current-user referent boundary plus event-only unstable identity failed 0/2; final `test/capture.test.mjs` passed 35/35. Syntax/diff/scope and no-content-log/no-random-id gates passed
 - Coordinator regression: `test/capture.test.mjs`, `test/control-store.test.mjs` and `test/store.test.mjs` passed 170/170 on local macOS temporary state; Task 1/2/3 report hashes remained byte-identical
 - Task 4 behavior: exact ordered evidence reasons, frozen negatives, synthetic-first rejection, role-validated explicit/transcript referents with current-user boundary, five-field source hash, native-first deterministic fallback and explicit `identity_unstable`; no Task 5+ job/launch/provider/Markdown/schema or main-session control behavior
-- Next action: one fresh frozen-scope review checks only Task 4 acceptance A-F and reports unsupported theoretical inputs as backlog; it must not expand into Task 5+
+- Task 4 review: `/root/task4_detector_review` returned `APPROVED` (Critical 0, Important 0, backlog 1); checklist A-F passed and its independent probe completed nine assertions. Report `.superpowers/sdd/isolate-feedback-control-plane-task-4-v2-review-1.md`
+- Task 4 backlog: a native explicit-feedback event has no supported producer payload or production evidence; defer until such a contract exists, do not patch or block the vertical loop
+- Task 4 completion: frozen and checked off after implementation `3cfeada`, implementer capture 35/35, coordinator 170/170 and fresh frozen review. No additional Task 4 review/fix round is allowed
+- Next action: generate and freeze Task 5 prompt orchestration scope; candidate commit must precede synchronous launch reservation/call, replay must reuse one job, ordinary/unstable/failure paths remain host-pass, and no legacy three-entry threshold or main-session status output may survive
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`

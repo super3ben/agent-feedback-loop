@@ -966,7 +966,7 @@ git commit -m "refactor: remove the conversation control plane"
 
 ### Task 4: 增加可解释的明确反馈候选分类器
 
-- [ ] **Task 4 complete: 增加可解释的明确反馈候选分类器**
+- [x] **Task 4 complete: 增加可解释的明确反馈候选分类器**
 
 **Files:**
 - Create: `src/feedback-signal.mjs`
@@ -981,7 +981,7 @@ git commit -m "refactor: remove the conversation control plane"
 - Produces: deterministic `normalizeHookEvent()` source-id fallback for replay-safe hosts without `event_id`/`prompt_id`
 - Consumes: the existing owned, non-symlink, bounded transcript-tail primitive in `capture.mjs`
 
-- [ ] **Step 1: Write RED fixtures for required positive and negative cases**
+- [x] **Step 1: Write RED fixtures for required positive and negative cases**
 
 ```js
 const explicit = await detectFeedbackCandidate({
@@ -1004,13 +1004,13 @@ Retain active-turn steering, recent interruption and stale interruption fixtures
 
 Add host fixtures in which: Codex JSONL contains the immediately preceding completed assistant message; a current-turn assistant message is active steering; Claude/Gemini provide an explicit assistant field; transcript path is missing/symlinked/unowned/oversized; and the same payload without a native prompt id is replayed. The replay must produce one source identity, while the same text in another session or turn produces another identity.
 
-- [ ] **Step 2: Run RED and confirm the current completed-turn test fails for the right reason**
+- [x] **Step 2: Run RED and confirm the current completed-turn test fails for the right reason**
 
 Run: `node --test test/capture.test.mjs`
 
 Expected: FAIL on the explicit completed-turn dissatisfaction fixture because current code returns `immediateReview:false`; negative and structural fixtures remain intelligible.
 
-- [ ] **Step 3: Implement deterministic evidence classes**
+- [x] **Step 3: Implement deterministic evidence classes**
 
 First implement direct referent resolution. Prefer a role-validated explicit assistant field supplied by the host. Otherwise read only an owned regular transcript tail within the byte/age limits and select the closest role-validated assistant message preceding the current user event; a same-turn assistant message is structural `active_turn_steering`, while a completed prior-turn assistant message is only a referent and still needs retrospective evidence. Never treat unparsed transcript bytes or a user/system message as assistant content.
 
@@ -1036,7 +1036,7 @@ Synthetic AFL controls are rejected before scoring. Never log `userText` or refe
 
 `feedbackSourceIdentity` hashes the five canonical identity fields with length-prefixed UTF-8 encoding. `normalizeHookEvent` first uses the host's `event_id`/`prompt_id`; when absent, it derives a deterministic source id from the canonical tuple `(cli, session id, turn/native-turn id, transcript path, redacted content hash)`. The content hash is a last-resort event discriminator, not a cross-event similarity key: session and turn remain part of the identity, so identical wording in a later session/turn is never suppressed. If the host supplies neither a stable session nor turn, mark the source `identity_unstable` and do not create a reviewer job rather than pretending replay idempotency.
 
-- [ ] **Step 4: Run focused tests and commit**
+- [x] **Step 4: Run focused tests and commit**
 
 Run: `node --test test/capture.test.mjs`
 
