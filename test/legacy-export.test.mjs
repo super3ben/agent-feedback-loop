@@ -129,7 +129,8 @@ async function legacyFixture(t, {
   includeBadLesson = true,
   includeReport = true,
   malformedReceipt = false,
-  cardSourceIds = ["raw-report-valid"]
+  cardSourceIds = ["raw-report-valid"],
+  persistedLessonOverrides = {}
 } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "afl-legacy-export-")));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -181,15 +182,36 @@ async function legacyFixture(t, {
       VALUES (?, ?, ?, ?, ?, ?)`);
     const insertRevision = database.prepare(`INSERT INTO lesson_revisions
       (lesson_id, revision, card_json, created_at) VALUES (?, ?, ?, ?)`);
+    const persistedLesson = {
+      severity: "Major",
+      responsibility: "agent_fault",
+      method_class: "verification-closure",
+      class_id: "completion-claim-without-evidence",
+      current_revision: 1,
+      ...persistedLessonOverrides
+    };
     insertLesson.run(
-      "raw-lesson-complete", "Major", "agent_fault", "verification-closure",
-      "completion-claim-without-evidence", 1
+      "raw-lesson-complete",
+      persistedLesson.severity,
+      persistedLesson.responsibility,
+      persistedLesson.method_class,
+      persistedLesson.class_id,
+      persistedLesson.current_revision
     );
     insertRevision.run(
       "raw-lesson-complete", 1,
       JSON.stringify(revisionCard({ source_ids: cardSourceIds })),
       CREATED_AT
     );
+    if (persistedLesson.current_revision > 1) {
+      insertRevision.run(
+        "raw-lesson-complete", persistedLesson.current_revision,
+        JSON.stringify(revisionCard({
+          when: "When the latest projection supersedes an older receipt revision."
+        })),
+        RECEIPT_AT
+      );
+    }
     if (includeBadLesson) {
       insertLesson.run(
         "raw-lesson-incomplete", "Major", "agent_fault", "verification-closure",
@@ -282,6 +304,64 @@ for (const version of [8, 9]) {
     const visiblePlan = JSON.stringify(dryRun);
     assert.doesNotMatch(visiblePlan, /raw-(?:receipt|lesson|report|job|project|feedback|assistant)/u);
     assert.doesNotMatch(visiblePlan, /PAYLOAD|persisted redacted|afl-legacy-export/u);
+  });
+}
+
+const EXACT_CURRENT_MISMATCHES = [
+  ["severity", { severity: "Critical" }],
+  ["responsibility", { responsibility: "shared_fault" }],
+  ["method_class", { method_class: "different-method" }],
+  ["class_id", { class_id: "different-completion-class" }]
+];
+
+for (const version of [8, 9]) {
+  test(`schema v${version} rejects exact-current lesson row mismatches opaquely`, async (t) => {
+    for (const [field, persistedLessonOverrides] of EXACT_CURRENT_MISMATCHES) {
+      await t.test(field, async (t) => {
+        const fixture = await legacyFixture(t, {
+          version,
+          includeBadLesson: false,
+          persistedLessonOverrides
+        });
+        const plan = await inspectLegacyExport(fixture);
+
+        assert.deepEqual(plan.counts, { planned: 0, incomplete: 1, conflicts: 0 });
+        assert.equal(plan.items.length, 1);
+        assert.deepEqual(Object.keys(plan.items[0]).sort(), ["id", "reason", "status"]);
+        assert.match(plan.items[0].id, /^legacy-[a-f0-9]{64}$/u);
+        assert.equal(plan.items[0].status, "incomplete");
+        assert.equal(plan.items[0].reason, "mismatched_lesson");
+        assert.ok(plan.items[0].reason.length <= 64);
+      });
+    }
+  });
+}
+
+for (const version of [8, 9]) {
+  test(`schema v${version} exports an older receipt from its historical fields`, async (t) => {
+    const fixture = await legacyFixture(t, {
+      version,
+      includeBadLesson: false,
+      persistedLessonOverrides: {
+        severity: "Critical",
+        responsibility: "shared_fault",
+        method_class: "different-method",
+        class_id: "different-completion-class",
+        current_revision: 2
+      }
+    });
+    const plan = await inspectLegacyExport(fixture);
+
+    assert.deepEqual(plan.counts, { planned: 1, incomplete: 0, conflicts: 0 });
+    assert.deepEqual(await executeLegacyExport({ plan, dryRun: false }), {
+      planned: 1, written: 1, skipped: 0, incomplete: 0, conflicts: 0
+    });
+    const [name] = await listReflectionFiles(fixture.outputDir);
+    const markdown = await readFile(path.join(fixture.outputDir, name), "utf8");
+    const parsed = parseReflectionMarkdown(markdown, { path: name });
+    assert.equal(parsed.methodClass, "verification_closure");
+    assert.equal(parsed.familyId, sha256("verification-closure\u0000completion-claim-without-evidence"));
+    assert.doesNotMatch(markdown, /different-method|different-completion-class/u);
   });
 }
 

@@ -432,9 +432,16 @@ function candidateFor({ receipt, payload, lesson, ordinal, reports, lessons, rev
   if (!lessonRow) return { item: incomplete(id, "missing_lesson") };
   const revisionRow = revisions.get(revisionKey(lesson.lesson_id, lesson.revision));
   if (!revisionRow) return { item: incomplete(id, "missing_revision") };
-  if (!Number.isSafeInteger(Number(lessonRow.current_revision))
-      || Number(lessonRow.current_revision) < lesson.revision) {
+  const currentRevision = Number(lessonRow.current_revision);
+  if (!Number.isSafeInteger(currentRevision) || currentRevision < lesson.revision) {
     return { item: incomplete(id, "mismatched_revision") };
+  }
+  if (currentRevision === lesson.revision
+      && (lessonRow.severity !== lesson.severity
+        || lessonRow.responsibility !== lesson.responsibility
+        || lessonRow.method_class !== lesson.method_class
+        || lessonRow.class_id !== lesson.class_id)) {
+    return { item: incomplete(id, "mismatched_lesson") };
   }
   if (!validTimestamp(receipt.created_at)
       || !validTimestamp(report.created_at)
