@@ -3,19 +3,27 @@ import { test } from "node:test";
 
 import { detectAllReviewerAdapters, detectReviewerAdapter } from "../src/reviewer-adapter.mjs";
 
-test("reviewer adapter derives capability from the captured provider and ignores the legacy generic command", async () => {
-  const configured = await detectReviewerAdapter({
+test("reviewer adapter uses provider-specific configuration and ignores the legacy generic command", async () => {
+  const legacyOnly = await detectReviewerAdapter({
     cli: "claude",
     command: process.execPath,
     pathValue: "",
     env: { PATH: "" }
   });
-  assert.equal(configured.available, false);
-  const builtIn = await detectReviewerAdapter({ cli: "codex", command: null });
-  assert.equal(builtIn.available, true);
-  assert.equal(builtIn.mode, "isolated_cli_process");
-  assert.equal(builtIn.assurance, "process_lifecycle_isolated");
-  assert.match(builtIn.reason, /short-lived/i);
+  assert.equal(legacyOnly.available, false);
+  assert.equal(legacyOnly.command, null);
+
+  const providerSpecific = await detectReviewerAdapter({
+    cli: "codex",
+    command: null,
+    pathValue: "",
+    env: { PATH: "", AGENT_FEEDBACK_LOOP_CODEX_COMMAND: process.execPath }
+  });
+  assert.equal(providerSpecific.available, true);
+  assert.equal(providerSpecific.command, process.execPath);
+  assert.equal(providerSpecific.mode, "isolated_cli_process");
+  assert.equal(providerSpecific.assurance, "process_lifecycle_isolated");
+  assert.match(providerSpecific.reason, /short-lived/i);
 });
 
 test("all supported CLIs have an adapter capability record", async () => {
