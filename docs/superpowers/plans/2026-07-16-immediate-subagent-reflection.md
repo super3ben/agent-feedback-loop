@@ -1140,10 +1140,12 @@ git commit -m "feat: queue explicit feedback immediately"
 - Modify: `test/e2e-smoke.test.mjs`
 
 **Interfaces:**
-- Produces: synchronous `launchDetachedReviewer({ platform, nodeExecutable, cliFile, home, jobId, launchEpoch, spawnImpl }) -> { attempted, reason }`
+- Produces: synchronous `launchDetachedReviewer({ platform, nodeExecutable, cliFile, home, jobId, launchEpoch, spawnImpl, env = process.env }) -> { attempted, reason }`
 - Produces: `recoverDueReviewers({ store, launchReviewer, limit = 1 }) -> { scanned, attempted }`
 - Consumes: CLI command `reviewer-run --home <home> --job-id <id>`
 - Transitional rule: Task 6 verifies the launcher with a fixture child but does not point production prompt jobs at the legacy `reviewer-run`; Task 9 atomically activates launcher + new runner
+
+**Frozen Task 6 acceptance:** (A) only `darwin` and `linux` are supported; inputs and absolute executable/CLI paths are validated before direct spawn; (B) arguments and process options are exact, use no shell, inherit no stdio, and the child is synchronously unrefed; (C) only a bounded environment allowlist reaches the child and no prompt/evidence content is logged; (D) spawn/unref failure is returned as a machine reason, and `recoverDueReviewers` releases only the matching reserved launch epoch; (E) recovery scans stable due order, reserves and attempts at most one job per call, and store/launcher failure remains prompt-safe; (F) a real disposable macOS child outlives its parent and writes a sentinel without leaking child output, while Linux options are covered through the same platform-neutral implementation; (G) the task does not wire the legacy runner, add a timer/scheduler, wait for a provider, change schema, support Windows, or touch real HOME/hooks/runtime state.
 
 - [ ] **Step 1: Write RED tests for exact spawn options and bounded recovery**
 
@@ -1166,7 +1168,7 @@ assert.deepEqual(result, { attempted: true, reason: "spawn_attempted" });
 assert.equal(unrefCalled, true);
 ```
 
-Test `darwin` and `linux`; `win32` returns `{attempted:false, reason:'unsupported_platform'}`. A synchronous spawn throw must call `recordReviewLaunchFailure` with the matching launch epoch and make the job immediately recoverable; a stale epoch cannot release a newer reservation. Recovery fixture with three jobs must attempt exactly one in stable order. A child object has to expose `unref`; otherwise treat launch as failed.
+Test `darwin` and `linux`; `win32` returns `{attempted:false, reason:'unsupported_platform'}`. When launch is exercised through `recoverDueReviewers`, a synchronous spawn/unref failure must call `recordReviewLaunchFailure` with the matching launch epoch and make the job immediately recoverable; a stale epoch cannot release a newer reservation. The process-only launcher does not own SQLite. Recovery fixture with three jobs must attempt exactly one in stable order. A child object has to expose `unref`; otherwise treat launch as failed.
 
 - [ ] **Step 2: Run RED**
 
@@ -1176,7 +1178,7 @@ Expected: FAIL because launcher/recovery module does not exist and current launc
 
 - [ ] **Step 3: Implement short-lived detached launch**
 
-Use direct `spawn`, never a shell. Prevalidate platform, executable and absolute CLI path. The function is intentionally synchronous: it only creates the child and calls `unref`, never awaits process exit. A synchronous spawn/unref exception returns `spawn_failed` and releases only the matching launch reservation; an unobserved child failure remains recoverable after `next_launch_at`. No stdout/stderr is inherited by the host.
+Use direct `spawn`, never a shell. Prevalidate platform, executable and absolute CLI path. The function is intentionally synchronous: it only creates the child and calls `unref`, never awaits process exit. A synchronous spawn/unref exception returns `spawn_failed`; the recovery orchestrator records that failure against only the matching reservation epoch. An asynchronous child error is consumed so it cannot crash the host and remains recoverable after `next_launch_at`. No stdout/stderr is inherited by the host. Pass only the existing reviewer-safe base environment (`PATH`, `HOME`, `TMPDIR`, locale and `TZ`), explicitly allowlisted operator variables and `AFL_REVIEW_*`; do not forward arbitrary secrets.
 
 ```js
 const child = spawnImpl(nodeExecutable, args, {
