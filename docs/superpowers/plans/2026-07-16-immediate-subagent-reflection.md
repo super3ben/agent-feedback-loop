@@ -1716,6 +1716,7 @@ git commit -m "feat: export legacy reflections without mutating the database"
 - Modify: `src/capture.mjs`
 - Modify: `src/feedback-signal.mjs`
 - Modify: `src/index.mjs`
+- Modify: `src/cli.mjs`
 - Delete: `src/schema.mjs`
 - Delete: `src/store.mjs`
 - Delete: `src/receipt.mjs`
@@ -1727,12 +1728,21 @@ git commit -m "feat: export legacy reflections without mutating the database"
 - Modify: `test/capture.test.mjs`
 - Modify: `test/control-store.test.mjs`
 - Modify: `test/runtime.test.mjs`
+- Modify: `docs/verification/2026-07-16-legacy-control-plane-audit.md`
 
 **Interfaces:**
 - Consumes: all normal runtime storage through `openControlStore()`
 - Produces: `stripSyntheticAflControlText(text) -> { text, syntheticOnly }` in `feedback-signal.mjs`
 - Removes: `paths.storeFile`, `openStore`, legacy schema migration, receipt renderer/parser and every long-term database body API
 - Preserves: legacy SQL access only inside `legacy-export.mjs`
+
+**Frozen Task 13 preflight decisions:**
+
+- The actual runtime graph still has one omitted consumer: `src/cli.mjs` imports `openStore()` for the legacy `reviewer-context`, `memory`, `capture`, `gc`, and live-doctor branches. Task 13 deletes those four legacy command families and their help entries rather than preserving a compatibility store. The temporary `doctor --live` implementation switches its isolated database canary to `initializeControlStore()`/`openControlStore()` while preserving the existing disposable-home E2E contract; Task 14 owns the final doctor shape and wording.
+- `captureSession()` and `captureObservedSession()` become control-store-only. Remove their duck-typed legacy fallbacks; do not add a second adapter. Move only the exact bounded synthetic AFL visible-line plus adjacent canonical-marker parser into `feedback-signal.mjs`, returning `{ text, syntheticOnly }`, and transfer its preservation tests before deleting `receipt.mjs`.
+- Existing control-store tests already own observation replay/races, encrypted-reference validation, bounded context, lease fencing, and the body-free schema. Add only the missing focused proofs for freshly created private directory/database modes, transaction rollback, and reopening a valid control database placed into WAL mode. Do not make WAL the runtime default. The old user-controlled capture on/off policy is rejected architecture, not a capability to recreate; invalid capture rejection remains covered by the canonical pre-side-effect tests.
+- Update the existing legacy audit with this transfer/delete disposition. Do not create another design document, schema, service, scheduler, RAG/index, runtime database compatibility layer, or real-HOME test.
+- Task 12 intentionally keeps the CLI export fixture in `test/cli.test.mjs`. Therefore the final old-table-name scan permits exactly `src/legacy-export.mjs`, `test/legacy-export.test.mjs`, and `test/cli.test.mjs`; only the production module may execute legacy `SELECT`s.
 
 - [ ] **Step 1: Write RED import-graph and synthetic-filter tests**
 
@@ -1755,7 +1765,7 @@ Expected: FAIL because capture still imports `receipt.mjs`, `paths.storeFile` st
 
 Implement `stripSyntheticAflControlText` as a bounded parser for only the exact legacy visible-line plus adjacent canonical marker shape. It must preserve fabricated, fenced, mismatched and mixed business text exactly as the current safety tests require, but expose no render/delivery API.
 
-Update all remaining imports to `control-store.mjs`/`control-schema.mjs`; remove `paths.storeFile` and old migration/lesson/notification APIs. Before deleting `test/store.test.mjs`, transfer every still-valid invariant into focused new tests: private directory/database modes, observation replay/race idempotency, encrypted-blob reference safety, capture-policy rejection, bounded reviewer context, transaction rollback, lease fencing, WAL reopen, and body-free schema. Mark only tests for receipt, notification, episode batching, maintenance scheduler, lesson/card DB or hold as intentionally rejected behavior in the audit document. Delete the legacy files/tests/fixture only after the transferred tests pass. `legacy-export.mjs` keeps its own literal read-only SELECT statements and must not import deleted code.
+Update all remaining imports to `control-store.mjs`/`control-schema.mjs`; remove `paths.storeFile` and old migration/lesson/notification APIs. Before deleting `test/store.test.mjs`, confirm or transfer every still-valid invariant into focused new tests: private directory/database modes, observation replay/race idempotency, encrypted-blob reference safety, invalid-capture rejection, bounded reviewer context, transaction rollback, lease fencing, WAL reopen, and body-free schema. Mark tests for the old capture-policy toggle, receipt, notification, episode batching, maintenance scheduler, lesson/card DB or hold as intentionally rejected behavior in the audit document. Delete the legacy files/tests/fixture only after the transferred tests pass. `legacy-export.mjs` keeps its own literal read-only SELECT statements and must not import deleted code. Remove the residual legacy CLI commands and keep live doctor on the control store; do not preserve any `openStore()` branch.
 
 - [ ] **Step 4: Run the full suite and source scans**
 
@@ -1763,13 +1773,13 @@ Run: `npm test`
 
 Expected: PASS with zero failures after old tests are either transferred to the new modules or deleted as rejected behavior.
 
-Run: `rg -n 'from "\./(store|schema|receipt|notification-delivery|codex-reconcile|reconcile-scheduler)\.mjs"|memory_overflow_hold|submitDueReview|feedback_candidate_event_ids' src templates test`
+Run: `rg -n 'from "\./(store|schema|receipt|notification-delivery|codex-reconcile|reconcile-scheduler)\.mjs"|openStore|storeFile|memory_overflow_hold|submitDueReview|feedback_candidate_event_ids' src templates test`
 
 Expected: no matches.
 
 Run: `rg -l 'review_receipts|report_contents|lesson_revisions' src test`
 
-Expected: exactly `src/legacy-export.mjs` and `test/legacy-export.test.mjs`.
+Expected: exactly `src/legacy-export.mjs`, `test/legacy-export.test.mjs`, and the Task 12 CLI fixture in `test/cli.test.mjs`.
 
 Run: `rg -n 'notification|receipt|episode|maintenance|scheduler|lesson/card|memory hold' docs/verification/2026-07-16-legacy-control-plane-audit.md`
 
