@@ -67,7 +67,7 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 
 > **当前 review 状态与最终收口边界：** 历史 Step 1-22 及后续 identity 修复已完成，但 Task 1 在 11 轮 review 后触发全局三轮熔断。最终 implementer 只执行新增 Step 23-27：对受支持的带时区 RFC3339 做一次 UTC ISO 规范化，补两条冻结回归，然后交给一次冻结清单 review。不得重做 schema、路径、安装器、SQL 架构或扩展输入格式；非 Critical 相邻发现进入 backlog。review 通过后由协调者勾选 Task 1 并立即进入 Task 2。
 
-- [ ] **Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime**
+- [x] **Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime**
 
 **Files（历史 Step 1-5，已实施，本轮不修改）：**
 - Modify: `src/index.mjs:73-119`
@@ -810,7 +810,7 @@ Expected: both frozen timestamp tests and the existing Task 1/legacy regression 
 
 Run `node --check src/control-store.mjs`, `node --check test/control-store.test.mjs`, and `git diff --check`. Confirm the implementation commit contains only `src/control-store.mjs` and `test/control-store.test.mjs`; preserve `.superpowers/sdd/task-1-report.md` as the uncommitted append-only handoff. Commit as `fix: normalize capture timestamps`.
 
-- [ ] **Step 27: Run one frozen Task 1 acceptance review**
+- [x] **Step 27: Run one frozen Task 1 acceptance review**
 
 The fresh reviewer checks only the global Task 1 frozen acceptance checklist, the two timestamp regressions, and the existing Task 1 regression evidence. It does not perform another open-ended whole-Task defect search. A frozen checklist failure or a Critical issue involving main-session interference, data corruption/unrecoverability, or security/privacy blocks Task 1; every other newly observed adjacent concern is recorded in backlog and does not start another review/fix round. On pass, the coordinator checks Task 1 and immediately dispatches Task 2.
 

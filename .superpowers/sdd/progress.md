@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | frozen acceptance review | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`, `d37c91f`; design `e1732a8`; plan `c6f984f`, circuit breaker `d3dd12a` | one frozen-checklist review pending | Timestamp RED 0/2; UTC and Asia/Shanghai GREEN 2/2 each; disposable-HOME four-file regression 159/159; scope two files. Task remains unchecked until the frozen checklist gate |
+| 1. Lean control DB | complete (frozen acceptance) | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`, `d37c91f`; design `e1732a8`; plan `c6f984f`, circuit breaker `d3dd12a` | PASS A-G; Critical 0; backlog 0 | Timestamp RED 0/2; UTC and Asia/Shanghai GREEN 2/2 each; disposable-HOME four-file regression 159/159; scope two files. macOS temporary-state build proof only; Linux/live/production remain unverified |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -32,8 +32,9 @@
 - Task 1 architecture retrospective: the core control DB direction is valid, but compatibility responsibilities and the review gate became overextended while the user-facing vertical loop remained unbuilt. The timezone-less counterexample has no supported producer evidence; one minimal normalization closeout is cheaper than more control-store redesign, after which Tasks 2–6 take priority.
 - Task 1 frozen acceptance: separate schema-v1 control DB and legacy isolation; side-effect-free frozen canonical preflight; blob/transaction/ref invariants; exact/alias/new replay and completeness regressions; timezone-less pre-side-effect rejection; timezone-bearing UTC-normalized alias replay; no real-state mutation.
 - Frozen timestamp closeout commit `d37c91f` changes only `src/control-store.mjs` and `test/control-store.test.mjs`. It adds exactly two tests and one small entry normalizer; SQL/schema/fallback behavior is unchanged. Reported GREEN is 2/2 under both `TZ=UTC` and `TZ=Asia/Shanghai`, plus 159/159 four-file regression.
+- Frozen Task 1 acceptance passed checklist A-G with Critical 0 and backlog 0. Task 1 is frozen and complete; no twelfth open-ended review/fix round is permitted. Linux, live hooks/runtime, Codex desktop visibility, and production evidence remain later verification boundaries.
 - Real Codex desktop installation/visibility remains a later user-authorized verify activity, separate from temporary-HOME build proof.
-- Task 1 is blocked at the configured review ceiling on three concrete contract gaps: over-limit alias ambiguity, incomplete schema fingerprinting, and concurrent replay duplicate-result propagation. No task checkbox or OpenSpec item was marked complete.
+- Historical review note: Task 1 previously stopped at the configured review ceiling on three concrete contract gaps. Those gaps and later bounded findings were resolved under explicit user-authorized rounds; this historical gate is superseded by the final frozen acceptance PASS.
 - On 2026-07-17 the user explicitly replied `继续`, authorizing one third-round exception limited to those three gaps; the task remains unchecked until a fresh reviewer approves it.
 - The exception review closed alias truncation and duplicate-result propagation but found two Task 1 blockers: incomplete generated-column/index-collation schema inspection and missing provider isolation in alias/explicit-target identity. A fourth round requires a new explicit user decision.
 - The user replied `继续` again on 2026-07-17, authorizing a fourth-round exception limited to those two blockers; no task is checked until a fresh reviewer approves.
