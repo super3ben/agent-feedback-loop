@@ -23,6 +23,50 @@ function unavailableCodexHost() {
   };
 }
 
+function mixedCodexConfig(home) {
+  const packRoot = path.join(home, ".agent", "feedback-loop");
+  return `unrelated_value = "keep-root"
+
+# agent-feedback-loop:start
+[[hooks.Stop]]
+matcher = "marked-stop-parent"
+options = { source = "user" }
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "${packRoot}/hooks/stop-hook.sh --mode codex"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/opt/user/keep-stop.sh"
+# migration note: the old ${packRoot}/hooks/stop-hook.sh handler must be removed
+# agent-feedback-loop:end
+
+[[hooks.UserPromptSubmit]]
+matcher = "unmarked-prompt-parent"
+options = { source = "user" }
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "${packRoot}/hooks/core-hook.sh --legacy-core"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "${packRoot}/hooks/codex-hook.sh"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "prompt"
+prompt = "${packRoot}/prompts/reflection-agent.md"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/opt/user/keep-prompt.sh"
+
+[unrelated]
+value = "keep-table"
+`;
+}
+
 function runWithInput(file, input, env, args = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, { env });
@@ -116,47 +160,82 @@ describe("agent-feedback-loop package", () => {
     assert.equal(geminiAfter.hooks.BeforeAgent?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("core-hook.sh"))) ?? false, false);
   });
 
-  it("upgrade removes only the managed AFL Stop hook", async () => {
-    const home = await tempHome();
-    const paths = pathsFor(home);
-    await mkdir(path.dirname(paths.codexConfig), { recursive: true });
-    await mkdir(path.dirname(paths.claudeSettings), { recursive: true });
-    await mkdir(path.dirname(paths.geminiSettings), { recursive: true });
-    await writeFile(paths.codexConfig, `# agent-feedback-loop:start
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "${home}/.agent/feedback-loop/hooks/stop-hook.sh --mode codex"
-# agent-feedback-loop:end
+  it("upgrade removes only managed AFL handlers from mixed Codex parents", async () => {
+    for (const operation of ["install", "uninstall"]) {
+      const home = await tempHome();
+      const paths = pathsFor(home);
+      await mkdir(path.dirname(paths.codexConfig), { recursive: true });
+      await writeFile(paths.codexConfig, mixedCodexConfig(home), "utf8");
 
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "${home}/.agent/feedback-loop/hooks/stop-hook.sh --mode codex"
+      if (operation === "install") await install({ home, codexHost: unavailableCodexHost() });
+      else await uninstall({ home, removeFiles: false });
 
-[[hooks.Stop]]
-[[hooks.Stop.hooks]]
-type = "command"
-command = "/opt/user/keep-stop.sh"
-`, "utf8");
-    await writeFile(paths.claudeSettings, `${JSON.stringify({ hooks: { Stop: [{ matcher: "", hooks: [
-      { type: "command", command: `${home}/.agent/feedback-loop/hooks/stop-hook.sh --mode claude` },
-      { type: "command", command: "/opt/user/keep-claude-stop.sh" }
-    ] }] } }, null, 2)}\n`, "utf8");
-    await writeFile(paths.geminiSettings, `${JSON.stringify({ hooks: { AfterAgent: [{ matcher: "", hooks: [
-      { type: "command", command: `${home}/.agent/feedback-loop/hooks/stop-hook.sh --mode gemini` },
-      { type: "command", command: "/opt/user/keep-gemini-after-agent.sh" }
-    ] }] } }, null, 2)}\n`, "utf8");
+      const codex = await readFile(paths.codexConfig, "utf8");
+      assert.match(codex, /matcher = "marked-stop-parent"/);
+      assert.match(codex, /matcher = "unmarked-prompt-parent"/);
+      assert.equal((codex.match(/options = \{ source = "user" \}/g) || []).length, 2);
+      assert.match(codex, /command = "\/opt\/user\/keep-stop\.sh"/);
+      assert.match(codex, /command = "\/opt\/user\/keep-prompt\.sh"/);
+      assert.match(codex, /unrelated_value = "keep-root"/);
+      assert.match(codex, /\[unrelated\]\s+value = "keep-table"/);
+      assert.doesNotMatch(codex, /^\s*(?:command|prompt)\s*=.*(?:stop-hook\.sh|codex-hook\.sh|--legacy-core|prompts\/reflection-agent\.md)/gm);
+      assert.match(codex, /# migration note:.*stop-hook\.sh/);
+      if (operation === "install") {
+        assert.equal((codex.match(/agent-feedback-loop:start/g) || []).length, 1);
+        assert.equal((codex.match(/agent-feedback-loop:end/g) || []).length, 1);
+      } else {
+        assert.doesNotMatch(codex, /agent-feedback-loop:(?:start|end)/);
+      }
+    }
+  });
 
-    await install({ home, codexHost: unavailableCodexHost() });
+  it("upgrade and uninstall remove the legacy LaunchAgent with bounded fake bootout", async () => {
+    const label = "io.github.super3ben.agent-feedback-loop.reconcile";
+    for (const operation of ["install", "uninstall"]) {
+      const home = await tempHome();
+      const plistFile = path.join(home, "Library", "LaunchAgents", `${label}.plist`);
+      await mkdir(path.dirname(plistFile), { recursive: true });
+      await writeFile(plistFile, "legacy-scheduler-sentinel\n", "utf8");
+      const calls = [];
+      const legacySchedulerHost = { async bootout(input) { calls.push(input); throw new Error("already unloaded"); } };
 
-    const codex = await readFile(paths.codexConfig, "utf8");
-    const claude = JSON.parse(await readFile(paths.claudeSettings, "utf8"));
-    const gemini = JSON.parse(await readFile(paths.geminiSettings, "utf8"));
-    assert.match(codex, /\/opt\/user\/keep-stop\.sh/);
-    assert.doesNotMatch(codex, /feedback-loop\/hooks\/stop-hook\.sh/);
-    assert.deepEqual(claude.hooks.Stop.flatMap((entry) => entry.hooks).map((hook) => hook.command), ["/opt/user/keep-claude-stop.sh"]);
-    assert.deepEqual(gemini.hooks.AfterAgent.flatMap((entry) => entry.hooks).map((hook) => hook.command), ["/opt/user/keep-gemini-after-agent.sh"]);
+      if (operation === "install") {
+        await install({
+          home,
+          platform: "darwin",
+          activateLegacySchedulerCleanup: true,
+          legacySchedulerHost,
+          codexHost: unavailableCodexHost()
+        });
+      } else {
+        await uninstall({
+          home,
+          platform: "darwin",
+          activateLegacySchedulerCleanup: true,
+          legacySchedulerHost,
+          removeFiles: false
+        });
+      }
+
+      await assert.rejects(stat(plistFile));
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].label, label);
+    }
+
+    const dryRunHome = await tempHome();
+    const dryRunPlist = path.join(dryRunHome, "Library", "LaunchAgents", `${label}.plist`);
+    await mkdir(path.dirname(dryRunPlist), { recursive: true });
+    await writeFile(dryRunPlist, "dry-run-sentinel\n", "utf8");
+    const dryRunCalls = [];
+    await install({
+      home: dryRunHome,
+      dryRun: true,
+      platform: "darwin",
+      activateLegacySchedulerCleanup: true,
+      legacySchedulerHost: { async bootout(input) { dryRunCalls.push(input); } }
+    });
+    assert.equal(await readFile(dryRunPlist, "utf8"), "dry-run-sentinel\n");
+    assert.equal(dryRunCalls.length, 0);
   });
 
   it("install removes obsolete hook files left by an older runtime", async () => {

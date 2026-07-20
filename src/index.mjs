@@ -1,4 +1,5 @@
 import { constants } from "node:fs";
+import { execFile } from "node:child_process";
 import {
   access,
   chmod,
@@ -27,6 +28,8 @@ const RUNTIME_VERSION = "0.7.6";
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
+const LEGACY_RECONCILE_LABEL = "io.github.super3ben.agent-feedback-loop.reconcile";
+const LEGACY_CLEANUP_TIMEOUT_MS = 5_000;
 
 // Declarative CLI registry. Adding a new model-visible CLI = adding one entry.
 // configKey/configPath are resolved against home in pathsFor.
@@ -217,48 +220,104 @@ function tomlString(value) {
   return JSON.stringify(value);
 }
 
-function removeMarkedCodexBlock(text) {
-  const lines = text.split(/\r?\n/);
-  const kept = [];
-  let skipping = false;
+function cleanLegacyCodexHooks(text, paths) {
+  const lines = text.split(/\r?\n/)
+    .filter((line) => line.trim() !== CODEX_MARKER_START && line.trim() !== CODEX_MARKER_END);
+  const blocks = [{ header: null, lines: [] }];
   for (const line of lines) {
-    if (line.trim() === CODEX_MARKER_START) {
-      skipping = true;
-      continue;
+    const header = line.trim();
+    if (/^\[\[[^\]]+\]\]$/.test(header) || /^\[[^\]]+\]$/.test(header)) {
+      blocks.push({ header, lines: [line] });
+    } else {
+      blocks.at(-1).lines.push(line);
     }
-    if (line.trim() === CODEX_MARKER_END) {
-      skipping = false;
-      continue;
-    }
-    if (!skipping) kept.push(line);
   }
-  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
-}
 
-function removeUnmarkedLegacyCodexBlocks(text, paths) {
-  const lines = text.split(/\r?\n/);
-  const chunks = [];
-  let current = [];
-  const isTopLevelHook = (line) => /^\s*\[\[hooks\.[^.\]]+\]\]\s*$/.test(line);
-  for (const line of lines) {
-    if (isTopLevelHook(line) && current.length > 0) {
-      chunks.push(current);
-      current = [];
+  const managedPaths = [
+    paths.coreHook,
+    paths.promptFile,
+    ...["codex-hook.sh", "claude-hook.sh", "stop-hook.sh"]
+      .map((name) => path.join(paths.packRoot, "hooks", name))
+  ];
+  const managedHandler = (block) => {
+    const targets = block.lines
+      .map((line) => line.match(/^\s*(?:command|prompt)\s*=\s*(.+?)\s*$/)?.[1])
+      .filter(Boolean);
+    return targets.some((target) => managedPaths.some((managedPath) => target.includes(managedPath)));
+  };
+  const cleaned = [];
+  for (let index = 0; index < blocks.length;) {
+    const block = blocks[index];
+    const parent = block.header?.match(/^\[\[hooks\.([^.\]]+)\]\]$/);
+    if (!parent) {
+      if (!block.header?.match(/^\[\[hooks\.[^.\]]+\.hooks\]\]$/) || !managedHandler(block)) cleaned.push(block);
+      index += 1;
+      continue;
     }
-    current.push(line);
+
+    const handlerHeader = `[[hooks.${parent[1]}.hooks]]`;
+    let next = index + 1;
+    const handlers = [];
+    while (next < blocks.length && blocks[next].header === handlerHeader) {
+      handlers.push(blocks[next]);
+      next += 1;
+    }
+    const remainingHandlers = handlers.filter((handler) => !managedHandler(handler));
+    const removedManagedHandler = remainingHandlers.length !== handlers.length;
+    if (!removedManagedHandler || remainingHandlers.length > 0) {
+      cleaned.push(block, ...remainingHandlers);
+    }
+    index = next;
   }
-  if (current.length > 0) chunks.push(current);
-  const legacyManagedHooks = ["codex-hook.sh", "claude-hook.sh", "stop-hook.sh"]
-    .map((name) => path.join(paths.packRoot, "hooks", name));
-  return chunks
-    .filter((chunk) => {
-      const content = chunk.join("\n");
-      return !legacyManagedHooks.some((hookPath) => content.includes(hookPath));
-    })
-    .flat()
+
+  return cleaned.flatMap((block) => block.lines)
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
+}
+
+function defaultLegacySchedulerHost() {
+  return {
+    bootout({ domain, label }) {
+      return new Promise((resolve) => {
+        execFile("launchctl", ["bootout", `${domain}/${label}`], {
+          timeout: LEGACY_CLEANUP_TIMEOUT_MS,
+          killSignal: "SIGKILL"
+        }, () => resolve());
+      });
+    }
+  };
+}
+
+async function boundedBestEffort(operation, timeoutMs = LEGACY_CLEANUP_TIMEOUT_MS) {
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(operation).catch(() => {}),
+      new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cleanupLegacyScheduler({ home, platform, dryRun, activate, host }) {
+  if (platform !== "darwin" || dryRun) return;
+  const plistFile = path.join(home, "Library", "LaunchAgents", `${LEGACY_RECONCILE_LABEL}.plist`);
+  if (activate) {
+    const domain = `gui/${typeof process.getuid === "function" ? process.getuid() : 0}`;
+    await boundedBestEffort(() => host.bootout({ domain, label: LEGACY_RECONCILE_LABEL, plistFile }));
+  }
+  try {
+    const parent = await lstat(path.dirname(plistFile));
+    const file = await lstat(plistFile);
+    const owned = typeof process.getuid !== "function" || (parent.uid === process.getuid() && file.uid === process.getuid());
+    if (!parent.isSymbolicLink() && parent.isDirectory() && !file.isSymbolicLink() && file.isFile() && owned) {
+      await rm(plistFile, { force: true });
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 }
 
 function codexHookBlock(paths, cli) {
@@ -366,7 +425,7 @@ async function installTomlBlock(paths, cli, dryRun, actions) {
   const configFile = paths[cli.configKey];
   await backup(configFile, dryRun, actions);
   const current = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
-  const cleaned = removeUnmarkedLegacyCodexBlocks(removeMarkedCodexBlock(current), paths);
+  const cleaned = cleanLegacyCodexHooks(current, paths);
   const block = codexHookBlock(paths, cli);
   const next = `${cleaned.trimEnd()}${cleaned.trim() ? "\n\n" : ""}${block}\n`;
   actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
@@ -408,6 +467,13 @@ export async function install(options = {}) {
   if (capability.status === "unavailable") throw new Error(capability.reason);
   const paths = pathsFor(home);
   const actions = [];
+  await cleanupLegacyScheduler({
+    home,
+    platform: options.platform || process.platform,
+    dryRun,
+    activate: options.activateLegacySchedulerCleanup ?? (path.resolve(home) === path.resolve(os.homedir())),
+    host: options.legacySchedulerHost || options.schedulerHost || defaultLegacySchedulerHost()
+  });
   await validateInstallRoots(paths, dryRun);
   if (!dryRun) {
     const controlStore = initializeControlStore({ paths });
@@ -442,7 +508,7 @@ async function uninstallCli(paths, cli, dryRun, actions) {
   await backup(configFile, dryRun, actions);
   if (cli.format === "toml") {
     const current = await readFile(configFile, "utf8");
-    const next = `${removeUnmarkedLegacyCodexBlocks(removeMarkedCodexBlock(current), paths)}\n`;
+    const next = `${cleanLegacyCodexHooks(current, paths)}\n`;
     actions.push(`disconnect ${cli.label} hook`);
     if (!dryRun) await writeFile(configFile, next, "utf8");
   } else {
@@ -458,6 +524,14 @@ export async function uninstall(options = {}) {
   const removeFiles = Boolean(options.removeFiles);
   const paths = pathsFor(home);
   const actions = [];
+
+  await cleanupLegacyScheduler({
+    home,
+    platform: options.platform || process.platform,
+    dryRun,
+    activate: options.activateLegacySchedulerCleanup ?? (path.resolve(home) === path.resolve(os.homedir())),
+    host: options.legacySchedulerHost || options.schedulerHost || defaultLegacySchedulerHost()
+  });
 
   for (const cli of CLIS) {
     await uninstallCli(paths, cli, dryRun, actions);
