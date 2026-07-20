@@ -16,7 +16,7 @@
 
 - Plan task: `Task 3 complete: 删除 Stop、notification、reconcile 与会话控制入口`
 - OpenSpec mappings: redesigned `1.1`, `1.2`, `1.3`, `2.1`, `2.2`, `2.3`, and `6.1` are partial because later mapped tasks still own detector, prompt orchestration, cleanup, doctor and final verification
-- Stage: `review-fix`
+- Stage: `frozen-re-review`
 - Task 2 base: `e7b9fa301aded09bb79c075d385e9dc2ab2e1052`
 - Task 2 allowed files: `src/control-store.mjs`, `test/control-store.test.mjs`; `.superpowers/sdd/task-2-report.md` may only receive an uncommitted append-only implementation handoff
 - Task 2 scope: immediate replay-idempotent candidate creation, bounded launch reservation/failure release, recoverable ordering, fenced claim/renew/assert/terminal transitions, bounded opaque context, retry exhaustion; no schema, scheduler, launcher, provider, notification, RAG, Markdown-body or live-state changes
@@ -51,7 +51,11 @@
 - Review finding I1: marked and unmarked Codex groups are removed wholesale when any nested handler is AFL-owned, losing unrelated sibling handlers during install/uninstall; JSON per-handler cleanup passes
 - Review finding I2: the deleted scheduler module leaves the prior KeepAlive plist and potentially loaded launchd label behind on upgrade/uninstall, so the removed daemon can still be restarted
 - Review-fix 1 scope: `src/index.mjs` and existing Task 3 fixtures only; one line-oriented exact managed-handler cleanup shared by install/uninstall, plus a private idempotent macOS-only legacy launchd bootout/unlink with injected fake host. No exported scheduler path/API/module, health claim, daemon or later-task feature
-- Next action: TDD both deterministic findings, rerun focused/static/scope gates, then one frozen re-review of I1/I2 and A-G only
+- Review-fix 1 result: `/root/task3_remove_control_plane` returned `DONE_WITH_CONCERNS`; commit `d96e77e5bbd06879172eee77602fb5c0ec9f199a` changes only `src/index.mjs` and `test/cli.test.mjs`
+- Review-fix 1 evidence: both deterministic findings were first reproduced RED 0/2, then focused GREEN 2/2; the complete Task 3 suite passed 28/28 for both implementer and coordinator, and static no-match, syntax, shell, diff and scope gates passed
+- Review-fix 1 behavior: one line-oriented cleaner removes only AFL-owned Codex nested handler tables while preserving mixed-parent matcher/options, unrelated sibling handlers and surrounding TOML; a private macOS-only bounded best-effort cleanup boots out the exact legacy label through an injected host and unlinks only the owned regular plist, without restoring any scheduler API/path/module/health field
+- Review-fix 1 boundary: disposable HOME and fake bootout only; no real `launchctl`, global config/runtime/database, Codex UI, Linux or production proof
+- Next action: one fresh frozen re-review may check only I1/I2 closure and checklist A-G regressions; no adjacent Task 4+ search or scope expansion
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`
