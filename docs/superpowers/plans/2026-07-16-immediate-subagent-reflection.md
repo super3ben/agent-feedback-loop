@@ -1577,12 +1577,23 @@ git commit -m "feat: select guidance directly from reflection documents"
 - Modify: `test/control-store.test.mjs`
 - Modify: `test/cli.test.mjs`
 - Modify: `test/reviewer-runner.test.mjs`
+- Modify: `test/reflection-document.test.mjs`
 
 **Interfaces:**
 - Produces: `store.recordReflectionSelected({ document, familyId, sessionUid, contextEpoch, taskFingerprint }) -> emissionId`
 - Produces: `store.markReflectionEmitted({ emissionId })`
+- Produces: `store.listPriorReflectionEmissions({ sessionUid, contextEpoch, taskFingerprint }) -> Emission[]`
 - Produces: `store.findPriorFamilyEmission({ familyId, before }) -> Emission | null`
 - Produces: `writePromptResponse({ cli, response, writer }) -> Promise<void>`; emission is recorded only after successful write
+
+**Frozen Task 11 preflight decisions:**
+
+- Reuse the existing schema-v1 `reflection_emissions` table exactly as declared; Task 11 adds control-store methods only and makes no schema or migration change.
+- `recordReflectionSelected` consumes the selected catalog document object and validates its absolute path, exact-byte `documentHash`, and matching `familyId`. Its existing uniqueness tuple is the idempotency boundary. A prior `selected` row does not suppress a retry; only a prior `emitted` row for the exact session/context/task tuple is returned by `listPriorReflectionEmissions` and passed into Task 10's selector.
+- The prompt hook records selected rows after deterministic selection and before the single host write. A selected-row or prior-emission lookup failure logs only an opaque `selection_record_failed` event and cannot remove already-built safe guidance. `writePromptResponse` calls the supplied writer exactly once. Only a resolved writer permits `markReflectionEmitted`; a post-write store failure logs `emission_record_failed`, does not retry the host response, and intentionally underclaims delivery.
+- `findPriorFamilyEmission` accepts only a timezone-bearing timestamp, normalizes it to UTC, and returns only `emitted_at < source captured timestamp`. The reviewer uses the catalog's already-computed exact-byte `documentHash` rather than reopening Markdown files. Controller annotation allows exactly `unknown` or `recurrence_after_emission`; provider output cannot claim effectiveness, and the controller entry contains only family id, document hash, and emitted timestamp.
+- The original whole-tree forbidden-word scan is not executable before Task 13 because the isolated legacy store/schema and unrelated test variable names intentionally still contain those words. Task 11 instead scans the new control-plane runtime and affected tests for forbidden state/API literals; Task 13 owns removal of the explicitly isolated legacy runtime.
+- No content body is added to SQLite, and no cache, RAG/index, scheduler, service, Stop hook, live HOME mutation, or provider/runtime activation is in scope.
 
 - [ ] **Step 1: Write RED tests for the four truthful state boundaries**
 
@@ -1618,14 +1629,14 @@ Run: `node --test test/control-store.test.mjs test/cli.test.mjs test/reviewer-ru
 
 Expected: PASS.
 
-Run: `rg -n '\bobserved\b|\beffective\b|emitted_unconfirmed' src templates test`
+Run: `rg -n "[\"'](?:observed|effective|emitted_unconfirmed)[\"']|markReflection(?:Observed|Effective)|recordReflection(?:Observed|Effective)" src/control-store.mjs src/cli.mjs src/reviewer-runner.mjs src/reflection-document.mjs test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs test/reflection-document.test.mjs`
 
-Expected: no active runtime or test matches.
+Expected: no matches in the new control-plane runtime or its affected tests. Legacy matches remain isolated until Task 13.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/control-store.mjs src/cli.mjs src/reviewer-runner.mjs src/reflection-document.mjs test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs
+git add src/control-store.mjs src/cli.mjs src/reviewer-runner.mjs src/reflection-document.mjs test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs test/reflection-document.test.mjs
 git commit -m "feat: audit reflection emission and recurrence honestly"
 ```
 
