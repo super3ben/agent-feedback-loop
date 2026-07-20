@@ -10,6 +10,7 @@ import { initializeControlStore } from "../src/control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { pathsFor } from "../src/index.mjs";
 import {
+  parseReflectionMarkdown,
   publishReflectionDocument,
   validateReflectionModel
 } from "../src/reflection-document.mjs";
@@ -128,6 +129,26 @@ async function reflectionFiles(projectDir) {
   }
 }
 
+async function publishPriorSameFamily(fixture) {
+  const model = validateReflectionModel({ ...VALID_LESSON }, {
+    sourceIdentity: "codex:session-prior:feedback-prior",
+    createdAt: "2026-07-20T00:00:04.000Z",
+    publishedAt: "2026-07-20T00:00:05.000Z"
+  });
+  const published = await publishReflectionDocument({ projectDir: fixture.projectDir, model });
+  return { model, published };
+}
+
+function sameFamilyLesson(model, overrides = {}) {
+  return {
+    ...VALID_LESSON,
+    family_id: model.family_id,
+    proposed_family_key: null,
+    recurrence_of: [model.reflection_id],
+    ...overrides
+  };
+}
+
 test("runReviewJob commits no_lesson without creating a reflection document", async (t) => {
   const fixture = await reviewFixture(t);
   const result = await runReviewJob({
@@ -170,6 +191,74 @@ test("runReviewJob publishes one stable Markdown document and only updates contr
   assert.equal(observedContext.prior.length, 6);
   assert.equal(observedContext.following.length, 2);
   assert.doesNotMatch(JSON.stringify(observedContext), /raw-secret|encrypted_raw_ref|following-3-must-not-appear/i);
+});
+
+test("same family after emission is negative evidence", async (t) => {
+  const fixture = await reviewFixture(t);
+  const prior = await publishPriorSameFamily(fixture);
+  const emissionId = fixture.store.recordReflectionSelected({
+    document: {
+      path: prior.published.path,
+      documentHash: prior.published.sha256,
+      familyId: prior.model.family_id
+    },
+    familyId: prior.model.family_id,
+    sessionUid: "codex:default:prior-session",
+    contextEpoch: 1,
+    taskFingerprint: "prior-task"
+  });
+  fixture.store.markReflectionEmitted({ emissionId });
+  const emission = fixture.store.getReflectionEmission(emissionId);
+  const providerEvidence = Array.from({ length: 8 }, (_, index) => `provider recurrence evidence ${index}`);
+  let providerContext;
+
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-recurrence-after-emission",
+    provider: async (context) => {
+      providerContext = context;
+      return sameFamilyLesson(prior.model, { repeated_pattern_evidence: providerEvidence });
+    }
+  });
+
+  assert.equal(
+    providerContext.reflectionCatalog.find((entry) => entry.reflectionId === prior.model.reflection_id).sha256,
+    prior.published.sha256,
+    "the reviewer catalog must carry the exact-byte hash loaded by the controller"
+  );
+  const parsed = parseReflectionMarkdown(await readFile(result.documentPath, "utf8"), { path: result.documentPath });
+  assert.equal(parsed.effectiveness, "recurrence_after_emission");
+  assert.equal(parsed.repeatedPatternEvidence.length, 8, "controller evidence must preserve the existing bound");
+  assert.deepEqual(parsed.repeatedPatternEvidence.slice(0, 7), providerEvidence.slice(0, 7));
+  const controllerEntry = JSON.parse(parsed.repeatedPatternEvidence.at(-1));
+  assert.deepEqual(controllerEntry, {
+    family_id: prior.model.family_id,
+    document_sha256: prior.published.sha256,
+    emitted_at: emission.emitted_at
+  });
+  assert.deepEqual(Object.keys(controllerEntry), ["family_id", "document_sha256", "emitted_at"]);
+});
+
+test("absence of recurrence remains unknown when publication has no emission", async (t) => {
+  const fixture = await reviewFixture(t);
+  const prior = await publishPriorSameFamily(fixture);
+  const providerEvidence = ["provider catalog establishes ordinary same-family recurrence"];
+
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-recurrence-without-emission",
+    provider: async () => sameFamilyLesson(prior.model, {
+      repeated_pattern_evidence: providerEvidence
+    })
+  });
+
+  const parsed = parseReflectionMarkdown(await readFile(result.documentPath, "utf8"), { path: result.documentPath });
+  assert.equal(parsed.effectiveness, "unknown");
+  assert.deepEqual(parsed.repeatedPatternEvidence, providerEvidence);
+  assert.equal(fixture.store.findPriorFamilyEmission({
+    familyId: prior.model.family_id,
+    before: "2026-07-20T00:09:10.000Z"
+  }), null);
 });
 
 for (const { name, sourceRawText, secret, normalText } of [

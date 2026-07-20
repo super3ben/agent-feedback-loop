@@ -20,6 +20,9 @@ try {
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const MAX_CONTEXT_EPOCH = 2_147_483_647;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const FAMILY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const TIMEZONE_TIMESTAMP = /(?:Z|[+-]\d{2}:\d{2})$/iu;
 const MAX_REVIEW_ATTEMPTS = 3;
 const DEFAULT_REVIEW_LEASE_MS = 185_000;
 const REVIEW_RETRY_DELAYS_MS = Object.freeze([30_000, 120_000]);
@@ -181,6 +184,28 @@ function explicitNow(value, fallback, field = "now") {
   const date = new Date(resolved);
   if (!Number.isFinite(date.getTime())) throw new TypeError(`${field} must be a valid date`);
   return date;
+}
+
+function timezoneTimestamp(value, field) {
+  if (typeof value !== "string" || !TIMEZONE_TIMESTAMP.test(value)) {
+    throw new TypeError(`${field} must include a timezone`);
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) throw new TypeError(`${field} must be a valid timestamp`);
+  return new Date(milliseconds).toISOString();
+}
+
+function requiredEpoch(value, field) {
+  const epoch = assertOptionalEpoch(value, field);
+  if (epoch === null) throw new TypeError(`${field} is required`);
+  return epoch;
+}
+
+function emissionId(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError("emissionId must be a positive integer");
+  }
+  return value;
 }
 
 function reviewCandidateCollision() {
@@ -726,6 +751,8 @@ function createStore(database, now) {
   const reviewTimestamp = (value) => explicitNow(value, now);
   const getReviewJob = (jobId) => database.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?")
     .get(assertString(jobId, "jobId", 512)) || null;
+  const getReflectionEmission = (id) => database.prepare("SELECT * FROM reflection_emissions WHERE id=?")
+    .get(emissionId(id)) || null;
   const insertReviewJobEvent = ({ jobId, eventType, reasonCode = null, leaseEpoch = null, timestamp }) => {
     database.prepare(`INSERT INTO review_job_events
       (job_id, event_type, reason_code, lease_epoch, created_at) VALUES (?, ?, ?, ?, ?)`).run(
@@ -753,6 +780,90 @@ function createStore(database, now) {
 
   return {
     database,
+    getReflectionEmission(id) {
+      const row = getReflectionEmission(id);
+      return row ? { ...row } : null;
+    },
+    recordReflectionSelected({ document, familyId, sessionUid, contextEpoch, taskFingerprint }) {
+      if (!document || typeof document !== "object" || Array.isArray(document)) {
+        throw new TypeError("document must be a selected catalog document");
+      }
+      const documentPath = assertString(document.path, "document.path", 4096);
+      if (!path.isAbsolute(documentPath) || documentPath.includes("\0")) {
+        throw new TypeError("document.path must be an absolute path");
+      }
+      const documentSha256 = assertString(document.documentHash, "document.documentHash", 64);
+      if (!SHA256_PATTERN.test(documentSha256)) {
+        throw new TypeError("document.documentHash must be an exact lowercase sha256");
+      }
+      const documentFamilyId = assertString(document.familyId, "document.familyId", 128);
+      const safeFamilyId = assertString(familyId, "familyId", 128);
+      if (!FAMILY_ID_PATTERN.test(documentFamilyId) || !FAMILY_ID_PATTERN.test(safeFamilyId)
+          || documentFamilyId !== safeFamilyId) {
+        throw new TypeError("familyId must match document.familyId");
+      }
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      const safeContextEpoch = requiredEpoch(contextEpoch, "contextEpoch");
+      const safeTaskFingerprint = assertString(taskFingerprint, "taskFingerprint", 2048);
+      return transaction(() => {
+        database.prepare(`INSERT INTO reflection_emissions
+          (document_path, document_sha256, family_id, session_uid, context_epoch,
+           task_fingerprint, selected_at, emitted_at, outcome, reason_code)
+          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'selected', NULL)
+          ON CONFLICT(document_sha256, session_uid, context_epoch, task_fingerprint) DO NOTHING`).run(
+          documentPath,
+          documentSha256,
+          safeFamilyId,
+          safeSessionUid,
+          safeContextEpoch,
+          safeTaskFingerprint,
+          nowIso(now)
+        );
+        const row = database.prepare(`SELECT * FROM reflection_emissions
+          WHERE document_sha256=? AND session_uid=? AND context_epoch=? AND task_fingerprint=?`).get(
+          documentSha256,
+          safeSessionUid,
+          safeContextEpoch,
+          safeTaskFingerprint
+        );
+        if (!row || row.family_id !== safeFamilyId) {
+          throw new ControlStoreError("reflection_emission_collision", "reflection emission collision");
+        }
+        return Number(row.id);
+      });
+    },
+    markReflectionEmitted({ emissionId: id }) {
+      const safeEmissionId = emissionId(id);
+      return transaction(() => {
+        const row = database.prepare(`UPDATE reflection_emissions
+          SET emitted_at=COALESCE(emitted_at, ?), outcome='emitted', reason_code=NULL
+          WHERE id=? RETURNING *`).get(nowIso(now), safeEmissionId);
+        if (!row) throw new TypeError("emissionId was not found");
+        return { ...row };
+      });
+    },
+    listPriorReflectionEmissions({ sessionUid, contextEpoch, taskFingerprint }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      const safeContextEpoch = requiredEpoch(contextEpoch, "contextEpoch");
+      const safeTaskFingerprint = assertString(taskFingerprint, "taskFingerprint", 2048);
+      return database.prepare(`SELECT * FROM reflection_emissions
+        WHERE session_uid=? AND context_epoch=? AND task_fingerprint=?
+          AND outcome='emitted' AND emitted_at IS NOT NULL
+        ORDER BY emitted_at, id`).all(
+        safeSessionUid,
+        safeContextEpoch,
+        safeTaskFingerprint
+      ).map((row) => ({ ...row, documentHash: row.document_sha256 }));
+    },
+    findPriorFamilyEmission({ familyId, before }) {
+      const safeFamilyId = assertString(familyId, "familyId", 128);
+      if (!FAMILY_ID_PATTERN.test(safeFamilyId)) throw new TypeError("familyId has an invalid format");
+      const cutoff = timezoneTimestamp(before, "before");
+      const row = database.prepare(`SELECT * FROM reflection_emissions
+        WHERE family_id=? AND outcome='emitted' AND emitted_at IS NOT NULL AND emitted_at<?
+        ORDER BY emitted_at DESC, id DESC LIMIT 1`).get(safeFamilyId, cutoff);
+      return row ? { ...row } : null;
+    },
     getReviewJob(jobId) {
       const row = getReviewJob(jobId);
       return row ? { ...row } : null;

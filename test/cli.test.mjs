@@ -130,6 +130,32 @@ function capturedEventCount(store) {
   return Number(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count);
 }
 
+async function publishSelectableReflection(fixture, overrides = {}) {
+  const projectDir = await realpath(fixture.home);
+  const model = {
+    title: "check the requirement boundary first",
+    reflection_id: "reflection-000000000000000000000011",
+    created_at: "2026-07-20T07:58:00.000Z",
+    published_at: "2026-07-20T07:59:00.000Z",
+    final_severity: "Critical",
+    responsibility: "agent_fault",
+    method_class: "requirement_boundary",
+    family_id: "family-requirement-boundary",
+    applies_when: ["修改已有架构前先核对用户目标"],
+    effectiveness: "unknown",
+    source_identity_hash: "11".padStart(64, "0"),
+    facts: ["private selection fact"],
+    user_complaint: "private selection complaint",
+    root_cause: "private selection cause",
+    class_of_mistake: "未先核对用户目标",
+    method_changes: ["先核对用户目标再修改架构"],
+    repeated_pattern_evidence: [],
+    ...overrides
+  };
+  const published = await publishReflectionDocument({ projectDir, model });
+  return { projectDir, model, published };
+}
+
 describe("agent-feedback-loop package", () => {
   it("explicit feedback commits one job before launch", async () => {
     const fixture = await promptOrchestrationFixture();
@@ -243,6 +269,248 @@ describe("agent-feedback-loop package", () => {
     assert.match(responses[1].hookSpecificOutput.additionalContext, /document_hash: [a-f0-9]{64}/u);
     assert.doesNotMatch(responses[1].hookSpecificOutput.additionalContext, /private launcher/u);
     assert.deepEqual(next.hostResponse, responses[1]);
+    fixture.controlStore.close();
+  });
+
+  it("selected is not emitted when the host writer rejects", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const { projectDir } = await publishSelectableReflection(fixture);
+    const writerError = new Error("synthetic_writer_failure");
+    let directWriterCalls = 0;
+    await assert.rejects(
+      cliModule.writePromptResponse({
+        cli: "codex",
+        response: { continue: true },
+        writer: async () => {
+          directWriterCalls += 1;
+          throw writerError;
+        }
+      }),
+      (error) => error === writerError
+    );
+    assert.equal(directWriterCalls, 1, "the output boundary must call its writer exactly once");
+
+    let hookWriterCalls = 0;
+    const result = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "selection-write-failure",
+        context_epoch: 3,
+        task_fingerprint: "task-write-failure",
+        cwd: projectDir,
+        prompt: "修改已有架构前先核对用户目标",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() { throw new Error("neutral prompt must not launch"); },
+      writeResponse: async () => {
+        hookWriterCalls += 1;
+        throw writerError;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    const [row] = fixture.controlStore.database.prepare("SELECT * FROM reflection_emissions").all();
+    assert.equal(hookWriterCalls, 1);
+    assert.equal(result.hostResponse, null);
+    assert.equal(result.reason, "response_failed");
+    assert.match(result.guidance, /document_hash: [a-f0-9]{64}/u);
+    assert.equal(row.outcome, "selected");
+    assert.equal(row.emitted_at, null);
+    assert.deepEqual(fixture.controlStore.listPriorReflectionEmissions({
+      sessionUid: "codex:default:selection-write-failure",
+      contextEpoch: 3,
+      taskFingerprint: "task-write-failure"
+    }), []);
+
+    let retryWriterCalls = 0;
+    const retry = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "selection-write-failure",
+        context_epoch: 3,
+        task_fingerprint: "task-write-failure",
+        cwd: projectDir,
+        prompt: "修改已有架构前先核对用户目标",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() { throw new Error("neutral prompt must not launch"); },
+      writeResponse: async (response) => {
+        retryWriterCalls += 1;
+        return response;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    const upgraded = fixture.controlStore.database.prepare("SELECT * FROM reflection_emissions").get();
+    assert.equal(retryWriterCalls, 1, "selected-only state must permit another host-write attempt");
+    assert.equal(upgraded.id, row.id);
+    assert.equal(upgraded.outcome, "emitted");
+    assert.equal(upgraded.emitted_at, PROMPT_CUTOFF);
+    assert.deepEqual(retry.hostResponse, retry.nativeResponse);
+    fixture.controlStore.close();
+  });
+
+  it("successful host write records emitted only after the writer resolves", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const { projectDir } = await publishSelectableReflection(fixture, {
+      reflection_id: "reflection-000000000000000000000012",
+      source_identity_hash: "12".padStart(64, "0")
+    });
+    let writerCalls = 0;
+    const result = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "selection-write-success",
+        context_epoch: 4,
+        task_fingerprint: "task-write-success",
+        cwd: projectDir,
+        prompt: "修改已有架构前先核对用户目标",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() { throw new Error("neutral prompt must not launch"); },
+      writeResponse: async (response) => {
+        writerCalls += 1;
+        const rowDuringWrite = fixture.controlStore.database.prepare("SELECT * FROM reflection_emissions").get();
+        assert.equal(rowDuringWrite.outcome, "selected");
+        assert.equal(rowDuringWrite.emitted_at, null);
+        return response;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    const row = fixture.controlStore.database.prepare("SELECT * FROM reflection_emissions").get();
+    assert.equal(writerCalls, 1);
+    assert.equal(row.outcome, "emitted");
+    assert.equal(row.emitted_at, PROMPT_CUTOFF);
+    assert.deepEqual(result.hostResponse, result.nativeResponse);
+    assert.equal(fixture.controlStore.listPriorReflectionEmissions({
+      sessionUid: "codex:default:selection-write-success",
+      contextEpoch: 4,
+      taskFingerprint: "task-write-success"
+    }).length, 1);
+
+    const replay = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "selection-write-success",
+        context_epoch: 4,
+        task_fingerprint: "task-write-success",
+        cwd: projectDir,
+        prompt: "修改已有架构前先核对用户目标",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() { throw new Error("neutral prompt must not launch"); },
+      writeResponse: async (response) => {
+        writerCalls += 1;
+        return response;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(writerCalls, 2);
+    assert.equal(replay.selection.selectedCount, 0, "only a prior emitted row suppresses the exact tuple");
+    assert.equal(
+      fixture.controlStore.database.prepare("SELECT COUNT(*) AS count FROM reflection_emissions").get().count,
+      1
+    );
+    fixture.controlStore.close();
+  });
+
+  it("selection ledger failures preserve already-built safe guidance", async () => {
+    for (const failedMethod of ["listPriorReflectionEmissions", "recordReflectionSelected"]) {
+      const fixture = await promptOrchestrationFixture();
+      const { projectDir } = await publishSelectableReflection(fixture);
+      let failedCalls = 0;
+      let writerCalls = 0;
+      const store = new Proxy(fixture.controlStore, {
+        get(target, property, receiver) {
+          if (property === failedMethod) {
+            return () => {
+              failedCalls += 1;
+              throw Object.assign(new Error("body-must-remain-opaque"), { code: "ledger_unavailable" });
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+
+      const result = await cliModule.handlePromptHook({
+        payload: explicitFeedbackPayload({
+          session_id: `selection-ledger-${failedMethod}`,
+          task_fingerprint: `task-${failedMethod}`,
+          cwd: projectDir,
+          prompt: "修改已有架构前先核对用户目标",
+          previous_assistant_message: undefined
+        }),
+        cli: "codex",
+        controlStore: store,
+        blobs: fixture.blobs,
+        launchReviewer() { throw new Error("neutral prompt must not launch"); },
+        writeResponse: async (response) => {
+          writerCalls += 1;
+          assert.match(response.hookSpecificOutput.additionalContext, /document_hash: [a-f0-9]{64}/u);
+          return response;
+        },
+        now: () => new Date(PROMPT_CUTOFF)
+      });
+
+      assert.equal(failedCalls, 1);
+      assert.equal(writerCalls, 1);
+      assert.match(result.guidance, /method_changes:/u);
+      fixture.controlStore.close();
+    }
+  });
+
+  it("emission record failure never retries the successful host writer", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const { projectDir } = await publishSelectableReflection(fixture);
+    let markCalls = 0;
+    let writerCalls = 0;
+    const store = new Proxy(fixture.controlStore, {
+      get(target, property, receiver) {
+        if (property === "markReflectionEmitted") {
+          return () => {
+            markCalls += 1;
+            throw Object.assign(new Error("body-must-remain-opaque"), { code: "ledger_unavailable" });
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+
+    const result = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "emission-record-failure",
+        task_fingerprint: "task-emission-record-failure",
+        cwd: projectDir,
+        prompt: "修改已有架构前先核对用户目标",
+        previous_assistant_message: undefined
+      }),
+      cli: "codex",
+      controlStore: store,
+      blobs: fixture.blobs,
+      launchReviewer() { throw new Error("neutral prompt must not launch"); },
+      writeResponse: async (response) => {
+        writerCalls += 1;
+        return response;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    const row = fixture.controlStore.database.prepare("SELECT * FROM reflection_emissions").get();
+    assert.equal(writerCalls, 1);
+    assert.equal(markCalls, 1);
+    assert.deepEqual(result.hostResponse, result.nativeResponse);
+    assert.equal(row.outcome, "selected", "audit failure must underclaim delivery");
+    assert.equal(row.emitted_at, null);
     fixture.controlStore.close();
   });
 

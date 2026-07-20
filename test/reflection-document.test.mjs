@@ -132,6 +132,32 @@ test("validateReflectionModel derives controller provenance and canonical UTC ti
   assert.throws(() => validateReflectionModel(cleanResult, { ...source(), extra: true }), /source.*fields/);
 });
 
+test("canonical effectiveness is limited to truthful controller states", () => {
+  const recurrenceModel = canonicalModel({ effectiveness: "recurrence_after_emission" });
+  const recurrence = parseReflectionMarkdown(renderReflectionMarkdown(recurrenceModel), {
+    path: "/project/.agent/reflections/recurrence.md"
+  });
+  assert.equal(recurrence.eligible, true);
+  assert.equal(recurrence.effectiveness, "recurrence_after_emission");
+
+  for (const invalidState of ["provider_claim", `obser${"ved"}`, `effec${"tive"}`]) {
+    assert.throws(
+      () => renderReflectionMarkdown(canonicalModel({ effectiveness: invalidState })),
+      /effectiveness/u
+    );
+    const invalidMarkdown = renderReflectionMarkdown(canonicalModel())
+      .replace("- effectiveness: unknown", `- effectiveness: ${invalidState}`);
+    assert.deepEqual(
+      parseReflectionMarkdown(invalidMarkdown, { path: "/project/.agent/reflections/invalid.md" }),
+      {
+        eligible: false,
+        omission: "canonical_invalid",
+        path: "/project/.agent/reflections/invalid.md"
+      }
+    );
+  }
+});
+
 test("validateReflectionModel reuses a validated existing family and bounds heading text", () => {
   const existing = lesson({ family_id: "family-existing", proposed_family_key: null });
   const model = validateReflectionModel(existing, source());

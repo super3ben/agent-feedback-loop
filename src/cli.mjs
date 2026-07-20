@@ -105,6 +105,14 @@ async function readPromptInput(stream = process.stdin, maxBytes = PROMPT_INPUT_M
   return input;
 }
 
+export async function writePromptResponse({ cli, response, writer }) {
+  if (typeof cli !== "string" || !cli.trim() || cli.length > 64) {
+    throw new TypeError("cli must be a bounded non-empty string");
+  }
+  if (typeof writer !== "function") throw new TypeError("writer must be a function");
+  await writer(response);
+}
+
 export async function handlePromptHook({
   payload,
   cli,
@@ -278,6 +286,17 @@ export async function handlePromptHook({
     },
     maxFileBytes: lowerOnlyLimit(selectionLimits.maxFileBytes, PROMPT_SELECTION_LIMITS.maxFileBytes)
   };
+  const selectedEmissionIds = [];
+  let priorEmissions = [];
+  try {
+    priorEmissions = controlStore.listPriorReflectionEmissions({
+      sessionUid: result.selectionInput.session.sessionUid,
+      contextEpoch: result.selectionInput.session.contextEpoch,
+      taskFingerprint: result.selectionInput.task.fingerprint
+    });
+  } catch {
+    promptDebug("selection_record_failed", "selection_record_failed");
+  }
   try {
     const catalog = await loadDocuments({
       projectDir: result.selectionInput.projectDir,
@@ -294,7 +313,7 @@ export async function handlePromptHook({
         maxDocumentTokens: lowerOnlyLimit(selectionLimits.maxDocumentTokens, PROMPT_SELECTION_LIMITS.maxDocumentTokens),
         maxTotalTokens: lowerOnlyLimit(selectionLimits.maxTotalTokens, PROMPT_SELECTION_LIMITS.maxTotalTokens)
       },
-      priorEmissions: [],
+      priorEmissions,
       publishedBefore: selectionPublishedBefore
     });
     const selectionOmissions = [...catalog.omissions, ...selection.omissions];
@@ -308,6 +327,19 @@ export async function handlePromptHook({
       omissionCount: selectionOmissions.length,
       tokenEstimate: selection.tokenEstimate
     };
+    for (const document of selection.selected) {
+      try {
+        selectedEmissionIds.push(controlStore.recordReflectionSelected({
+          document,
+          familyId: document.familyId,
+          sessionUid: result.selectionInput.session.sessionUid,
+          contextEpoch: result.selectionInput.session.contextEpoch,
+          taskFingerprint: result.selectionInput.task.fingerprint
+        }));
+      } catch {
+        promptDebug("selection_record_failed", "selection_record_failed", document.documentHash);
+      }
+    }
   } catch (error) {
     promptDebug("selection", boundedSelectionReason(error));
     result.guidance = "";
@@ -324,12 +356,24 @@ export async function handlePromptHook({
         hookSpecificOutput: { hookEventName, additionalContext: result.guidance }
       }
     : { ...nativeResponse };
+  let responseWritten = false;
   try {
-    result.hostResponse = await writeResponse(result.nativeResponse);
+    await writePromptResponse({ cli, response: result.nativeResponse, writer: writeResponse });
+    responseWritten = true;
+    result.hostResponse = result.nativeResponse;
   } catch (error) {
     result.hostResponse = null;
     result.reason = "response_failed";
     promptDebug("response", boundedReason(error, "response_failed"));
+  }
+  if (responseWritten) {
+    for (const emissionId of selectedEmissionIds) {
+      try {
+        controlStore.markReflectionEmitted({ emissionId });
+      } catch {
+        promptDebug("emission_record_failed", "emission_record_failed", String(emissionId));
+      }
+    }
   }
   return result;
 }

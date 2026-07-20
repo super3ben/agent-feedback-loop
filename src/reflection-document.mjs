@@ -16,6 +16,7 @@ const CANONICAL_METADATA = [
   "method_class", "family_id", "applies_when", "effectiveness", "source_identity_hash"
 ];
 const SEVERITIES = new Set(["Major", "Critical", "Blocker"]);
+const EFFECTIVENESS_STATES = new Set(["unknown", "recurrence_after_emission"]);
 const METHOD_CLASS_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const FAMILY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const TIMEZONE_TIMESTAMP = /(?:Z|[+-]\d{2}:\d{2})$/i;
@@ -158,6 +159,10 @@ export function validateReflectionModel(result, source) {
 }
 
 export function renderReflectionMarkdown(model) {
+  const effectiveness = model.effectiveness ?? "unknown";
+  if (!EFFECTIVENESS_STATES.has(effectiveness)) {
+    throw new TypeError("effectiveness is not a canonical controller state");
+  }
   return [
     `# 反思报告：${encodeCanonicalText(model.title)}`,
     "",
@@ -169,7 +174,7 @@ export function renderReflectionMarkdown(model) {
     `- method_class: ${encodeCanonicalText(model.method_class)}`,
     `- family_id: ${encodeCanonicalText(model.family_id)}`,
     `- applies_when: ${model.applies_when.map(encodeCanonicalText).join(" | ")}`,
-    `- effectiveness: ${encodeCanonicalText(model.effectiveness ?? "unknown")}`,
+    `- effectiveness: ${encodeCanonicalText(effectiveness)}`,
     `- source_identity_hash: ${encodeCanonicalText(model.source_identity_hash)}`,
     "",
     "## facts proven by context", "", ...model.facts.map((fact) => `- ${encodeCanonicalText(fact)}`), "",
@@ -282,7 +287,8 @@ function canonicalDocument(metadata, sections, title, filePath) {
       || !SEVERITIES.has(decodedMetadata.get("final_severity"))
       || decodedMetadata.get("responsibility") !== "agent_fault"
       || !METHOD_CLASS_PATTERN.test(decodedMetadata.get("method_class"))
-      || !FAMILY_ID_PATTERN.test(decodedMetadata.get("family_id"))) {
+      || !FAMILY_ID_PATTERN.test(decodedMetadata.get("family_id"))
+      || !EFFECTIVENESS_STATES.has(decodedMetadata.get("effectiveness"))) {
     return ineligible(filePath, "canonical_invalid");
   }
   let createdAt;

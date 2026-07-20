@@ -236,6 +236,90 @@ test("fresh control schema contains only transient tables", () => {
   store.close();
 });
 
+test("selected is not emitted", () => {
+  const { paths } = fixture();
+  let current = new Date("2026-07-20T01:00:00.000Z");
+  const store = initializeControlStore({ paths, now: () => new Date(current) });
+  const document = Object.freeze({
+    path: "/private/project/.agent/reflections/reflection.md",
+    documentHash: "a".repeat(64),
+    familyId: "family-selection-boundary"
+  });
+  const selection = {
+    document,
+    familyId: document.familyId,
+    sessionUid: "codex:default:session-selection",
+    contextEpoch: 2,
+    taskFingerprint: "task-selection-boundary"
+  };
+
+  const emissionId = store.recordReflectionSelected(selection);
+  assert.equal(store.recordReflectionSelected(selection), emissionId, "the unique tuple must return one stable id");
+  assert.deepEqual(store.getReflectionEmission(emissionId), {
+    id: emissionId,
+    document_path: document.path,
+    document_sha256: document.documentHash,
+    family_id: document.familyId,
+    session_uid: selection.sessionUid,
+    context_epoch: selection.contextEpoch,
+    task_fingerprint: selection.taskFingerprint,
+    selected_at: current.toISOString(),
+    emitted_at: null,
+    outcome: "selected",
+    reason_code: null
+  });
+  assert.deepEqual(store.listPriorReflectionEmissions({
+    sessionUid: selection.sessionUid,
+    contextEpoch: selection.contextEpoch,
+    taskFingerprint: selection.taskFingerprint
+  }), [], "a selected-only row must not suppress a retry");
+
+  assert.throws(
+    () => store.recordReflectionSelected({ ...selection, familyId: "family-mismatch" }),
+    /familyId/u
+  );
+  assert.throws(
+    () => store.findPriorFamilyEmission({ familyId: document.familyId, before: "2026-07-20T01:00:01" }),
+    /timezone/u
+  );
+
+  current = new Date("2026-07-20T01:00:01.000Z");
+  store.markReflectionEmitted({ emissionId });
+  const firstEmission = store.getReflectionEmission(emissionId);
+  assert.equal(firstEmission.outcome, "emitted");
+  assert.equal(firstEmission.emitted_at, current.toISOString());
+
+  current = new Date("2026-07-20T01:00:02.000Z");
+  store.markReflectionEmitted({ emissionId });
+  assert.equal(
+    store.getReflectionEmission(emissionId).emitted_at,
+    firstEmission.emitted_at,
+    "an idempotent mark must preserve the first emitted_at"
+  );
+  assert.deepEqual(
+    store.listPriorReflectionEmissions({
+      sessionUid: selection.sessionUid,
+      contextEpoch: selection.contextEpoch,
+      taskFingerprint: selection.taskFingerprint
+    }).map((row) => row.id),
+    [emissionId]
+  );
+  assert.equal(store.findPriorFamilyEmission({
+    familyId: document.familyId,
+    before: firstEmission.emitted_at
+  }), null, "an equal source timestamp is not after emission");
+  assert.equal(store.findPriorFamilyEmission({
+    familyId: document.familyId,
+    before: new Date(Date.parse(firstEmission.emitted_at) + 1).toISOString()
+  }).id, emissionId);
+
+  for (const forbiddenSuffix of [`Obser${"ved"}`, `Effec${"tive"}`]) {
+    assert.equal(`markReflection${forbiddenSuffix}` in store, false);
+    assert.equal(`recordReflection${forbiddenSuffix}` in store, false);
+  }
+  store.close();
+});
+
 test("runtime open does not create a missing control database", () => {
   const { paths } = fixture();
   assert.throws(

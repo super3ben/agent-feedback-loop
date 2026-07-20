@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import path from "node:path";
 
 import { redactText } from "./capture.mjs";
@@ -22,6 +21,8 @@ const FAILURE_CODES = new Set([
   "publication_collision"
 ]);
 const EVENT_TEXT_FIELDS = ["text", "prompt", "message", "content", "output", "response"];
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const TIMEZONE_TIMESTAMP = /(?:Z|[+-]\d{2}:\d{2})$/iu;
 
 class ReviewJobError extends Error {
   constructor(code, cause) {
@@ -29,10 +30,6 @@ class ReviewJobError extends Error {
     this.name = "ReviewJobError";
     this.code = code;
   }
-}
-
-function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
 }
 
 function boundedText(value, maxCharacters = 16_384) {
@@ -87,13 +84,28 @@ async function contextEvent(row, blobs) {
 
 async function catalogSummaries(projectDir, publishedBefore) {
   const catalog = await readReflectionCatalog({ projectDir, publishedBefore });
-  return Promise.all(catalog.documents.map(async (document) => ({
+  return catalog.documents.map((document) => ({
     reflectionId: document.reflectionId,
     familyId: document.familyId,
     methodClass: document.methodClass,
     appliesWhen: [...document.appliesWhen],
-    sha256: sha256(await readFile(document.path))
-  })));
+    sha256: document.documentHash
+  }));
+}
+
+function controllerRecurrenceEntry(emission, familyId) {
+  if (!emission || emission.family_id !== familyId
+      || !SHA256_PATTERN.test(String(emission.document_sha256 ?? ""))
+      || typeof emission.emitted_at !== "string"
+      || !TIMEZONE_TIMESTAMP.test(emission.emitted_at)
+      || !Number.isFinite(Date.parse(emission.emitted_at))) {
+    throw new ReviewJobError("context_invalid");
+  }
+  return JSON.stringify({
+    family_id: familyId,
+    document_sha256: emission.document_sha256,
+    emitted_at: new Date(Date.parse(emission.emitted_at)).toISOString()
+  });
 }
 
 async function assertProjectBoundary(projectDir) {
@@ -248,8 +260,24 @@ export async function runReviewJob({
       createdAt: context.source.sourceTimestamp ?? context.source.createdAt,
       publishedAt: context.job.created_at
     });
+    const priorEmission = store.findPriorFamilyEmission({
+      familyId: model.family_id,
+      before: context.source.sourceTimestamp ?? context.source.createdAt
+    });
+    if (priorEmission) {
+      model = {
+        ...model,
+        effectiveness: "recurrence_after_emission",
+        repeated_pattern_evidence: [
+          ...model.repeated_pattern_evidence.slice(0, 7),
+          controllerRecurrenceEntry(priorEmission, model.family_id)
+        ]
+      };
+    }
   } catch (error) {
-    const failure = new ReviewJobError("provider_invalid", error);
+    const failure = error instanceof ReviewJobError
+      ? error
+      : new ReviewJobError("provider_invalid", error);
     recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
     throw failure;
   }
