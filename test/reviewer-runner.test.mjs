@@ -36,7 +36,10 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function reviewFixture(t, { initialNow = "2026-07-20T00:00:00.000Z" } = {}) {
+async function reviewFixture(t, {
+  initialNow = "2026-07-20T00:00:00.000Z",
+  sourceRawText = "The previous response ignored the requirement. Authorization: Bearer raw-secret"
+} = {}) {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-home-")));
   const projectDir = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-project-")));
   t.after(() => Promise.all([
@@ -90,7 +93,7 @@ async function reviewFixture(t, { initialNow = "2026-07-20T00:00:00.000Z" } = {}
   });
   const sourceEventUid = await capture({
     role: "user",
-    rawText: "The previous response ignored the requirement. Authorization: Bearer raw-secret",
+    rawText: sourceRawText,
     referentEventUid,
     sourceTimestamp: "2026-07-20T08:09:10+08:00"
   });
@@ -168,6 +171,46 @@ test("runReviewJob publishes one stable Markdown document and only updates contr
   assert.equal(observedContext.following.length, 2);
   assert.doesNotMatch(JSON.stringify(observedContext), /raw-secret|encrypted_raw_ref|following-3-must-not-appear/i);
 });
+
+for (const { name, sourceRawText, secret, normalText } of [
+  {
+    name: "English natural-language assignment",
+    sourceRawText: "The previous response ignored the requirement. The password is SyntheticOnly-456+ for this test",
+    secret: "SyntheticOnly-456+",
+    normalText: "The previous response ignored the requirement."
+  },
+  {
+    name: "Chinese natural-language assignment",
+    sourceRawText: "上次回答没有遵守要求。服务器密码是 SyntheticOnly-123+ 请直接连接",
+    secret: "SyntheticOnly-123+",
+    normalText: "上次回答没有遵守要求。"
+  },
+  {
+    name: "reminder-style credential context",
+    sourceRawText: "The previous response ignored the requirement. The password was already shared for operator SyntheticReminder-842+",
+    secret: "SyntheticReminder-842+",
+    normalText: "The previous response ignored the requirement."
+  }
+]) {
+  test(`encrypted reviewer context redacts ${name}`, async (t) => {
+    const fixture = await reviewFixture(t, { sourceRawText });
+    let observedContext;
+
+    await runReviewJob({
+      ...fixture,
+      ownerId: `owner-redaction-${name}`,
+      provider: async (context) => {
+        observedContext = context;
+        return { outcome: "no_lesson" };
+      }
+    });
+
+    assert.ok(observedContext);
+    assert.doesNotMatch(observedContext.source.text, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(observedContext.source.text, /\[REDACTED\]/);
+    assert.match(observedContext.source.text, new RegExp(normalText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  });
+}
 
 test("invalid provider output is retryable with the fixed provider_invalid reason", async (t) => {
   const fixture = await reviewFixture(t);
@@ -249,6 +292,84 @@ test("a stale owner cannot publish after a new owner claims the expired lease", 
   );
   assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
   assert.equal(fixture.store.getReviewJob(fixture.jobId).owner_id, "owner-current");
+});
+
+test("publication renews the owner lease at the visibility fence", async (t) => {
+  const fixture = await reviewFixture(t);
+  let renewalCount = 0;
+  let assertionCount = 0;
+  const timedStore = new Proxy(fixture.store, {
+    get(target, property, receiver) {
+      if (property === "renewReviewLease") {
+        return (input) => {
+          renewalCount += 1;
+          const renewed = target.renewReviewLease(input);
+          fixture.advance(renewalCount === 1 ? 29_990 : 20);
+          return renewed;
+        };
+      }
+      if (property === "assertReviewLease") {
+        return (input) => {
+          assertionCount += 1;
+          const asserted = target.assertReviewLease(input);
+          if (renewalCount === 1 && assertionCount === 2) fixture.advance(20);
+          return asserted;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  const result = await runReviewJob({
+    ...fixture,
+    store: timedStore,
+    ownerId: "owner-visibility-fence",
+    provider: async () => ({ ...VALID_LESSON })
+  });
+
+  assert.equal(result.outcome, "published");
+  assert.equal(renewalCount, 2);
+  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
+});
+
+test("an expired owner loses callback renewal before any canonical file is visible", async (t) => {
+  const fixture = await reviewFixture(t);
+  let renewalCount = 0;
+  let assertionCount = 0;
+  const expiredStore = new Proxy(fixture.store, {
+    get(target, property, receiver) {
+      if (property === "renewReviewLease") {
+        return (input) => {
+          renewalCount += 1;
+          return target.renewReviewLease(input);
+        };
+      }
+      if (property === "assertReviewLease") {
+        return (input) => {
+          assertionCount += 1;
+          const asserted = target.assertReviewLease(input);
+          if (assertionCount === 1) fixture.advance(30_001);
+          return asserted;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  await assert.rejects(
+    runReviewJob({
+      ...fixture,
+      store: expiredStore,
+      ownerId: "owner-expired-at-fence",
+      provider: async () => ({ ...VALID_LESSON })
+    }),
+    (error) => error.code === "lease_lost"
+  );
+
+  assert.equal(renewalCount, 2);
+  assert.deepEqual(await reflectionFiles(fixture.projectDir), []);
 });
 
 test("a retry adopts identical bytes after a crash following visible publication", async (t) => {

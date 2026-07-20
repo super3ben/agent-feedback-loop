@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { redactText } from "./capture.mjs";
 import {
   publishReflectionDocument,
   readReflectionCatalog,
@@ -21,12 +22,6 @@ const FAILURE_CODES = new Set([
   "publication_collision"
 ]);
 const EVENT_TEXT_FIELDS = ["text", "prompt", "message", "content", "output", "response"];
-const SECRET_PATTERNS = [
-  /\bauthorization\s*:\s*bearer\s+\S+/giu,
-  /\b(password|passwd|passcode|api[_ -]?key|secret|token)\s*[=:]\s*\S+/giu,
-  /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{12,})\b/gu,
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/giu
-];
 
 class ReviewJobError extends Error {
   constructor(code, cause) {
@@ -40,14 +35,9 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function redactCredentials(value) {
-  let text = String(value ?? "").normalize("NFC");
-  for (const pattern of SECRET_PATTERNS) text = text.replace(pattern, "[REDACTED]");
-  return text;
-}
-
 function boundedText(value, maxCharacters = 16_384) {
-  return Array.from(redactCredentials(value)).slice(0, maxCharacters).join("");
+  const redacted = redactText(String(value ?? "").normalize("NFC")).text;
+  return Array.from(redacted).slice(0, maxCharacters).join("");
 }
 
 function hostText(raw) {
@@ -270,7 +260,12 @@ export async function runReviewJob({
     const published = await publishReflectionDocument({
       projectDir,
       model,
-      beforeRename: () => store.assertReviewLease({ jobId, ownerId, leaseEpoch })
+      beforeRename: () => store.renewReviewLease({
+        jobId,
+        ownerId,
+        leaseEpoch,
+        leaseMs: PUBLICATION_LEASE_MS
+      })
     });
     store.completeReviewPublished({
       jobId,
