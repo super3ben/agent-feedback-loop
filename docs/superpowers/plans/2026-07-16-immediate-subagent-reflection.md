@@ -34,6 +34,9 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - 同一功能累计经历 3 轮修复或正式复审后，不得自动开启下一轮补丁。必须先完成一次架构复盘，分别判断：原始用户价值是否实现；缺陷属于职责混乱、规格不清、实现错误、测试过拟合还是 reviewer 扩围；是否存在真实受支持输入或生产证据；继续修补、简化、删除或延期哪个成本最低；是否已经过度设计或过度优化。
 - 只有主会话干扰、数据损坏或不可恢复、安全/隐私问题、或者冻结的核心验收条件失败，才能继续阻塞当前任务。仅存在于未声明输入、缺少真实生产者证据的理论反例默认进入 backlog，不触发下一轮修复。
 - 超过熔断阈值后的 reviewer 只能检查持久化的冻结验收清单和对应回归，不得重新做开放式全范围缺陷搜索。新的相邻 finding 除非达到上述阻塞等级，否则记录到 backlog 并放行当前任务。
+- Review Loop Guard 从 Task 7 当前冻结复审结果及后续任务生效；Task 1 不重开，Task 2–6 不回填历史 review/receipt 事件。每次 task review 使用稳定 `Review-Run-ID`，每个 Critical/Important finding 使用稳定 `Invariant-ID` 与 `Boundary`；同一 finding 改名用 `add-alias`，同 task/boundary 的真实独立 finding 用带理由的 `declare-distinct`。
+- `.superpowers/sdd/review-loop-state.json` 是 Guard 唯一持久状态源。任何 Critical/Important 修复派发前必须依次成功执行 `record-review`、`authorize-fix`、把 JSON receipt 持久化到仓库内，并由 `task-brief --mode fix --guard-receipt` 消费；不得手写 fix brief、换 ID、重置计数或绕过门禁。
+- Guard exit 3 触发架构 checkpoint 且只允许一次 `architecture_fix`；exit 4 必须等待人工决定；exit 5/6 必须先诊断状态、身份、checkpoint 或 receipt。上述状态均阻断自动修复，但不扩大冻结验收范围。
 - Task 1 架构复盘结论：原始“明确不满立即启动后台 subagent，发布 Markdown，并在后续会话生效”的用户价值尚未实现，因为 Task 2–6 尚未开始；SQLite/Markdown/后台 subagent 的基础边界仍然成立，但 `control-store` 同时承担 legacy alias、canonical identity、去重、attachment、replay 和时间解析，兼容层职责已经过载，11 轮 review 也证明原 gate 缺少停止条件。
 - Task 1 的 review-11 时间戳反例来自当前未声明、无真实生产者证据的无时区输入；仓库内当前 capture/reconcile 生产者与 Task 1 fixture 均使用带时区 ISO。成本最低的收口是只在入口把带时区 RFC3339 规范化为 UTC ISO，并补两条回归；不新增 schema、epoch 字段、服务、解析框架或大规模设计文档。
 - Task 1 冻结验收清单仅包含：独立 control DB/legacy 隔离和 schema v1 不变；公共 capture 在副作用前冻结并验证 body-free canonical identity；blob I/O 位于 SQLite 事务外且 writer ref fail closed；exact/alias/new 与 replay/ref/completeness 既有回归通过；无时区时间戳在 blob/SQLite 前拒绝；受支持的带时区 alias 规范化为 UTC 后可原样 replay；真实 HOME/hooks/runtime/database 未触碰。最终 Task 1 review 只按此清单和既有回归作 pass/fail。
