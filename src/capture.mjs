@@ -1,7 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
-import { lstat, open } from "node:fs/promises";
+import { createHash } from "node:crypto";
 
 import { ControlStoreError, normalizeCaptureIdentity, prepareCapture } from "./control-store.mjs";
+import {
+  classifyRetrospectiveEvidence,
+  lengthPrefixedUtf8Sha256,
+  outputTextFromAssistantContent,
+  readDirectAssistantReferent,
+  roleValidatedAssistantMessage,
+  textFromValue
+} from "./feedback-signal.mjs";
 import { stripReceiptControlText } from "./receipt.mjs";
 
 const SECRET_PATTERNS = [
@@ -13,7 +20,6 @@ const SECRET_PATTERNS = [
 ];
 const CREDENTIAL_CONTEXT_PATTERN = /\b(?:password|passwd|passcode|credential|api[_ -]?key|token|secret)\b|密码|口令|密钥/i;
 const CONTEXT_TOKEN_PATTERN = /[^\s,，;；。!?！？"'`<>]+/g;
-const TERMINAL_TURN_EVENTS = new Set(["task_complete", "turn_aborted"]);
 
 function hasArrayValues(value) {
   return Array.isArray(value) && value.some((item) => String(item ?? "").trim());
@@ -72,125 +78,53 @@ export function redactText(input, { blockedTokenHashes = [] } = {}) {
   };
 }
 
-async function readOwnedTranscriptTail(file, maxBytes) {
-  if (!file) return "";
-  const info = await lstat(file);
-  if (!info.isFile() || info.isSymbolicLink()) return "";
-  if (typeof process.getuid === "function" && info.uid !== process.getuid()) return "";
-  const length = Math.min(info.size, maxBytes);
-  if (length <= 0) return "";
-  const handle = await open(file, "r");
-  try {
-    const buffer = Buffer.alloc(length);
-    const { bytesRead } = await handle.read(buffer, 0, length, info.size - length);
-    return buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await handle.close();
-  }
-}
-
 export async function detectStructuralFeedbackSignal(payload, {
   maxBytes = 2 * 1024 * 1024,
   maxSignalAgeMs = 15 * 60 * 1000,
   now = () => Date.now()
 } = {}) {
   const input = payload || {};
-  if (!input.transcript_path) return { immediateReview: false, reason: "none" };
-  let transcript;
-  try {
-    transcript = await readOwnedTranscriptTail(input.transcript_path, maxBytes);
-  } catch {
+  const resolved = await readDirectAssistantReferent({
+    cli: input.cli || "codex",
+    payload: input,
+    maxBytes,
+    maxSignalAgeMs,
+    now
+  });
+  const referent = resolved.referent
+    ? {
+        id: resolved.referent.eventUid,
+        turnId: resolved.referent.turnId,
+        timestamp: resolved.referent.timestamp,
+        text: resolved.referent.text
+      }
+    : null;
+  if (["active_turn_steering", "prior_turn_interrupted"].includes(resolved.structuralReason)) {
+    return {
+      immediateReview: true,
+      reason: resolved.structuralReason,
+      ...(referent ? { referent } : {})
+    };
+  }
+  if (resolved.structuralReason === "stale_interruption") {
+    return { immediateReview: false, reason: "stale_interruption" };
+  }
+  if (resolved.structuralReason === "transcript_unavailable") {
     return { immediateReview: false, reason: "transcript_unavailable" };
   }
-  const currentTurn = String(input.turn_id || input.turnId || "");
-  let latestTerminal = null;
-  let latestTerminalAt = null;
-  let transcriptTurn = null;
-  let latestAssistantReferent = null;
-  for (const line of transcript.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (record?.type === "turn_context") {
-      transcriptTurn = String(record.payload?.turn_id || "") || transcriptTurn;
-      continue;
-    }
-    if (record?.type === "response_item" && record.payload?.type === "message") {
-      const messageTurn = String(record.payload.internal_chat_message_metadata_passthrough?.turn_id || transcriptTurn || "");
-      if (currentTurn && messageTurn === currentTurn && record.payload.role === "assistant") {
-        const assistantText = stripReceiptControlText(textFromValue(record.payload.content || record.payload.text || record.payload.message)).trim();
-        if (assistantText) {
-          const timestamp = record.timestamp || null;
-          const derivedId = createHash("sha256")
-            .update(`${messageTurn}\u0000${timestamp || ""}\u0000${assistantText}`)
-            .digest("hex")
-            .slice(0, 24);
-          latestAssistantReferent = {
-            id: String(record.payload.id || record.payload.message_id || record.payload.internal_chat_message_metadata_passthrough?.message_id || `derived:${derivedId}`),
-            turnId: messageTurn,
-            timestamp,
-            text: assistantText.slice(-16 * 1024)
-          };
-        }
-      }
-      continue;
-    }
-    if (record?.type === "event_msg") {
-      const event = record.payload || {};
-      if (!TERMINAL_TURN_EVENTS.has(event.type)) continue;
-      if (currentTurn && String(event.turn_id || "") === currentTurn) continue;
-      latestTerminal = event.type;
-      const parsedTimestamp = Date.parse(record.timestamp || "");
-      latestTerminalAt = Number.isFinite(parsedTimestamp) ? parsedTimestamp : null;
-    }
-  }
-  if (latestAssistantReferent) return { immediateReview: true, reason: "active_turn_steering", referent: latestAssistantReferent };
-  if (latestTerminal === "turn_aborted") {
-    if (latestTerminalAt != null && now() - latestTerminalAt > maxSignalAgeMs) {
-      return { immediateReview: false, reason: "stale_interruption" };
-    }
-    return { immediateReview: true, reason: "prior_turn_interrupted" };
+  const classified = classifyRetrospectiveEvidence({
+    userText: input.prompt || input.text || "",
+    hasReferent: Boolean(resolved.referent)
+  });
+  if (classified.candidate) {
+    return {
+      immediateReview: true,
+      reason: "explicit_retrospective_feedback",
+      reasonCodes: classified.reasonCodes,
+      referent
+    };
   }
   return { immediateReview: false, reason: "none" };
-}
-
-function textFromValue(value) {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.map(textFromValue).filter(Boolean).join("\n");
-  if (!value || typeof value !== "object") return "";
-  return [value.text, value.content, value.message, value.output_text]
-    .map(textFromValue)
-    .filter(Boolean)
-    .join("\n");
-}
-
-function outputTextFromAssistantContent(value) {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) return value.map(outputTextFromAssistantContent).filter(Boolean).join("\n");
-  if (!value || typeof value !== "object") return "";
-  const type = String(value.type || "").toLowerCase();
-  if (type && !["text", "output_text"].includes(type)) return "";
-  if (typeof value.text === "string") return value.text;
-  if (typeof value.output_text === "string") return value.output_text;
-  return type ? "" : outputTextFromAssistantContent(value.content || value.message);
-}
-
-function roleValidatedAssistantMessage(record) {
-  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
-  if (record.type === "response_item") {
-    return record.payload?.type === "message" && record.payload?.role === "assistant"
-      ? record.payload
-      : null;
-  }
-  if (["message", "assistant_message"].includes(record.type) || !record.type) {
-    return record.role === "assistant" ? record : null;
-  }
-  if (record.type === "assistant" && record.message?.role === "assistant") return record.message;
-  return null;
 }
 
 export function extractRoleValidatedAssistantOutput(transcriptText, { maxChars = 64 * 1024 } = {}) {
@@ -249,18 +183,27 @@ export function extractTranscriptExcerpt(transcriptText, { maxChars = 12 * 1024 
 export function normalizeHookEvent({ cli, payload, installationId = "unknown", timeout, timeoutUnit, capturePolicyRevision = 1 }) {
   const input = typeof payload === "string" ? { prompt: payload } : (payload || {});
   const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];
-  const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
-  const generatedId = `generated:${Date.now().toString(36)}:${randomUUID()}`;
-  const explicitEventId = input.event_id || input.eventId || input.prompt_id || input.promptId;
+  const stableSessionId = String(input.session_id || input.sessionId || "").trim();
+  const nativeSessionId = stableSessionId || "unknown";
+  const explicitEventId = input.event_id || input.eventId || input.prompt_id || input.promptId || null;
   const nativeTurnId = input.native_turn || input.turn_id || input.turnId || null;
-  const sourceEventId = String(explicitEventId || generatedId);
+  const stableTurnId = nativeTurnId === null ? "" : String(nativeTurnId).trim();
+  const redacted = redactText(input.prompt || input.text || "");
+  const transcriptPath = String(input.transcript_path || input.transcriptPath || "");
+  const derivedSourceId = `derived:${lengthPrefixedUtf8Sha256([
+    cli,
+    stableSessionId,
+    stableTurnId,
+    transcriptPath,
+    redacted.contentHash
+  ])}`;
+  const sourceEventId = String(explicitEventId || derivedSourceId);
   const sequenceSource = input.event_seq || input.eventSeq || input.native_turn || input.turn_id || input.turnId;
   const hashedSequence = Number.parseInt(createHash("sha256").update(sourceEventId).digest("hex").slice(0, 12), 16);
   const eventSeq = Number.isFinite(Number(sequenceSource)) ? Number(sequenceSource) : (hashedSequence || 1);
   const sessionUid = `${cli}:${installationId}:${nativeSessionId}`;
   const eventUid = `${cli}:${installationId}:${nativeSessionId}:${sourceEventId}`;
   const projectId = input.cwd || input.project_id || `unscoped:${cli}:${createHash("sha256").update(nativeSessionId).digest("hex").slice(0, 16)}`;
-  const redacted = redactText(input.prompt || input.text || "");
   return {
     cli,
     installation_id: installationId,
@@ -295,6 +238,7 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
     file_refs: Array.isArray(input.file_refs) ? input.file_refs : [],
     artifact_hashes: Array.isArray(input.artifact_hashes) ? input.artifact_hashes : [],
     source_timestamp: input.timestamp || null,
+    identity_unstable: !stableSessionId && !stableTurnId,
     timeout,
     timeout_unit: timeoutUnit
   };

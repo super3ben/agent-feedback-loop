@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { test } from "node:test";
 import { pathsFor } from "../src/index.mjs";
 import { captureObservedSession, captureSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
+import { classifyRetrospectiveEvidence, detectFeedbackCandidate, feedbackSourceIdentity, readDirectAssistantReferent } from "../src/feedback-signal.mjs";
 import { renderReceiptControl } from "../src/receipt.mjs";
 import { openStore } from "../src/store.mjs";
 
@@ -79,20 +81,38 @@ test("detects an immediately preceding interrupted turn without matching prompt 
   assert.deepEqual(signal, { immediateReview: true, reason: "prior_turn_interrupted" });
 });
 
-test("completed-turn corrective wording stays on deferred review instead of a keyword fast path", async () => {
+test("explicit completed-turn dissatisfaction becomes an immediate review candidate", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-signal-control-"));
   const transcript = path.join(home, "rollout.jsonl");
   await writeFile(transcript, [
-    JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted", turn_id: "turn-1", reason: "interrupted" } }),
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-2" } }),
+    JSON.stringify({
+      timestamp: "2026-07-14T12:00:00.000Z",
+      type: "response_item",
+      payload: {
+        id: "assistant-prior",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "previous design" }]
+      }
+    }),
     JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-2" } })
   ].join("\n"), "utf8");
 
   const signal = await detectStructuralFeedbackSignal({
     transcript_path: transcript,
     turn_id: "turn-3",
-    prompt: "为什么又用了 Termius，之前已经说过应该直接用 SSH"
+    prompt: "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西"
   });
-  assert.deepEqual(signal, { immediateReview: false, reason: "none" });
+  assert.equal(signal.immediateReview, true);
+  assert.equal(signal.reason, "explicit_retrospective_feedback");
+  assert.deepEqual(signal.reasonCodes, [
+    "negative_evaluation",
+    "backward_reference",
+    "causal_accountability",
+    "expected_process_contrast"
+  ]);
+  assert.equal(signal.referent.id, "assistant-prior");
 });
 
 test("does not fast-track a stale interruption after a long idle resume", async () => {
@@ -168,6 +188,301 @@ test("same-turn requirement additions before assistant output stay on the batch 
   assert.deepEqual(signal, { immediateReview: false, reason: "none" });
 });
 
+test("classifies the frozen explicit dissatisfaction with ordered independent evidence", async () => {
+  const referent = { eventUid: "assistant:1", text: "previous design" };
+  const userText = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
+
+  const classified = classifyRetrospectiveEvidence({ userText, hasReferent: true });
+  assert.deepEqual(classified, {
+    candidate: true,
+    reasonCodes: [
+      "negative_evaluation",
+      "backward_reference",
+      "causal_accountability",
+      "expected_process_contrast"
+    ],
+    score: 100
+  });
+
+  const detected = await detectFeedbackCandidate({ payload: {}, userText, referent, now: () => 0 });
+  assert.equal(detected.candidate, true);
+  assert.deepEqual(detected.reasonCodes, classified.reasonCodes);
+  assert.equal(detected.score, 100);
+  assert.equal(detected.referent, referent);
+});
+
+test("ordinary prompts, invited design calibration and isolated keywords are not candidates", async () => {
+  const negativeCases = [
+    "reviewer job 是干嘛的？",
+    "按推荐执行",
+    "以后量大了再上 RAG",
+    "为什么",
+    "问题",
+    "反思"
+  ];
+  for (const userText of negativeCases) {
+    const result = await detectFeedbackCandidate({ payload: {}, userText, referent: null, now: () => 0 });
+    assert.equal(result.candidate, false, userText);
+  }
+
+  const invited = await detectFeedbackCandidate({
+    payload: { invited_design_calibration: true },
+    userText: "为什么不先讨论问题和反思边界？",
+    referent: { eventUid: "assistant:question", text: "Which design boundary do you prefer?" },
+    now: () => 0
+  });
+  assert.equal(invited.candidate, false);
+});
+
+test("synthetic AFL hook control is rejected before retrospective scoring", async () => {
+  const userText = [
+    '<hook_prompt hook_run_id="stop:4:/tmp/config.toml">',
+    "Output this receipt verbatim before stopping:",
+    "[AFL] 已复核，本次未形成长期经验 · job=52cd37 · receipt=de027c",
+    "</hook_prompt>",
+    "为什么你之前没有考虑，导致事情变复杂了，而是等我发现才开始反思"
+  ].join("\n");
+  const detected = await detectFeedbackCandidate({
+    payload: { hook_run_id: "stop:4:/tmp/config.toml" },
+    userText,
+    referent: { eventUid: "assistant:prior", text: "prior answer" },
+    now: () => 0
+  });
+  assert.deepEqual(detected, { candidate: false, reasonCodes: [], score: 0, referent: null });
+});
+
+test("prefers role-validated explicit Claude and Gemini assistant referents", async () => {
+  const claude = await readDirectAssistantReferent({
+    cli: "claude",
+    payload: {
+      turn_id: "claude-current",
+      assistant_message: {
+        role: "assistant",
+        event_id: "claude-assistant",
+        turn_id: "claude-prior",
+        content: [{ type: "text", text: "Claude prior answer" }]
+      }
+    },
+    maxBytes: 1024,
+    now: () => 0
+  });
+  assert.deepEqual(claude, {
+    referent: {
+      eventUid: "claude-assistant",
+      turnId: "claude-prior",
+      timestamp: null,
+      text: "Claude prior answer"
+    },
+    structuralReason: null
+  });
+
+  const gemini = await readDirectAssistantReferent({
+    cli: "gemini",
+    payload: {
+      turn_id: "gemini-current",
+      previous_assistant_message: {
+        role: "assistant",
+        message_id: "gemini-assistant",
+        turn_id: "gemini-prior",
+        content: [{ type: "output_text", text: "Gemini prior answer" }]
+      }
+    },
+    maxBytes: 1024,
+    now: () => 0
+  });
+  assert.equal(gemini.referent.eventUid, "gemini-assistant");
+  assert.equal(gemini.referent.text, "Gemini prior answer");
+  assert.equal(gemini.structuralReason, null);
+});
+
+test("rejects explicit non-assistant fields and unparsed user or system transcript bytes", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-role-validation-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    '{"role":"assistant","content":"truncated',
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "assistant-like user text" }] } }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "system", content: [{ type: "text", text: "assistant-like system text" }] } })
+  ].join("\n"), "utf8");
+
+  const result = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: {
+      turn_id: "turn-current",
+      transcript_path: transcript,
+      assistant_message: { role: "user", event_id: "not-assistant", content: "do not trust" }
+    },
+    maxBytes: 4096,
+    now: () => 0
+  });
+  assert.equal(result.referent, null);
+  assert.equal(result.structuralReason, null);
+});
+
+test("uses the closest completed Codex assistant as referent without making structure sufficient", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-completed-referent-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-1" } }),
+    JSON.stringify({ type: "response_item", payload: { id: "assistant-old", type: "message", role: "assistant", content: [{ type: "output_text", text: "older answer" }] } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1" } }),
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-2" } }),
+    JSON.stringify({ timestamp: "2026-07-14T12:00:00.000Z", type: "response_item", payload: { id: "assistant-nearest", type: "message", role: "assistant", content: [{ type: "output_text", text: "nearest answer" }] } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-2" } })
+  ].join("\n"), "utf8");
+
+  const resolved = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: { transcript_path: transcript, turn_id: "turn-3" },
+    maxBytes: 4096,
+    now: () => Date.parse("2026-07-14T12:01:00.000Z")
+  });
+  assert.equal(resolved.referent.eventUid, "assistant-nearest");
+  assert.equal(resolved.referent.text, "nearest answer");
+  assert.equal(resolved.structuralReason, null);
+
+  const neutral = await detectFeedbackCandidate({
+    payload: { transcript_path: transcript, turn_id: "turn-3" },
+    userText: "请继续",
+    now: () => Date.parse("2026-07-14T12:01:00.000Z")
+  });
+  assert.equal(neutral.candidate, false);
+  assert.equal(neutral.referent.eventUid, "assistant-nearest");
+});
+
+test("stops Codex referent selection at the current user event boundary", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-user-boundary-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  await writeFile(transcript, [
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-prior" } }),
+    JSON.stringify({ type: "response_item", payload: { id: "assistant-before", type: "message", role: "assistant", content: [{ type: "output_text", text: "answer before current user" }] } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-prior" } }),
+    JSON.stringify({ type: "turn_context", payload: { turn_id: "turn-current" } }),
+    JSON.stringify({ type: "response_item", payload: { id: "current-user", type: "message", role: "user", content: [{ type: "input_text", text: "current feedback" }] } }),
+    JSON.stringify({ type: "response_item", payload: { id: "assistant-after", type: "message", role: "assistant", content: [{ type: "output_text", text: "must not become the referent" }] } })
+  ].join("\n"), "utf8");
+
+  const resolved = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: {
+      event_id: "current-user",
+      prompt: "current feedback",
+      transcript_path: transcript,
+      turn_id: "turn-current"
+    },
+    maxBytes: 4096,
+    now: () => 0
+  });
+  assert.equal(resolved.referent.eventUid, "assistant-before");
+  assert.equal(resolved.structuralReason, null);
+});
+
+test("transcript safety rejects missing, symlinked and unowned files and bounds oversized tails", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-transcript-safety-"));
+  const transcript = path.join(home, "rollout.jsonl");
+  const assistantLine = JSON.stringify({
+    type: "response_item",
+    payload: { id: "assistant-safe", type: "message", role: "assistant", content: [{ type: "output_text", text: "safe answer" }] }
+  });
+  await writeFile(transcript, `${assistantLine}\n${"x".repeat(2048)}`, "utf8");
+
+  const missing = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: { transcript_path: path.join(home, "missing.jsonl"), turn_id: "turn-current" },
+    maxBytes: 128,
+    now: () => 0
+  });
+  assert.equal(missing.referent, null);
+
+  const link = path.join(home, "linked.jsonl");
+  await symlink(transcript, link);
+  const linked = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: { transcript_path: link, turn_id: "turn-current" },
+    maxBytes: 4096,
+    now: () => 0
+  });
+  assert.equal(linked.referent, null);
+
+  const originalGetuid = process.getuid;
+  try {
+    process.getuid = () => originalGetuid() + 1;
+    const unowned = await readDirectAssistantReferent({
+      cli: "codex",
+      payload: { transcript_path: transcript, turn_id: "turn-current" },
+      maxBytes: 4096,
+      now: () => 0
+    });
+    assert.equal(unowned.referent, null);
+  } finally {
+    process.getuid = originalGetuid;
+  }
+
+  const bounded = await readDirectAssistantReferent({
+    cli: "codex",
+    payload: { transcript_path: transcript, turn_id: "turn-current" },
+    maxBytes: 128,
+    now: () => 0
+  });
+  assert.equal(bounded.referent, null);
+});
+
+test("feedback source identity uses five length-prefixed UTF-8 fields", () => {
+  const fields = ["codex", "session:甲", "3", "prompt:event", "assistant:1"];
+  const expected = createHash("sha256");
+  for (const field of fields) {
+    const bytes = Buffer.from(field, "utf8");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(bytes.length);
+    expected.update(length).update(bytes);
+  }
+
+  assert.equal(feedbackSourceIdentity({
+    cli: fields[0],
+    sessionUid: fields[1],
+    contextEpoch: 3,
+    sourceEventId: fields[3],
+    referentEventUid: fields[4]
+  }), expected.digest("hex"));
+  assert.notEqual(
+    feedbackSourceIdentity({ cli: "ab", sessionUid: "c", contextEpoch: 1, sourceEventId: "d", referentEventUid: "e" }),
+    feedbackSourceIdentity({ cli: "a", sessionUid: "bc", contextEpoch: 1, sourceEventId: "d", referentEventUid: "e" })
+  );
+});
+
+test("normalizes native prompt identity first and derives replay-stable fallback identity", () => {
+  const native = normalizeHookEvent({
+    cli: "codex",
+    payload: { session_id: "native-session", turn_id: "native-turn", event_id: "event-first", prompt_id: "prompt-second", prompt: "same words" }
+  });
+  assert.equal(native.source_event_id, "prompt:event-first");
+  assert.equal(native.identity_unstable, false);
+
+  const payload = {
+    session_id: "replay-session",
+    turn_id: "turn-1",
+    transcript_path: "/tmp/replay.jsonl",
+    prompt: "same words"
+  };
+  const first = normalizeHookEvent({ cli: "codex", payload });
+  const replay = normalizeHookEvent({ cli: "codex", payload: { ...payload } });
+  assert.equal(first.source_event_id, replay.source_event_id);
+  assert.equal(first.event_uid, replay.event_uid);
+  assert.equal(first.identity_unstable, false);
+
+  const anotherSession = normalizeHookEvent({ cli: "codex", payload: { ...payload, session_id: "replay-session-2" } });
+  const anotherTurn = normalizeHookEvent({ cli: "codex", payload: { ...payload, turn_id: "turn-2" } });
+  assert.notEqual(first.source_event_id, anotherSession.source_event_id);
+  assert.notEqual(first.source_event_id, anotherTurn.source_event_id);
+
+  const eventOnly = normalizeHookEvent({ cli: "codex", payload: { event_id: "native-event-only", prompt: "same words" } });
+  assert.equal(eventOnly.source_event_id, "prompt:native-event-only");
+  assert.equal(eventOnly.identity_unstable, true);
+
+  const unstable = normalizeHookEvent({ cli: "codex", payload: { prompt: "same words", cwd: "/tmp/project" } });
+  assert.equal(unstable.identity_unstable, true);
+  assert.match(unstable.source_event_id, /^prompt:derived:/);
+});
+
 test("capture stores index data and encrypted raw evidence with restrictive modes", async () => {
   const { paths, store, blobs } = await fixture();
   const event = normalizeHookEvent({
@@ -215,16 +530,17 @@ test("capture aliases a later transcript observation to a legacy hook without a 
   store.close();
 });
 
-test("identical hook messages in one native turn remain distinct occurrences", async () => {
+test("replaying an identical hook payload in one native turn reuses the source identity", async () => {
   const { store, blobs } = await fixture();
   const input = { session_id: "repeat-session", turn_id: "turn-1", cwd: "/tmp/repeat-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" };
   const first = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
   const second = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
 
-  assert.notEqual(first.event_uid, second.event_uid);
+  assert.equal(first.event_uid, second.event_uid);
   await captureObservedSession({ store, blobs, event: first, rawText: input.prompt });
-  await captureObservedSession({ store, blobs, event: second, rawText: input.prompt });
-  assert.equal(store.listSessionEvents(input.cwd).length, 2);
+  const replay = await captureObservedSession({ store, blobs, event: second, rawText: input.prompt });
+  assert.equal(replay.duplicate, true);
+  assert.equal(store.listSessionEvents(input.cwd).length, 1);
   store.close();
 });
 
