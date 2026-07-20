@@ -14,9 +14,20 @@
 
 ## Current task
 
-- Plan task: `Task 7 complete: 先定义结构化 reviewer result，保持旧 runtime 全绿`
-- OpenSpec mappings: redesigned `1.1`, `1.2`, `1.3`, `2.1`, `2.2`, `2.3`, and `6.1` are partial because later mapped tasks still own detector, prompt orchestration, cleanup, doctor and final verification
-- Stage: `review`
+- Plan task: `Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证`
+- OpenSpec mappings: `1.1`–`6.3`, `7.1`, and `7.4` have current automated evidence; `7.2`, `7.3`, and `7.5` remain pending their explicitly separated real-provider/Linux/real-state checks
+- Stage: `implementation complete; frozen task review pending`
+- Task 15 base: `e19c815a540819be47f13552c0ff017999a06322`
+- Task 15 scope: one deterministic platform smoke plus E2E assertions and build evidence; no source, schema, scheduler, RAG, service, post-turn hook, control receipt, Windows, or real-state installation change
+- Task 15 RED: the first behavior-complete run passed 10/11 and failed only because the distinct recurrence sentence did not contain the detector's required negative-evaluation evidence; the fixture was corrected without changing runtime code
+- Task 15 targeted GREEN: the final `node --test test/e2e-smoke.test.mjs test/platform-smoke.test.mjs` passed 11/11 in 10.832 s on Darwin arm64 Node v26.0.0
+- Task 15 full GREEN: the final `npm test` passed 266/266 in 20.552 s; the v8/v9 legacy fixtures each prove dry-run side-effect freedom, first apply, idempotent second apply, and unchanged source hashes
+- Task 15 package proof: `npm pack --dry-run --json` returned `agent-feedback-loop@0.8.0`, 31 files, 72,116 packed bytes, and 296,057 unpacked bytes
+- Task 15 deterministic vertical proof: installed prompt hook returned in under two seconds with no control text, created one durable job, detached a real child process, atomically published immutable Markdown, injected only on a later matching prompt, classified a later same-family complaint as `recurrence_after_emission`, selected only the newest family method, rejected the neutral reviewer question, and emitted Top-4 from five severe families without a global hold
+- Pending coordinator gates: `AFL_REAL_PROVIDER=1` macOS run, official Node Linux container run, guarded real-state after snapshot/diff, and Task 15 frozen review; real Codex desktop visibility and production remain outside build acceptance
+
+## Archived execution history
+
 - Task 2 base: `e7b9fa301aded09bb79c075d385e9dc2ab2e1052`
 - Task 2 allowed files: `src/control-store.mjs`, `test/control-store.test.mjs`; `.superpowers/sdd/task-2-report.md` may only receive an uncommitted append-only implementation handoff
 - Task 2 scope: immediate replay-idempotent candidate creation, bounded launch reservation/failure release, recoverable ordering, fenced claim/renew/assert/terminal transitions, bounded opaque context, retry exhaustion; no schema, scheduler, launcher, provider, notification, RAG, Markdown-body or live-state changes

@@ -175,7 +175,7 @@ writeFileSync(process.env.AFL_REVIEW_PROVIDER_SENTINEL + "." + jobId, JSON.strin
     AFL_REVIEW_PROVIDER_SENTINEL: providerSentinel
   }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
   assert.deepEqual(JSON.parse(result.stdout), { continue: true });
-  assert.doesNotMatch(result.stdout, /\[AFL\]|afl-receipt|hookPrompt|checkpoint|runner_transition/i);
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /\[AFL\]|afl-receipt|Output this receipt|reviewer.*queued|hookPrompt|checkpoint|runner_transition/i);
   assert.equal(result.stderr, "");
 
   const deadline = Date.now() + 3_000;
@@ -200,6 +200,45 @@ writeFileSync(process.env.AFL_REVIEW_PROVIDER_SENTINEL + "." + jobId, JSON.strin
     assert.equal(providerRecord.argvContainsEvidence, false);
   }
   assert.ok(jobs.some((job) => job.job_id === recoverCandidate.jobId));
+});
+
+test("installed neutral reviewer question creates no review work", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-installed-neutral-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
+  await install({ home, codexHost: unavailableCodexHost() });
+  const paths = pathsFor(home);
+  const payload = JSON.stringify({
+    session_id: "neutral-reviewer-session",
+    event_id: "neutral-reviewer-event",
+    turn_id: "neutral-reviewer-turn-2",
+    cwd: projectDir,
+    timestamp: new Date().toISOString(),
+    prompt: "reviewer job 是干嘛的？",
+    previous_assistant_message: {
+      role: "assistant",
+      id: "neutral-reviewer-assistant",
+      turn_id: "neutral-reviewer-turn-1",
+      timestamp: new Date(Date.now() - 1_000).toISOString(),
+      content: [{ type: "output_text", text: "The reviewer runs outside the prompt turn." }]
+    }
+  });
+
+  const result = await runHook(paths.coreHook, payload, {
+    ...process.env,
+    HOME: home,
+    TMPDIR: home
+  }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+  assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+  assert.equal(result.stderr, "");
+
+  const store = openControlStore({ paths });
+  try {
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count, 0);
+  } finally {
+    store.close();
+  }
+  await assert.rejects(access(path.join(projectDir, ".agent", "reflections")), { code: "ENOENT" });
 });
 
 test("parse and control-store failures return native prompt no-ops", async () => {
