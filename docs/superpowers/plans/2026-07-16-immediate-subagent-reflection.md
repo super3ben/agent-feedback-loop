@@ -1642,7 +1642,7 @@ git commit -m "feat: audit reflection emission and recurrence honestly"
 
 ### Task 12: 实现旧数据库的显式只读 Markdown 导出
 
-- [ ] **Task 12 complete: 实现旧数据库的显式只读 Markdown 导出**
+- [x] **Task 12 complete: 实现旧数据库的显式只读 Markdown 导出**
 
 **Files:**
 - Create: `src/legacy-export.mjs`
@@ -1666,7 +1666,7 @@ git commit -m "feat: audit reflection emission and recurrence honestly"
 - Dry-run validates and inspects but never creates `outputDir`. Apply first revalidates the source fingerprint and refuses the canonical `pathsFor(os.homedir()).legacyDatabase` before output side effects. It accepts an existing owned symlink-free output directory or creates only its final `0700` leaf beneath an owned symlink-free parent, then delegates every document write to Task 8's atomic publisher. Identical documents count as skipped; `publication_collision` counts as conflict and never overwrites; unexpected publication errors fail the command. Recheck the source fingerprint after execution.
 - The CLI requires exactly one occurrence of each explicit path option, exactly one of `--dry-run` or `--apply`, and no unknown/duplicate/missing-value arguments. No bypass flag, automatic source discovery, live migration, schema change, RAG/index, scheduler, service, hook mutation, provider activation or real-HOME test is in scope.
 
-- [ ] **Step 1: Write RED tests with an immutable legacy DB copy**
+- [x] **Step 1: Write RED tests with an immutable legacy DB copy**
 
 Build minimal v8 and v9 fixtures in temporary directories, including a closed static copy of a valid WAL source set, hash each existing database/WAL/SHM member, then run:
 
@@ -1685,19 +1685,19 @@ assert.deepEqual(hashLegacyFiles(sourceDb), originalHashes);
 
 Test a missing report, malformed lesson body, output collision and symlink source/output rejection.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test test/legacy-export.test.mjs test/cli.test.mjs`
 
 Expected: FAIL because no export module/command exists.
 
-- [ ] **Step 3: Implement read-only inspection and idempotent apply**
+- [x] **Step 3: Implement read-only inspection and idempotent apply**
 
 Require absolute explicit paths and exactly one of `--dry-run` or `--apply`. Reject symlink/non-owned inputs, copy the explicitly supplied DB plus any WAL/SHM siblings into a private temporary snapshot, hash the supplied source set before and after, and execute only literal `SELECT` statements against the private snapshot; never import `openStore()` or run migrations. This avoids `immutable=1` silently ignoring WAL content while guaranteeing the operator's supplied copy is unchanged. Convert only complete evidence to `ReflectionModel`, use `legacy-<row id>` reflection identity plus content hash, and publish into the explicit output directory through Task 8's shared atomic writer.
 
 Return counts and opaque legacy ids only. Do not print report content. `--apply` must compare canonical paths and always refuse `pathsFor(os.homedir()).legacyDatabase`. The supported safe procedure is to copy the old DB/WAL/SHM set to a temporary directory first and export that copy; this version exposes no bypass flag. Dry-run never creates the output directory; apply accepts only an owned non-symlink directory (or creates its final leaf beneath an owned non-symlink parent).
 
-- [ ] **Step 4: Run export and CLI tests, then commit**
+- [x] **Step 4: Run export and CLI tests, then commit**
 
 Run: `node --test test/legacy-export.test.mjs test/cli.test.mjs test/reflection-document.test.mjs`
 
