@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | reviewing identity-coherence fix | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`; design `e1732a8`; plan `c6f984f` | review-11 in progress via fresh independent reviewer | Review-10 fix is GREEN 22/22 focused and 157/157 four-file regression with a NO_BLOCKER read-only audit; task remains unchecked until formal review |
+| 1. Lean control DB | blocked by review-11 timestamp semantic split | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`; design `e1732a8`; plan `c6f984f` | CHANGES_REQUIRED: 0 Critical / 1 Important / 0 Minor | Review-10 blockers are closed, but SQLite candidate time parsing and JS exact-replay parsing can still create an unreplayable alias; next fix/re-review needs explicit authorization |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
@@ -43,3 +43,4 @@
 - The user replied `继续` after review 9, authorizing exactly one bounded fix for the public null-writer invariant and one fresh independent re-review; the direct-only nullable path remains unchanged.
 - Review 10 approves the public writer-ref fix but finds two deterministic identity-contract blockers: alias attachment can create a completeness-mismatched observation that exact replay rejects, and most snake/camel canonical identity conflicts are silently resolved by precedence. The authorized review-9 fix/re-review round is consumed; no further fix is dispatched without a new explicit user decision.
 - On 2026-07-20 the user replied `继续`, authorizing one review-10 identity-coherence fix and one fresh independent re-review. The fix must use a shared conflict-validating reader for all existing canonical alias groups and a shared replay-compatible alias-target rule with completeness applied before candidate bounding; no schema, hook, scheduler, notification, RAG, Markdown-truth, or later-task expansion is authorized.
+- Review 11 confirms both review-10 blockers are closed but proves one remaining semantic split: SQLite `julianday()` accepts a timezone-less timestamp as a 60-second alias match while JavaScript `Date.parse()` sees a 28,740-second difference, so the same accepted alias immediately collides on replay. The authorized fix/re-review round is consumed; no timestamp-contract fix is dispatched without a new explicit user decision.
