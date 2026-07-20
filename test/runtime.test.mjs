@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,7 +20,7 @@ const ALLOWED_CONTROL_TABLES = [
   "store_meta"
 ];
 
-test("paths separate versioned runtime from durable data and keys", async () => {
+test("legacy database has no normal path alias", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-runtime-"));
   const paths = pathsFor(home);
 
@@ -29,30 +29,50 @@ test("paths separate versioned runtime from durable data and keys", async () => 
   assert.match(paths.keyRoot, /feedback-loop-keys$/);
   assert.notEqual(paths.runtimeRoot, paths.dataRoot);
   assert.notEqual(paths.dataRoot, paths.keyRoot);
-  assert.match(paths.storeFile, /feedback-loop\.sqlite3$/);
+  assert.equal(Object.hasOwn(paths, ["store", "File"].join("")), false);
+  assert.match(paths.legacyDatabase, /store[\\/]feedback-loop\.sqlite3$/);
+  assert.match(paths.controlDatabase, /store[\\/]control\.sqlite3$/);
 });
 
-test("separates the lean control database from the legacy database", async () => {
-  const home = await mkdtemp(path.join(tmpdir(), "afl-control-paths-"));
-  const paths = pathsFor(home);
+function staticRelativeImportGraph(entry) {
+  const reachable = new Set();
+  const pending = [entry];
+  while (pending.length > 0) {
+    const file = pending.pop();
+    if (reachable.has(file)) continue;
+    reachable.add(file);
+    const source = readFileSync(file, "utf8");
+    for (const match of source.matchAll(/(?:from\s+|import\s*)["'](\.{1,2}\/[^"]+)["']/g)) {
+      const target = path.resolve(path.dirname(file), match[1]);
+      pending.push(target);
+    }
+  }
+  return reachable;
+}
 
-  assert.match(paths.controlDatabase, /store[\\/]control\.sqlite3$/);
-  assert.match(paths.legacyDatabase, /store[\\/]feedback-loop\.sqlite3$/);
-  assert.equal(paths.legacyDatabase, paths.storeFile);
-  assert.notEqual(paths.controlDatabase, paths.legacyDatabase);
+test("normal runtime imports only the control store", () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const reachable = staticRelativeImportGraph(path.join(root, "bin", "agent-feedback-loop.mjs"));
+  for (const banned of [
+    "schema.mjs",
+    "store.mjs",
+    "receipt.mjs",
+    "notification-delivery.mjs",
+    "codex-reconcile.mjs",
+    "reconcile-scheduler.mjs"
+  ]) {
+    assert.equal([...reachable].some((file) => file.endsWith(path.sep + banned)), false, banned);
+  }
 });
 
 test("install initializes only the lean control database", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-control-install-"));
   const paths = pathsFor(home);
-  await mkdir(path.dirname(paths.legacyDatabase), { recursive: true, mode: 0o700 });
-  await writeFile(paths.legacyDatabase, "legacy-sentinel", { mode: 0o600 });
 
   await install({ home });
   const controlStore = openControlStore({ paths });
   assert.deepEqual(listUserTables(controlStore.database), ALLOWED_CONTROL_TABLES);
   controlStore.close();
-  assert.equal(await readFile(paths.legacyDatabase, "utf8"), "legacy-sentinel");
 });
 
 test("fresh install is prompt-only", async () => {
@@ -82,7 +102,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
   assert.equal(current.runtimeVersion, "0.7.6");
-  assert.equal(current.schemaVersion, 9);
+  assert.equal(current.schemaVersion, 1);
 });
 
 test("installed prompt wrapper has no legacy queue or control transport", async () => {

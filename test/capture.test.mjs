@@ -6,28 +6,47 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { captureObservedSession, captureSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
+import { detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
-import { classifyRetrospectiveEvidence, detectFeedbackCandidate, feedbackSourceIdentity, readDirectAssistantReferent } from "../src/feedback-signal.mjs";
-import { renderReceiptControl } from "../src/receipt.mjs";
-import { openStore } from "../src/store.mjs";
+import { classifyRetrospectiveEvidence, detectFeedbackCandidate, feedbackSourceIdentity, readDirectAssistantReferent, stripSyntheticAflControlText } from "../src/feedback-signal.mjs";
 
-const RECEIPT_CONTROL = renderReceiptControl({
-  notification_id: "1".repeat(64),
-  job_id: `7e876e${"2".repeat(58)}`,
-  event_uid: null,
-  kind: "review_completed",
-  payload_json: JSON.stringify({ severity: "Major", lesson_count: 1 }),
-  language: "en"
-}).text;
+function syntheticControl() {
+  const id = "1".repeat(64);
+  const line = "[AFL] Feedback candidate captured · event=abcdef · receipt=111111";
+  const nonce = createHash("sha256")
+    .update(`receipt-control:v2\u0000${id}\u0000candidate_captured\u0000${line}`)
+    .digest("hex")
+    .slice(0, 16);
+  const marker = `<!--afl-receipt id=${id} nonce=${nonce} state=candidate_captured-->`;
+  return `${line}\n${marker}`;
+}
+
+test("synthetic control stripping no longer needs receipt transport", () => {
+  const control = syntheticControl();
+  const [line, marker] = control.split("\n");
+
+  assert.deepEqual(stripSyntheticAflControlText(control), { text: "", syntheticOnly: true });
+  assert.deepEqual(stripSyntheticAflControlText(`business answer\n${control}`), { text: "business answer", syntheticOnly: false });
+  for (const preserved of [
+    `> ${control.replace("\n", "\n> ")}`,
+    `\`\`\`text\n${control}\n\`\`\``,
+    `${line.replace("receipt=111111", "receipt=222222")}\n${marker}`,
+    `${line.replace("Feedback candidate captured", "Feedback candidate captured for business")}\n${marker}`
+  ]) {
+    assert.deepEqual(stripSyntheticAflControlText(preserved), { text: preserved, syntheticOnly: false });
+  }
+  assert.deepEqual(
+    stripSyntheticAflControlText(`business answer\n${control}\nmore business text`),
+    { text: "business answer\nmore business text", syntheticOnly: false }
+  );
+});
 
 async function fixture() {
   const home = await mkdtemp(path.join(tmpdir(), "afl-capture-"));
   const paths = pathsFor(home);
-  const store = openStore({ paths });
   const keyProvider = new BlobKeyProvider({ keyRoot: paths.keyRoot });
   const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider });
-  return { paths, store, blobs };
+  return { paths, blobs };
 }
 
 test("normalizes CLI events with namespaced IDs and native timeout units", () => {
@@ -165,7 +184,7 @@ test("does not treat a receipt-only assistant transcript message as a steering r
         role: "assistant",
         content: [{
           type: "output_text",
-          text: RECEIPT_CONTROL
+          text: syntheticControl()
         }]
       }
     })
@@ -483,178 +502,11 @@ test("normalizes native prompt identity first and derives replay-stable fallback
   assert.match(unstable.source_event_id, /^prompt:derived:/);
 });
 
-test("capture stores index data and encrypted raw evidence with restrictive modes", async () => {
-  const { paths, store, blobs } = await fixture();
-  const event = normalizeHookEvent({
-    cli: "codex",
-    payload: { installationId: "install-1", sessionId: "s1", eventId: "e1", cwd: "/tmp/project", prompt: "token=sk-live-secret" }
-  });
-  const result = await captureSession({ store, blobs, event, rawText: "token=sk-live-secret" });
-  assert.ok(result.blobPath.endsWith(".enc"));
-  const indexed = store.listSessionEvents("/tmp/project")[0];
-  assert.doesNotMatch(indexed.redacted_text, /sk-live-secret/);
-  assert.equal(indexed.encrypted_raw_ref, result.blobPath);
-  assert.match(indexed.redaction_manifest_json, /token/);
-  assert.doesNotMatch(await readFile(result.blobPath, "utf8"), /sk-live-secret/);
-  assert.equal((await stat(result.blobPath)).mode & 0o777, 0o600);
-  assert.equal((await stat(paths.keyRoot)).mode & 0o777, 0o700);
-  store.close();
-});
-
-test("capture aliases a later transcript observation to a legacy hook without a native turn", async () => {
-  const { store, blobs } = await fixture();
-  const hookEvent = normalizeHookEvent({
-    cli: "codex",
-    installationId: "default",
-    capturePolicyRevision: store.getCapturePolicy().revision,
-    payload: { session_id: "alias-session", cwd: "/tmp/alias-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" }
-  });
-  await captureObservedSession({ store, blobs, event: hookEvent, rawText: "use direct SSH" });
-
-  const transcriptEvent = normalizeHookEvent({
-    cli: "codex",
-    installationId: "default",
-    capturePolicyRevision: store.getCapturePolicy().revision,
-    payload: { session_id: "alias-session", turn_id: "turn-1", cwd: "/tmp/alias-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:01.000Z" }
-  });
-  transcriptEvent.event_uid = "codex:default:alias-session:message:transcript-1";
-  transcriptEvent.source_event_id = "message:transcript-1";
-  transcriptEvent.source_namespace = "transcript_message";
-  transcriptEvent.observation_source_id = "transcript-1";
-  const captured = await captureObservedSession({ store, blobs, event: transcriptEvent, rawText: "use direct SSH" });
-
-  assert.equal(captured.duplicate, true);
-  assert.equal(captured.eventUid, hookEvent.event_uid);
-  assert.equal(store.listSessionEvents("/tmp/alias-project").length, 1);
-  assert.equal(store.getEventObservation("codex", "transcript_message", "transcript-1").event_uid, hookEvent.event_uid);
-  store.close();
-});
-
-test("replaying an identical hook payload in one native turn reuses the source identity", async () => {
-  const { store, blobs } = await fixture();
-  const input = { session_id: "repeat-session", turn_id: "turn-1", cwd: "/tmp/repeat-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" };
-  const first = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
-  const second = normalizeHookEvent({ cli: "codex", installationId: "default", capturePolicyRevision: store.getCapturePolicy().revision, payload: input });
-
-  assert.equal(first.event_uid, second.event_uid);
-  await captureObservedSession({ store, blobs, event: first, rawText: input.prompt });
-  const replay = await captureObservedSession({ store, blobs, event: second, rawText: input.prompt });
-  assert.equal(replay.duplicate, true);
-  assert.equal(store.listSessionEvents(input.cwd).length, 1);
-  store.close();
-});
-
-test("a hook without a native turn does not alias an older transcript event from another turn", async () => {
-  const { store, blobs } = await fixture();
-  const transcriptEvent = normalizeHookEvent({
-    cli: "codex",
-    installationId: "default",
-    capturePolicyRevision: store.getCapturePolicy().revision,
-    payload: { session_id: "late-session", turn_id: "turn-old", cwd: "/tmp/late-project", prompt: "use direct SSH", timestamp: "2026-07-14T12:00:00.000Z" }
-  });
-  transcriptEvent.event_uid = "codex:default:late-session:message:old";
-  transcriptEvent.source_event_id = "message:old";
-  transcriptEvent.source_namespace = "transcript_message";
-  transcriptEvent.observation_source_id = "old";
-  await captureObservedSession({ store, blobs, event: transcriptEvent, rawText: "use direct SSH" });
-
-  const hookEvent = normalizeHookEvent({
-    cli: "codex",
-    installationId: "default",
-    capturePolicyRevision: store.getCapturePolicy().revision,
-    payload: { session_id: "late-session", cwd: "/tmp/late-project", prompt: "use direct SSH", timestamp: "2026-07-14T13:00:00.000Z" }
-  });
-  const captured = await captureObservedSession({ store, blobs, event: hookEvent, rawText: "use direct SSH" });
-
-  assert.equal(captured.duplicate, false);
-  assert.equal(store.listSessionEvents("/tmp/late-project").length, 2);
-  store.close();
-});
-
-test("different raw secrets that redact identically keep distinct encrypted evidence", async () => {
-  const { store, blobs } = await fixture();
-  const first = normalizeHookEvent({ cli: "codex", payload: { session_id: "same-session", turn_id: "1", cwd: "/tmp/project", prompt: "token=first-secret" } });
-  const second = normalizeHookEvent({ cli: "codex", payload: { session_id: "same-session", turn_id: "2", cwd: "/tmp/project", prompt: "token=second-secret" } });
-  assert.equal(first.content_hash, second.content_hash);
-  const firstCapture = await captureSession({ store, blobs, event: first, rawText: "token=first-secret" });
-  const secondCapture = await captureSession({ store, blobs, event: second, rawText: "token=second-secret" });
-  assert.notEqual(firstCapture.blobPath, secondCapture.blobPath);
-  assert.equal(await blobs.read(firstCapture.blobPath), "token=first-secret");
-  assert.equal(await blobs.read(secondCapture.blobPath), "token=second-secret");
-  store.close();
-});
-
-test("a duplicate event rejection does not remove encrypted evidence used by the stored event", async () => {
-  const { store, blobs } = await fixture();
-  const event = normalizeHookEvent({ cli: "codex", payload: { session_id: "duplicate-session", turn_id: "1", cwd: "/tmp/project", prompt: "same raw evidence" } });
-  const first = await captureSession({ store, blobs, event, rawText: "same raw evidence" });
-  await assert.rejects(() => captureSession({ store, blobs, event: { ...event }, rawText: "same raw evidence" }), /UNIQUE|constraint/i);
-  assert.equal(await blobs.read(first.blobPath), "same raw evidence");
-  store.close();
-});
-
-test("GC preserves a shared blob and prunes only old unreferenced encrypted evidence", async () => {
-  const { paths, store, blobs } = await fixture();
-  store.close();
-  const sharedRaw = "shared raw evidence";
-  const first = normalizeHookEvent({ cli: "codex", payload: { session_id: "shared-session", turn_id: "1", cwd: "/tmp/shared", prompt: "first" } });
-  first.role = "assistant";
-  const second = normalizeHookEvent({ cli: "codex", payload: { session_id: "shared-session", turn_id: "2", cwd: "/tmp/shared", prompt: "second" } });
-  second.role = "assistant";
-  const oldStore = openStore({ paths, now: () => new Date("2020-01-01T00:00:00.000Z") });
-  const firstCapture = await captureSession({ store: oldStore, blobs, event: first, rawText: sharedRaw });
-  oldStore.close();
-  const currentStore = openStore({ paths });
-  const secondCapture = await captureSession({ store: currentStore, blobs, event: second, rawText: sharedRaw });
-  assert.equal(firstCapture.blobPath, secondCapture.blobPath);
-
-  const duplicate = { ...second, event_uid: "duplicate-index-event", source_event_id: second.source_event_id, event_seq: 999 };
-  const orphanHash = (await import("node:crypto")).createHash("sha256").update("orphan raw evidence").digest("hex");
-  await assert.rejects(() => captureSession({ store: currentStore, blobs, event: duplicate, rawText: "orphan raw evidence" }), /UNIQUE|constraint/i);
-  assert.equal(await access(path.join(paths.blobRoot, `${orphanHash}.enc`)).then(() => true), true);
-
-  const rows = currentStore.listSessionEvents("/tmp/shared");
-  const sharedRef = rows[0].encrypted_raw_ref;
-  const zeroRefs = currentStore.gcExpired({ beforeMs: Date.now() - 24 * 60 * 60 * 1000 }).blobRefs;
-  assert.deepEqual(zeroRefs, []);
-  const removed = await blobs.pruneUnreferenced(currentStore.listEncryptedRawRefs(), { beforeMs: Date.now() + 1 });
-  assert.ok(removed.some((file) => file.endsWith(`${orphanHash}.enc`)));
-  assert.equal(await blobs.read(sharedRef), sharedRaw);
-  currentStore.close();
-});
-
-test("capture policy off prevents index and blob writes", async () => {
-  const { store, blobs } = await fixture();
-  store.setCapturePolicy({ enabled: false, revision: 2 });
-  const event = normalizeHookEvent({
-    cli: "claude",
-    payload: { installationId: "install-1", sessionId: "s2", eventId: "e2", cwd: "/tmp/project", prompt: "do not store" },
-    capturePolicyRevision: 2
-  });
-  await assert.rejects(() => captureSession({ store, blobs, event, rawText: "do not store" }), /disabled|policy/i);
-  assert.equal(store.listSessionEvents("/tmp/project").length, 0);
-  store.close();
-});
-
 test("missing native event IDs are generated without collapsing distinct prompts", () => {
   const first = normalizeHookEvent({ cli: "codex", payload: { installationId: "i", sessionId: "s", prompt: "first" } });
   const second = normalizeHookEvent({ cli: "codex", payload: { installationId: "i", sessionId: "s", prompt: "second" } });
   assert.notEqual(first.event_uid, second.event_uid);
   assert.notEqual(first.source_event_id, "unknown");
-});
-
-test("unscoped events remain reviewable and prompt/stop source IDs cannot collide", async () => {
-  const { store, blobs } = await fixture();
-  const prompt = normalizeHookEvent({ cli: "codex", payload: { session_id: "unscoped-session", event_id: "shared-native-id", prompt: "prior answer was wrong" } });
-  const stop = normalizeStopEvent({ cli: "codex", payload: { session_id: "unscoped-session", event_id: "shared-native-id", last_assistant_message: "unsupported answer" } });
-  assert.match(prompt.project_id, /^unscoped:codex:/);
-  assert.equal(stop.project_id, prompt.project_id);
-  assert.notEqual(prompt.source_event_id, stop.source_event_id);
-  await captureSession({ store, blobs, event: prompt, rawText: "prior answer was wrong" });
-  await captureSession({ store, blobs, event: stop, rawText: "unsupported answer" });
-  assert.equal(store.listSessionEvents(prompt.project_id).length, 2);
-  assert.equal(store.submitDueReview({ projectId: prompt.project_id, minEntries: 1, cooldownMs: 0 }).status, "pending");
-  store.close();
 });
 
 test("normalizes stop payloads into assistant evidence with honest completeness", () => {
@@ -676,20 +528,15 @@ test("normalizes stop payloads into assistant evidence with honest completeness"
   assert.deepEqual(gemini.file_refs, ["src/a.js"]);
 });
 
-test("receipt control stop capture excludes synthetic receipt-only and preserves mixed assistant output", async () => {
-  const { store, blobs } = await fixture();
-  const projectId = "/tmp/receipt-stop-project";
-  const control = RECEIPT_CONTROL;
+test("synthetic stop controls are excluded while mixed assistant output stays evidence", () => {
+  const control = syntheticControl();
   const normalized = normalizeStopEvent({
     cli: "codex",
     installationId: "install-receipt",
-    payload: { session_id: "receipt-stop", turn_id: "1", cwd: projectId, last_assistant_message: control }
+    payload: { session_id: "receipt-stop", turn_id: "1", cwd: "/tmp/receipt-stop-project", last_assistant_message: control }
   });
 
   assert.equal(normalized.redacted_text, "");
-  await captureSession({ store, blobs, event: normalized, rawText: control });
-  assert.equal(store.pendingReviewEventCount(projectId), 0);
-  assert.equal(store.listSessionEvents(projectId).some((event) => event.redacted_text?.includes("[AFL]")), false);
 
   const mixed = normalizeStopEvent({
     cli: "codex",
@@ -697,12 +544,11 @@ test("receipt control stop capture excludes synthetic receipt-only and preserves
     payload: {
       session_id: "receipt-stop-mixed",
       turn_id: "2",
-      cwd: projectId,
+      cwd: "/tmp/receipt-stop-project",
       last_assistant_message: `normal answer\n${control}`
     }
   });
   assert.equal(mixed.redacted_text, "normal answer");
-  store.close();
 });
 
 test("extracts a bounded redacted assistant excerpt from transcript-only stop evidence", () => {

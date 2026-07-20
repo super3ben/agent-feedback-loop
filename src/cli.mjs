@@ -6,10 +6,9 @@ import { fileURLToPath } from "node:url";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
 import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookEvent } from "./capture.mjs";
-import { openControlStore } from "./control-store.mjs";
+import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
-import { openStore } from "./store.mjs";
 import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
@@ -422,12 +421,6 @@ Usage:
   agent-feedback-loop uninstall [--home <path>] [--dry-run] [--remove-files]
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
-  agent-feedback-loop memory list|show [--home <path>]
-  agent-feedback-loop memory explain <session-id> [--verbose] [--home <path>]
-  agent-feedback-loop memory promote <lesson-id> [project-id] [--home <path>]
-  agent-feedback-loop capture status|on|off [--home <path>]
-  agent-feedback-loop gc status|run [--home <path>]
-  agent-feedback-loop reviewer-context --job-id <id> [--home <path>]
   agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
   agent-feedback-loop paths [--home <path>]
 `);
@@ -482,12 +475,10 @@ export async function main(args) {
       const tempHome = await mkdtemp(path.join(tmpdir(), "afl-live-doctor-"));
       try {
         const livePaths = pathsFor(tempHome);
-        const liveStore = openStore({ paths: livePaths });
-        liveStore.setCapturePolicy({ enabled: true, revision: 1 });
-        liveStore.captureSessionEvent({ event_uid: "synthetic:doctor", session_uid: "synthetic:doctor", event_seq: 1, context_epoch: 1, project_id: "synthetic_canary", role: "system", redacted_text: "synthetic", content_hash: "synthetic", capture_policy_revision: 1, data_class: "synthetic_canary" });
+        const liveStore = initializeControlStore({ paths: livePaths });
         liveStore.close();
         const configuredPaths = pathsFor(options.home);
-        const configuredStore = openStore({ paths: configuredPaths });
+        const configuredStore = openControlStore({ paths: configuredPaths });
         const configuredBlobs = new EncryptedBlobStore({ root: configuredPaths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: configuredPaths.keyRoot }) });
         const canaryHash = "f".repeat(64);
         const canaryFile = await configuredBlobs.write(canaryHash, "synthetic-canary");
@@ -553,61 +544,6 @@ export async function main(args) {
     } catch (error) {
       console.error(`agent-feedback-loop: reviewer.job=${opaqueLogValue(jobId, "unknown")} provider=${opaqueLogValue(providerName, "unknown")} reason=${boundedReason(error, "reviewer_failed")} duration_ms=${Date.now() - startedAt}`);
       throw error;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-  if (command === "reviewer-context") {
-    const paths = pathsFor(options.home);
-    const store = openStore({ paths });
-    try {
-      console.log(JSON.stringify(store.getReviewerContext(optionValue(options.args, "--job-id")), null, 2));
-    } finally {
-      store.close();
-    }
-    return;
-  }
-  if (command === "memory" || command === "capture" || command === "gc") {
-    const paths = pathsFor(options.home);
-    const store = openStore({ paths });
-    try {
-      if (command === "memory") {
-        const action = options.args[0] || "list";
-        if (action === "promote") {
-          const promoted = store.promoteLesson({ lessonId: options.args[1], projectId: options.args[2] || null });
-          console.log(JSON.stringify({ command, action, lesson: promoted }, null, 2));
-        } else if (action === "explain") {
-          const reference = options.args[1];
-          if (!reference) throw new Error("memory explain requires a session id");
-          const trace = store.explainMemory(reference);
-          if (!trace) throw new Error(`feedback memory session not found: ${reference}`);
-          const outputTrace = options.args.includes("--verbose") ? trace : { ...trace };
-          if (!options.args.includes("--verbose")) delete outputTrace.events;
-          console.log(JSON.stringify({ command, action, trace: outputTrace }, null, 2));
-        } else {
-          const rows = store.selectLessons({ projectId: action === "list" ? (options.args[1] || null) : null });
-          console.log(JSON.stringify({ command, action, lessons: rows }, null, 2));
-        }
-      } else if (command === "capture") {
-        const action = options.args[0] || "status";
-        const current = action === "on" || action === "off"
-          ? store.setCapturePolicy({ enabled: action === "on", revision: Date.now() })
-          : store.getCapturePolicy();
-        console.log(JSON.stringify({ command, action: options.args[0] || "status", policy: current }, null, 2));
-      } else {
-        const action = options.args[0] || "status";
-        if (action === "run") {
-          const days = Number(process.env.AGENT_FEEDBACK_LOOP_RETENTION_DAYS || 10);
-          const beforeMs = Date.now() - days * 24 * 60 * 60 * 1000;
-          const result = store.gcExpired({ beforeMs });
-          const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot }) });
-          const removedBlobs = await blobs.pruneUnreferenced(store.listEncryptedRawRefs(), { beforeMs });
-          console.log(JSON.stringify({ command, action, retentionDays: days, status: "completed", ...result, removedBlobCount: removedBlobs.length }, null, 2));
-        } else {
-          console.log(JSON.stringify({ command, action, status: "ready", retentionDays: Number(process.env.AGENT_FEEDBACK_LOOP_RETENTION_DAYS || 10) }, null, 2));
-        }
-      }
     } finally {
       store.close();
     }

@@ -1,5 +1,29 @@
 # Legacy control-plane audit
 
+## Task 13 final disposition
+
+Task 13 removed the transitional runtime files `src/schema.mjs`,
+`src/store.mjs`, `src/receipt.mjs`, and `src/lessons.mjs`, together with their
+store, receipt, lesson, and schema-fixture tests. Normal runtime storage now
+opens only `control.sqlite3` through `initializeControlStore()` and
+`openControlStore()`. `paths.legacyDatabase` remains solely as the explicit
+input location for the read-only `legacy-export` command; `paths.storeFile` no
+longer exists and no normal runtime path opens the legacy database.
+
+The old receipt renderer/delivery API is deleted. The only transferred behavior
+is `stripSyntheticAflControlText()` in `feedback-signal.mjs`: it removes an
+exact adjacent visible AFL line and canonical marker, while preserving quoted,
+fenced, fabricated, mismatched, and mixed business text as evidence.
+
+| Old family | Final disposition | Replacement or retained boundary |
+| --- | --- | --- |
+| notification and receipt delivery | Deleted; no delivery transport or receipt state remains. | Prompt-only orchestration from Task 3; no replacement delivery API. |
+| episode batching and maintenance | Deleted; no episode router, maintenance command, or maintenance table remains. | No replacement: rejected architecture. |
+| resident scheduler and reconciliation | Deleted; no scheduler import, LaunchAgent health, or resident reconciliation remains. | Detached reviewer recovery from Tasks 6 and 9 only. |
+| lesson/card, report, and long-term database bodies | Deleted from runtime. | Published Markdown documents from Tasks 8–10. |
+| capture-policy toggle and memory hold | Deleted/rejected; no user-controlled capture switch or `memory_overflow_hold` survives. | Canonical pre-side-effect validation and bounded control context. |
+| legacy database reads | Retained only in `src/legacy-export.mjs`; tests may use its offline fixture. | Task 12 read-only exporter. |
+
 ## Scope and method
 
 This audit records every runtime-affecting path changed by
@@ -30,5 +54,7 @@ Task 1 runtime addition is a separate `control.sqlite3`; it uses no legacy
 DDL, performs no legacy import, and must never open `feedback-loop.sqlite3`.
 No notification, receipt/Stop/hookPrompt, episode, maintenance, resident
 scheduler, or long-term SQLite-content path is a permitted dependency of the
-new control store. Task 13 remains responsible for deleting the transitional
-legacy runtime once every consumer has moved.
+new control store. Task 13 has deleted the transitional legacy runtime after
+every normal consumer moved. The remaining legacy database access is the
+explicit, read-only Task 12 exporter boundary described above; it is not a
+normal runtime dependency.

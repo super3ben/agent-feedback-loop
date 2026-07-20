@@ -236,6 +236,41 @@ test("fresh control schema contains only transient tables", () => {
   store.close();
 });
 
+test("new control directories and database are private", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  assert.equal(statSync(paths.dataRoot).mode & 0o777, 0o700);
+  assert.equal(statSync(path.dirname(paths.controlDatabase)).mode & 0o777, 0o700);
+  assert.equal(statSync(paths.controlDatabase).mode & 0o777, 0o600);
+  store.close();
+});
+
+test("control database transaction rollback leaves no partial session", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  store.database.exec("BEGIN IMMEDIATE");
+  try {
+    store.database.prepare("INSERT INTO sessions(session_uid, cli, project_id, context_epoch, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("rollback-session", "codex", "rollback-project", 1, "2026-07-20T00:00:00.000Z", "2026-07-20T00:00:00.000Z");
+    throw new Error("force rollback");
+  } catch (error) {
+    store.database.exec("ROLLBACK");
+    assert.equal(error.message, "force rollback");
+  }
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_uid = ?").get("rollback-session").count, 0);
+  store.close();
+});
+
+test("control database explicitly placed in WAL mode reopens", () => {
+  const { paths } = fixture();
+  const initialized = initializeControlStore({ paths });
+  assert.equal(String(initialized.database.prepare("PRAGMA journal_mode = WAL").get().journal_mode).toLowerCase(), "wal");
+  initialized.close();
+  const reopened = openControlStore({ paths });
+  assert.deepEqual(listUserTables(reopened.database), ALLOWED_CONTROL_TABLES);
+  reopened.close();
+});
+
 test("selected is not emitted", () => {
   const { paths } = fixture();
   let current = new Date("2026-07-20T01:00:00.000Z");

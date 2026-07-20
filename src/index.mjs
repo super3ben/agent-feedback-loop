@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
 import { createCodexHost } from "./codex-host.mjs";
 import { initializeControlStore } from "./control-store.mjs";
-import { SCHEMA_VERSION } from "./schema.mjs";
+import { SCHEMA_VERSION } from "./control-schema.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
@@ -88,7 +88,6 @@ export function pathsFor(home = os.homedir()) {
     keyRoot,
     controlDatabase: path.join(dataRoot, "store", "control.sqlite3"),
     legacyDatabase,
-    storeFile: legacyDatabase,
     blobRoot: path.join(dataRoot, "blobs", "sha256"),
     safetyProjection: path.join(dataRoot, "safety", "guard.json.mac"),
     exportsRoot: path.join(dataRoot, "exports"),

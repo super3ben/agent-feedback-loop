@@ -1,13 +1,20 @@
 import { createHash } from "node:crypto";
 import { lstat, open } from "node:fs/promises";
 
-import { stripReceiptControlText } from "./receipt.mjs";
-
 const DEFAULT_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_SIGNAL_AGE_MS = 15 * 60 * 1000;
 const MAX_REFERENT_CHARS = 16 * 1024;
 const TERMINAL_TURN_EVENTS = new Set(["task_complete", "turn_aborted"]);
 const STRUCTURAL_CANDIDATE_REASONS = new Set(["active_turn_steering", "prior_turn_interrupted"]);
+const SYNTHETIC_AFL_MARKER = /^<!--afl-receipt id=([a-f0-9]{64}) nonce=([a-f0-9]{16}) state=([a-z_]+)-->$/;
+const SYNTHETIC_AFL_VISIBLE_LINES = Object.freeze({
+  candidate_captured: /^\[AFL\] (?:已捕获反馈候选|Feedback candidate captured) · event=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_queued: /^\[AFL\] (?:后台反思已排队|Background review queued) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_completed: /^\[AFL\] (?:反思完成|Review completed) · severity=(?:Minor|Major|Critical|Blocker) · lessons=\d+ · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  reviewed_no_lesson: /^\[AFL\] (?:已复核，本次未形成长期经验|Reviewed; no long-term lesson was created) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  review_exhausted: /^\[AFL\] (?:反思失败，证据已保留并等待重试|Review failed; evidence retained for retry) · job=[a-f0-9]{6} · receipt=([a-f0-9]{6})$/,
+  lesson_delivered: /^\[AFL\] (?:已向本任务投递 \d+ 条历史经验|Delivered \d+ prior lessons to this task) · receipt=([a-f0-9]{6})$/
+});
 
 const REASON_ORDER = Object.freeze([
   "negative_evaluation",
@@ -63,6 +70,71 @@ function firstNonEmpty(...values) {
     if (text) return text;
   }
   return null;
+}
+
+function syntheticAflLines(text) {
+  const lines = [];
+  let start = 0;
+  while (start < text.length) {
+    const newline = text.indexOf("\n", start);
+    if (newline === -1) {
+      lines.push({ start, end: text.length, contentEnd: text.length, content: text.slice(start) });
+      break;
+    }
+    const contentEnd = newline > start && text[newline - 1] === "\r" ? newline - 1 : newline;
+    lines.push({ start, end: newline + 1, contentEnd, content: text.slice(start, contentEnd) });
+    start = newline + 1;
+  }
+  return lines;
+}
+
+function syntheticAflNonce(id, state, visibleLine) {
+  return createHash("sha256")
+    .update(`receipt-control:v2\u0000${id}\u0000${state}\u0000${visibleLine}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+// This deliberately recognizes only the historic, generated pair. It is not a
+// receipt API: malformed, quoted, fenced, or ordinary AFL prose stays evidence.
+export function stripSyntheticAflControlText(text) {
+  const source = String(text ?? "");
+  const lines = syntheticAflLines(source);
+  const removals = [];
+  let fence = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const visibleLine = lines[index].content;
+    if (fence) {
+      const closing = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(visibleLine);
+      if (closing && closing[1][0] === fence.character && closing[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const opening = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(visibleLine);
+    if (opening && !(opening[1][0] === "`" && opening[2].includes("`"))) {
+      fence = { character: opening[1][0], length: opening[1].length };
+      continue;
+    }
+    const markerLine = lines[index + 1];
+    const marker = SYNTHETIC_AFL_MARKER.exec(markerLine?.content || "");
+    if (!marker) continue;
+    const [, id, nonce, state] = marker;
+    const visible = SYNTHETIC_AFL_VISIBLE_LINES[state]?.exec(visibleLine);
+    if (!visible || visible[1] !== id.slice(0, 6) || nonce !== syntheticAflNonce(id, state, visibleLine)) continue;
+    removals.push({
+      start: index === 0 ? lines[index].start : lines[index - 1].contentEnd,
+      end: index === 0 ? markerLine.end : markerLine.contentEnd
+    });
+    index += 1;
+  }
+  if (removals.length === 0) return { text: source, syntheticOnly: false };
+  let stripped = "";
+  let cursor = 0;
+  for (const removal of removals) {
+    stripped += source.slice(cursor, removal.start);
+    cursor = removal.end;
+  }
+  stripped += source.slice(cursor);
+  return { text: stripped, syntheticOnly: !stripped.trim() };
 }
 
 export function lengthPrefixedUtf8Sha256(values) {
@@ -153,9 +225,9 @@ async function readOwnedTranscriptTail(file, maxBytes) {
 }
 
 function assistantReferent(message, { cli, turnId = null, timestamp = null } = {}) {
-  const text = stripReceiptControlText(
+  const text = stripSyntheticAflControlText(
     outputTextFromAssistantContent(message?.content ?? message?.text ?? message?.message)
-  ).trim();
+  ).text.trim();
   if (!text) return null;
   const eventUid = firstNonEmpty(
     message.event_uid,
@@ -335,7 +407,7 @@ function isSyntheticAflControl(payload, userText) {
   const text = String(userText ?? "");
   if (/<\/?hook_prompt\b/iu.test(text)) return true;
   if (/Output this receipt verbatim before stopping:/iu.test(text) && /(?:\[AFL\]|<!--afl-receipt\b)/u.test(text)) return true;
-  return Boolean(text.trim()) && !stripReceiptControlText(text).trim();
+  return Boolean(text.trim()) && stripSyntheticAflControlText(text).syntheticOnly;
 }
 
 export async function detectFeedbackCandidate({

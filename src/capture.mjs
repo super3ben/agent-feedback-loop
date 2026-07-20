@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 
-import { ControlStoreError, normalizeCaptureIdentity, prepareCapture } from "./control-store.mjs";
+import { ControlStoreError, prepareCapture } from "./control-store.mjs";
 import {
   classifyRetrospectiveEvidence,
   lengthPrefixedUtf8Sha256,
   outputTextFromAssistantContent,
   readDirectAssistantReferent,
   roleValidatedAssistantMessage,
-  textFromValue
+  textFromValue,
+  stripSyntheticAflControlText
 } from "./feedback-signal.mjs";
-import { stripReceiptControlText } from "./receipt.mjs";
 
 const SECRET_PATTERNS = [
   { name: "token", pattern: /(token|api[_-]?key|secret)\s*[=:]\s*([^\s,;]+)/gi },
@@ -314,7 +314,7 @@ export function normalizeStopEvent({ cli, payload, installationId = "unknown", c
   const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
   const nativeTurn = String(input.turn_id || input.turnId || input.native_turn || "unknown");
   const sourceEventId = String(input.event_id || input.eventId || `stop:${nativeTurn}`);
-  const text = stripReceiptControlText(input.last_assistant_message || input.assistant_response || input.prompt_response || input.response || input.output || input.transcript_excerpt || "");
+  const text = stripSyntheticAflControlText(input.last_assistant_message || input.assistant_response || input.prompt_response || input.response || input.output || input.transcript_excerpt || "").text;
   const redacted = redactText(text);
   const eventSeq = Number.parseInt(createHash("sha256").update(`stop\u0000${sourceEventId}`).digest("hex").slice(0, 8), 16) || 1;
   const projectId = input.cwd || input.project_id || `unscoped:${cli}:${createHash("sha256").update(nativeSessionId).digest("hex").slice(0, 16)}`;
@@ -377,66 +377,11 @@ async function capturePreparedControlSession({ store, blobs, preparedCapture, ra
 }
 
 export async function captureSession({ store, blobs, event, rawText }) {
-  if (typeof store.resolveOrInsertCapture === "function") {
-    const preparedCapture = prepareCapture({ event, rawText });
-    return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
-  }
-  store.assertCaptureAllowed(event);
-  const rawContentHash = createHash("sha256").update(String(rawText)).digest("hex");
-  const blobPath = await blobs.write(rawContentHash, rawText);
-  event.encrypted_raw_ref = blobPath;
-  // A content-addressed blob may already be referenced by an earlier event.
-  // Never remove it on an index conflict; retention GC owns deletion.
-  const captureResult = store.captureSessionEvent(event);
-  // GC can unlink an old zero-reference content-addressed file between the
-  // initial write and the SQLite insert. Re-check after the durable reference
-  // exists; a concurrent GC will now observe the reference and leave it alone.
-  await blobs.write(rawContentHash, rawText);
-  return { event, blobPath, ...captureResult };
-}
-
-function isConstraintError(error) {
-  return String(error?.code || "").startsWith("ERR_SQLITE_CONSTRAINT")
-    || (error?.code === "ERR_SQLITE_ERROR" && /UNIQUE|constraint/i.test(error.message || ""));
+  const preparedCapture = prepareCapture({ event, rawText });
+  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
 }
 
 export async function captureObservedSession({ store, blobs, event, rawText }) {
-  if (typeof store.resolveOrInsertCapture === "function") {
-    const preparedCapture = prepareCapture({ event, rawText });
-    return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
-  }
-  const identity = normalizeCaptureIdentity(event, { requireEventIdentity: true });
-  store.assertCaptureAllowed(event);
-  const observationInput = {
-    ...identity,
-    provider: identity.source_provider,
-    sourceNamespace: identity.source_namespace,
-    sourceId: identity.source_id,
-    sourceEventId: identity.source_event_id,
-    sourceOffset: identity.source_offset,
-    captureSource: identity.capture_source,
-    sessionUid: identity.session_uid,
-    contextEpoch: identity.context_epoch,
-    eventUid: identity.event_uid,
-    referentEventUid: identity.referent_event_uid,
-    nativeTurnId: identity.native_turn_id,
-    contentHash: identity.content_hash,
-    sourceTimestamp: identity.source_timestamp
-  };
-  const existing = store.resolveEventObservation(observationInput);
-  if (existing) return { event, eventUid: existing.event_uid, duplicate: true, observation: existing, blobPath: existing.encrypted_raw_ref || null };
-  try {
-    const captured = await captureSession({ store, blobs, event, rawText });
-    return {
-      ...captured,
-      eventUid: captured.event_uid || event.event_uid,
-      duplicate: captured.duplicate === true,
-      observation: null
-    };
-  } catch (error) {
-    if (!isConstraintError(error)) throw error;
-    const raced = store.resolveEventObservation(observationInput);
-    if (!raced) throw error;
-    return { event, eventUid: raced.event_uid, duplicate: true, observation: raced, blobPath: raced.encrypted_raw_ref || null };
-  }
+  const preparedCapture = prepareCapture({ event, rawText });
+  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
 }
