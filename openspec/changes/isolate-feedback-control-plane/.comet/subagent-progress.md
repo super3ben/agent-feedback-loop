@@ -86,7 +86,9 @@
 - Fix architecture: replace precedence-only canonical alias reads with one conflict-validating alias invariant, and make alias attachment and exact replay share one target-compatibility rule that includes completeness before candidate bounding
 - Fix scope: `src/control-store.mjs` and `test/control-store.test.mjs` only; preserve observation-specific alias identity, schema v1, public/direct APIs, Markdown truth, and the disabled live-hook boundary
 - Dirty-worktree attribution: `.superpowers/sdd/task-1-report.md` remains the prior agents' append-only in-scope handoff; the new implementer must append its own section and leave the report uncommitted
-- Next action: dispatch a fresh TDD implementer for the authorized identity-coherence fix, then one fresh independent Task 1 re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Fix base: `e08ed2c0bec45be2a1431a8858120efb3404f301`
+- Fix dispatch: fresh implementer `/root/task1_identity_coherence_fix` is executing the authorized review-10 correction with TDD; allowed production/test scope is exactly `src/control-store.mjs` and `test/control-store.test.mjs`
+- Next action: wait for the implementer result, verify its commit/report/scope, then dispatch one fresh independent Task 1 re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
