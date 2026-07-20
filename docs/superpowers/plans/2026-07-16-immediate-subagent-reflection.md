@@ -1480,13 +1480,23 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 **Files:**
 - Replace: `src/selector.mjs`
 - Modify: `src/cli.mjs`
+- Modify: `src/reflection-document.mjs`
 - Modify: `test/selector.test.mjs`
 - Modify: `test/cli.test.mjs`
+- Modify: `test/reflection-document.test.mjs`
 
 **Interfaces:**
 - Produces: `loadReflectionDocuments({ projectDir, publishedBefore, maxFileBytes }) -> { documents, omissions }`, implemented as the selector-facing projection of `readReflectionCatalog()`
 - Produces: `selectReflections({ documents, prompt, session, task, budget, priorEmissions, publishedBefore }) -> { guidance, selected, omissions, tokenEstimate }`
 - Produces: omission reasons `not_applicable`, `count_budget`, `token_budget`, `oversized_document`, `legacy_incomplete`, `family_projection`, `prior_emission`, `parse_error`, `published_after_cutoff`, `catalog_limit`
+
+**Frozen Task 10 preflight decisions:**
+- `readReflectionCatalog()` adds the SHA-256 of the exact bytes already read through its bounded `O_NOFOLLOW` handle to each eligible document. This is the only Task 8-layer extension: selector code must not reopen files, duplicate parsing, or add a cache/index.
+- Catalog omissions map deterministically as follows: `file_too_large -> oversized_document`, `max_files_exceeded -> catalog_limit`, `legacy_incomplete -> legacy_incomplete`, `published_after_cutoff -> published_after_cutoff`, and every other unsafe/invalid catalog result to `parse_error`. Diagnostic identities are opaque hashes, not report text or absolute paths.
+- The exact Task 10 pipeline below governs the older high-level design prose: applicability precedes family projection; recurrence counts every complete loaded document in the family, while the projected method is the newest applicable document by `(createdAt, reflectionId)`.
+- A distinct normalized `task.paths` or `task.tools` value adds 8 only when it exactly equals a normalized `applies_when`, `class_of_mistake`, `method_class`, or individual `method_change` value. Prompt lexical overlap remains independently required when there is no such metadata match.
+- The prompt hook passes the normalized event's prompt/session/context/task/path/tool fields, an empty `priorEmissions` list until Task 11, and optional injected lower-only limits clamped to the hard defaults. It adds guidance through the existing native response envelope `{ ...(continue), hookSpecificOutput: { hookEventName, additionalContext } }`; an empty or failed selection remains the host no-op.
+- The explicit legacy `memory list` command may continue calling the old store's `selectLessons()` until Task 13. Task 10 removes that symbol only from the selector and prompt-hook path; it does not disguise or prematurely delete the isolated migration surface.
 
 - [ ] **Step 1: Write direct-document RED tests**
 
@@ -1510,7 +1520,7 @@ Add deterministic repeat, oversized plus safe sibling, one family with three doc
 
 - [ ] **Step 2: Run RED**
 
-Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs`
+Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs test/cli.test.mjs`
 
 Expected: FAIL because the current selector reads database lesson cards and returns `memory_overflow_hold` for severe count/size.
 
@@ -1534,18 +1544,18 @@ Compute relevance without embeddings: normalize unique lowercase Latin word toke
 
 - [ ] **Step 4: Run focused tests and verify the hold symbol is gone**
 
-Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs`
+Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs test/cli.test.mjs`
 
 Expected: PASS.
 
-Run: `rg -n 'memory_overflow_hold|selectLessons|compileLessonCard' src/selector.mjs src/cli.mjs test/selector.test.mjs test/cli.test.mjs`
+Run: `rg -n 'memory_overflow_hold|compileLessonCard|legacyMemoryStore' src/selector.mjs src/cli.mjs test/selector.test.mjs test/cli.test.mjs`
 
-Expected: no active selector/prompt matches. The legacy `lessons.mjs` remains only for the isolated old store until Task 13.
+Expected: no matches. Then run `rg -n 'selectLessons' src/selector.mjs test/selector.test.mjs`; expected: no matches. A separate `rg -n 'selectLessons' src/cli.mjs` may show only the explicit legacy `memory list` command outside the prompt-hook path. The legacy `lessons.mjs` and old store remain isolated until Task 13.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/selector.mjs src/cli.mjs test/selector.test.mjs test/cli.test.mjs
+git add src/selector.mjs src/cli.mjs src/reflection-document.mjs test/selector.test.mjs test/cli.test.mjs test/reflection-document.test.mjs
 git commit -m "feat: select guidance directly from reflection documents"
 ```
 
