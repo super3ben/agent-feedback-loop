@@ -20,7 +20,7 @@
 | 9. Reviewer runner terminal outcomes | complete (frozen) | `1497203`; fix `f1bc209` | APPROVED; Critical 0, Important 0, Minor 0, Backlog 0; both Guard loops closed | initial RED 93/98; fix RED 7/12; focused 147/147; full 302/302; fresh reviewer 5/5; native macOS detached proof |
 | 10. Deterministic Markdown Top-K | complete (frozen) | `7d927bb`, test closeout `11e0cb9`, fix `41c7ea7` | APPROVED; Critical 0, Important 0, Minor 0; Guard loop closed | initial RED 30/43; fix RED 0/1; focused+store 100/100; full 301/301; native macOS proof |
 | 11. Selected/emitted/recurrence evidence | complete (frozen) | `41e32fd` | APPROVED; Critical 0, Important 0, Minor 0, Backlog 0; no Guard finding opened | RED 0/5 plus 0/3; focused 8/8; affected 131/131; full 309/309; reviewer novel probe passed |
-| 12. Read-only legacy export | pending | pending | pending | pending |
+| 12. Read-only legacy export | complete (frozen) | `049c598`, fix `8954176` | APPROVED; Critical 0, Important 0, Minor 0, Backlog 0; Guard loop closed | focused 62/62; full 333/333; native disposable macOS CLI proof |
 | 13. Delete transitional legacy runtime | pending | pending | pending | pending |
 | 14. Doctor/logs/docs/package | pending | pending | pending | pending |
 | 15. End-to-end macOS/Linux build proof | pending | pending | pending | pending |
