@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { access, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -54,6 +55,23 @@ test("install initializes only the lean control database", async () => {
   assert.equal(await readFile(paths.legacyDatabase, "utf8"), "legacy-sentinel");
 });
 
+test("fresh install is prompt-only", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-prompt-only-install-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const codex = await readFile(paths.codexConfig, "utf8");
+  const claude = JSON.parse(await readFile(paths.claudeSettings, "utf8"));
+  const gemini = JSON.parse(await readFile(paths.geminiSettings, "utf8"));
+
+  assert.equal([...codex.matchAll(/^\[\[hooks\.([^\].]+)\]\]$/gm)].map((match) => match[1]).includes("Stop"), false);
+  assert.equal(claude.hooks.Stop?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("feedback-loop"))) ?? false, false);
+  assert.equal(gemini.hooks.AfterAgent?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("feedback-loop"))) ?? false, false);
+  assert.equal(existsSync(path.join(paths.packRoot, "hooks", "stop-hook.sh")), false);
+  assert.equal("stopHook" in paths, false);
+  assert.equal("reconcileLaunchAgent" in paths, false);
+  assert.equal("reconcileLog" in paths, false);
+});
+
 test("stable launcher resolves an atomically selected versioned runtime", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-current-runtime-"));
   await install({ home });
@@ -67,18 +85,14 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.equal(current.schemaVersion, 9);
 });
 
-test("installed Stop templates contain capture only and no receipt backstop", async () => {
-  const home = await mkdtemp(path.join(tmpdir(), "afl-stop-template-"));
+test("installed prompt wrapper has no legacy queue or control transport", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-prompt-template-"));
   await install({ home });
   const paths = pathsFor(home);
-  const stopHook = await readFile(paths.stopHook, "utf8");
   const coreHook = await readFile(paths.coreHook, "utf8");
 
-  for (const template of [stopHook, coreHook]) {
-    assert.doesNotMatch(template, /backstop/i);
-    assert.doesNotMatch(template, /decision["'= :]+block/i);
-    assert.doesNotMatch(template, /Output this receipt verbatim before stopping/i);
-  }
+  assert.match(coreHook, /"\$runtime_launcher" hook "\$@"/);
+  assert.doesNotMatch(coreHook, /trigger-rules|QUEUE_DIR|backstop|receipt|reviewer|notification/i);
 });
 
 test("remove-files removes runtime but preserves durable data and keys", async () => {

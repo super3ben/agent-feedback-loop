@@ -202,7 +202,7 @@ function hookSummary(hook) {
   };
 }
 
-export function assessCodexHookListing({ listing, cwd, home, promptCommand, backstopCommand }) {
+export function assessCodexHookListing({ listing, cwd, home, promptCommand }) {
   const rows = Array.isArray(listing?.data) ? listing.data : [];
   const target = rows.find((row) => row?.cwd && canonicalPath(row.cwd) === canonicalPath(cwd));
   if (!target) {
@@ -212,7 +212,6 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand, back
       runnable: false,
       status: "cwd_missing",
       prompt: hookSummary(null),
-      backstop: hookSummary(null),
       warnings: [],
       errors: []
     };
@@ -226,15 +225,13 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand, back
     && canonicalPath(hook.sourcePath) === canonicalPath(expectedSourcePath)
     && hook?.command === command;
   const promptHook = hooks.find((hook) => matchesIdentity(hook, "userPromptSubmit", promptCommand));
-  const backstopHook = hooks.find((hook) => matchesIdentity(hook, "stop", backstopCommand));
   const prompt = hookSummary(promptHook);
-  const backstop = hookSummary(backstopHook);
-  const configured = prompt.found && backstop.found;
-  const runnable = configured && prompt.runnable && backstop.runnable;
+  const configured = prompt.found;
+  const runnable = configured && prompt.runnable;
   let status = "trusted";
   if (!configured) status = "missing";
   else if (!runnable) {
-    const statuses = [prompt.trustStatus, backstop.trustStatus];
+    const statuses = [prompt.trustStatus];
     status = statuses.includes("modified") ? "modified"
       : statuses.includes("untrusted") ? "untrusted"
         : statuses.includes("missing") ? "missing"
@@ -246,7 +243,6 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand, back
     runnable,
     status,
     prompt,
-    backstop,
     warnings: target.warnings || [],
     errors: target.errors || []
   };
@@ -262,7 +258,6 @@ function unavailableAssessment(error) {
     activeDesktopState: "not_observed",
     reason: boundedReason(error),
     prompt: { found: false, enabled: false, trustStatus: "unknown", runnable: false },
-    backstop: { found: false, enabled: false, trustStatus: "unknown", runnable: false },
     warnings: [],
     errors: []
   };
@@ -300,7 +295,7 @@ export function createCodexHost(options = {}) {
         if (!before.configured) return { ...before, hostCommand, inspectionScope: "spawned_app_server", activeDesktopState: "not_observed" };
         if (!before.runnable) {
           const state = {};
-          for (const hook of [before.prompt, before.backstop]) {
+          for (const hook of [before.prompt]) {
             if (!hook.key || !hook.currentHash) continue;
             state[hook.key] = { trusted_hash: hook.currentHash, enabled: true };
           }
