@@ -78,3 +78,23 @@ git diff --check
 - This task does not establish Linux field acceptance, live provider behavior on
   every supported CLI, or desktop-task hot-reload acceptance. Documentation states
   those limits explicitly.
+
+## Guarded review closeout
+
+- Formal review `isolate-feedback-control-plane-task-14-v2-review-1` reported four
+  Important invariants: incomplete doctor readiness, content-shaped family logging,
+  false successful-launch diagnostics, and a missing post-claim failure event.
+- The first three consumed generation-1 local-fix receipts. The terminal-event
+  invariant returned `blocked_direction_review`; its recorded checkpoint selected
+  exactly one new fixed event, `review_failed`, and consumed one architecture-fix
+  receipt before implementation.
+- Fix commit `d14731c` changed only `src/index.mjs`, `src/cli.mjs`,
+  `test/cli.test.mjs`, and the fixed-event design list. Focused Task 14 regression
+  passed 50/50; the full suite passed 264/264; package verification retained
+  version 0.8.0 and 31 files with no removed control-plane artifact.
+- A real macOS disposable-HOME install plus `doctor --live` returned the exact six
+  status families, available control store/reflection directory,
+  `legacyStopRemoved: true`, and `ready: true`. Real HOME was not modified.
+- Frozen re-review `isolate-feedback-control-plane-task-14-v2-rereview-1` returned
+  APPROVED with Critical/Important/Minor/Backlog all zero. All four Guard loops are
+  closed without resetting their failure history.

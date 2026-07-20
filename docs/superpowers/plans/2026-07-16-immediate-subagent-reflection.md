@@ -1794,7 +1794,7 @@ git commit -m "refactor: remove the legacy feedback runtime"
 
 ### Task 14: 收敛 doctor、日志、安装文档和包内容
 
-- [ ] **Task 14 complete: 收敛 doctor、日志、安装文档和包内容**
+- [x] **Task 14 complete: 收敛 doctor、日志、安装文档和包内容**
 
 **Files:**
 - Modify: `src/index.mjs:560-680`
@@ -1821,7 +1821,7 @@ git commit -m "refactor: remove the legacy feedback runtime"
 - Export one runtime version constant from `src/index.mjs` and set it with `package.json` to exactly `0.8.0`; installed versioned paths/current metadata and doctor read that same constant. Do not create a package lock or compatibility alias for `0.7.6`.
 - Rewrite the English/Chinese README and installed rule to describe only the implemented prompt-only pipeline: immediate detached reviewer, immutable project Markdown, later-prompt cutoff, lean control DB, no Stop/session receipt/status output, no RAG/resident scheduler, macOS/Linux support, explicit read-only legacy export, hooks-disabled rollback, and authorization boundaries. Do not claim Task 15 Linux/live-provider/desktop acceptance before its evidence exists.
 
-- [ ] **Step 1: Write RED doctor, log-privacy and pack-content tests**
+- [x] **Step 1: Write RED doctor, log-privacy and pack-content tests**
 
 ```js
 assert.deepEqual(Object.keys(doctor.status).sort(), [
@@ -1837,13 +1837,13 @@ Add `npm pack --dry-run --json` assertions that deleted modules/templates are ab
 
 Add adversarial logger inputs in which a caller passes prompt/report text through an allowed key such as `reason` or `document`; assert the logger emits `invalid_reason_code`/an opaque hash rather than trusting the field name alone.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='doctor reports only the prompt and document pipeline|structured logs never contain content|package excludes removed control plane files' test/runtime.test.mjs test/cli.test.mjs`
 
 Expected: FAIL because doctor/package/docs still describe scheduler, receipt, lesson DB and Stop behavior.
 
-- [ ] **Step 3: Implement bounded diagnostic surfaces and update documentation**
+- [x] **Step 3: Implement bounded diagnostic surfaces and update documentation**
 
 Use an allowlist logger:
 
@@ -1857,7 +1857,7 @@ export function structuredLog(event, fields) {
 
 `validateLogFields` must enforce enum event/reason/result codes, opaque id/hash patterns and bounded non-negative integers; unknown or content-shaped values are replaced by fixed reason codes, never truncated raw text. Document the exact timing boundary: current prompt never waits; the publication cutoff guarantees a valid document can affect only a later matching prompt. Explain direct Markdown selection, control DB/legacy DB separation, no RAG/scheduler, macOS/Linux support, dry-run/export/apply procedure, troubleshooting, rollback to hooks-disabled state and explicit live-install authorization.
 
-- [ ] **Step 4: Run tests and packaging checks**
+- [x] **Step 4: Run tests and packaging checks**
 
 Run: `node --test test/runtime.test.mjs test/cli.test.mjs`
 
@@ -1867,7 +1867,7 @@ Run: `npm pack --dry-run --json`
 
 Expected: exit 0; file list contains no deleted control-plane artifact.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/index.mjs src/cli.mjs package.json README.md README-zh.md templates/rules/feedback-loop.md test/runtime.test.mjs test/cli.test.mjs
