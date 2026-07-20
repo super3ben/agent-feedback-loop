@@ -892,7 +892,7 @@ git commit -m "feat: add immediate reviewer job control"
 
 ### Task 3: 删除 Stop、notification、reconcile 与会话控制入口
 
-- [ ] **Task 3 complete: 删除 Stop、notification、reconcile 与会话控制入口**
+- [x] **Task 3 complete: 删除 Stop、notification、reconcile 与会话控制入口**
 
 **Files:**
 - Modify: `src/index.mjs:20-675`
@@ -920,7 +920,7 @@ git commit -m "feat: add immediate reviewer job control"
 - Produces: doctor fields `promptHook`, `controlStore`, `reflectionDirectory`, `reviewerProvider`, `legacyStopRemoved`
 - Removes: CLI `capture-stop`, `reconcile`, `reconcile-daemon`, receipt commands and notifier APIs
 
-- [ ] **Step 1: Write installer and CLI RED tests**
+- [x] **Step 1: Write installer and CLI RED tests**
 
 ```js
 assert.equal(codexManagedEvents(config).includes("Stop"), false);
@@ -933,13 +933,13 @@ assert.doesNotMatch(help.stdout, /capture-stop|reconcile-daemon|receipt/);
 
 Add upgrade fixtures containing an AFL-managed Stop entry plus an unrelated user Stop entry; assert only the AFL entry is removed.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='fresh install is prompt-only|upgrade removes only the managed AFL Stop hook|CLI exposes no receipt or reconcile control plane' test/runtime.test.mjs test/cli.test.mjs test/e2e-smoke.test.mjs`
 
 Expected: FAIL because current installer still copies `stop-hook.sh`, installs a launchd scheduler and exposes receipt/reconcile commands.
 
-- [ ] **Step 3: Remove obsolete runtime modules and managed entries**
+- [x] **Step 3: Remove obsolete runtime modules and managed entries**
 
 Keep each host's native prompt response schema but delete all Stop definitions and scheduler lifecycle code. The managed Codex block must contain one `UserPromptSubmit` hook only. Claude/Gemini JSON patching must filter AFL-owned Stop entries while preserving unrelated entries. Update `assessCodexHookListing()` and synchronization so configured/runnable status depends only on that prompt hook and never expects or trusts a backstop.
 
@@ -947,13 +947,13 @@ Reduce `core-hook.sh` to the stable runtime launcher plus bounded fail-open hand
 
 Retain existing stable runtime resolution and symlink protections. Delete obsolete notification/reconcile files rather than leaving disabled imports or CLI branches. The legacy `store.mjs`/`schema.mjs`/`receipt.mjs` remain temporarily isolated only because later migration tasks still replace their consumers; Task 13 must delete them and proves no imports remain.
 
-- [ ] **Step 4: Run focused package tests**
+- [x] **Step 4: Run focused package tests**
 
 Run: `node --test test/runtime.test.mjs test/cli.test.mjs test/e2e-smoke.test.mjs test/codex-host.test.mjs`
 
 Expected: PASS; no test invokes an AFL Stop hook, notification transport or reconcile daemon. Capture-only synthetic-control parsing may still exercise the temporary legacy receipt parser until Task 13.
 
-- [ ] **Step 5: Verify deleted symbols are gone and commit**
+- [x] **Step 5: Verify deleted symbols are gone and commit**
 
 Run: `rg -n 'notification_deliver|afl-receipt|hookPrompt|capture-stop|reconcile-daemon|memory_maintenance|feedback_episode' src/cli.mjs src/index.mjs templates/hooks test/runtime.test.mjs test/cli.test.mjs test/e2e-smoke.test.mjs`
 
