@@ -8,7 +8,7 @@
 
 | Task | Status | Implementation | Review | Verification |
 | --- | --- | --- | --- | --- |
-| 1. Lean control DB | reviewing identity-coherence fix | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`; design `e1732a8`; plan `c6f984f` | fresh independent review pending | Review-10 fix is GREEN 22/22 focused and 157/157 four-file regression with a NO_BLOCKER read-only audit; task remains unchecked until formal review |
+| 1. Lean control DB | reviewing identity-coherence fix | `4a1791a`, `aa770c6`, `864240b`, `9e62862`, `44acbfd`, `5053dda`, `d11cb8a`, `535704d`, `da19db1`, `9fb6cd6`, `88c2c4b`; design `e1732a8`; plan `c6f984f` | review-11 in progress via fresh independent reviewer | Review-10 fix is GREEN 22/22 focused and 157/157 four-file regression with a NO_BLOCKER read-only audit; task remains unchecked until formal review |
 | 2. Immediate job and fenced lease APIs | pending | pending | pending | pending |
 | 3. Remove Stop/notification/reconcile | pending | pending | pending | pending |
 | 4. Explicit dissatisfaction detector | pending | pending | pending | pending |
