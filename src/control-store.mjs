@@ -783,6 +783,27 @@ function createStore(database, now) {
       const timestamp = current.toISOString();
       const nextLaunchAt = new Date(current.getTime() + safeCooldownMs).toISOString();
       return transaction(() => {
+        const exhausted = database.prepare(`UPDATE reviewer_jobs
+          SET state='failed', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+              next_launch_at=NULL, completed_at=?, result_code=NULL,
+              error_code='attempts_exhausted'
+          WHERE job_id=? AND state='running' AND attempt>=?
+            AND lease_until IS NOT NULL AND lease_until<=?
+          RETURNING *`).get(timestamp, safeJobId, MAX_REVIEW_ATTEMPTS, timestamp);
+        if (exhausted) {
+          insertReviewJobEvent({
+            jobId: safeJobId,
+            eventType: "failed",
+            reasonCode: "attempts_exhausted",
+            leaseEpoch: Number(exhausted.lease_epoch),
+            timestamp
+          });
+          return {
+            launch: false,
+            launchEpoch: Number(exhausted.launch_epoch),
+            reason: "terminal"
+          };
+        }
         const reserved = database.prepare(`UPDATE reviewer_jobs
           SET launch_epoch=launch_epoch+1, next_launch_at=?
           WHERE job_id=? AND attempt<?
@@ -847,12 +868,13 @@ function createStore(database, now) {
       if (safeLimit === 0) return [];
       const timestamp = reviewTimestamp(at).toISOString();
       return database.prepare(`SELECT * FROM reviewer_jobs
-        WHERE attempt<? AND (next_launch_at IS NULL OR next_launch_at<=?) AND (
-          (state IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+        WHERE (next_launch_at IS NULL OR next_launch_at<=?) AND (
+          (state IN ('pending','retryable') AND attempt<?
+            AND (next_attempt_at IS NULL OR next_attempt_at<=?))
           OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
         )
         ORDER BY created_at, job_id LIMIT ?`).all(
-        MAX_REVIEW_ATTEMPTS, timestamp, timestamp, timestamp, safeLimit
+        timestamp, MAX_REVIEW_ATTEMPTS, timestamp, timestamp, safeLimit
       ).map((row) => ({ ...row }));
     },
     claimReviewJob({ jobId, ownerId, leaseMs = DEFAULT_REVIEW_LEASE_MS }) {

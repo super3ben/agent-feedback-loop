@@ -2564,6 +2564,69 @@ test("review failures retry after 30 and 120 seconds then exhaust at attempt thr
   fixture.store.close();
 });
 
+test("bounded recovery finalizes an expired third reviewer attempt exactly once", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "crashed-third-attempt-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:crashed-third-attempt:source:none"
+  });
+
+  const first = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-1" });
+  fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-1",
+    leaseEpoch: first.leaseEpoch,
+    reasonCode: "provider_timeout"
+  });
+  fixture.advance(30_000);
+  const second = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-2" });
+  fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-2",
+    leaseEpoch: second.leaseEpoch,
+    reasonCode: "provider_timeout"
+  });
+  fixture.advance(120_000);
+  const third = fixture.store.claimReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-3",
+    leaseMs: 1_000
+  });
+  fixture.advance(1_001);
+
+  const due = fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() });
+  assert.deepEqual(due.map((row) => row.job_id), [candidate.jobId]);
+  assert.deepEqual(
+    fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 }),
+    { launch: false, launchEpoch: 0, reason: "terminal" }
+  );
+
+  const exhausted = fixture.store.database.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?")
+    .get(candidate.jobId);
+  assert.equal(exhausted.state, "failed");
+  assert.equal(exhausted.attempt, 3);
+  assert.equal(exhausted.owner_id, null);
+  assert.equal(exhausted.lease_until, null);
+  assert.equal(exhausted.next_attempt_at, null);
+  assert.equal(exhausted.next_launch_at, null);
+  assert.equal(exhausted.completed_at, fixture.now().toISOString());
+  assert.equal(exhausted.error_code, "attempts_exhausted");
+
+  const failedEvents = () => fixture.store.database.prepare(`SELECT event_type, reason_code, lease_epoch
+    FROM review_job_events WHERE job_id=? AND event_type='failed'`).all(candidate.jobId);
+  assert.deepEqual(failedEvents().map((row) => ({ ...row })), [{
+    event_type: "failed",
+    reason_code: "attempts_exhausted",
+    lease_epoch: third.leaseEpoch
+  }]);
+  assert.deepEqual(fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() }), []);
+  assert.equal(fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 }).launch, false);
+  assert.equal(fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-4" }).job, null);
+  assert.equal(failedEvents().length, 1);
+  fixture.store.close();
+});
+
 test("recoverable review jobs are due, stable and hard-capped at eight", () => {
   const fixture = reviewJobFixture();
   for (let index = 0; index < 10; index += 1) {
