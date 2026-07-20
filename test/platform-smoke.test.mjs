@@ -307,12 +307,16 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
 
   const firstDocuments = await waitFor(async () => {
     const documents = await parsedReflections(projectDir);
-    if (documents.length === 1) return documents;
-    const [job] = reviewJobs(paths);
+    const jobs = reviewJobs(paths);
+    const [job] = jobs;
     if (realProvider && job?.error_code === "provider_unavailable") throw new Error("real_provider_unavailable");
     if (realProvider && job?.state === "reviewed_no_lesson") throw new Error("real_provider_no_lesson");
+    if (documents.length === 1 && jobs.length === 1 && jobs.every((current) => current.state === "published")) {
+      return documents;
+    }
     return null;
   }, { timeoutMs: realProvider ? 190_000 : 10_000, failureCode: realProvider ? "real_provider_timeout" : "deterministic_provider_timeout" });
+  assert.deepEqual(reviewJobs(paths).map((job) => job.state), ["published"]);
   const firstDocument = firstDocuments[0];
   assert.equal(firstDocument.parsed.eligible, true);
   assert.equal(firstDocument.parsed.canonical, true);
@@ -357,8 +361,12 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
 
   const documents = await waitFor(async () => {
     const current = await parsedReflections(projectDir);
-    return current.length === 2 ? current : null;
+    const jobs = reviewJobs(paths);
+    return current.length === 2 && jobs.length === 2 && jobs.every((job) => job.state === "published")
+      ? current
+      : null;
   }, { timeoutMs: 10_000, failureCode: "deterministic_recurrence_timeout" });
+  assert.deepEqual(reviewJobs(paths).map((job) => job.state), ["published", "published"]);
   const recurrence = documents.find((document) => document.parsed.effectiveness === "recurrence_after_emission");
   assert.ok(recurrence);
   assert.equal(recurrence.parsed.familyId, firstDocument.parsed.familyId);
