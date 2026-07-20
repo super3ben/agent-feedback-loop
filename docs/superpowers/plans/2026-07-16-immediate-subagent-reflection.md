@@ -1567,7 +1567,7 @@ git commit -m "feat: select guidance directly from reflection documents"
 
 ### Task 11: 分离 selected、emitted 与复发负向证据
 
-- [ ] **Task 11 complete: 分离 selected、emitted 与复发负向证据**
+- [x] **Task 11 complete: 分离 selected、emitted 与复发负向证据**
 
 **Files:**
 - Modify: `src/control-store.mjs`
@@ -1595,7 +1595,7 @@ git commit -m "feat: select guidance directly from reflection documents"
 - The original whole-tree forbidden-word scan is not executable before Task 13 because the isolated legacy store/schema and unrelated test variable names intentionally still contain those words. Task 11 instead scans the new control-plane runtime and affected tests for forbidden state/API literals; Task 13 owns removal of the explicitly isolated legacy runtime.
 - No content body is added to SQLite, and no cache, RAG/index, scheduler, service, Stop hook, live HOME mutation, or provider/runtime activation is in scope.
 
-- [ ] **Step 1: Write RED tests for the four truthful state boundaries**
+- [x] **Step 1: Write RED tests for the four truthful state boundaries**
 
 ```js
 const emissionId = store.recordReflectionSelected(selection);
@@ -1611,19 +1611,19 @@ assert.equal(store.getReflectionEmission(emissionId).outcome, "emitted");
 
 Add two same-family reviewer fixtures: one after a qualifying emitted timestamp yields `recurrence_after_emission`; one after publication with no emission remains ordinary recurrence and effectiveness `unknown`. Assert no API/state named `observed` or `effective` exists.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='selected is not emitted|successful host write records emitted|same family after emission is negative evidence|absence of recurrence remains unknown' test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs`
 
 Expected: FAIL because current delivery state uses lesson application/receipt observation semantics.
 
-- [ ] **Step 3: Implement emission ordering and recurrence annotation**
+- [x] **Step 3: Implement emission ordering and recurrence annotation**
 
 Create one selected row per application identity `(document_sha256, session_uid, context_epoch, task_fingerprint)`. Attempt selected-row insertion before the host write, but if that audit write fails, still return the already-built safe guidance and log `selection_record_failed`; audit failure cannot suppress business context. Write host JSON exactly once; only after the writer resolves, mark all successfully created rows emitted. A store failure after host output underclaims emission and logs `emission_record_failed`; it must not retry the host response.
 
 Before publishing a lesson result, query a prior same-family emitted record strictly earlier than the source event's captured timestamp. If found, append a controller-authored bounded repeated-pattern entry containing only the prior family/document hash and emitted timestamp, validate any provider `recurrence_of` ids against the same-family catalog, and set model field `effectiveness: recurrence_after_emission`; otherwise set `effectiveness: unknown`. An emission produced later in the same hook cannot qualify. This fact is rendered into the new Markdown, not inferred from silence.
 
-- [ ] **Step 4: Run focused regression and forbidden-state scan**
+- [x] **Step 4: Run focused regression and forbidden-state scan**
 
 Run: `node --test test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs test/reflection-document.test.mjs`
 
@@ -1633,7 +1633,7 @@ Run: `rg -n "[\"'](?:observed|effective|emitted_unconfirmed)[\"']|markReflection
 
 Expected: no matches in the new control-plane runtime or its affected tests. Legacy matches remain isolated until Task 13.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/control-store.mjs src/cli.mjs src/reviewer-runner.mjs src/reflection-document.mjs test/control-store.test.mjs test/cli.test.mjs test/reviewer-runner.test.mjs test/reflection-document.test.mjs
