@@ -1475,7 +1475,7 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 
 ### Task 10: 用 Markdown 文档实现确定性 Top-K 与 omission
 
-- [ ] **Task 10 complete: 用 Markdown 文档实现确定性 Top-K 与 omission**
+- [x] **Task 10 complete: 用 Markdown 文档实现确定性 Top-K 与 omission**
 
 **Files:**
 - Replace: `src/selector.mjs`
@@ -1500,7 +1500,7 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 - The explicit legacy `memory list` command may continue calling the old store's `selectLessons()` until Task 13. Task 10 removes that symbol only from the selector and prompt-hook path; it does not disguise or prematurely delete the isolated migration surface.
 - `test/store.test.mjs` must remain runnable between Tasks 10 and 13. Remove only its direct import of the replaced selector and the old `memory_overflow_hold` test now covered by `test/selector.test.mjs`; retain every legacy store invariant until Task 13 performs the audited transfer/deletion.
 
-- [ ] **Step 1: Write direct-document RED tests**
+- [x] **Step 1: Write direct-document RED tests**
 
 Create real Markdown fixtures through `renderReflectionMarkdown()` and cover:
 
@@ -1520,13 +1520,13 @@ assert.equal("hold" in result, false);
 
 Add deterministic repeat, oversized plus safe sibling, one family with three documents, incomplete legacy, Chinese/English relevance, zero-relevance exclusion and prior-emission fixtures. The family fixture must select only the newest eligible method and count recurrence from documents. Add a launcher race fixture through `handlePromptHook`: a document atomically published with `published_at === selectionPublishedBefore` is excluded from the current response and becomes eligible on the next matching prompt.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs test/cli.test.mjs`
 
 Expected: FAIL because the current selector reads database lesson cards and returns `memory_overflow_hold` for severe count/size.
 
-- [ ] **Step 3: Implement direct loading, total order and bounded guidance**
+- [x] **Step 3: Implement direct loading, total order and bounded guidance**
 
 Read only `*.md` regular files under the project reflection directory, reject symlinks, cap each read to `maxFileBytes`, enforce strict `published_at < publishedBefore`, and parse through Task 8. Apply the steps in this exact order: stable catalog parse/omissions; applicability (`relevanceScore > 0`); per-family newest complete document projection by `(createdAt, reflectionId)`; prior-emission suppression for the same `(document hash, session, context, task)`; rank; per-document budget; Top-K/total budget. Rank the projected documents with this exact tuple:
 
@@ -1544,7 +1544,7 @@ Use stable lexicographic comparison. Guidance contains only `applies_when`, `cla
 
 Compute relevance without embeddings: normalize unique lowercase Latin word tokens and unique overlapping CJK bigrams from the prompt; add 4 points for each intersection with `applies_when`, 3 for `class_of_mistake`, 2 for `method_class`, and 1 for `method_changes`, capped at 40. Exact normalized path/tool task metadata matches add 8 each. A zero score is `not_applicable`, never injected merely because it is severe. Estimate budget conservatively and deterministically: each CJK code point counts as one token, each Latin alphanumeric run as `ceil(length / 4)`, and each remaining non-whitespace code point as one. Default `maxFileBytes` is 131072, `maxCards` is 4, `maxDocumentTokens` is 320, and `maxTotalTokens` is 900; configuration may lower but not exceed these hard limits in the prompt hook.
 
-- [ ] **Step 4: Run focused tests and verify the hold symbol is gone**
+- [x] **Step 4: Run focused tests and verify the hold symbol is gone**
 
 Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs test/cli.test.mjs`
 
@@ -1558,7 +1558,7 @@ Run: `rg -n 'memory_overflow_hold|compileLessonCard|legacyMemoryStore' src/selec
 
 Expected: no matches. Then run `rg -n 'selectLessons' src/selector.mjs test/selector.test.mjs`; expected: no matches. A separate `rg -n 'selectLessons' src/cli.mjs` may show only the explicit legacy `memory list` command outside the prompt-hook path. The legacy `lessons.mjs` and old store remain isolated until Task 13.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/selector.mjs src/cli.mjs src/reflection-document.mjs test/selector.test.mjs test/cli.test.mjs test/reflection-document.test.mjs test/store.test.mjs
