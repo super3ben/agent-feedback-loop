@@ -1484,6 +1484,7 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 - Modify: `test/selector.test.mjs`
 - Modify: `test/cli.test.mjs`
 - Modify: `test/reflection-document.test.mjs`
+- Modify: `test/store.test.mjs` (remove only the obsolete selector/hold import and its replaced coverage)
 
 **Interfaces:**
 - Produces: `loadReflectionDocuments({ projectDir, publishedBefore, maxFileBytes }) -> { documents, omissions }`, implemented as the selector-facing projection of `readReflectionCatalog()`
@@ -1497,6 +1498,7 @@ git commit -m "feat: publish reviewer outcomes as markdown"
 - A distinct normalized `task.paths` or `task.tools` value adds 8 only when it exactly equals a normalized `applies_when`, `class_of_mistake`, `method_class`, or individual `method_change` value. Prompt lexical overlap remains independently required when there is no such metadata match.
 - The prompt hook passes the normalized event's prompt/session/context/task/path/tool fields, an empty `priorEmissions` list until Task 11, and optional injected lower-only limits clamped to the hard defaults. It adds guidance through the existing native response envelope `{ ...(continue), hookSpecificOutput: { hookEventName, additionalContext } }`; an empty or failed selection remains the host no-op.
 - The explicit legacy `memory list` command may continue calling the old store's `selectLessons()` until Task 13. Task 10 removes that symbol only from the selector and prompt-hook path; it does not disguise or prematurely delete the isolated migration surface.
+- `test/store.test.mjs` must remain runnable between Tasks 10 and 13. Remove only its direct import of the replaced selector and the old `memory_overflow_hold` test now covered by `test/selector.test.mjs`; retain every legacy store invariant until Task 13 performs the audited transfer/deletion.
 
 - [ ] **Step 1: Write direct-document RED tests**
 
@@ -1548,6 +1550,10 @@ Run: `node --test test/selector.test.mjs test/reflection-document.test.mjs test/
 
 Expected: PASS.
 
+Run: `npm test`
+
+Expected: PASS with zero failures; the transitional legacy store tests remain executable even though their obsolete selector/hold case has been removed.
+
 Run: `rg -n 'memory_overflow_hold|compileLessonCard|legacyMemoryStore' src/selector.mjs src/cli.mjs test/selector.test.mjs test/cli.test.mjs`
 
 Expected: no matches. Then run `rg -n 'selectLessons' src/selector.mjs test/selector.test.mjs`; expected: no matches. A separate `rg -n 'selectLessons' src/cli.mjs` may show only the explicit legacy `memory list` command outside the prompt-hook path. The legacy `lessons.mjs` and old store remain isolated until Task 13.
@@ -1555,7 +1561,7 @@ Expected: no matches. Then run `rg -n 'selectLessons' src/selector.mjs test/sele
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/selector.mjs src/cli.mjs src/reflection-document.mjs test/selector.test.mjs test/cli.test.mjs test/reflection-document.test.mjs
+git add src/selector.mjs src/cli.mjs src/reflection-document.mjs test/selector.test.mjs test/cli.test.mjs test/reflection-document.test.mjs test/store.test.mjs
 git commit -m "feat: select guidance directly from reflection documents"
 ```
 
