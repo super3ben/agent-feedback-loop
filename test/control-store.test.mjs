@@ -245,19 +245,23 @@ test("new control directories and database are private", () => {
   store.close();
 });
 
-test("control database transaction rollback leaves no partial session", () => {
+test("control capture mutation rolls back all writes when its second write aborts", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });
-  store.database.exec("BEGIN IMMEDIATE");
-  try {
-    store.database.prepare("INSERT INTO sessions(session_uid, cli, project_id, context_epoch, started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run("rollback-session", "codex", "rollback-project", 1, "2026-07-20T00:00:00.000Z", "2026-07-20T00:00:00.000Z");
-    throw new Error("force rollback");
-  } catch (error) {
-    store.database.exec("ROLLBACK");
-    assert.equal(error.message, "force rollback");
-  }
+  const rollbackEvent = event({
+    event_uid: "rollback-event",
+    session_uid: "rollback-session",
+    source_event_id: "rollback-source",
+    content_hash: "c".repeat(64),
+    encrypted_raw_ref: "/private/blobs/rollback.enc"
+  });
+  store.database.exec("CREATE TEMP TRIGGER abort_second_capture_write BEFORE INSERT ON session_events BEGIN SELECT RAISE(ABORT, 'forced session-event abort'); END");
+
+  assert.throws(() => store.captureSessionEvent(rollbackEvent), /forced session-event abort/);
+
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_uid = ?").get("rollback-session").count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events WHERE event_uid = ?").get("rollback-event").count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations WHERE observed_event_uid = ?").get("rollback-event").count, 0);
   store.close();
 });
 

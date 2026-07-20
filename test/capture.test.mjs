@@ -6,19 +6,31 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, normalizeStopEvent, redactText } from "../src/capture.mjs";
+import { detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, redactText } from "../src/capture.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { classifyRetrospectiveEvidence, detectFeedbackCandidate, feedbackSourceIdentity, readDirectAssistantReferent, stripSyntheticAflControlText } from "../src/feedback-signal.mjs";
 
+test("capture runtime has no dormant Stop normalization path", async () => {
+  const captureSource = await readFile(new URL("../src/capture.mjs", import.meta.url), "utf8");
+  const forbidden = ["normalize" + "StopEvent", "stop_" + "payload", "stop_" + "hook"];
+  for (const identifier of forbidden) assert.ok(!captureSource.includes(identifier), `${identifier} must not remain in capture runtime`);
+});
+
 function syntheticControl() {
+  return syntheticControlFor({
+    state: "candidate_captured",
+    visibleLine: "[AFL] Feedback candidate captured · event=abcdef · receipt=111111"
+  });
+}
+
+function syntheticControlFor({ state, visibleLine }) {
   const id = "1".repeat(64);
-  const line = "[AFL] Feedback candidate captured · event=abcdef · receipt=111111";
   const nonce = createHash("sha256")
-    .update(`receipt-control:v2\u0000${id}\u0000candidate_captured\u0000${line}`)
+    .update(`receipt-control:v2\u0000${id}\u0000${state}\u0000${visibleLine}`)
     .digest("hex")
     .slice(0, 16);
-  const marker = `<!--afl-receipt id=${id} nonce=${nonce} state=candidate_captured-->`;
-  return `${line}\n${marker}`;
+  const marker = `<!--afl-receipt id=${id} nonce=${nonce} state=${state}-->`;
+  return `${visibleLine}\n${marker}`;
 }
 
 test("synthetic control stripping no longer needs receipt transport", () => {
@@ -39,6 +51,24 @@ test("synthetic control stripping no longer needs receipt transport", () => {
     stripSyntheticAflControlText(`business answer\n${control}\nmore business text`),
     { text: "business answer\nmore business text", syntheticOnly: false }
   );
+});
+
+test("synthetic control stripping recognizes every canonical state in English and Chinese", () => {
+  const visibleLines = [
+    ["candidate_captured", "[AFL] Feedback candidate captured · event=abcdef · receipt=111111", "[AFL] 已捕获反馈候选 · event=abcdef · receipt=111111"],
+    ["review_queued", "[AFL] Background review queued · job=abcdef · receipt=111111", "[AFL] 后台反思已排队 · job=abcdef · receipt=111111"],
+    ["review_completed", "[AFL] Review completed · severity=Minor · lessons=2 · job=abcdef · receipt=111111", "[AFL] 反思完成 · severity=Minor · lessons=2 · job=abcdef · receipt=111111"],
+    ["reviewed_no_lesson", "[AFL] Reviewed; no long-term lesson was created · job=abcdef · receipt=111111", "[AFL] 已复核，本次未形成长期经验 · job=abcdef · receipt=111111"],
+    ["review_exhausted", "[AFL] Review failed; evidence retained for retry · job=abcdef · receipt=111111", "[AFL] 反思失败，证据已保留并等待重试 · job=abcdef · receipt=111111"],
+    ["lesson_delivered", "[AFL] Delivered 2 prior lessons to this task · receipt=111111", "[AFL] 已向本任务投递 2 条历史经验 · receipt=111111"]
+  ];
+
+  for (const [state, ...translations] of visibleLines) {
+    for (const visibleLine of translations) {
+      const control = syntheticControlFor({ state, visibleLine });
+      assert.deepEqual(stripSyntheticAflControlText(control), { text: "", syntheticOnly: true }, `${state}: ${visibleLine}`);
+    }
+  }
 });
 
 async function fixture() {
@@ -507,72 +537,6 @@ test("missing native event IDs are generated without collapsing distinct prompts
   const second = normalizeHookEvent({ cli: "codex", payload: { installationId: "i", sessionId: "s", prompt: "second" } });
   assert.notEqual(first.event_uid, second.event_uid);
   assert.notEqual(first.source_event_id, "unknown");
-});
-
-test("normalizes stop payloads into assistant evidence with honest completeness", () => {
-  const claude = normalizeStopEvent({
-    cli: "claude",
-    payload: { session_id: "s1", turn_id: "2", cwd: "/tmp/project", last_assistant_message: "Implemented without running tests" },
-    installationId: "install-1"
-  });
-  const gemini = normalizeStopEvent({
-    cli: "gemini",
-    payload: { session_id: "s2", turn_id: "3", cwd: "/tmp/project", prompt_response: "Done", tool_name: "write_file", file_refs: ["src/a.js"] },
-    installationId: "install-1"
-  });
-  assert.equal(claude.role, "assistant");
-  assert.equal(claude.redacted_text, "Implemented without running tests");
-  assert.equal(claude.capture_source, "stop_payload");
-  assert.equal(claude.capture_completeness, "partial");
-  assert.equal(gemini.tool_name, "write_file");
-  assert.deepEqual(gemini.file_refs, ["src/a.js"]);
-});
-
-test("synthetic stop controls are excluded while mixed assistant output stays evidence", () => {
-  const control = syntheticControl();
-  const normalized = normalizeStopEvent({
-    cli: "codex",
-    installationId: "install-receipt",
-    payload: { session_id: "receipt-stop", turn_id: "1", cwd: "/tmp/receipt-stop-project", last_assistant_message: control }
-  });
-
-  assert.equal(normalized.redacted_text, "");
-
-  const mixed = normalizeStopEvent({
-    cli: "codex",
-    installationId: "install-receipt",
-    payload: {
-      session_id: "receipt-stop-mixed",
-      turn_id: "2",
-      cwd: "/tmp/receipt-stop-project",
-      last_assistant_message: `normal answer\n${control}`
-    }
-  });
-  assert.equal(mixed.redacted_text, "normal answer");
-});
-
-test("extracts a bounded redacted assistant excerpt from transcript-only stop evidence", () => {
-  const transcript = [
-    JSON.stringify({ role: "user", content: "please verify" }),
-    JSON.stringify({ role: "assistant", content: "I skipped verification token=secret-value" })
-  ].join("\n");
-  const excerpt = extractTranscriptExcerpt(transcript, { maxChars: 256 });
-  const event = normalizeStopEvent({
-    cli: "codex",
-    payload: {
-      session_id: "transcript-only",
-      turn_id: "4",
-      cwd: "/tmp/project",
-      transcript_path: "/tmp/transcript.jsonl",
-      transcript_excerpt: excerpt,
-      capture_completeness: "transcript_tail_read"
-    }
-  });
-  assert.match(event.redacted_text, /skipped verification/);
-  assert.doesNotMatch(event.redacted_text, /secret-value/);
-  assert.doesNotMatch(event.redacted_text, /please verify/);
-  assert.ok(event.redacted_text.length <= 256);
-  assert.equal(event.capture_completeness, "transcript_tail_read");
 });
 
 test("blob store rejects path traversal hashes", async () => {

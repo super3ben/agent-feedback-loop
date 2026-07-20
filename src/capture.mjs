@@ -308,53 +308,6 @@ export function normalizeAssistantReferentEvent({
   };
 }
 
-export function normalizeStopEvent({ cli, payload, installationId = "unknown", capturePolicyRevision = 1 }) {
-  const input = payload || {};
-  const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];
-  const nativeSessionId = String(input.session_id || input.sessionId || "unknown");
-  const nativeTurn = String(input.turn_id || input.turnId || input.native_turn || "unknown");
-  const sourceEventId = String(input.event_id || input.eventId || `stop:${nativeTurn}`);
-  const text = stripSyntheticAflControlText(input.last_assistant_message || input.assistant_response || input.prompt_response || input.response || input.output || input.transcript_excerpt || "").text;
-  const redacted = redactText(text);
-  const eventSeq = Number.parseInt(createHash("sha256").update(`stop\u0000${sourceEventId}`).digest("hex").slice(0, 8), 16) || 1;
-  const projectId = input.cwd || input.project_id || `unscoped:${cli}:${createHash("sha256").update(nativeSessionId).digest("hex").slice(0, 16)}`;
-  return {
-    cli,
-    installation_id: installationId,
-    native_session_id: nativeSessionId,
-    session_uid: `${cli}:${installationId}:${nativeSessionId}`,
-    event_uid: `${cli}:${installationId}:${nativeSessionId}:stop:${sourceEventId}`,
-    source_event_id: `stop:${sourceEventId}`,
-    source_namespace: "stop_hook",
-    parent_event_id: input.parent_event_id || input.parentEventId || null,
-    event_seq: eventSeq,
-    native_turn: nativeTurn,
-    native_turn_id: nativeTurn,
-    context_epoch: Number(input.context_epoch || 1),
-    task_fingerprint: input.task_fingerprint || `${projectId}:${nativeSessionId}`,
-    task_type: input.task_type || input.taskType || null,
-    paths: Array.isArray(input.paths) ? input.paths : [],
-    tools: Array.isArray(input.tools) ? input.tools : [],
-    project_id: projectId,
-    cwd: input.cwd || null,
-    role: "assistant",
-    redacted_text: redacted.text,
-    content_hash: redacted.contentHash,
-    redaction_manifest: redacted.manifest,
-    capture_policy_revision: capturePolicyRevision,
-    data_class: input.data_class || "normal",
-    capture_source: input.transcript_path ? "stop_payload+transcript_ref" : "stop_payload",
-    capture_completeness: input.capture_completeness || (input.transcript_path ? "partial" : "partial"),
-    tool_name: input.tool_name || toolRefs.find((value) => typeof value === "string" && value.trim()) || null,
-    tool_args: input.tool_args || (toolRefs.length ? { tool_refs: toolRefs } : null),
-    tool_refs: toolRefs,
-    textual_output_ref: input.transcript_path || input.textual_output_ref || null,
-    file_refs: Array.isArray(input.file_refs) ? input.file_refs : [],
-    artifact_hashes: Array.isArray(input.artifact_hashes) ? input.artifact_hashes : [],
-    source_timestamp: input.timestamp || null
-  };
-}
-
 async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText }) {
   const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
   if (typeof writerRef !== "string" || !writerRef || writerRef.length > 4096) {
