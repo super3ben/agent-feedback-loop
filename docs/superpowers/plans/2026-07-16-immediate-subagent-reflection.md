@@ -29,6 +29,15 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - 必须审计并删除当前分支 `7d6b1e3..9c89e00` 中与新设计不兼容的 notification、Stop、episode、maintenance 和 scheduler 代码；不能因代码已经提交而保留 dormant path。
 - 每个实现任务都必须先加载并遵循 `superpowers:test-driven-development`：先观察正确 RED，再写最小 GREEN，运行定向回归后才允许 commit。
 
+## Review Circuit Breaker and Frozen Acceptance Policy
+
+- 同一功能累计经历 3 轮修复或正式复审后，不得自动开启下一轮补丁。必须先完成一次架构复盘，分别判断：原始用户价值是否实现；缺陷属于职责混乱、规格不清、实现错误、测试过拟合还是 reviewer 扩围；是否存在真实受支持输入或生产证据；继续修补、简化、删除或延期哪个成本最低；是否已经过度设计或过度优化。
+- 只有主会话干扰、数据损坏或不可恢复、安全/隐私问题、或者冻结的核心验收条件失败，才能继续阻塞当前任务。仅存在于未声明输入、缺少真实生产者证据的理论反例默认进入 backlog，不触发下一轮修复。
+- 超过熔断阈值后的 reviewer 只能检查持久化的冻结验收清单和对应回归，不得重新做开放式全范围缺陷搜索。新的相邻 finding 除非达到上述阻塞等级，否则记录到 backlog 并放行当前任务。
+- Task 1 架构复盘结论：原始“明确不满立即启动后台 subagent，发布 Markdown，并在后续会话生效”的用户价值尚未实现，因为 Task 2–6 尚未开始；SQLite/Markdown/后台 subagent 的基础边界仍然成立，但 `control-store` 同时承担 legacy alias、canonical identity、去重、attachment、replay 和时间解析，兼容层职责已经过载，11 轮 review 也证明原 gate 缺少停止条件。
+- Task 1 的 review-11 时间戳反例来自当前未声明、无真实生产者证据的无时区输入；仓库内当前 capture/reconcile 生产者与 Task 1 fixture 均使用带时区 ISO。成本最低的收口是只在入口把带时区 RFC3339 规范化为 UTC ISO，并补两条回归；不新增 schema、epoch 字段、服务、解析框架或大规模设计文档。
+- Task 1 冻结验收清单仅包含：独立 control DB/legacy 隔离和 schema v1 不变；公共 capture 在副作用前冻结并验证 body-free canonical identity；blob I/O 位于 SQLite 事务外且 writer ref fail closed；exact/alias/new 与 replay/ref/completeness 既有回归通过；无时区时间戳在 blob/SQLite 前拒绝；受支持的带时区 alias 规范化为 UTC 后可原样 replay；真实 HOME/hooks/runtime/database 未触碰。最终 Task 1 review 只按此清单和既有回归作 pass/fail。
+
 ## Baseline Evidence Before Implementation
 
 - `npm test` on base `cc14224444ef26894e407218235c37297714605c` ran 216 tests in 57.58s: 215 passed and the legacy `installed Stop hook kills an uncooperative process tree within a hard deadline` timing assertion failed.
@@ -56,7 +65,7 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 
 ### Task 1: 并行建立轻量 control DB，不破坏旧 runtime
 
-> **当前 review 状态与本轮执行边界：** 下列历史 Step 1-5 已由 `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72..9c3405c` 的当前提交链实施，其中 `535704d` 完成了 15-field canonical identity 修订；review-8 仍以三个 Important finding 判定 Task 1 未通过，所以本 Task 总复选框保持未勾选。本轮 implementer 只执行新增 Step 6-22 的 transaction-boundary amendment，不重做 Step 1-5 的 schema、路径、安装器或审计架构，不勾选 Task 1；完成后必须交回新的独立 review gate。
+> **当前 review 状态与最终收口边界：** 历史 Step 1-22 及后续 identity 修复已完成，但 Task 1 在 11 轮 review 后触发全局三轮熔断。最终 implementer 只执行新增 Step 23-27：对受支持的带时区 RFC3339 做一次 UTC ISO 规范化，补两条冻结回归，然后交给一次冻结清单 review。不得重做 schema、路径、安装器、SQL 架构或扩展输入格式；非 Critical 相邻发现进入 backlog。review 通过后由协调者勾选 Task 1 并立即进入 Task 2。
 
 - [ ] **Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime**
 
@@ -70,6 +79,10 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - Modify: `src/capture.mjs:350-405`
 - Modify: `src/control-store.mjs:23-488`
 - Modify: `test/control-store.test.mjs:704-1390`
+
+**Files（最终 Step 23-27 唯一允许修改）：**
+- Modify: `src/control-store.mjs`
+- Modify: `test/control-store.test.mjs`
 
 现有 `EncryptedBlobStore.write(contentHash, rawText) -> Promise<string>` 已满足 content-addressed 第一次写入与 post-commit second-write；本轮不得修改 `src/crypto-store.mjs`。原有 v1 表、列、索引和 fingerprint 已足够表达原子决策；本轮不得修改 `src/control-schema.mjs`、schema version、CLI、installer、service、scheduler、RAG、Stop、notification 或 Markdown/SQLite ownership boundary。
 
@@ -769,6 +782,37 @@ git commit -m "fix: make public capture resolution atomic"
 ```
 
 Do not mark Task 1 complete in this plan. Record the implementation commit in the coordination artifact and dispatch a fresh Task 1 review covering all three review-8 findings as one transaction-boundary correction.
+
+- [ ] **Step 23: Write exactly two frozen timestamp regressions and observe RED**
+
+Add only these two behavior tests to `test/control-store.test.mjs`:
+
+1. `timezone-less source timestamp is rejected before blob or database side effects`: a public capture with `source_timestamp = "2026-07-20T02:11:00.000"` rejects synchronously before the first blob write and leaves sessions/events/observations at zero.
+2. `timezone-offset alias normalizes to UTC and exact replay succeeds`: a canonical `Z` event plus a different observation alias expressed with an equivalent explicit offset returns `alias`; its stored/normalized identity is UTC ISO, and the identical alias replay returns `exact_replay` with one event/two observations.
+
+Run only the two selected tests. The first must fail because the current bounded-string normalizer accepts timezone-less input; the second may already satisfy its replay assertion but must fail its UTC-normalization assertion. Do not add a general invalid-date matrix or widen the accepted timestamp language.
+
+- [ ] **Step 24: Implement the minimal entry normalization**
+
+In `src/control-store.mjs`, add one small timestamp normalizer used by the existing `source_timestamp` / `sourceTimestamp` alias group. A non-null value must be a bounded RFC3339 string with explicit `Z` or `±HH:MM`; parse it once and return `new Date(epoch).toISOString()`. Timezone-less or unparsable input fails before `prepareCapture()` returns. Equivalent offset aliases compare after normalization. Keep the existing SQL, schema v1, direct null fallback, five-minute window, native-turn fallback and all other identity fields unchanged; do not add an epoch column, parsing framework, new service or second timestamp representation.
+
+- [ ] **Step 25: Run focused GREEN and the existing Task 1 regression**
+
+Run the exact two-test pattern from Step 23, then:
+
+```bash
+node --test test/control-store.test.mjs test/runtime.test.mjs test/capture.test.mjs test/store.test.mjs
+```
+
+Expected: both frozen timestamp tests and the existing Task 1/legacy regression pass. Run the focused tests once under `TZ=UTC` and once under `TZ=Asia/Shanghai`; outcomes must be identical. Do not repeat the full npm suite unless these commands expose an unknown failure.
+
+- [ ] **Step 26: Run static/scope gates and commit**
+
+Run `node --check src/control-store.mjs`, `node --check test/control-store.test.mjs`, and `git diff --check`. Confirm the implementation commit contains only `src/control-store.mjs` and `test/control-store.test.mjs`; preserve `.superpowers/sdd/task-1-report.md` as the uncommitted append-only handoff. Commit as `fix: normalize capture timestamps`.
+
+- [ ] **Step 27: Run one frozen Task 1 acceptance review**
+
+The fresh reviewer checks only the global Task 1 frozen acceptance checklist, the two timestamp regressions, and the existing Task 1 regression evidence. It does not perform another open-ended whole-Task defect search. A frozen checklist failure or a Critical issue involving main-session interference, data corruption/unrecoverability, or security/privacy blocks Task 1; every other newly observed adjacent concern is recorded in backlog and does not start another review/fix round. On pass, the coordinator checks Task 1 and immediately dispatches Task 2.
 
 ### Task 2: 实现即时 candidate job 与 fenced lease 控制 API
 

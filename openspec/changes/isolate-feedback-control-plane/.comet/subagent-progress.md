@@ -104,12 +104,14 @@
 - Review ceiling: the single identity-coherence fix plus fresh review-11 explicitly authorized on 2026-07-20 has been consumed; no review-11 fix agent is authorized yet
 - User authorization: on 2026-07-20 the user replied `继续`, authorizing one root-cause timestamp-contract amendment, its TDD implementation, and one fresh independent re-review
 - Verified producer boundary: current capture/reconcile producers and all Task 1 fixtures use timezone-bearing ISO strings, but the public normalizer only enforces a bounded string; the review-11 counterexample is therefore an accepted-input contract defect, not a test-only SQLite oddity
-- Timestamp architecture: optional input must be a valid timezone-bearing RFC3339 instant with at most millisecond precision, normalized once to fixed-width UTC ISO before signature/blob/SQLite work; equivalent offset aliases normalize equal. Candidate SQL and exact replay must compare the same canonical inclusive time-window bounds and must not independently parse raw timestamp text
+- Timestamp architecture: current supported producers already emit timezone-bearing ISO. The final closeout adds one small entry normalizer to UTC ISO so existing SQL/replay consume canonical values; it does not redesign SQL, add epoch state, or build a parsing framework
 - Scope boundary: no schema/version/service/scheduler/hook/notification/RAG/Markdown ownership or later-task change; real hooks, HOME, runtime pointer, and feedback database remain untouched
 - Dirty-worktree attribution: `.superpowers/sdd/task-1-report.md` remains the prior agents' append-only handoff and must be preserved uncommitted
-- Timestamp amendment base: `81729dea85426240554675af23050605e1e43d92`
-- Timestamp amendment dispatch: fresh architecture agent `/root/task1_timestamp_contract_spec` is updating only the Design Doc, control-plane delta spec, OpenSpec tasks and Task 1 plan with the approved canonical UTC contract and RED/GREEN gates
-- Next action: wait for the timestamp contract amendment, validate its commit/scope, then dispatch one fresh TDD implementer and one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Policy override: a newer user instruction applies a three-round circuit breaker, architecture retrospective and frozen acceptance scope after eleven Task 1 reviews. The prior four-document timestamp amendment was interrupted before edits and is superseded
+- Architecture retrospective: original user value is still pending in Tasks 2–6; Task 1's storage direction is sound, but `control-store` compatibility responsibilities and open-ended review became overextended. The timezone-less probe has no current producer evidence, so broader timestamp/SQL redesign would be over-optimization
+- Frozen implementation: exactly two timestamp regressions plus one small timezone-bearing RFC3339-to-UTC entry normalization in `src/control-store.mjs`; implementation scope is only `src/control-store.mjs` and `test/control-store.test.mjs`
+- Frozen review: one fresh reviewer checks only the persisted Task 1 checklist and regression evidence. Only main-session interference, data loss/unrecoverability, security/privacy, or a frozen-checklist failure blocks; every other adjacent finding enters backlog and cannot launch another Task 1 fix round
+- Next action: commit the policy/plan adjustment, dispatch one fresh TDD implementer for Steps 23-26, then run the single frozen Task 1 acceptance review. On pass, check off Task 1 and immediately continue Task 2
 
 ## Superseded implementation
 
