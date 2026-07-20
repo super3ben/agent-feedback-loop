@@ -1956,6 +1956,100 @@ test("public target-compatible alias attaches and exact replay succeeds", async 
   store.close();
 });
 
+test("timezone-less source timestamp is rejected before blob or database side effects", async () => {
+  const { store } = controlCaptureFixture();
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      return "/private/blobs/timezone-less.enc";
+    }
+  };
+
+  await assert.rejects(
+    captureObservedSession({
+      store,
+      blobs,
+      event: event({
+        event_uid: "timezone-less-event",
+        source_identity: undefined,
+        source_event_id: "timezone-less-source",
+        source_namespace: "prompt_hook",
+        observation_source_id: "timezone-less-observation",
+        capture_source: "prompt_hook",
+        native_turn_id: "timezone-less-turn",
+        source_timestamp: "2026-07-20T02:11:00.000",
+        encrypted_raw_ref: null
+      }),
+      rawText: "timezone-less evidence"
+    }),
+    /source_timestamp/
+  );
+
+  assert.equal(blobWrites, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 0);
+  store.close();
+});
+
+test("timezone-offset alias normalizes to UTC and exact replay succeeds", async () => {
+  const { store } = controlCaptureFixture();
+  const blobs = {
+    async write() {
+      return "/private/blobs/timezone-offset-alias.enc";
+    }
+  };
+  const canonicalTimestamp = "2026-07-20T02:10:00.000Z";
+  const shared = {
+    session_uid: "timezone-offset-alias-session",
+    source_identity: undefined,
+    native_turn_id: "timezone-offset-alias-turn",
+    content_hash: "d".repeat(64),
+    completeness: "prompt_only",
+    encrypted_raw_ref: null
+  };
+  const canonical = event({
+    ...shared,
+    event_uid: "timezone-offset-canonical-event",
+    source_event_id: "timezone-offset-canonical-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "timezone-offset-canonical-observation",
+    capture_source: "prompt_hook",
+    source_timestamp: canonicalTimestamp
+  });
+  const alias = event({
+    ...shared,
+    event_uid: "timezone-offset-alias-event",
+    source_event_id: "timezone-offset-alias-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "timezone-offset-alias-observation",
+    capture_source: "transcript_payload",
+    source_timestamp: "2026-07-20T10:10:00.000+08:00"
+  });
+
+  const first = await captureObservedSession({ store, blobs, event: canonical, rawText: "timezone-offset evidence" });
+  const attached = await captureObservedSession({ store, blobs, event: alias, rawText: "timezone-offset evidence" });
+  const replay = await captureObservedSession({ store, blobs, event: { ...alias }, rawText: "timezone-offset evidence" });
+  const preparedAlias = controlStoreModule.prepareCapture({ event: alias, rawText: "timezone-offset evidence" });
+  const canonicalAlias = controlStoreModule.prepareCapture({
+    event: { ...alias, source_timestamp: canonicalTimestamp },
+    rawText: "timezone-offset evidence"
+  });
+
+  assert.equal(first.kind, "new");
+  assert.equal(attached.kind, "alias");
+  assert.equal(replay.kind, "exact_replay");
+  assert.equal(attached.eventUid, first.eventUid);
+  assert.equal(replay.eventUid, first.eventUid);
+  assert.equal(preparedAlias.identity.source_timestamp, canonicalTimestamp);
+  assert.equal(preparedAlias.signature, canonicalAlias.signature);
+  assert.equal(store.database.prepare("SELECT source_timestamp FROM session_events").get().source_timestamp, canonicalTimestamp);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+
 test("public alias candidate applies completeness compatibility before LIMIT", async () => {
   const { store } = controlCaptureFixture();
   const shared = {

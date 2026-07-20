@@ -226,6 +226,19 @@ function normalizedEncryptedRawRef(input) {
   );
 }
 
+function normalizeSourceTimestamp(value) {
+  const timestamp = assertOptionalString(value, "source_timestamp", 128);
+  if (timestamp === null) return null;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(timestamp)) {
+    throw new TypeError("source_timestamp must be an RFC3339 timestamp with an explicit timezone");
+  }
+  const epoch = Date.parse(timestamp);
+  if (!Number.isFinite(epoch)) {
+    throw new TypeError("source_timestamp must be an RFC3339 timestamp with an explicit timezone");
+  }
+  return new Date(epoch).toISOString();
+}
+
 export function normalizeCaptureIdentity(input, { requireEventIdentity = false } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("capture identity input must be an object");
@@ -303,7 +316,7 @@ export function normalizeCaptureIdentity(input, { requireEventIdentity = false }
     source_timestamp: readAliasGroup(
       input,
       ["source_timestamp", "sourceTimestamp"],
-      (value) => assertOptionalString(value, "source_timestamp", 128)
+      (value) => normalizeSourceTimestamp(value)
     ),
     role: assertString(input.role, "role", 64),
     referent_event_uid: readAliasGroup(
