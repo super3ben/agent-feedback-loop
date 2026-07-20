@@ -1710,7 +1710,7 @@ git commit -m "feat: export legacy reflections without mutating the database"
 
 ### Task 13: 删除迁移期旧 store/schema/receipt，证明运行图已收敛
 
-- [ ] **Task 13 complete: 删除迁移期旧 store/schema/receipt，证明运行图已收敛**
+- [x] **Task 13 complete: 删除迁移期旧 store/schema/receipt，证明运行图已收敛**
 
 **Files:**
 - Modify: `src/capture.mjs`
@@ -1744,7 +1744,7 @@ git commit -m "feat: export legacy reflections without mutating the database"
 - Update the existing legacy audit with this transfer/delete disposition. Do not create another design document, schema, service, scheduler, RAG/index, runtime database compatibility layer, or real-HOME test.
 - Task 12 intentionally keeps the CLI export fixture in `test/cli.test.mjs`. Therefore the final old-table-name scan permits exactly `src/legacy-export.mjs`, `test/legacy-export.test.mjs`, and `test/cli.test.mjs`; only the production module may execute legacy `SELECT`s.
 
-- [ ] **Step 1: Write RED import-graph and synthetic-filter tests**
+- [x] **Step 1: Write RED import-graph and synthetic-filter tests**
 
 ```js
 assert.equal(stripSyntheticAflControlText("[AFL] queued\n<!--afl-receipt id=x--> ").syntheticOnly, true);
@@ -1755,19 +1755,19 @@ assert.equal("controlDatabase" in pathsFor(tempHome), true);
 
 Add a module-graph test that starts from `bin/agent-feedback-loop.mjs`, follows static relative imports, and asserts the reachable set excludes `schema.mjs`, `store.mjs`, `receipt.mjs`, `notification-delivery.mjs`, `codex-reconcile.mjs` and `reconcile-scheduler.mjs` before those files are deleted.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='synthetic control stripping no longer needs receipt transport|normal runtime imports only the control store|legacy database has no normal path alias' test/capture.test.mjs test/control-store.test.mjs test/runtime.test.mjs`
 
 Expected: FAIL because capture still imports `receipt.mjs`, `paths.storeFile` still exists for the old runtime, and the legacy modules remain reachable.
 
-- [ ] **Step 3: Move the narrow synthetic parser and delete the legacy runtime**
+- [x] **Step 3: Move the narrow synthetic parser and delete the legacy runtime**
 
 Implement `stripSyntheticAflControlText` as a bounded parser for only the exact legacy visible-line plus adjacent canonical marker shape. It must preserve fabricated, fenced, mismatched and mixed business text exactly as the current safety tests require, but expose no render/delivery API.
 
 Update all remaining imports to `control-store.mjs`/`control-schema.mjs`; remove `paths.storeFile` and old migration/lesson/notification APIs. Before deleting `test/store.test.mjs`, confirm or transfer every still-valid invariant into focused new tests: private directory/database modes, observation replay/race idempotency, encrypted-blob reference safety, invalid-capture rejection, bounded reviewer context, transaction rollback, lease fencing, WAL reopen, and body-free schema. Mark tests for the old capture-policy toggle, receipt, notification, episode batching, maintenance scheduler, lesson/card DB or hold as intentionally rejected behavior in the audit document. Delete the legacy files/tests/fixture only after the transferred tests pass. `legacy-export.mjs` keeps its own literal read-only SELECT statements and must not import deleted code. Remove the residual legacy CLI commands and keep live doctor on the control store; do not preserve any `openStore()` branch.
 
-- [ ] **Step 4: Run the full suite and source scans**
+- [x] **Step 4: Run the full suite and source scans**
 
 Run: `npm test`
 
@@ -1785,7 +1785,7 @@ Run: `rg -n 'notification|receipt|episode|maintenance|scheduler|lesson/card|memo
 
 Expected: every old architecture family has an explicit delete/reject disposition and replacement task; there are no unclassified entries.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A src test
