@@ -37,6 +37,34 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const CANONICAL_ESCAPES = new Map([
+  ["%", "%25"],
+  ["\\", "%5C"],
+  ["|", "%7C"],
+  ["\r", "%0D"],
+  ["\n", "%0A"]
+]);
+const CANONICAL_UNESCAPES = new Map(
+  [...CANONICAL_ESCAPES].map(([plain, escaped]) => [escaped.slice(1), plain]).concat([
+    ["4E", "N"],
+    ["6E", "n"]
+  ])
+);
+
+function encodeCanonicalText(value) {
+  let encoded = value.replace(/[%\\|\r\n]/gu, (character) => CANONICAL_ESCAPES.get(character));
+  if (/^none$/iu.test(encoded)) {
+    const first = encoded.codePointAt(0).toString(16).toUpperCase().padStart(2, "0");
+    encoded = `%${first}${encoded.slice(1)}`;
+  }
+  return encoded;
+}
+
+function decodeCanonicalText(value) {
+  if (/%(?!25|5C|7C|0D|0A|4E|6E)/u.test(value)) throw new Error("invalid canonical escape");
+  return value.replace(/%(25|5C|7C|0D|0A|4E|6E)/gu, (_, code) => CANONICAL_UNESCAPES.get(code));
+}
+
 function isRecord(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
@@ -131,26 +159,26 @@ export function validateReflectionModel(result, source) {
 
 export function renderReflectionMarkdown(model) {
   return [
-    `# 反思报告：${model.title}`,
+    `# 反思报告：${encodeCanonicalText(model.title)}`,
     "",
-    `- reflection_id: ${model.reflection_id}`,
-    `- created_at: ${model.created_at}`,
-    `- published_at: ${model.published_at}`,
-    `- final_severity: ${model.final_severity}`,
-    `- responsibility: ${model.responsibility}`,
-    `- method_class: ${model.method_class}`,
-    `- family_id: ${model.family_id}`,
-    `- applies_when: ${model.applies_when.join(" | ")}`,
-    `- effectiveness: ${model.effectiveness ?? "unknown"}`,
-    `- source_identity_hash: ${model.source_identity_hash}`,
+    `- reflection_id: ${encodeCanonicalText(model.reflection_id)}`,
+    `- created_at: ${encodeCanonicalText(model.created_at)}`,
+    `- published_at: ${encodeCanonicalText(model.published_at)}`,
+    `- final_severity: ${encodeCanonicalText(model.final_severity)}`,
+    `- responsibility: ${encodeCanonicalText(model.responsibility)}`,
+    `- method_class: ${encodeCanonicalText(model.method_class)}`,
+    `- family_id: ${encodeCanonicalText(model.family_id)}`,
+    `- applies_when: ${model.applies_when.map(encodeCanonicalText).join(" | ")}`,
+    `- effectiveness: ${encodeCanonicalText(model.effectiveness ?? "unknown")}`,
+    `- source_identity_hash: ${encodeCanonicalText(model.source_identity_hash)}`,
     "",
-    "## facts proven by context", "", ...model.facts.map((fact) => `- ${fact}`), "",
-    "## user complaint in plain language", "", model.user_complaint, "",
-    "## root cause", "", model.root_cause, "",
-    "## class of mistake", "", model.class_of_mistake, "",
-    "## method change", "", ...model.method_changes.map((item, index) => `${index + 1}. ${item}`), "",
+    "## facts proven by context", "", ...model.facts.map((fact) => `- ${encodeCanonicalText(fact)}`), "",
+    "## user complaint in plain language", "", encodeCanonicalText(model.user_complaint), "",
+    "## root cause", "", encodeCanonicalText(model.root_cause), "",
+    "## class of mistake", "", encodeCanonicalText(model.class_of_mistake), "",
+    "## method change", "", ...model.method_changes.map((item, index) => `${index + 1}. ${encodeCanonicalText(item)}`), "",
     "## repeated pattern evidence", "", ...(model.repeated_pattern_evidence.length
-      ? model.repeated_pattern_evidence.map((item) => `- ${item}`)
+      ? model.repeated_pattern_evidence.map((item) => `- ${encodeCanonicalText(item)}`)
       : ["- none"]), ""
   ].join("\n");
 }
@@ -196,6 +224,14 @@ function listItems(value) {
   return items.length === 1 && /^none$/iu.test(items[0]) ? [] : items;
 }
 
+function canonicalListItems(value) {
+  if (!value) return [];
+  const lines = value.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const items = lines.map((line) => line.replace(/^(?:[-*+]\s+|\d+[.)]\s+)/u, "").trim()).filter(Boolean);
+  if (items.length === 1 && /^none$/iu.test(items[0])) return [];
+  return items.map(decodeCanonicalText);
+}
+
 function filenameCreatedAt(filePath) {
   const name = path.basename(filePath);
   let match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-|\.)/u.exec(name);
@@ -218,28 +254,45 @@ function ineligible(filePath, omission) {
 }
 
 function canonicalDocument(metadata, sections, title, filePath) {
-  if (CANONICAL_METADATA.some((key) => !metadata.has(key))
-      || !/^reflection-[a-f0-9]{24}$/u.test(metadata.get("reflection_id"))
-      || !/^[a-f0-9]{64}$/u.test(metadata.get("source_identity_hash"))
-      || !SEVERITIES.has(metadata.get("final_severity"))
-      || metadata.get("responsibility") !== "agent_fault"
-      || !METHOD_CLASS_PATTERN.test(metadata.get("method_class"))
-      || !FAMILY_ID_PATTERN.test(metadata.get("family_id"))) {
+  if (CANONICAL_METADATA.some((key) => !metadata.has(key))) {
+    return ineligible(filePath, "canonical_invalid");
+  }
+  let decodedMetadata;
+  let decodedTitle;
+  let facts;
+  let complaint;
+  let rootCause;
+  let classOfMistake;
+  let methodChanges;
+  let repeatedPatternEvidence;
+  try {
+    decodedMetadata = new Map(CANONICAL_METADATA.map((key) => [key, decodeCanonicalText(metadata.get(key))]));
+    decodedTitle = decodeCanonicalText(title);
+    facts = canonicalListItems(sections.get("facts"));
+    complaint = decodeCanonicalText((sections.get("complaint") ?? "").trim());
+    rootCause = decodeCanonicalText((sections.get("rootCause") ?? "").trim());
+    classOfMistake = decodeCanonicalText((sections.get("mistakeClass") ?? "").trim());
+    methodChanges = canonicalListItems(sections.get("methodChange"));
+    repeatedPatternEvidence = canonicalListItems(sections.get("repeatedPattern"));
+  } catch {
+    return ineligible(filePath, "canonical_invalid");
+  }
+  if (!/^reflection-[a-f0-9]{24}$/u.test(decodedMetadata.get("reflection_id"))
+      || !/^[a-f0-9]{64}$/u.test(decodedMetadata.get("source_identity_hash"))
+      || !SEVERITIES.has(decodedMetadata.get("final_severity"))
+      || decodedMetadata.get("responsibility") !== "agent_fault"
+      || !METHOD_CLASS_PATTERN.test(decodedMetadata.get("method_class"))
+      || !FAMILY_ID_PATTERN.test(decodedMetadata.get("family_id"))) {
     return ineligible(filePath, "canonical_invalid");
   }
   let createdAt;
   let publishedAt;
   try {
-    createdAt = utcTimestamp(metadata.get("created_at"), "created_at");
-    publishedAt = utcTimestamp(metadata.get("published_at"), "published_at");
+    createdAt = utcTimestamp(decodedMetadata.get("created_at"), "created_at");
+    publishedAt = utcTimestamp(decodedMetadata.get("published_at"), "published_at");
   } catch {
     return ineligible(filePath, "canonical_invalid");
   }
-  const facts = listItems(sections.get("facts"));
-  const complaint = normalizedSectionText(sections.get("complaint") ?? "");
-  const rootCause = normalizedSectionText(sections.get("rootCause") ?? "");
-  const classOfMistake = normalizedSectionText(sections.get("mistakeClass") ?? "");
-  const methodChanges = listItems(sections.get("methodChange"));
   if (!facts.length || !complaint || !rootCause || !classOfMistake || !methodChanges.length) {
     return ineligible(filePath, "canonical_invalid");
   }
@@ -247,23 +300,23 @@ function canonicalDocument(metadata, sections, title, filePath) {
     eligible: true,
     canonical: true,
     path: filePath,
-    title,
-    reflectionId: metadata.get("reflection_id"),
+    title: decodedTitle,
+    reflectionId: decodedMetadata.get("reflection_id"),
     createdAt,
     publishedAt,
-    severity: metadata.get("final_severity"),
+    severity: decodedMetadata.get("final_severity"),
     responsibility: "agent_fault",
-    methodClass: metadata.get("method_class"),
-    familyId: metadata.get("family_id"),
-    appliesWhen: metadata.get("applies_when").split(/\s*\|\s*/u).filter(Boolean),
-    effectiveness: metadata.get("effectiveness"),
-    sourceIdentityHash: metadata.get("source_identity_hash"),
+    methodClass: decodedMetadata.get("method_class"),
+    familyId: decodedMetadata.get("family_id"),
+    appliesWhen: metadata.get("applies_when").split(/\s*\|\s*/u).filter(Boolean).map(decodeCanonicalText),
+    effectiveness: decodedMetadata.get("effectiveness"),
+    sourceIdentityHash: decodedMetadata.get("source_identity_hash"),
     facts,
     userComplaint: complaint,
     rootCause,
     classOfMistake,
     methodChanges,
-    repeatedPatternEvidence: listItems(sections.get("repeatedPattern"))
+    repeatedPatternEvidence
   };
 }
 
@@ -348,6 +401,20 @@ async function assertOwnedDirectory(fsImpl, directory, label) {
   const info = await fsImpl.lstat(directory);
   if (info.isSymbolicLink()) throw new Error(`${label}_symlink`);
   if (!info.isDirectory()) throw new Error(`${label}_not_directory`);
+  if (info.uid !== currentUid()) throw new Error(`${label}_not_owned`);
+}
+
+async function assertSymlinkFreeOwnedDirectory(fsImpl, directory, label) {
+  const root = path.parse(directory).root;
+  const components = path.relative(root, directory).split(path.sep).filter(Boolean);
+  let current = root;
+  let info = await fsImpl.lstat(current);
+  for (const component of components) {
+    current = path.join(current, component);
+    info = await fsImpl.lstat(current);
+    if (info.isSymbolicLink()) throw new Error(`${label}_symlink`);
+    if (!info.isDirectory()) throw new Error(`${label}_not_directory`);
+  }
   if (info.uid !== currentUid()) throw new Error(`${label}_not_owned`);
 }
 
@@ -478,17 +545,20 @@ async function publicationDirectory({ projectDir, reflectionDir, fsImpl }) {
   }
   if (process.platform !== "darwin" && process.platform !== "linux") throw new Error("unsupported_platform");
   if (reflectionDir !== undefined) {
-    await assertOwnedDirectory(fsImpl, reflectionDir, "reflection_directory");
-    return { directory: reflectionDir, verify: () => assertOwnedDirectory(fsImpl, reflectionDir, "reflection_directory") };
+    await assertSymlinkFreeOwnedDirectory(fsImpl, reflectionDir, "reflection_directory");
+    return {
+      directory: reflectionDir,
+      verify: () => assertSymlinkFreeOwnedDirectory(fsImpl, reflectionDir, "reflection_directory")
+    };
   }
 
-  await assertOwnedDirectory(fsImpl, projectDir, "project_root");
+  await assertSymlinkFreeOwnedDirectory(fsImpl, projectDir, "project_root");
   const agentDir = path.join(projectDir, ".agent");
   const directory = path.join(agentDir, "reflections");
   await createPrivateDirectory(fsImpl, agentDir, "agent_directory");
   await createPrivateDirectory(fsImpl, directory, "reflection_directory");
   const verify = async () => {
-    await assertOwnedDirectory(fsImpl, projectDir, "project_root");
+    await assertSymlinkFreeOwnedDirectory(fsImpl, projectDir, "project_root");
     await assertOwnedDirectory(fsImpl, agentDir, "agent_directory");
     await assertOwnedDirectory(fsImpl, directory, "reflection_directory");
   };
@@ -532,15 +602,19 @@ async function publicationForIdentity(fsImpl, directory, reflectionId, expectedH
   for (const entry of candidates) {
     const candidatePath = path.join(directory, entry.name);
     if (entry.isSymbolicLink() || !entry.isFile()) throw publicationError("publication_collision");
+    let handle;
     let bytes;
     let parsed;
     try {
-      const info = await fsImpl.lstat(candidatePath);
-      if (info.isSymbolicLink() || !info.isFile()) throw new Error("candidate is not a regular file");
-      bytes = await fsImpl.readFile(candidatePath);
+      handle = await fsImpl.open(candidatePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("candidate is not a regular file");
+      bytes = await handle.readFile();
       parsed = parseReflectionMarkdown(strictUtf8(bytes), { path: candidatePath });
     } catch (error) {
       throw publicationError("publication_collision", error);
+    } finally {
+      await handle?.close();
     }
     if (!parsed.eligible || !parsed.canonical || parsed.reflectionId !== reflectionId) {
       throw publicationError("publication_collision");
@@ -582,7 +656,6 @@ export async function publishReflectionDocument({
 
   const tempPath = path.join(directory, `.reflection-${process.pid}-${randomBytes(8).toString("hex")}.tmp`);
   let handle;
-  let renamed = false;
   try {
     try {
       handle = await fsImpl.open(tempPath, "wx", 0o600);
@@ -607,12 +680,19 @@ export async function publishReflectionDocument({
     );
     if (identityRaced) return identityRaced;
     try {
-      await fsImpl.rename(tempPath, targetPath);
-      renamed = true;
+      await fsImpl.link(tempPath, targetPath);
     } catch (error) {
+      if (error?.code === "EEXIST") {
+        const adopted = await publicationForIdentity(
+          fsImpl, directory, model.reflection_id, expectedHash
+        );
+        if (adopted) return adopted;
+        throw publicationError("publication_collision", error);
+      }
       throw publicationError("publication_rename_failed", error);
     }
     try {
+      await fsImpl.unlink(tempPath);
       await syncDirectory(fsImpl, directory);
       const actualHash = sha256(await fsImpl.readFile(targetPath));
       if (actualHash !== expectedHash) throw new Error("published hash mismatch");
@@ -626,13 +706,11 @@ export async function publishReflectionDocument({
     } catch {
       // The original publication error is more useful than a cleanup failure.
     }
-    if (!renamed) {
-      try {
-        await fsImpl.unlink(tempPath);
-      } catch (error) {
-        if (error?.code !== "ENOENT") {
-          // A private, non-selectable temp may remain if the filesystem rejects cleanup.
-        }
+    try {
+      await fsImpl.unlink(tempPath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        // A private, non-selectable temp may remain if the filesystem rejects cleanup.
       }
     }
   }

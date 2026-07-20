@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -55,7 +55,7 @@ function canonicalModel(overrides = {}) {
 }
 
 async function disposableProject(t) {
-  const projectDir = await mkdtemp(path.join(os.tmpdir(), "afl-reflection-document-"));
+  const projectDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "afl-reflection-document-")));
   t.after(() => rm(projectDir, { recursive: true, force: true }));
   return projectDir;
 }
@@ -65,7 +65,7 @@ async function copyFixture(name, destination) {
 }
 
 function injectedFs(stage) {
-  let renamed = false;
+  let published = false;
   return new Proxy(fsPromises, {
     get(target, property) {
       if (property === "open") {
@@ -88,18 +88,18 @@ function injectedFs(stage) {
           return handle;
         };
       }
-      if (property === "rename" && stage === "rename") {
+      if (property === "link" && stage === "rename") {
         return async () => { throw Object.assign(new Error("injected rename failure"), { code: "EIO" }); };
       }
-      if (property === "rename") {
+      if (property === "link") {
         return async (...args) => {
-          await target.rename(...args);
-          renamed = true;
+          await target.link(...args);
+          published = true;
         };
       }
       if (property === "readFile" && stage === "post-rename-hash") {
         return async (...args) => {
-          if (renamed) throw Object.assign(new Error("injected verification read failure"), { code: "EIO" });
+          if (published) throw Object.assign(new Error("injected verification read failure"), { code: "EIO" });
           return target.readFile(...args);
         };
       }
@@ -167,6 +167,31 @@ test("canonical Markdown renders the exact readable contract and round-trips", (
   assert.deepEqual(parsed.methodChanges, model.method_changes);
   assert.equal(parsed.publishedAt, model.published_at);
   assert.equal(parsed.sourceIdentityHash, model.source_identity_hash);
+});
+
+test("canonical Markdown losslessly round-trips structural text values", () => {
+  const model = canonicalModel({
+    applies_when: ["prompt contains A | B", String.raw`a literal \\ backslash`],
+    facts: ["first line\nsecond line", String.raw`path C:\review\facts`],
+    user_complaint: "line one\nline two | still one complaint",
+    root_cause: String.raw`the parser treated \\ and | as syntax`,
+    class_of_mistake: "serialization\nmust be injective",
+    method_changes: ["preserve line one\npreserve line two", String.raw`keep C:\review\method`],
+    repeated_pattern_evidence: ["none", "A | B", String.raw`literal \\ evidence`]
+  });
+
+  const parsed = parseReflectionMarkdown(renderReflectionMarkdown(model), {
+    path: "/project/.agent/reflections/lossless.md"
+  });
+
+  assert.equal(parsed.eligible, true);
+  assert.deepEqual(parsed.appliesWhen, model.applies_when);
+  assert.deepEqual(parsed.facts, model.facts);
+  assert.equal(parsed.userComplaint, model.user_complaint);
+  assert.equal(parsed.rootCause, model.root_cause);
+  assert.equal(parsed.classOfMistake, model.class_of_mistake);
+  assert.deepEqual(parsed.methodChanges, model.method_changes);
+  assert.deepEqual(parsed.repeatedPatternEvidence, model.repeated_pattern_evidence);
 });
 
 test("legacy aliases are explicit, case-insensitive, and derive only from normalized class text", async () => {
@@ -331,6 +356,57 @@ test("publication is private, idempotent, verified, and refuses content collisio
   assert.equal(catalog.documents[0].reflectionId, model.reflection_id);
 });
 
+test("concurrent same-identity publishers never overwrite a conflicting target", async (t) => {
+  const projectDir = await disposableProject(t);
+  const first = canonicalModel({ root_cause: "First competing content." });
+  const second = canonicalModel({ root_cause: "Second competing content." });
+  let hooksWaiting = 0;
+  let releaseHooks;
+  const hooksReady = new Promise((resolve) => { releaseHooks = resolve; });
+  let finalReads = 0;
+  let releaseReads;
+  const readsReady = new Promise((resolve) => { releaseReads = resolve; });
+  let finalScanPhase = false;
+  const beforeRename = async () => {
+    hooksWaiting += 1;
+    if (hooksWaiting === 2) {
+      finalScanPhase = true;
+      releaseHooks();
+    }
+    await hooksReady;
+  };
+  const coordinatedFs = new Proxy(fsPromises, {
+    get(target, property) {
+      if (property === "readdir") {
+        return async (...args) => {
+          const entries = await target.readdir(...args);
+          if (finalScanPhase && finalReads < 2) {
+            finalReads += 1;
+            if (finalReads === 2) releaseReads();
+            await readsReady;
+          }
+          return entries;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+
+  const settled = await Promise.allSettled([
+    publishReflectionDocument({ projectDir, model: first, beforeRename, fsImpl: coordinatedFs }),
+    publishReflectionDocument({ projectDir, model: second, beforeRename, fsImpl: coordinatedFs })
+  ]);
+  const fulfilled = settled.map((result, index) => ({ result, index }))
+    .filter(({ result }) => result.status === "fulfilled");
+  const rejected = settled.filter((result) => result.status === "rejected");
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0].reason.message, /publication_collision/);
+  const winningModel = [first, second][fulfilled[0].index];
+  assert.equal(await readFile(fulfilled[0].result.value.path, "utf8"), renderReflectionMarkdown(winningModel));
+});
+
 test("publication validates exclusive absolute roots and rejects symlinked protected directories", async (t) => {
   const projectDir = await disposableProject(t);
   const exportDir = await disposableProject(t);
@@ -346,4 +422,28 @@ test("publication validates exclusive absolute roots and rejects symlinked prote
 
   const exported = await publishReflectionDocument({ reflectionDir: exportDir, model });
   assert.equal(path.dirname(exported.path), exportDir);
+});
+
+test("publication rejects project and reflection roots beneath symlinked ancestors before writing", async (t) => {
+  const aliases = await disposableProject(t);
+  const physical = await disposableProject(t);
+  const physicalProject = path.join(physical, "project");
+  const physicalReflectionDir = path.join(physical, "export");
+  await mkdir(physicalProject);
+  await mkdir(physicalReflectionDir);
+  await symlink(physical, path.join(aliases, "linked-parent"));
+
+  const projectDir = path.join(aliases, "linked-parent", "project");
+  await assert.rejects(
+    publishReflectionDocument({ projectDir, model: canonicalModel() }),
+    /project_root_symlink/
+  );
+  assert.deepEqual(await readdir(physicalProject), []);
+
+  const reflectionDir = path.join(aliases, "linked-parent", "export");
+  await assert.rejects(
+    publishReflectionDocument({ reflectionDir, model: canonicalModel() }),
+    /reflection_directory_symlink/
+  );
+  assert.deepEqual(await readdir(physicalReflectionDir), []);
 });
