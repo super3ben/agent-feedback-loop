@@ -67,6 +67,134 @@ function controlCaptureFixture() {
   };
 }
 
+function canonicalAliasEvent(overrides = {}) {
+  return event({
+    event_uid: "alias-matrix-event",
+    session_uid: "alias-matrix-session",
+    cli: "codex",
+    context_epoch: 7,
+    source_event_id: "alias-matrix-source-event",
+    source_namespace: "prompt_hook",
+    observation_source_id: "alias-matrix-source",
+    source_offset: 11,
+    capture_source: "prompt_hook",
+    native_turn_id: "alias-matrix-turn",
+    source_timestamp: "2026-07-20T01:00:00.000Z",
+    referent_event_uid: "alias-matrix-referent",
+    content_hash: "b".repeat(64),
+    completeness: "prompt_only",
+    encrypted_raw_ref: "/private/blobs/alias-matrix.enc",
+    source_identity: undefined,
+    ...overrides
+  });
+}
+
+const CAPTURE_ALIAS_CASES = [
+  [
+    "source_provider/provider/cli",
+    { source_provider: "codex", provider: "codex", cli: "codex" },
+    { source_provider: "codex", provider: "claude", cli: "codex" }
+  ],
+  [
+    "session_uid/sessionUid",
+    { session_uid: "alias-matrix-session", sessionUid: "alias-matrix-session" },
+    { session_uid: "alias-matrix-session", sessionUid: "other-session" }
+  ],
+  [
+    "context_epoch/contextEpoch",
+    { context_epoch: 7, contextEpoch: 7 },
+    { context_epoch: 7, contextEpoch: 8 }
+  ],
+  [
+    "source_event_id/sourceEventId",
+    { source_event_id: "alias-matrix-source-event", sourceEventId: "alias-matrix-source-event" },
+    { source_event_id: "alias-matrix-source-event", sourceEventId: "other-source-event" }
+  ],
+  [
+    "source_namespace/sourceNamespace",
+    { source_namespace: "prompt_hook", sourceNamespace: "prompt_hook" },
+    { source_namespace: "prompt_hook", sourceNamespace: "transcript_message" }
+  ],
+  [
+    "source_id/sourceId/observation_source_id",
+    {
+      source_id: "alias-matrix-source",
+      sourceId: "alias-matrix-source",
+      observation_source_id: "alias-matrix-source"
+    },
+    {
+      source_id: "alias-matrix-source",
+      sourceId: "other-source",
+      observation_source_id: "alias-matrix-source"
+    }
+  ],
+  [
+    "event_uid/eventUid",
+    { event_uid: "alias-matrix-event", eventUid: "alias-matrix-event" },
+    { event_uid: "alias-matrix-event", eventUid: "other-event" }
+  ],
+  [
+    "source_offset/sourceOffset",
+    { source_offset: 11, sourceOffset: 11 },
+    { source_offset: 11, sourceOffset: 12 }
+  ],
+  [
+    "native_turn_id/nativeTurnId/native_turn",
+    {
+      native_turn_id: "alias-matrix-turn",
+      nativeTurnId: "alias-matrix-turn",
+      native_turn: "alias-matrix-turn"
+    },
+    {
+      native_turn_id: "alias-matrix-turn",
+      nativeTurnId: "other-turn",
+      native_turn: "alias-matrix-turn"
+    }
+  ],
+  [
+    "source_timestamp/sourceTimestamp",
+    {
+      source_timestamp: "2026-07-20T01:00:00.000Z",
+      sourceTimestamp: "2026-07-20T01:00:00.000Z"
+    },
+    {
+      source_timestamp: "2026-07-20T01:00:00.000Z",
+      sourceTimestamp: "2026-07-20T01:01:00.000Z"
+    }
+  ],
+  [
+    "referent_event_uid/referentEventUid",
+    { referent_event_uid: "alias-matrix-referent", referentEventUid: "alias-matrix-referent" },
+    { referent_event_uid: "alias-matrix-referent", referentEventUid: "other-referent" }
+  ],
+  [
+    "content_hash/contentHash",
+    { content_hash: "b".repeat(64), contentHash: "b".repeat(64) },
+    { content_hash: "b".repeat(64), contentHash: "c".repeat(64) }
+  ],
+  [
+    "completeness/capture_completeness",
+    { completeness: "prompt_only", capture_completeness: "prompt_only" },
+    { completeness: "prompt_only", capture_completeness: "partial" }
+  ],
+  [
+    "capture_source/captureSource",
+    { capture_source: "prompt_hook", captureSource: "prompt_hook" },
+    { capture_source: "prompt_hook", captureSource: "transcript_payload" }
+  ],
+  [
+    "encrypted_raw_ref/encryptedRawRef",
+    {
+      encrypted_raw_ref: "/private/blobs/alias-matrix.enc",
+      encryptedRawRef: "/private/blobs/alias-matrix.enc"
+    },
+    {
+      encrypted_raw_ref: "/private/blobs/alias-matrix.enc",
+      encryptedRawRef: "/private/blobs/other.enc"
+    }
+  ]
+];
+
 test("fresh control schema contains only transient tables", () => {
   const { paths } = fixture();
   mkdirSync(path.dirname(paths.legacyDatabase), { recursive: true, mode: 0o700 });
@@ -1135,6 +1263,108 @@ test("invalid canonical capture identity is rejected before blob or database sid
   }
 });
 
+test("public capture rejects conflicting aliases before blob or database side effects", async (t) => {
+  for (const [caseName, , conflictingAliases] of CAPTURE_ALIAS_CASES) {
+    await t.test(caseName, async () => {
+      const { store } = controlCaptureFixture();
+      let blobWrites = 0;
+      const blobs = {
+        async write() {
+          blobWrites += 1;
+          return "/private/blobs/alias-matrix.enc";
+        }
+      };
+      let rejected = false;
+      try {
+        await captureObservedSession({
+          store,
+          blobs,
+          event: canonicalAliasEvent(conflictingAliases),
+          rawText: "conflicting alias evidence"
+        });
+      } catch {
+        rejected = true;
+      }
+      const outcome = {
+        rejected,
+        blobWrites,
+        sessions: store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count,
+        events: store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count,
+        observations: store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count
+      };
+      store.close();
+
+      assert.deepEqual(outcome, {
+        rejected: true,
+        blobWrites: 0,
+        sessions: 0,
+        events: 0,
+        observations: 0
+      });
+    });
+  }
+});
+
+test("direct capture uses the shared conflict-validating alias normalizer", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  let rejected = false;
+  try {
+    store.captureSessionEvent(canonicalAliasEvent({
+      event_uid: "alias-matrix-event",
+      eventUid: "other-event"
+    }));
+  } catch {
+    rejected = true;
+  }
+  const outcome = {
+    rejected,
+    sessions: store.database.prepare("SELECT COUNT(*) AS count FROM sessions").get().count,
+    events: store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count,
+    observations: store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count
+  };
+  store.close();
+
+  assert.deepEqual(outcome, {
+    rejected: true,
+    sessions: 0,
+    events: 0,
+    observations: 0
+  });
+});
+
+test("equivalent duplicate aliases normalize identically in public and direct capture", async () => {
+  const { store } = controlCaptureFixture();
+  const equivalentAliases = CAPTURE_ALIAS_CASES.reduce(
+    (aliases, [, equivalent]) => Object.assign(aliases, equivalent),
+    {}
+  );
+  let blobWrites = 0;
+  const blobs = {
+    async write() {
+      blobWrites += 1;
+      return "/private/blobs/alias-matrix.enc";
+    }
+  };
+  const canonical = canonicalAliasEvent(equivalentAliases);
+
+  const first = await captureObservedSession({
+    store,
+    blobs,
+    event: { ...canonical },
+    rawText: "equivalent alias evidence"
+  });
+  const directReplay = store.captureSessionEvent({ ...canonical });
+
+  assert.equal(blobWrites, 2);
+  assert.equal(first.kind, "new");
+  assert.equal(directReplay.kind, "exact_replay");
+  assert.equal(directReplay.eventUid, first.eventUid);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 1);
+  store.close();
+});
+
 test("public capture uses one frozen snapshot across the blob await", async () => {
   const { store } = controlCaptureFixture();
   let firstWriteStartedResolve;
@@ -1627,6 +1857,237 @@ test("concurrent different first aliases resolve to one event and two observatio
     store.database.prepare(`SELECT observed_event_uid FROM event_observations
       ORDER BY observed_event_uid`).all().map((row) => row.observed_event_uid),
     ["different-alias-hook-event", "different-alias-transcript-event"]
+  );
+  store.close();
+});
+
+test("public completeness-incompatible alias becomes a replayable new event", async () => {
+  const { store } = controlCaptureFixture();
+  const blobs = {
+    async write() {
+      return "/private/blobs/completeness-shared.enc";
+    }
+  };
+  const shared = {
+    session_uid: "completeness-session",
+    source_identity: undefined,
+    native_turn_id: "completeness-turn",
+    source_timestamp: "2026-07-20T02:00:00.000Z",
+    content_hash: "d".repeat(64),
+    encrypted_raw_ref: null
+  };
+  const prompt = event({
+    ...shared,
+    event_uid: "completeness-prompt-event",
+    source_event_id: "completeness-prompt-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "completeness-prompt-observation",
+    capture_source: "prompt_hook",
+    completeness: "prompt_only"
+  });
+  const partial = event({
+    ...shared,
+    event_uid: "completeness-partial-event",
+    source_event_id: "completeness-partial-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "completeness-partial-observation",
+    capture_source: "transcript_payload",
+    completeness: "partial"
+  });
+
+  const first = await captureObservedSession({ store, blobs, event: prompt, rawText: "shared evidence" });
+  const second = await captureObservedSession({ store, blobs, event: partial, rawText: "shared evidence" });
+  const replay = await captureObservedSession({ store, blobs, event: { ...partial }, rawText: "shared evidence" });
+
+  assert.equal(first.kind, "new");
+  assert.equal(second.kind, "new");
+  assert.equal(replay.kind, "exact_replay");
+  assert.equal(replay.eventUid, second.eventUid);
+  assert.notEqual(second.eventUid, first.eventUid);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+
+test("public target-compatible alias attaches and exact replay succeeds", async () => {
+  const { store } = controlCaptureFixture();
+  const blobs = {
+    async write() {
+      return "/private/blobs/compatible-alias.enc";
+    }
+  };
+  const shared = {
+    session_uid: "compatible-alias-session",
+    source_identity: undefined,
+    native_turn_id: "compatible-alias-turn",
+    source_timestamp: "2026-07-20T02:10:00.000Z",
+    content_hash: "e".repeat(64),
+    completeness: "prompt_only",
+    encrypted_raw_ref: null
+  };
+  const prompt = event({
+    ...shared,
+    event_uid: "compatible-prompt-event",
+    source_event_id: "compatible-prompt-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "compatible-prompt-observation",
+    capture_source: "prompt_hook"
+  });
+  const transcript = event({
+    ...shared,
+    event_uid: "compatible-transcript-event",
+    source_event_id: "compatible-transcript-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "compatible-transcript-observation",
+    capture_source: "transcript_payload"
+  });
+
+  const first = await captureObservedSession({ store, blobs, event: prompt, rawText: "compatible evidence" });
+  const alias = await captureObservedSession({ store, blobs, event: transcript, rawText: "compatible evidence" });
+  const replay = await captureObservedSession({ store, blobs, event: { ...transcript }, rawText: "compatible evidence" });
+
+  assert.equal(first.kind, "new");
+  assert.equal(alias.kind, "alias");
+  assert.equal(replay.kind, "exact_replay");
+  assert.equal(alias.eventUid, first.eventUid);
+  assert.equal(replay.eventUid, first.eventUid);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 1);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 2);
+  store.close();
+});
+
+test("public alias candidate applies completeness compatibility before LIMIT", async () => {
+  const { store } = controlCaptureFixture();
+  const shared = {
+    session_uid: "completeness-limit-session",
+    source_identity: undefined,
+    native_turn_id: "completeness-limit-turn",
+    content_hash: "f".repeat(64)
+  };
+  for (const [eventUid, sourceTimestamp, completeness, encryptedRawRef] of [
+    ["incompatible-before-limit-a", "2026-07-20T03:00:00.000Z", "partial", "/private/blobs/incompatible-a.enc"],
+    ["incompatible-before-limit-b", "2026-07-20T03:01:00.000Z", "partial", "/private/blobs/incompatible-b.enc"],
+    ["compatible-after-limit", "2026-07-20T03:02:00.000Z", "prompt_only", "/private/blobs/compatible-after-limit.enc"]
+  ]) {
+    const seeded = store.captureSessionEvent(event({
+      ...shared,
+      event_uid: eventUid,
+      source_event_id: `${eventUid}-source`,
+      source_namespace: "prompt_hook",
+      observation_source_id: `${eventUid}-observation`,
+      capture_source: "prompt_hook",
+      source_timestamp: sourceTimestamp,
+      completeness,
+      encrypted_raw_ref: encryptedRawRef
+    }));
+    assert.equal(seeded.kind, "new");
+  }
+  const blobs = {
+    async write() {
+      return "/private/blobs/compatible-after-limit.enc";
+    }
+  };
+  const incoming = event({
+    ...shared,
+    event_uid: "incoming-after-completeness-limit",
+    source_event_id: "incoming-after-completeness-limit-source",
+    source_namespace: "transcript_message",
+    observation_source_id: "incoming-after-completeness-limit-observation",
+    capture_source: "transcript_payload",
+    source_timestamp: "2026-07-20T03:03:00.000Z",
+    completeness: "prompt_only",
+    encrypted_raw_ref: null
+  });
+
+  const alias = await captureObservedSession({ store, blobs, event: incoming, rawText: "limit evidence" });
+  const replay = await captureObservedSession({ store, blobs, event: { ...incoming }, rawText: "limit evidence" });
+  const directInput = {
+    provider: "codex",
+    sessionUid: shared.session_uid,
+    contextEpoch: 1,
+    sourceNamespace: "transcript_direct",
+    sourceId: "direct-after-completeness-limit-observation",
+    nativeTurnId: shared.native_turn_id,
+    role: "user",
+    contentHash: shared.content_hash,
+    sourceTimestamp: "2026-07-20T03:04:00.000Z",
+    completeness: "prompt_only",
+    encryptedRawRef: "/private/blobs/compatible-after-limit.enc"
+  };
+  const directAlias = store.resolveEventObservation(directInput);
+  const directReplay = store.resolveEventObservation({ ...directInput });
+
+  assert.equal(alias.kind, "alias");
+  assert.equal(alias.eventUid, "compatible-after-limit");
+  assert.equal(replay.kind, "exact_replay");
+  assert.equal(replay.eventUid, "compatible-after-limit");
+  assert.equal(directAlias.event_uid, "compatible-after-limit");
+  assert.equal(directAlias.duplicate, false);
+  assert.equal(directReplay.event_uid, "compatible-after-limit");
+  assert.equal(directReplay.duplicate, true);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 3);
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM event_observations").get().count, 5);
+  store.close();
+});
+
+test("direct alias does not attach a completeness-incompatible target", () => {
+  const { paths } = fixture();
+  const store = initializeControlStore({ paths });
+  const canonical = event({
+    event_uid: "direct-completeness-target",
+    session_uid: "direct-completeness-session",
+    source_identity: undefined,
+    source_event_id: "direct-completeness-source",
+    source_namespace: "prompt_hook",
+    observation_source_id: "direct-completeness-observation",
+    capture_source: "prompt_hook",
+    native_turn_id: "direct-completeness-turn",
+    source_timestamp: "2026-07-20T03:20:00.000Z",
+    completeness: "prompt_only",
+    encrypted_raw_ref: "/private/blobs/direct-completeness.enc"
+  });
+  store.captureSessionEvent(canonical);
+
+  assert.throws(
+    () => store.resolveEventObservation({
+      provider: "codex",
+      sessionUid: canonical.session_uid,
+      contextEpoch: canonical.context_epoch,
+      sourceNamespace: "transcript_explicit",
+      sourceId: "direct-completeness-explicit-incompatible",
+      eventUid: canonical.event_uid,
+      nativeTurnId: canonical.native_turn_id,
+      role: canonical.role,
+      contentHash: canonical.content_hash,
+      sourceTimestamp: canonical.source_timestamp,
+      completeness: "partial",
+      encryptedRawRef: canonical.encrypted_raw_ref
+    }),
+    (error) => error?.code === "control_observation_collision"
+  );
+
+  const resolved = store.resolveEventObservation({
+    provider: "codex",
+    sessionUid: canonical.session_uid,
+    contextEpoch: canonical.context_epoch,
+    sourceNamespace: "transcript_message",
+    sourceId: "direct-completeness-incompatible",
+    nativeTurnId: canonical.native_turn_id,
+    role: canonical.role,
+    contentHash: canonical.content_hash,
+    sourceTimestamp: canonical.source_timestamp,
+    completeness: "partial",
+    encryptedRawRef: canonical.encrypted_raw_ref
+  });
+
+  assert.equal(resolved, null);
+  assert.equal(
+    store.database.prepare(`SELECT COUNT(*) AS count FROM event_observations
+      WHERE source_id IN (?, ?)`).get(
+      "direct-completeness-explicit-incompatible",
+      "direct-completeness-incompatible"
+    ).count,
+    0
   );
   store.close();
 });

@@ -180,67 +180,104 @@ function collision() {
   return new ControlStoreError("control_observation_collision", "control observation collision");
 }
 
-function firstDefined(input, fields) {
-  for (const field of fields) {
-    if (input[field] !== null && input[field] !== undefined) return input[field];
+function readAliasGroup(input, aliases, normalize, {
+  defaultValue = null,
+  conflict = () => new TypeError(`${aliases.join("/")} aliases must identify the same value`)
+} = {}) {
+  let resolved = defaultValue;
+  let supplied = false;
+  for (const alias of aliases) {
+    const rawValue = input[alias];
+    if (rawValue === null || rawValue === undefined) continue;
+    const normalizedValue = normalize(rawValue, alias);
+    if (supplied && normalizedValue !== resolved) throw conflict();
+    resolved = normalizedValue;
+    supplied = true;
   }
-  return null;
+  return resolved;
 }
 
 function normalizedCaptureSource(input, provider, sourceNamespace) {
-  const snakeValue = input.capture_source;
-  const camelValue = input.captureSource;
-  const snake = snakeValue == null ? null : assertString(snakeValue, "capture_source", 256);
-  const camel = camelValue == null ? null : assertString(camelValue, "captureSource", 256);
-  if (snake !== null && camel !== null && snake !== camel) {
-    throw new TypeError("capture_source and captureSource must identify the same capture source");
-  }
-  return snake ?? camel ?? `${provider}:${sourceNamespace}`;
+  return readAliasGroup(
+    input,
+    ["capture_source", "captureSource"],
+    (value, alias) => assertString(value, alias, 256),
+    {
+      defaultValue: `${provider}:${sourceNamespace}`,
+      conflict: () => new TypeError("capture_source and captureSource must identify the same capture source")
+    }
+  );
 }
 
 function normalizedCompleteness(input) {
-  const completeness = input.completeness == null
-    ? null
-    : assertString(input.completeness, "completeness", 64);
-  const captureCompleteness = input.capture_completeness == null
-    ? null
-    : assertString(input.capture_completeness, "capture_completeness", 64);
-  return completeness ?? captureCompleteness;
+  return readAliasGroup(
+    input,
+    ["completeness", "capture_completeness"],
+    (value, alias) => assertString(value, alias, 64)
+  );
 }
 
 function normalizedEncryptedRawRef(input) {
-  const snakeValue = input.encrypted_raw_ref;
-  const camelValue = input.encryptedRawRef;
-  const snake = snakeValue == null ? null : assertString(snakeValue, "encrypted_raw_ref", 4096);
-  const camel = camelValue == null ? null : assertString(camelValue, "encryptedRawRef", 4096);
-  if (snake !== null && camel !== null && snake !== camel) throw collision();
-  return snake ?? camel;
+  return readAliasGroup(
+    input,
+    ["encrypted_raw_ref", "encryptedRawRef"],
+    (value, alias) => assertString(value, alias, 4096),
+    { conflict: collision }
+  );
 }
 
 export function normalizeCaptureIdentity(input, { requireEventIdentity = false } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("capture identity input must be an object");
   }
-  const provider = assertString(firstDefined(input, ["source_provider", "provider", "cli"]), "source_provider", 64);
-  const sessionUid = assertString(firstDefined(input, ["session_uid", "sessionUid"]), "session_uid", 512);
-  const contextEpochValue = firstDefined(input, ["context_epoch", "contextEpoch"]);
+  const provider = assertString(readAliasGroup(
+    input,
+    ["source_provider", "provider", "cli"],
+    (value) => assertString(value, "source_provider", 64)
+  ), "source_provider", 64);
+  const sessionUid = assertString(readAliasGroup(
+    input,
+    ["session_uid", "sessionUid"],
+    (value) => assertString(value, "session_uid", 512)
+  ), "session_uid", 512);
+  const contextEpochValue = readAliasGroup(
+    input,
+    ["context_epoch", "contextEpoch"],
+    (value) => assertOptionalEpoch(value, "context_epoch")
+  );
   const contextEpoch = assertOptionalEpoch(contextEpochValue, "context_epoch");
   if (requireEventIdentity && contextEpoch === null) {
     throw new TypeError("context_epoch must be a bounded positive integer");
   }
-  const sourceEventValue = firstDefined(input, ["source_event_id", "sourceEventId"]);
+  const sourceEventValue = readAliasGroup(
+    input,
+    ["source_event_id", "sourceEventId"],
+    (value) => assertOptionalString(value, "source_event_id", 1024)
+  );
   const sourceEventId = requireEventIdentity
     ? assertString(sourceEventValue, "source_event_id", 1024)
     : assertOptionalString(sourceEventValue, "source_event_id", 1024);
-  const sourceNamespaceValue = firstDefined(input, ["source_namespace", "sourceNamespace"]);
+  const sourceNamespaceValue = readAliasGroup(
+    input,
+    ["source_namespace", "sourceNamespace"],
+    (value) => assertString(value, "source_namespace", 128)
+  );
   const sourceNamespace = sourceNamespaceValue == null && requireEventIdentity
     ? "hook"
     : assertString(sourceNamespaceValue, "source_namespace", 128);
-  const sourceIdValue = firstDefined(input, ["source_id", "sourceId", "observation_source_id"]);
+  const sourceIdValue = readAliasGroup(
+    input,
+    ["source_id", "sourceId", "observation_source_id"],
+    (value) => assertString(value, "source_id", 1024)
+  );
   const sourceId = sourceIdValue == null && requireEventIdentity
     ? sourceEventId
     : assertString(sourceIdValue, "source_id", 1024);
-  const eventUidValue = firstDefined(input, ["event_uid", "eventUid"]);
+  const eventUidValue = readAliasGroup(
+    input,
+    ["event_uid", "eventUid"],
+    (value) => assertOptionalString(value, "event_uid", 512)
+  );
   const completenessValue = normalizedCompleteness(input);
   const identity = {
     event_uid: requireEventIdentity
@@ -252,13 +289,33 @@ export function normalizeCaptureIdentity(input, { requireEventIdentity = false }
     source_namespace: sourceNamespace,
     source_id: sourceId,
     source_event_id: sourceEventId,
-    source_offset: assertOptionalSourceOffset(firstDefined(input, ["source_offset", "sourceOffset"]), "source_offset"),
+    source_offset: readAliasGroup(
+      input,
+      ["source_offset", "sourceOffset"],
+      (value) => assertOptionalSourceOffset(value, "source_offset")
+    ),
     capture_source: normalizedCaptureSource(input, provider, sourceNamespace),
-    native_turn_id: assertOptionalString(firstDefined(input, ["native_turn_id", "nativeTurnId", "native_turn"]), "native_turn_id", 512),
-    source_timestamp: assertOptionalString(firstDefined(input, ["source_timestamp", "sourceTimestamp"]), "source_timestamp", 128),
+    native_turn_id: readAliasGroup(
+      input,
+      ["native_turn_id", "nativeTurnId", "native_turn"],
+      (value) => assertOptionalString(value, "native_turn_id", 512)
+    ),
+    source_timestamp: readAliasGroup(
+      input,
+      ["source_timestamp", "sourceTimestamp"],
+      (value) => assertOptionalString(value, "source_timestamp", 128)
+    ),
     role: assertString(input.role, "role", 64),
-    referent_event_uid: assertOptionalString(firstDefined(input, ["referent_event_uid", "referentEventUid"]), "referent_event_uid", 512),
-    content_hash: assertString(firstDefined(input, ["content_hash", "contentHash"]), "content_hash", 128),
+    referent_event_uid: readAliasGroup(
+      input,
+      ["referent_event_uid", "referentEventUid"],
+      (value) => assertOptionalString(value, "referent_event_uid", 512)
+    ),
+    content_hash: assertString(readAliasGroup(
+      input,
+      ["content_hash", "contentHash"],
+      (value) => assertString(value, "content_hash", 128)
+    ), "content_hash", 128),
     completeness: requireEventIdentity
       ? assertString(completenessValue, "completeness", 64)
       : assertOptionalString(completenessValue, "completeness", 64)
@@ -354,7 +411,7 @@ function sameEncryptedRawRef(row, fields) {
   return (row.encrypted_raw_ref ?? null) === fields.encrypted_raw_ref;
 }
 
-function sameObservedEvent(row, fields) {
+function sameObservationBinding(row, fields) {
   const boundKey = observationKey(
     fields.source_provider,
     fields.session_uid,
@@ -370,40 +427,59 @@ function sameObservedEvent(row, fields) {
     && (fields.context_epoch == null || Number(row.observation_context_epoch) === fields.context_epoch)
     && row.observation_source_namespace === fields.source_namespace
     && row.observation_source_id === fields.source_id
-    && row.capture_source === fields.capture_source
-    && row.session_uid === fields.session_uid
-    && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
-    && row.source_provider === fields.source_provider
-    && row.role === fields.role
-    && row.content_hash === fields.content_hash;
+    && row.capture_source === fields.capture_source;
 }
 
-function samePreparedEventBinding(row, fields) {
-  const incomingTimestampValue = fields.source_timestamp ?? row.observed_at;
+function targetCompatibility(fields, timestampFallback) {
+  return {
+    session_uid: fields.session_uid,
+    source_provider: fields.source_provider,
+    context_epoch: fields.context_epoch,
+    role: fields.role,
+    content_hash: fields.content_hash,
+    native_turn_id: fields.native_turn_id,
+    source_timestamp: fields.source_timestamp ?? timestampFallback,
+    completeness: fields.completeness
+  };
+}
+
+function sameTargetEvent(row, target, {
+  exactNativeTurn = false,
+  exactTimestamp = false
+} = {}) {
+  const incomingTimestampValue = target.source_timestamp;
   const persistedTimestampValue = row.source_timestamp ?? row.created_at;
   const incomingTimestamp = Date.parse(incomingTimestampValue);
   const persistedTimestamp = Date.parse(persistedTimestampValue);
-  const timestampMatches = persistedTimestampValue === incomingTimestampValue
-    || (Number.isFinite(incomingTimestamp)
-      && Number.isFinite(persistedTimestamp)
-      && Math.abs(incomingTimestamp - persistedTimestamp) <= 5 * 60 * 1000);
-  const nativeTurnMatches = (row.native_turn_id ?? null) === fields.native_turn_id
-    || (row.native_turn_id == null && fields.native_turn_id != null);
-  return sameObservedEvent(row, fields)
+  const timestampMatches = exactTimestamp
+    ? (row.source_timestamp ?? null) === incomingTimestampValue
+    : persistedTimestampValue === incomingTimestampValue
+      || (Number.isFinite(incomingTimestamp)
+        && Number.isFinite(persistedTimestamp)
+        && Math.abs(incomingTimestamp - persistedTimestamp) <= 5 * 60 * 1000);
+  const nativeTurnMatches = (row.native_turn_id ?? null) === target.native_turn_id
+    || (!exactNativeTurn && row.native_turn_id == null && target.native_turn_id != null);
+  return row.session_uid === target.session_uid
+    && row.source_provider === target.source_provider
+    && (target.context_epoch == null || Number(row.context_epoch) === target.context_epoch)
+    && row.role === target.role
+    && row.content_hash === target.content_hash
     && nativeTurnMatches
     && timestampMatches
-    && row.completeness === fields.completeness;
+    && (target.completeness == null || row.completeness === target.completeness);
+}
+
+function samePreparedCaptureBinding(row, fields) {
+  return sameObservationBinding(row, fields)
+    && sameTargetEvent(row, targetCompatibility(fields, row.observed_at));
 }
 
 function sameObservationTarget(row, fields) {
   return (!fields.event_uid || row.observed_event_uid === fields.event_uid)
-    && row.session_uid === fields.session_uid
-    && (fields.context_epoch == null || Number(row.context_epoch) === fields.context_epoch)
-    && row.source_provider === fields.source_provider
-    && row.role === fields.role
-    && row.content_hash === fields.content_hash
-    && (row.native_turn_id ?? null) === fields.native_turn_id
-    && (row.source_timestamp ?? null) === fields.source_timestamp;
+    && sameTargetEvent(row, targetCompatibility(fields, fields.source_timestamp), {
+      exactNativeTurn: true,
+      exactTimestamp: true
+    });
 }
 
 function requireCompatibleDirectRef(row, fields) {
@@ -506,6 +582,34 @@ function createStore(database, now) {
     return database.prepare("SELECT * FROM event_observations WHERE observation_key=?").get(fields.observation_key);
   };
 
+  const selectCompatibleTargetCandidates = (target, nativeTurnId) => database.prepare(`SELECT e.*
+    FROM session_events e
+    WHERE e.session_uid = ?
+      AND e.source_provider = ?
+      AND e.role = ?
+      AND e.content_hash = ?
+      AND (? IS NULL OR e.context_epoch = ?)
+      AND (? IS NULL OR e.completeness = ?)
+      AND COALESCE(e.native_turn_id, '') = COALESCE(?, '')
+      AND julianday(COALESCE(e.source_timestamp, e.created_at))
+          BETWEEN julianday(?) - (5.0 / 1440.0)
+              AND julianday(?) + (5.0 / 1440.0)
+    ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid
+    LIMIT 2`).all(
+    target.session_uid, target.source_provider, target.role, target.content_hash,
+    target.context_epoch, target.context_epoch,
+    target.completeness, target.completeness,
+    nativeTurnId, target.source_timestamp, target.source_timestamp
+  );
+
+  const compatibleTargetCandidates = (target) => {
+    let candidates = selectCompatibleTargetCandidates(target, target.native_turn_id);
+    if (!candidates.length && target.native_turn_id != null) {
+      candidates = selectCompatibleTargetCandidates(target, null);
+    }
+    return candidates;
+  };
+
   const resolveOrInsertCapture = ({ preparedCapture, authoritativeEncryptedRef }) => {
     const authoritativeRef = authoritativeEncryptedRef == null
       ? null
@@ -514,7 +618,7 @@ function createStore(database, now) {
     return transaction(() => {
       const existingObservation = eventObservation(database, fields);
       if (existingObservation) {
-        if (!samePreparedEventBinding(existingObservation, fields)
+        if (!samePreparedCaptureBinding(existingObservation, fields)
             || !sameEncryptedRawRef(existingObservation, fields)) {
           throw collision();
         }
@@ -531,25 +635,7 @@ function createStore(database, now) {
       if (existingSession && existingSession.cli !== fields.cli) throw collision();
 
       const timestamp = nowIso(now);
-      const incomingTimestamp = fields.source_timestamp || timestamp;
-      const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.*
-        FROM session_events e
-        WHERE e.session_uid = ?
-          AND e.source_provider = ?
-          AND e.role = ?
-          AND e.content_hash = ?
-          AND e.context_epoch = ?
-          AND COALESCE(e.native_turn_id, '') = COALESCE(?, '')
-          AND julianday(COALESCE(e.source_timestamp, e.created_at))
-              BETWEEN julianday(?) - (5.0 / 1440.0)
-                  AND julianday(?) + (5.0 / 1440.0)
-        ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid
-        LIMIT 2`).all(
-        fields.session_uid, fields.source_provider, fields.role, fields.content_hash,
-        fields.context_epoch, nativeTurnId, incomingTimestamp, incomingTimestamp
-      );
-      let candidates = selectCandidates(fields.native_turn_id);
-      if (!candidates.length && fields.native_turn_id != null) candidates = selectCandidates(null);
+      const candidates = compatibleTargetCandidates(targetCompatibility(fields, timestamp));
       if (candidates.length === 1 && sameEncryptedRawRef(candidates[0], fields)) {
         const observation = insertObservation(fields, candidates[0].event_uid, timestamp);
         return captureResolution("alias", candidates[0], observation);
@@ -597,7 +683,7 @@ function createStore(database, now) {
       return transaction(() => {
         const existing = eventObservation(database, fields);
         if (existing) {
-          if (!sameObservedEvent(existing, fields)) throw collision();
+          if (!samePreparedCaptureBinding(existing, fields)) throw collision();
           requireCompatibleDirectRef(existing, fields);
           return { ...existing, duplicate: true };
         }
@@ -623,21 +709,7 @@ function createStore(database, now) {
         }
         const incomingTimestamp = fields.source_timestamp || nowIso(now);
         if (!Number.isFinite(Date.parse(incomingTimestamp))) return null;
-        const contextClause = fields.context_epoch == null ? "" : " AND e.context_epoch=?";
-        const selectCandidates = (nativeTurnId) => database.prepare(`SELECT e.* FROM session_events e
-          WHERE e.session_uid=? AND e.source_provider=? AND e.role=? AND e.content_hash=?${contextClause}
-            AND COALESCE(e.native_turn_id, '')=COALESCE(?, '')
-            AND julianday(COALESCE(e.source_timestamp, e.created_at))
-              BETWEEN julianday(?) - (5.0 / 1440.0) AND julianday(?) + (5.0 / 1440.0)
-          ORDER BY COALESCE(e.source_timestamp, e.created_at), e.event_uid LIMIT 2`).all(
-          fields.session_uid, fields.source_provider, fields.role, fields.content_hash,
-          ...(fields.context_epoch == null ? [] : [fields.context_epoch]), nativeTurnId,
-          incomingTimestamp, incomingTimestamp
-        );
-        let candidates = selectCandidates(fields.native_turn_id);
-        if (!candidates.length && fields.native_turn_id != null) {
-          candidates = selectCandidates(null);
-        }
+        const candidates = compatibleTargetCandidates(targetCompatibility(fields, incomingTimestamp));
         if (candidates.length !== 1) return null;
         const candidate = candidates[0];
         requireCompatibleDirectRef(candidate, fields);
