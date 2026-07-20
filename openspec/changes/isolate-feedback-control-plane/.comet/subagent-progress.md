@@ -111,7 +111,9 @@
 - Architecture retrospective: original user value is still pending in Tasks 2–6; Task 1's storage direction is sound, but `control-store` compatibility responsibilities and open-ended review became overextended. The timezone-less probe has no current producer evidence, so broader timestamp/SQL redesign would be over-optimization
 - Frozen implementation: exactly two timestamp regressions plus one small timezone-bearing RFC3339-to-UTC entry normalization in `src/control-store.mjs`; implementation scope is only `src/control-store.mjs` and `test/control-store.test.mjs`
 - Frozen review: one fresh reviewer checks only the persisted Task 1 checklist and regression evidence. Only main-session interference, data loss/unrecoverability, security/privacy, or a frozen-checklist failure blocks; every other adjacent finding enters backlog and cannot launch another Task 1 fix round
-- Next action: commit the policy/plan adjustment, dispatch one fresh TDD implementer for Steps 23-26, then run the single frozen Task 1 acceptance review. On pass, check off Task 1 and immediately continue Task 2
+- Frozen closeout base: `d3dd12a4400ef4dd6c330f9c5048ebfdd314230e`
+- Frozen closeout dispatch: fresh implementer `/root/task1_timestamp_closeout` is executing only Steps 23-26 with TDD; allowed scope is exactly `src/control-store.mjs` and `test/control-store.test.mjs`
+- Next action: wait for the two-test closeout, verify its commit/report/scope, then run the single frozen Task 1 acceptance review. On pass, check off Task 1 and immediately continue Task 2
 
 ## Superseded implementation
 
