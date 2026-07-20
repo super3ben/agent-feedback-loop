@@ -1281,7 +1281,7 @@ git commit -m "feat: define validated reviewer results"
 
 ### Task 8: 建立 canonical/legacy Markdown 文档层与原子发布
 
-- [ ] **Task 8 complete: 建立 canonical/legacy Markdown 文档层与原子发布**
+- [x] **Task 8 complete: 建立 canonical/legacy Markdown 文档层与原子发布**
 
 **Files:**
 - Create: `src/reflection-document.mjs`
@@ -1299,7 +1299,7 @@ git commit -m "feat: define validated reviewer results"
 - Produces: canonical metadata keys `reflection_id`, `created_at`, `published_at`, `final_severity`, `responsibility`, `method_class`, `family_id`, `applies_when`, `effectiveness`, `source_identity_hash`
 - `validateReflectionModel` 的 controller source envelope 固定为 `{ sourceIdentity, createdAt, publishedAt }`：前两项来自 durable job/source event，`publishedAt` 是调用者在 publication fence 内固定并在 crash adoption 时复用的带时区时间；文档层只校验并规范化为 UTC，不自行读取时钟或新增持久状态
 
-- [ ] **Step 1: Write RED tests for the exact readable format and legacy compatibility**
+- [x] **Step 1: Write RED tests for the exact readable format and legacy compatibility**
 
 ```js
 const markdown = renderReflectionMarkdown(model);
@@ -1322,7 +1322,7 @@ Add three read-only-derived fixture shapes matching the existing repository repo
 
 For a legacy document with severity, responsibility, a bounded mistake-class section and a bounded actionable method-change/preventive-constraint section, derive `methodClass = legacy-method-<first 20 hex chars of sha256(normalized class)>` and `familyId = legacy-family-<first 20 hex chars of sha256(normalized class + "\n" + methodClass)>`. This allows current documents that predate those metadata keys to remain selectable and groups only exact normalized mistake classes; it does not pretend semantic equivalence. Derive `createdAt` from a recognized filename timestamp, otherwise owned file mtime; use mtime as the legacy publication cutoff. Missing mistake class or actionable method returns `{eligible:false, omission:'legacy_incomplete'}`. Catalog tests must read only regular `*.md` files, reject symlink entries, enforce the two hard limits and return stable path order. Canonical `published_at >= publishedBefore` and concurrently modified legacy files with `mtime >= publishedBefore` are excluded as `published_after_cutoff`.
 
-- [ ] **Step 2: Write atomic publication RED tests**
+- [x] **Step 2: Write atomic publication RED tests**
 
 Use an injectable filesystem that fails at write, file sync, rename and post-rename hash verification. Assert no canonical target is selectable after pre-rename failures, duplicate `reflection_id` reuses an identical hash, and a conflicting existing target returns `publication_collision` without overwrite.
 
@@ -1330,7 +1330,7 @@ Run: `node --test test/reflection-document.test.mjs`
 
 Expected: FAIL because the document module does not exist.
 
-- [ ] **Step 3: Implement validation, rendering, parsing and publication**
+- [x] **Step 3: Implement validation, rendering, parsing and publication**
 
 Canonical rendering must use the established report format, not YAML or a separate card database:
 
@@ -1364,7 +1364,7 @@ Derive controller-owned fields rather than trusting the provider: `reflection_id
 
 Use a 0600 same-directory temp file, `FileHandle.sync()`, `rename()`, directory sync when supported, and SHA-256 verification. Reject a symlinked project root, `.agent` directory or reflections directory before every publish. Slug sanitization allows lowercase ASCII letters, digits and hyphens only; fall back to the reflection id prefix. An explicit `reflectionDir` exists only for legacy export and is subject to the same ownership/symlink checks.
 
-- [ ] **Step 4: Run document tests and commit**
+- [x] **Step 4: Run document tests and commit**
 
 Run: `node --test test/reflection-document.test.mjs`
 
