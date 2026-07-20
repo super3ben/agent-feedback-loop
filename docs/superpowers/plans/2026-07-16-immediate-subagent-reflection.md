@@ -1212,7 +1212,7 @@ git commit -m "feat: add the detached reviewer launcher"
 
 ### Task 7: 先定义结构化 reviewer result，保持旧 runtime 全绿
 
-- [ ] **Task 7 complete: 先定义结构化 reviewer result，保持旧 runtime 全绿**
+- [x] **Task 7 complete: 先定义结构化 reviewer result，保持旧 runtime 全绿**
 
 **Files:**
 - Create: `src/reviewer-result.mjs`
@@ -1230,7 +1230,7 @@ git commit -m "feat: add the detached reviewer launcher"
 
 **Frozen Task 7 acceptance:** (A) `no_lesson` is exactly `{outcome}` and `lesson` has exactly the declared fields; (B) lesson severity is `Major|Critical|Blocker`, responsibility is `agent_fault`, controlled identifiers and all strings/arrays obey the stated bounds, and facts/applies-when/method changes are non-empty; (C) an existing family must be controller-allowlisted with `proposed_family_key:null`, while a new family has `family_id:null`, a normalized proposed key, no recurrence ids and a deterministic controller-derived id; prior reflection ids in `recurrence_of` must resolve through `recurrenceFamilyById` to the selected existing family; (D) unknown/source/receipt/notification fields, obvious credential/control payloads and caller mutation are rejected without logging content; (E) the JSON Schema mirrors the static two-outcome contract while catalog/secret semantics are independently enforced in JavaScript; (F) `readSecureReviewerResult()` uses a no-follow opened file, accepts only one owned 0600 regular file of 1..256 KiB, decodes strict UTF-8 JSON, and removes only the same owned regular file on success or failure without touching a symlink; (G) only the five declared files change and no provider, runner, CLI, database, Markdown publication or real runtime is activated.
 
-- [ ] **Step 1: Write RED contract tests**
+- [x] **Step 1: Write RED contract tests**
 
 ```js
 const noLesson = validateReviewerResult({ outcome: "no_lesson" }, { allowedFamilyIds: [] });
@@ -1256,19 +1256,19 @@ assert.equal(validateReviewerResult({
 
 Reject invented source ids, unsupported severity/responsibility, unbounded arrays/strings, empty reusable method, obvious credential/control payloads and extra operational fields such as receipt/notification. Bound `applies_when` to 8 items × 160 chars, `facts` to 12 × 512, complaint/root-cause/class fields to 2,048 chars each, `method_changes` to 8 × 512, repeated-pattern evidence to 8 × 512 and recurrence ids to 16 × 128; every required string is trimmed and non-empty. An existing `family_id` is accepted only when it appears in `allowedFamilyIds`, requires `proposed_family_key:null`, and each prior reflection id in `recurrence_of` must map to that same family in the controller-supplied `recurrenceFamilyById`. Otherwise `family_id` must be null, `recurrence_of` must be empty and `proposed_family_key` must normalize to lowercase ASCII letters/digits/hyphens. The controller derives a new stable id as `family-<first 20 hex chars of sha256(method_class + "\n" + proposed_family_key)>`.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test test/reviewer-result.test.mjs test/reviewer-result-file.test.mjs`
 
 Expected: FAIL because the standalone result validator, schema and secure result-file reader do not exist.
 
-- [ ] **Step 3: Implement the standalone result contract**
+- [x] **Step 3: Implement the standalone result contract**
 
 Use one JSON Schema with `oneOf` for the two outcomes and `additionalProperties:false`. `validateReviewerResult` enforces the same limits in JavaScript so provider output cannot bypass schema validation.
 
 Rename the private output-file boundary to `readSecureReviewerResult(path)`. It opens with no-follow semantics, then accepts one 0600 regular file owned by the current uid, rejects zero or more than 256 KiB before JSON parsing, decodes strict UTF-8, returns the parsed value to the separate semantic validator, and removes only the same owned regular inode in `finally` on success or parse/validation failure. It never follows or removes a symlink and never renders or logs the content. Codex writes this path via `--output-last-message`; Claude/Gemini stdout envelopes are unwrapped and copied by the controller into the same exclusive 0600 boundary before validation. This is an internal provider result channel, not a user-visible receipt.
 
-- [ ] **Step 4: Run new and unchanged reviewer tests, then commit**
+- [x] **Step 4: Run new and unchanged reviewer tests, then commit**
 
 Run: `node --test test/reviewer-result.test.mjs test/reviewer-result-file.test.mjs test/reviewer-provider.test.mjs test/reviewer-runner.test.mjs test/reviewer-adapter.test.mjs test/reviewer-auth.test.mjs`
 
