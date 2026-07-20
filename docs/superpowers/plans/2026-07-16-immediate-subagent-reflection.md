@@ -1132,7 +1132,7 @@ git commit -m "feat: queue explicit feedback immediately"
 
 ### Task 6: 实现 macOS/Linux detached reviewer 与 prompt-time recovery
 
-- [ ] **Task 6 complete: 实现 macOS/Linux detached reviewer 与 prompt-time recovery**
+- [x] **Task 6 complete: 实现 macOS/Linux detached reviewer 与 prompt-time recovery**
 
 **Files:**
 - Create: `src/reviewer-launcher.mjs`
@@ -1147,7 +1147,7 @@ git commit -m "feat: queue explicit feedback immediately"
 
 **Frozen Task 6 acceptance:** (A) only `darwin` and `linux` are supported; inputs and absolute executable/CLI paths are validated before direct spawn; (B) arguments and process options are exact, use no shell, inherit no stdio, and the child is synchronously unrefed; (C) only a bounded environment allowlist reaches the child and no prompt/evidence content is logged; (D) spawn/unref failure is returned as a machine reason, and `recoverDueReviewers` releases only the matching reserved launch epoch; (E) recovery scans stable due order, reserves and attempts at most one job per call, and store/launcher failure remains prompt-safe; (F) a real disposable macOS child outlives its parent and writes a sentinel without leaking child output, while Linux options are covered through the same platform-neutral implementation; (G) the task does not wire the legacy runner, add a timer/scheduler, wait for a provider, change schema, support Windows, or touch real HOME/hooks/runtime state.
 
-- [ ] **Step 1: Write RED tests for exact spawn options and bounded recovery**
+- [x] **Step 1: Write RED tests for exact spawn options and bounded recovery**
 
 ```js
 const result = launchDetachedReviewer({
@@ -1170,13 +1170,13 @@ assert.equal(unrefCalled, true);
 
 Test `darwin` and `linux`; `win32` returns `{attempted:false, reason:'unsupported_platform'}`. When launch is exercised through `recoverDueReviewers`, a synchronous spawn/unref failure must call `recordReviewLaunchFailure` with the matching launch epoch and make the job immediately recoverable; a stale epoch cannot release a newer reservation. The process-only launcher does not own SQLite. Recovery fixture with three jobs must attempt exactly one in stable order. A child object has to expose `unref`; otherwise treat launch as failed.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test test/reviewer-launcher.test.mjs test/e2e-smoke.test.mjs`
 
 Expected: FAIL because launcher/recovery module does not exist and current launcher is embedded in `cli.mjs`.
 
-- [ ] **Step 3: Implement short-lived detached launch**
+- [x] **Step 3: Implement short-lived detached launch**
 
 Use direct `spawn`, never a shell. Prevalidate platform, executable and absolute CLI path. The function is intentionally synchronous: it only creates the child and calls `unref`, never awaits process exit. A synchronous spawn/unref exception returns `spawn_failed`; the recovery orchestrator records that failure against only the matching reservation epoch. An asynchronous child error is consumed so it cannot crash the host and remains recoverable after `next_launch_at`. No stdout/stderr is inherited by the host. Pass only the existing reviewer-safe base environment (`PATH`, `HOME`, `TMPDIR`, locale and `TZ`), explicitly allowlisted operator variables and `AFL_REVIEW_*`; do not forward arbitrary secrets.
 
@@ -1194,13 +1194,13 @@ return { attempted: true, reason: "spawn_attempted" };
 
 Keep production wiring dependency-injected in this task. The lifecycle E2E uses a fixture CLI that writes a sentinel after its parent returns; do not send a new control-store job to the still-legacy `reviewer-run`. Task 9 will call `recoverDueReviewers({limit:1})` once per prompt after the new candidate's reservation, once the new runner protocol is active. Recovery is not a timer, performs at most one synchronous spawn attempt, and cannot wait for a child or provider.
 
-- [ ] **Step 4: Run focused and process-lifecycle tests**
+- [x] **Step 4: Run focused and process-lifecycle tests**
 
 Run: `node --test test/reviewer-launcher.test.mjs test/e2e-smoke.test.mjs`
 
 Expected: PASS; a fixture child writes a completion sentinel after the hook process has already returned, and host output contains no child output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/reviewer-launcher.mjs test/reviewer-launcher.test.mjs test/e2e-smoke.test.mjs
