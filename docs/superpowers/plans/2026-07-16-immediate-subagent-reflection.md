@@ -1380,6 +1380,7 @@ git commit -m "feat: publish reflection documents atomically"
 - [ ] **Task 9 complete: 让 reviewer runner 只提交 no-lesson 或 published 文档终态**
 
 **Files:**
+- Modify: `src/index.mjs`
 - Modify: `src/reviewer-provider.mjs`
 - Modify: `src/reviewer-runner.mjs`
 - Modify: `src/reviewer-adapter.mjs`
@@ -1401,6 +1402,13 @@ git commit -m "feat: publish reflection documents atomically"
 - Consumes: `launchDetachedReviewer()`/`recoverDueReviewers()` from Task 6 and activates them with the new runner only in this task
 - Produces: `runReviewJob({ jobId, ownerId, store, blobs, provider, projectDir }) -> { outcome, documentPath }`
 - Produces: CLI `reviewer-run --home <home> --job-id <id>` with no stdout business/control message
+
+**Frozen Task 9 preflight:**
+- `sourceIdentity` is the durable `reviewer_jobs.source_identity`; `createdAt` is the source event's timezone-bearing `source_timestamp`, falling back to its captured `created_at`; `publishedAt` is the durable job `created_at`. The runner normalizes these through the Task 8 model boundary. It must not use `claimed_at` or a retry-time clock because either would change the canonical document hash after a crash.
+- `reviewer-run` derives the provider from the captured source provider and the project root from the absolute `project_id`; unscoped/non-absolute project identities fail as `context_invalid`. The control database stores only terminal state plus published path/hash.
+- The provider result is handed off only through the Task 7 private `0600` result-file reader. Codex receives `--output-last-message`; Claude/Gemini bounded stdout is normalized into the same private file. Provider output, stderr and evidence bodies never appear in operational logs or thrown error messages.
+- The prompt hook performs one synchronous detached spawn for its reservation and one bounded recovery scan. Neither path awaits the reviewer or introduces a timer/scheduler. A failed spawn releases only its fenced launch reservation.
+- This preflight adds `src/index.mjs` solely to repoint the installed schema path from the deleted receipt schema to `reviewer-result.schema.json`; it does not change installation or runtime layout.
 
 - [ ] **Step 1: Write runner RED tests for both terminal outcomes and publication fencing**
 
