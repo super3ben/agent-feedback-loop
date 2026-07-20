@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "const": "no_lesson" }
+      },
+      "required": ["outcome"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "outcome": { "const": "lesson" },
+        "final_severity": { "enum": ["Major", "Critical", "Blocker"] },
+        "responsibility": { "const": "agent_fault" },
+        "method_class": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+        },
+        "family_id": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "proposed_family_key": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "applies_when": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+          }
+        },
+        "facts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+          }
+        },
+        "user_complaint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+        },
+        "root_cause": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+        },
+        "class_of_mistake": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+        },
+        "method_changes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+          }
+        },
+        "repeated_pattern_evidence": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+          }
+        },
+        "recurrence_of": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(?![\\s\\S]*\\s$)\\S[\\s\\S]*$"
+          }
+        }
+      },
+      "required": [
+        "outcome",
+        "final_severity",
+        "responsibility",
+        "method_class",
+        "family_id",
+        "proposed_family_key",
+        "applies_when",
+        "facts",
+        "user_complaint",
+        "root_cause",
+        "class_of_mistake",
+        "method_changes",
+        "repeated_pattern_evidence",
+        "recurrence_of"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "family_id": { "type": "null" },
+                "proposed_family_key": { "type": "string" },
+                "recurrence_of": { "maxItems": 0 }
+              }
+            },
+            {
+              "properties": {
+                "family_id": { "type": "string" },
+                "proposed_family_key": { "type": "null" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
