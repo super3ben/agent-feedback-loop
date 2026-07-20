@@ -1377,7 +1377,7 @@ git commit -m "feat: publish reflection documents atomically"
 
 ### Task 9: 让 reviewer runner 只提交 no-lesson 或 published 文档终态
 
-- [ ] **Task 9 complete: 让 reviewer runner 只提交 no-lesson 或 published 文档终态**
+- [x] **Task 9 complete: 让 reviewer runner 只提交 no-lesson 或 published 文档终态**
 
 **Files:**
 - Modify: `src/index.mjs`
@@ -1410,7 +1410,7 @@ git commit -m "feat: publish reflection documents atomically"
 - The prompt hook performs one synchronous detached spawn for its reservation and one bounded recovery scan. Neither path awaits the reviewer or introduces a timer/scheduler. A failed spawn releases only its fenced launch reservation.
 - This preflight adds `src/index.mjs` solely to repoint the installed schema path from the deleted receipt schema to `reviewer-result.schema.json`; it does not change installation or runtime layout.
 
-- [ ] **Step 1: Write runner RED tests for both terminal outcomes and publication fencing**
+- [x] **Step 1: Write runner RED tests for both terminal outcomes and publication fencing**
 
 ```js
 const noLesson = await runReviewJob({ ...fixture, provider: async () => ({ outcome: "no_lesson" }) });
@@ -1425,13 +1425,13 @@ assert.equal(store.getReviewJob(jobId).published_sha256, sha256(readFileSync(les
 
 Add invalid provider result, publication collision, lease expiry during provider call, stale-owner submission and crash-after-rename adoption. A lease that expires during the provider call must fail the pre-publication fence without creating a canonical file. A crash after a fenced rename may leave one valid immutable document; the next owner may adopt only that same reflection id/hash and may never overwrite it.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test test/reviewer-provider.test.mjs test/reviewer-runner.test.mjs test/reviewer-adapter.test.mjs test/control-store.test.mjs test/e2e-smoke.test.mjs`
 
 Expected: FAIL because current runner submits a receipt plus database lesson/report/notification transaction.
 
-- [ ] **Step 3: Implement bounded context and terminal commits**
+- [x] **Step 3: Implement bounded context and terminal commits**
 
 First atomically switch the production CLI wiring: `handlePromptHook` injects the synchronous detached launcher for newly reserved jobs and then performs one bounded recovery; `reviewer-run` opens only the control store and invokes the new runner. There must be no commit in which a control-store job is launched into the legacy runner protocol.
 
@@ -1462,7 +1462,7 @@ Immediately before any canonical rename, recheck the current owner/epoch and ren
 
 On retryable provider/publication failure call `failReviewJob` with one fixed enum reason (`provider_unavailable`, `provider_timeout`, `provider_invalid`, `context_invalid`, `lease_lost`, `publication_failed`, `publication_collision`) and the Task 2 backoff; exhausted jobs become `failed`. Remove lesson/report/notification writes from completion.
 
-- [ ] **Step 4: Run focused runner/store/e2e regression and commit**
+- [x] **Step 4: Run focused runner/store/e2e regression and commit**
 
 Run: `node --test test/reviewer-result.test.mjs test/reviewer-result-file.test.mjs test/reviewer-provider.test.mjs test/reviewer-runner.test.mjs test/reviewer-adapter.test.mjs test/control-store.test.mjs test/e2e-smoke.test.mjs test/reflection-document.test.mjs`
 
