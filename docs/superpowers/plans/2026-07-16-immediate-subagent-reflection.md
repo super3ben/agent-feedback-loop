@@ -816,7 +816,7 @@ The fresh reviewer checks only the global Task 1 frozen acceptance checklist, th
 
 ### Task 2: 实现即时 candidate job 与 fenced lease 控制 API
 
-- [ ] **Task 2 complete: 实现即时 candidate job 与 fenced lease 控制 API**
+- [x] **Task 2 complete: 实现即时 candidate job 与 fenced lease 控制 API**
 
 **Files:**
 - Modify: `src/control-store.mjs`
@@ -833,7 +833,7 @@ The fresh reviewer checks only the global Task 1 frozen acceptance checklist, th
 - Produces: `store.getReviewContext({ jobId, priorLimit = 6, followingLimit = 2 }) -> { job, source, referent, prior, following }`
 - Produces: stale owner fencing by `(job_id, owner_id, lease_epoch)`
 
-- [ ] **Step 1: Write RED tests for identity, immediate readiness and fencing**
+- [x] **Step 1: Write RED tests for identity, immediate readiness and fencing**
 
 ```js
 const first = store.createReviewCandidate(candidate);
@@ -853,13 +853,13 @@ assert.equal(wake1.launchEpoch, 1);
 
 Add a stale lease assertion in which owner A expires, owner B claims a higher epoch, and A cannot publish.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='candidate identity is replay-idempotent|different sessions are never text-deduplicated|launch reservation is bounded|stale reviewer owners cannot publish' test/control-store.test.mjs`
 
 Expected: FAIL because the new APIs do not exist and current `submitDueReview()` still depends on queue count/cooldown semantics.
 
-- [ ] **Step 3: Implement the minimal transactional APIs**
+- [x] **Step 3: Implement the minimal transactional APIs**
 
 Use one `BEGIN IMMEDIATE` transaction per state change. `createReviewCandidate` inserts the job immediately and never counts unrelated queue rows. `reserveReviewLaunch` atomically increments `launch_epoch` and advances `next_launch_at`; a synchronous spawn failure may release only the same epoch. `listRecoverableReviewJobs` returns only due pending/retryable/expired-running jobs ordered by `created_at, job_id` with `limit` hard-capped to 8.
 
@@ -877,13 +877,13 @@ createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity,
 
 The new control store never defines `queue_events`, `submitDueReview`, `feedback_candidate_event_ids` or minEntries/maxAge batching. `getReviewContext` returns opaque event ids, encrypted blob references and bounded metadata in stable chronological order; the runner owns decryption. Use `MAX_REVIEW_ATTEMPTS = 3`, a 185-second default lease for the 180-second provider timeout, and retry delays of 30/120 seconds before the final `failed` state. Claim increments `attempt` and `lease_epoch`; `failReviewJob` may move only the current owner/epoch to `retryable` or `failed`. The temporary legacy store remains unchanged until Task 13 so intermediate commits keep the old consumer tests green.
 
-- [ ] **Step 4: Run focused regression**
+- [x] **Step 4: Run focused regression**
 
 Run: `node --test test/control-store.test.mjs test/store.test.mjs test/capture.test.mjs`
 
 Expected: PASS with job/event rows bounded and no notification, lesson or report body writes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/control-store.mjs test/control-store.test.mjs
