@@ -16,7 +16,7 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `blocked`
+- Stage: `implementing`
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`
@@ -102,7 +102,12 @@
 - Probe evidence: disposable `TZ=Asia/Shanghai` probe returned `new -> alias -> control_observation_collision`, with SQLite delta 60 seconds, JavaScript delta 28,740 seconds, and 1 event/2 observations
 - Root-cause synthesis: timestamp text has no single canonical public contract or parse representation, so structurally shared target compatibility still has two runtime semantics. The fix must define and enforce one preflight timestamp contract and make SQL/replay consume the same canonical value, not add a replay-only exception
 - Review ceiling: the single identity-coherence fix plus fresh review-11 explicitly authorized on 2026-07-20 has been consumed; no review-11 fix agent is authorized yet
-- Next action: wait for explicit user authorization of one timestamp-contract TDD fix plus one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- User authorization: on 2026-07-20 the user replied `继续`, authorizing one root-cause timestamp-contract amendment, its TDD implementation, and one fresh independent re-review
+- Verified producer boundary: current capture/reconcile producers and all Task 1 fixtures use timezone-bearing ISO strings, but the public normalizer only enforces a bounded string; the review-11 counterexample is therefore an accepted-input contract defect, not a test-only SQLite oddity
+- Timestamp architecture: optional input must be a valid timezone-bearing RFC3339 instant with at most millisecond precision, normalized once to fixed-width UTC ISO before signature/blob/SQLite work; equivalent offset aliases normalize equal. Candidate SQL and exact replay must compare the same canonical inclusive time-window bounds and must not independently parse raw timestamp text
+- Scope boundary: no schema/version/service/scheduler/hook/notification/RAG/Markdown ownership or later-task change; real hooks, HOME, runtime pointer, and feedback database remain untouched
+- Dirty-worktree attribution: `.superpowers/sdd/task-1-report.md` remains the prior agents' append-only handoff and must be preserved uncommitted
+- Next action: amend the approved Task 1 design/spec/plan with the explicit timestamp contract, validate it, then dispatch one fresh TDD implementer and one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
