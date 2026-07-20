@@ -7,9 +7,12 @@ import { promisify } from "node:util";
 import { test } from "node:test";
 
 import { install, pathsFor } from "../src/index.mjs";
+import { openControlStore } from "../src/control-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
+const BIN = path.join(ROOT, "bin", "agent-feedback-loop.mjs");
+const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
 
 function runHook(file, input, env, args) {
   return new Promise((resolve, reject) => {
@@ -69,6 +72,66 @@ test("installed prompt hook remains bounded fail-open", async () => {
 
   assert.deepEqual(JSON.parse(result.stdout), { continue: true });
   assert.equal(result.stderr, "");
+});
+
+test("installed explicit feedback commits one job before launch transition", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-installed-feedback-"));
+  await install({ home, codexHost: unavailableCodexHost() });
+  const paths = pathsFor(home);
+  const payload = JSON.stringify({
+    session_id: "installed-feedback-session",
+    event_id: "installed-feedback-event",
+    turn_id: "installed-feedback-turn-2",
+    cwd: path.join(home, "project"),
+    timestamp: "2026-07-20T08:00:00.000Z",
+    prompt: EXPLICIT_FEEDBACK,
+    previous_assistant_message: {
+      role: "assistant",
+      id: "installed-assistant-event",
+      turn_id: "installed-feedback-turn-1",
+      timestamp: "2026-07-20T07:59:59.000Z",
+      content: [{ type: "output_text", text: "I changed the design before confirming the boundary." }]
+    }
+  });
+
+  const result = await runHook(paths.coreHook, payload, { ...process.env, HOME: home, TMPDIR: home }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+  const controlStore = openControlStore({ paths });
+  try {
+    const job = controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
+    assert.ok(job?.job_id);
+    assert.equal(job.state, "pending");
+    assert.equal(Number(job.launch_epoch), 1);
+    assert.equal(controlStore.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 2);
+  } finally {
+    controlStore.close();
+  }
+  assert.deepEqual(JSON.parse(result.stdout), { continue: true });
+  assert.doesNotMatch(result.stdout, /\[AFL\]|afl-receipt|hookPrompt|checkpoint|runner_transition/i);
+  assert.equal(result.stderr, "");
+});
+
+test("parse and control-store failures return native prompt no-ops", async () => {
+  const installedHome = await mkdtemp(path.join(tmpdir(), "afl-installed-parse-failure-"));
+  await install({ home: installedHome, codexHost: unavailableCodexHost() });
+  const installedPaths = pathsFor(installedHome);
+  const parseFailure = await runHook(
+    installedPaths.coreHook,
+    "{not-json",
+    { ...process.env, HOME: installedHome, TMPDIR: installedHome },
+    ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]
+  );
+  assert.equal(parseFailure.stdout, '{"continue":true}\n');
+  assert.equal(parseFailure.stderr, "");
+
+  const uninitializedHome = await mkdtemp(path.join(tmpdir(), "afl-uninitialized-store-"));
+  const storeFailure = await runHook(
+    process.execPath,
+    JSON.stringify({ session_id: "missing-store", turn_id: "turn-1", prompt: "hello" }),
+    { ...process.env, HOME: uninitializedHome, TMPDIR: uninitializedHome },
+    [BIN, "hook", "--home", uninitializedHome, "--event", "UserPromptSubmit", "--cli", "codex", "--continue"]
+  );
+  assert.equal(storeFailure.stdout, '{"continue":true}\n');
+  assert.equal(storeFailure.stderr, "");
 });
 
 test("CLI live doctor runs only an isolated temporary canary", async () => {

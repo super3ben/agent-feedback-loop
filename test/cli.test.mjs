@@ -7,6 +7,9 @@ import { promisify } from "node:util";
 import { describe, it } from "node:test";
 
 import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
+import * as cliModule from "../src/cli.mjs";
+import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
+import { initializeControlStore } from "../src/control-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -82,7 +85,362 @@ function runWithInput(file, input, env, args = []) {
   });
 }
 
+const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
+const PROMPT_CUTOFF = "2026-07-20T08:00:00.000Z";
+
+function explicitFeedbackPayload(overrides = {}) {
+  const sessionId = overrides.session_id || "feedback-session-1";
+  return {
+    session_id: sessionId,
+    event_id: "feedback-event-1",
+    turn_id: "feedback-turn-2",
+    cwd: "/tmp/afl-task-5-project",
+    timestamp: "2026-07-20T07:59:59.000Z",
+    prompt: EXPLICIT_FEEDBACK,
+    previous_assistant_message: {
+      role: "assistant",
+      id: "assistant-event-1",
+      turn_id: "feedback-turn-1",
+      timestamp: "2026-07-20T07:59:58.000Z",
+      content: [{ type: "output_text", text: "I changed the design before confirming the simpler boundary." }]
+    },
+    ...overrides
+  };
+}
+
+async function promptOrchestrationFixture() {
+  const home = await tempHome();
+  const paths = pathsFor(home);
+  const controlStore = initializeControlStore({ paths, now: () => new Date(PROMPT_CUTOFF) });
+  const blobs = new EncryptedBlobStore({
+    root: paths.blobRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+  });
+  return { home, paths, controlStore, blobs };
+}
+
+function reviewJobCount(store) {
+  return Number(store.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count);
+}
+
+function capturedEventCount(store) {
+  return Number(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count);
+}
+
 describe("agent-feedback-loop package", () => {
+  it("explicit feedback commits one job before launch", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const calls = [];
+
+    const response = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer(jobId, launchEpoch) {
+        assert.equal(reviewJobCount(fixture.controlStore), 1);
+        assert.deepEqual(
+          fixture.controlStore.database.prepare("SELECT role FROM session_events ORDER BY role").all().map((row) => row.role),
+          ["assistant", "user"]
+        );
+        calls.push(`launch:${jobId}:${launchEpoch}`);
+      },
+      async writeResponse(result) {
+        calls.push("response");
+        assert.equal(result.operationalText, null);
+        return { continue: true };
+      },
+      now() {
+        calls.push("cutoff");
+        return new Date(PROMPT_CUTOFF);
+      }
+    });
+
+    const job = fixture.controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
+    assert.deepEqual(calls, ["cutoff", `launch:${job.job_id}:1`, "response"]);
+    assert.equal(job.source_event_uid, fixture.controlStore.database.prepare("SELECT event_uid FROM session_events WHERE role='user'").get().event_uid);
+    assert.equal(job.referent_event_uid, fixture.controlStore.database.prepare("SELECT event_uid FROM session_events WHERE role='assistant'").get().event_uid);
+    assert.equal(response.selectionPublishedBefore, PROMPT_CUTOFF);
+    assert.equal(response.selectionInput.publishedBefore, PROMPT_CUTOFF);
+    assert.equal(response.operationalText, null);
+    assert.deepEqual(response.hostResponse, { continue: true });
+    fixture.controlStore.close();
+  });
+
+  it("hook replay reuses the job", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const launches = [];
+    let responses = 0;
+    const input = {
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
+      async writeResponse() { responses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    };
+
+    await cliModule.handlePromptHook(input);
+    await cliModule.handlePromptHook(input);
+
+    assert.equal(reviewJobCount(fixture.controlStore), 1);
+    assert.equal(capturedEventCount(fixture.controlStore), 2);
+    assert.equal(launches.length, 1);
+    assert.equal(responses, 2);
+    fixture.controlStore.close();
+  });
+
+  it("same complaint in another session starts another review", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const launches = [];
+    const invoke = (payload) => cliModule.handlePromptHook({
+      payload,
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    await invoke(explicitFeedbackPayload());
+    await invoke(explicitFeedbackPayload({
+      session_id: "feedback-session-2",
+      event_id: "feedback-event-2",
+      turn_id: "feedback-turn-4",
+      previous_assistant_message: {
+        role: "assistant",
+        id: "assistant-event-2",
+        turn_id: "feedback-turn-3",
+        timestamp: "2026-07-20T07:59:58.000Z",
+        content: [{ type: "output_text", text: "I changed the design before confirming the simpler boundary." }]
+      }
+    }));
+
+    assert.equal(reviewJobCount(fixture.controlStore), 2);
+    assert.equal(launches.length, 2);
+    assert.notEqual(launches[0][0], launches[1][0]);
+    fixture.controlStore.close();
+  });
+
+  it("prompt failures remain host-pass", async () => {
+    const ordinary = await promptOrchestrationFixture();
+    let ordinaryResponses = 0;
+    const ordinaryResult = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({ prompt: "reviewer job 是干嘛的？" }),
+      cli: "codex",
+      controlStore: ordinary.controlStore,
+      legacyMemoryStore: null,
+      blobs: ordinary.blobs,
+      launchReviewer() { throw new Error("ordinary prompt must not launch"); },
+      writeResponse: async () => { ordinaryResponses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(reviewJobCount(ordinary.controlStore), 0);
+    assert.equal(capturedEventCount(ordinary.controlStore), 0);
+    assert.equal(ordinaryResponses, 1);
+    assert.equal(ordinaryResult.operationalText, null);
+    ordinary.controlStore.close();
+
+    const failedCapture = await promptOrchestrationFixture();
+    let captureFailureResponses = 0;
+    const captureFailureResult = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: failedCapture.controlStore,
+      legacyMemoryStore: null,
+      blobs: { async write() { throw new Error("fixture_blob_failure"); } },
+      launchReviewer() { throw new Error("capture failure must not launch"); },
+      writeResponse: async () => { captureFailureResponses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(reviewJobCount(failedCapture.controlStore), 0);
+    assert.equal(capturedEventCount(failedCapture.controlStore), 0);
+    assert.equal(captureFailureResponses, 1);
+    assert.equal(captureFailureResult.operationalText, null);
+    failedCapture.controlStore.close();
+
+    const failedStore = await promptOrchestrationFixture();
+    let storeFailureResponses = 0;
+    const storeProxy = new Proxy(failedStore.controlStore, {
+      get(target, property, receiver) {
+        if (property === "createReviewCandidate") return () => { throw new Error("fixture_store_failure"); };
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    const storeFailureResult = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: storeProxy,
+      legacyMemoryStore: null,
+      blobs: failedStore.blobs,
+      launchReviewer() { throw new Error("store failure must not launch"); },
+      writeResponse: async () => { storeFailureResponses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(reviewJobCount(failedStore.controlStore), 0);
+    assert.equal(capturedEventCount(failedStore.controlStore), 2);
+    assert.equal(storeFailureResponses, 1);
+    assert.equal(storeFailureResult.operationalText, null);
+    failedStore.controlStore.close();
+
+    const failedLaunch = await promptOrchestrationFixture();
+    let launchFailureResponses = 0;
+    const launchFailureResult = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: failedLaunch.controlStore,
+      legacyMemoryStore: null,
+      blobs: failedLaunch.blobs,
+      launchReviewer() { throw new Error("fixture_launch_failure"); },
+      writeResponse: async () => { launchFailureResponses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(reviewJobCount(failedLaunch.controlStore), 1);
+    assert.equal(launchFailureResponses, 1);
+    assert.equal(launchFailureResult.operationalText, null);
+    failedLaunch.controlStore.close();
+
+    const failedSelection = await promptOrchestrationFixture();
+    let selectionFailureResponses = 0;
+    const selectionFailureResult = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({ prompt: "按推荐执行" }),
+      cli: "codex",
+      controlStore: failedSelection.controlStore,
+      legacyMemoryStore: { selectLessons() { throw new Error("fixture_selection_failure"); } },
+      blobs: failedSelection.blobs,
+      launchReviewer() { throw new Error("ordinary prompt must not launch"); },
+      writeResponse: async () => { selectionFailureResponses += 1; return { continue: true }; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(reviewJobCount(failedSelection.controlStore), 0);
+    assert.equal(selectionFailureResponses, 1);
+    assert.equal(selectionFailureResult.operationalText, null);
+    failedSelection.controlStore.close();
+  });
+
+  it("prompt hook never awaits launcher completion", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const never = new Promise(() => {});
+    let timer;
+    const response = await Promise.race([
+      cliModule.handlePromptHook({
+        payload: explicitFeedbackPayload(),
+        cli: "codex",
+        controlStore: fixture.controlStore,
+        legacyMemoryStore: null,
+        blobs: fixture.blobs,
+        launchReviewer: () => never,
+        writeResponse: async () => ({ continue: true }),
+        now: () => new Date(PROMPT_CUTOFF)
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("prompt hook awaited launcher completion")), 1_000);
+      })
+    ]);
+    clearTimeout(timer);
+
+    assert.equal(reviewJobCount(fixture.controlStore), 1);
+    assert.equal(response.operationalText, null);
+    fixture.controlStore.close();
+  });
+
+  it("unstable prompt identity creates no evidence or job", async () => {
+    const fixture = await promptOrchestrationFixture();
+    let launches = 0;
+    const payload = explicitFeedbackPayload({
+      session_id: undefined,
+      event_id: "native-but-unscoped-feedback",
+      turn_id: undefined,
+      previous_assistant_message: {
+        role: "assistant",
+        id: "unstable-referent",
+        content: [{ type: "output_text", text: "I changed the design too early." }]
+      }
+    });
+    delete payload.session_id;
+    delete payload.turn_id;
+
+    const response = await cliModule.handlePromptHook({
+      payload,
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer() { launches += 1; },
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    assert.equal(capturedEventCount(fixture.controlStore), 0);
+    assert.equal(reviewJobCount(fixture.controlStore), 0);
+    assert.equal(launches, 0);
+    assert.equal(response.reason, "identity_unstable");
+    fixture.controlStore.close();
+  });
+
+  it("trusted structural feedback without a referent creates a source-only job", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const launches = [];
+    const payload = {
+      session_id: "structural-session",
+      event_id: "structural-feedback-1",
+      turn_id: "structural-turn-1",
+      cwd: "/tmp/afl-task-5-project",
+      timestamp: "2026-07-20T07:59:59.000Z",
+      prompt: "停止刚才的等待，直接处理当前问题。",
+      active_turn_steering: true
+    };
+
+    await cliModule.handlePromptHook({
+      payload,
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer(jobId, launchEpoch) { launches.push([jobId, launchEpoch]); },
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    const job = fixture.controlStore.database.prepare("SELECT * FROM reviewer_jobs").get();
+    assert.equal(capturedEventCount(fixture.controlStore), 1);
+    assert.equal(job.referent_event_uid, null);
+    assert.deepEqual(launches, [[job.job_id, 1]]);
+    fixture.controlStore.close();
+  });
+
+  it("retrospective text without a referent creates no evidence or job", async () => {
+    const fixture = await promptOrchestrationFixture();
+    let launches = 0;
+    await cliModule.handlePromptHook({
+      payload: {
+        session_id: "no-referent-session",
+        event_id: "no-referent-feedback",
+        turn_id: "no-referent-turn",
+        cwd: "/tmp/afl-task-5-project",
+        timestamp: "2026-07-20T07:59:59.000Z",
+        prompt: EXPLICIT_FEEDBACK
+      },
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      legacyMemoryStore: null,
+      blobs: fixture.blobs,
+      launchReviewer() { launches += 1; },
+      writeResponse: async () => ({ continue: true }),
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    assert.equal(capturedEventCount(fixture.controlStore), 0);
+    assert.equal(reviewJobCount(fixture.controlStore), 0);
+    assert.equal(launches, 0);
+    fixture.controlStore.close();
+  });
+
   it("synchronizes Codex trust for only the generated prompt command", async () => {
     const home = await tempHome();
     const calls = [];

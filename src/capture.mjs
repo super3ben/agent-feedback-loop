@@ -244,6 +244,70 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
   };
 }
 
+export function normalizeAssistantReferentEvent({
+  cli,
+  event,
+  referent,
+  installationId = "unknown",
+  capturePolicyRevision = 1
+}) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new TypeError("event must be an object");
+  }
+  if (!referent || typeof referent !== "object" || Array.isArray(referent)) {
+    throw new TypeError("referent must be an object");
+  }
+  const referentText = String(referent.text || "");
+  if (!referentText.trim()) throw new TypeError("referent text must be non-empty");
+  const referentIdentity = lengthPrefixedUtf8Sha256([
+    cli,
+    event.session_uid,
+    event.context_epoch,
+    referent.eventUid,
+    referent.turnId,
+    referent.timestamp
+  ]);
+  const redacted = redactText(referentText);
+  const sourceEventId = `assistant:${referentIdentity}`;
+  return {
+    cli,
+    installation_id: installationId,
+    native_session_id: event.native_session_id,
+    session_uid: event.session_uid,
+    event_uid: `${event.session_uid}:${sourceEventId}`,
+    source_event_id: sourceEventId,
+    source_namespace: "transcript_message",
+    observation_source_id: sourceEventId,
+    parent_event_id: null,
+    event_seq: Number.parseInt(referentIdentity.slice(0, 12), 16) || 1,
+    native_turn: referent.turnId || null,
+    native_turn_id: referent.turnId || null,
+    context_epoch: event.context_epoch,
+    task_fingerprint: event.task_fingerprint,
+    task_type: event.task_type,
+    paths: [],
+    tools: [],
+    project_id: event.project_id,
+    cwd: event.cwd,
+    role: "assistant",
+    referent_event_uid: null,
+    redacted_text: redacted.text,
+    content_hash: redacted.contentHash,
+    redaction_manifest: redacted.manifest,
+    capture_policy_revision: capturePolicyRevision,
+    data_class: event.data_class || "normal",
+    capture_source: "prompt_hook_assistant_referent",
+    capture_completeness: "transcript_visible_assistant",
+    tool_name: null,
+    tool_args: null,
+    tool_refs: [],
+    textual_output_ref: null,
+    file_refs: [],
+    artifact_hashes: [],
+    source_timestamp: referent.timestamp || null
+  };
+}
+
 export function normalizeStopEvent({ cli, payload, installationId = "unknown", capturePolicyRevision = 1 }) {
   const input = payload || {};
   const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];

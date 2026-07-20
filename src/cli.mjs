@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { doctor, install, pathsFor, uninstall } from "./index.mjs";
+import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookEvent } from "./capture.mjs";
+import { openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
+import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
 import { openStore } from "./store.mjs";
 import { ReviewerRunner } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
@@ -39,6 +42,197 @@ function parseArgs(args) {
     }
   }
   return { command, options };
+}
+
+const PROMPT_INPUT_MAX_BYTES = 2 * 1024 * 1024;
+const REVIEW_LAUNCH_COOLDOWN_MS = 5_000;
+
+function boundedReason(error, fallback) {
+  const value = String(error?.code || "").toLowerCase();
+  return /^[a-z0-9_.-]{1,64}$/.test(value) ? value : fallback;
+}
+
+function promptDebug(stage, reason, opaqueId = null) {
+  if (process.env.AGENT_FEEDBACK_LOOP_DEBUG !== "1") return;
+  const safeStage = /^[a-z0-9_.-]{1,48}$/.test(String(stage)) ? String(stage) : "unknown";
+  const safeReason = /^[a-z0-9_.-]{1,64}$/.test(String(reason)) ? String(reason) : "unknown";
+  const safeId = /^[a-zA-Z0-9_.:-]{1,128}$/.test(String(opaqueId || "")) ? String(opaqueId) : "none";
+  console.error(`agent-feedback-loop: hook.stage=${safeStage} reason=${safeReason} id=${safeId}`);
+}
+
+function cutoffIso(value) {
+  const parsed = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (!Number.isFinite(parsed.getTime())) throw new TypeError("hook cutoff must be a valid timestamp");
+  return parsed.toISOString();
+}
+
+async function readPromptInput(stream = process.stdin, maxBytes = PROMPT_INPUT_MAX_BYTES) {
+  let input = "";
+  let bytes = 0;
+  stream.setEncoding("utf8");
+  for await (const chunk of stream) {
+    bytes += Buffer.byteLength(chunk, "utf8");
+    if (bytes > maxBytes) throw new Error("prompt_input_too_large");
+    input += chunk;
+  }
+  return input;
+}
+
+export async function handlePromptHook({
+  payload,
+  cli,
+  controlStore,
+  legacyMemoryStore = null,
+  blobs,
+  launchReviewer = () => {},
+  writeResponse = async () => null,
+  now = () => new Date()
+}) {
+  let selectionPublishedBefore;
+  try {
+    selectionPublishedBefore = cutoffIso(now());
+  } catch (error) {
+    selectionPublishedBefore = new Date().toISOString();
+    promptDebug("cutoff", boundedReason(error, "invalid_cutoff"));
+  }
+
+  const result = {
+    operationalText: null,
+    selectionPublishedBefore,
+    selectionInput: { publishedBefore: selectionPublishedBefore },
+    candidate: false,
+    reason: "not_candidate",
+    jobId: null,
+    launchRequested: false
+  };
+  const input = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload
+    : { prompt: String(payload ?? "") };
+  const userText = String(input.prompt ?? input.text ?? "");
+  let event = null;
+  let signal = null;
+
+  try {
+    event = normalizeHookEvent({
+      cli,
+      payload: input,
+      installationId: "default",
+      capturePolicyRevision: 1
+    });
+    signal = await detectFeedbackCandidate({
+      payload: { ...input, cli },
+      userText,
+      now: () => new Date(selectionPublishedBefore)
+    });
+    result.candidate = signal.candidate === true;
+    result.reason = signal.candidate ? "candidate" : "not_candidate";
+  } catch (error) {
+    result.reason = "detector_failed";
+    promptDebug("detector", boundedReason(error, "detector_failed"));
+  }
+
+  if (signal?.candidate && event?.identity_unstable) {
+    result.candidate = false;
+    result.reason = "identity_unstable";
+    promptDebug("candidate", "identity_unstable");
+  } else if (signal?.candidate && event) {
+    let sourceCapture = null;
+    let referentCapture = null;
+    try {
+      if (signal.referent) {
+        const referentEvent = normalizeAssistantReferentEvent({
+          cli,
+          event,
+          referent: signal.referent,
+          installationId: "default",
+          capturePolicyRevision: 1
+        });
+        referentCapture = await captureObservedSession({
+          store: controlStore,
+          blobs,
+          event: referentEvent,
+          rawText: signal.referent.text
+        });
+      }
+      sourceCapture = await captureObservedSession({
+        store: controlStore,
+        blobs,
+        event: {
+          ...event,
+          referent_event_uid: referentCapture?.eventUid ?? null
+        },
+        rawText: userText
+      });
+    } catch (error) {
+      result.reason = "capture_failed";
+      promptDebug("capture", boundedReason(error, "capture_failed"));
+    }
+
+    if (sourceCapture) {
+      let candidate = null;
+      let reservation = null;
+      try {
+        const referentEventUid = referentCapture?.eventUid ?? null;
+        candidate = controlStore.createReviewCandidate({
+          sourceEventUid: sourceCapture.eventUid,
+          referentEventUid,
+          sourceIdentity: feedbackSourceIdentity({
+            cli: event.cli,
+            sessionUid: sourceCapture.eventView.session_uid,
+            contextEpoch: event.context_epoch,
+            sourceEventId: sourceCapture.eventView.source_event_id,
+            referentEventUid: referentEventUid ?? "none"
+          }),
+          projectId: event.project_id
+        });
+        result.jobId = candidate.jobId;
+        reservation = controlStore.reserveReviewLaunch({
+          jobId: candidate.jobId,
+          cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
+        });
+      } catch (error) {
+        result.reason = "store_failed";
+        promptDebug("store", boundedReason(error, "store_failed"), candidate?.jobId);
+      }
+
+      if (candidate && reservation?.launch) {
+        try {
+          const ignored = launchReviewer(candidate.jobId, reservation.launchEpoch);
+          if (ignored && typeof ignored.catch === "function") void ignored.catch(() => {});
+          result.launchRequested = true;
+          result.reason = "launch_reserved";
+        } catch (error) {
+          result.reason = "launch_failed";
+          promptDebug("launch", boundedReason(error, "launch_failed"), candidate.jobId);
+        }
+      } else if (candidate && reservation) {
+        result.reason = reservation.reason;
+      }
+    }
+  }
+
+  result.selectionInput = {
+    publishedBefore: selectionPublishedBefore,
+    projectId: event?.project_id ?? null,
+    sessionUid: event?.session_uid ?? null,
+    contextEpoch: event?.context_epoch ?? null
+  };
+  try {
+    if (legacyMemoryStore && typeof legacyMemoryStore.selectLessons === "function") {
+      legacyMemoryStore.selectLessons({ projectId: event?.project_id ?? null });
+    }
+  } catch (error) {
+    promptDebug("selection", boundedReason(error, "selection_failed"));
+  }
+
+  try {
+    result.hostResponse = await writeResponse(result);
+  } catch (error) {
+    result.hostResponse = null;
+    result.reason = "response_failed";
+    promptDebug("response", boundedReason(error, "response_failed"));
+  }
+  return result;
 }
 
 function printHelp() {
@@ -226,13 +420,51 @@ export async function main(args) {
   if (command === "hook") {
     const cli = options.cli || options.args[0] || "unknown";
     const withContinue = options.args.includes("--continue");
-    const response = withContinue ? { continue: true } : {};
-    await new Promise((resolve) => {
-      process.stdin.on("data", () => {});
-      process.stdin.on("end", resolve);
-    });
-    void cli;
-    console.log(JSON.stringify(response));
+    const nativeResponse = withContinue ? { continue: true } : {};
+    let responseWritten = false;
+    const writeResponse = async () => {
+      if (!responseWritten) console.log(JSON.stringify(nativeResponse));
+      responseWritten = true;
+      return nativeResponse;
+    };
+    let rawPayload;
+    let payload;
+    try {
+      rawPayload = await readPromptInput();
+      payload = JSON.parse(rawPayload || "{}");
+    } catch (error) {
+      promptDebug("input", boundedReason(error, "invalid_input"));
+      await writeResponse();
+      return;
+    }
+
+    const paths = pathsFor(options.home);
+    let controlStore = null;
+    try {
+      controlStore = openControlStore({ paths });
+      const blobs = new EncryptedBlobStore({
+        root: paths.blobRoot,
+        keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+      });
+      await handlePromptHook({
+        payload,
+        cli,
+        controlStore,
+        legacyMemoryStore: null,
+        blobs,
+        launchReviewer(jobId) {
+          promptDebug("launch", "runner_transition", jobId);
+          return { launched: false, reason: "runner_transition" };
+        },
+        writeResponse,
+        now: () => new Date()
+      });
+    } catch (error) {
+      promptDebug("hook", boundedReason(error, "hook_failed"));
+      await writeResponse();
+    } finally {
+      controlStore?.close();
+    }
     return;
   }
   throw new Error(`Unknown command: ${command}`);
