@@ -96,7 +96,13 @@
 - Task 6 implementation handoff: `.superpowers/sdd/task-6-report.md` remains uncommitted; Task 1-5 report hashes are unchanged
 - Task 6 frozen review: `/root/task6_frozen_review` returned `APPROVED` (Critical 0, Important 0, backlog 0); checklist A-G passed and its fresh launcher suite passed 7/7 without repeating the 111-test regression. Report `.superpowers/sdd/isolate-feedback-control-plane-task-6-v2-review-1.md`
 - Task 6 completion: frozen and checked off after implementation `dd18ed3`, focused 16/16, wider 111/111, real disposable macOS lifecycle evidence and one fresh frozen review. No additional Task 6 review/fix round is allowed
-- Next action: preflight Task 7's standalone structured reviewer-result contract without activating the legacy or new production runner
+- Task 7 base: `ca094f949f8bc6901d5446c3e22af8e18b5ba08d`
+- Task 7 brief: `.superpowers/sdd/task-7-brief.md`
+- Task 7 baseline: unchanged reviewer provider/runner/adapter/auth tests passed 18/18 on Darwin arm64 with Node v26.0.0
+- Task 7 allowed scope: create only `src/reviewer-result.mjs`, `src/reviewer-result-file.mjs`, `templates/schemas/reviewer-result.schema.json`, `test/reviewer-result.test.mjs`, and `test/reviewer-result-file.test.mjs`; `.superpowers/sdd/task-7-report.md` is an uncommitted handoff and Task 1-6 reports remain byte-identical
+- Task 7 frozen acceptance: A exact two-outcome fields; B bounded controlled lesson values; C allowlisted existing-family recurrence mapping versus deterministic new-family identity; D reject unknown/source/credential/control payloads without content logs; E schema and JS static contract agree; F no-follow owned 0600 regular result file, strict UTF-8/size bounds and same-inode cleanup; G five files only with old runtime unchanged and no Task 8/9 activation
+- Task 7 boundary: no database, Markdown render/publish, provider/runner/CLI wiring, receipt deletion, scheduler, live hook or real-state mutation; old runtime remains green until Task 9 switches atomically
+- Next action: dispatch one TDD implementer for the five frozen Task 7 files, then run one fresh frozen A-G review
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`

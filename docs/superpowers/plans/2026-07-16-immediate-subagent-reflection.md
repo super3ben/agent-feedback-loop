@@ -1220,9 +1220,12 @@ git commit -m "feat: add the detached reviewer launcher"
 
 **Interfaces:**
 - Produces: `ReviewResult = { outcome, final_severity, responsibility, method_class, family_id, proposed_family_key, applies_when, facts, user_complaint, root_cause, class_of_mistake, method_changes, repeated_pattern_evidence, recurrence_of }`
-- Produces: `validateReviewerResult(value, { allowedFamilyIds = [] }) -> ReviewResult`
+- Produces: `validateReviewerResult(value, { allowedFamilyIds = [], recurrenceFamilyById = new Map() }) -> ReviewResult`
+- Produces: `deriveReviewerFamilyId(methodClass, proposedFamilyKey) -> family-<20 lowercase hex>`
 - Produces: `readSecureReviewerResult(path) -> unknown`; semantic validation remains in `validateReviewerResult`
 - Transitional rule: existing provider/runner/receipt files remain active and unchanged until Task 9 atomically switches the whole reviewer path
+
+**Frozen Task 7 acceptance:** (A) `no_lesson` is exactly `{outcome}` and `lesson` has exactly the declared fields; (B) lesson severity is `Major|Critical|Blocker`, responsibility is `agent_fault`, controlled identifiers and all strings/arrays obey the stated bounds, and facts/applies-when/method changes are non-empty; (C) an existing family must be controller-allowlisted with `proposed_family_key:null`, while a new family has `family_id:null`, a normalized proposed key, no recurrence ids and a deterministic controller-derived id; prior reflection ids in `recurrence_of` must resolve through `recurrenceFamilyById` to the selected existing family; (D) unknown/source/receipt/notification fields, obvious credential/control payloads and caller mutation are rejected without logging content; (E) the JSON Schema mirrors the static two-outcome contract while catalog/secret semantics are independently enforced in JavaScript; (F) `readSecureReviewerResult()` uses a no-follow opened file, accepts only one owned 0600 regular file of 1..256 KiB, decodes strict UTF-8 JSON, and removes only the same owned regular file on success or failure without touching a symlink; (G) only the five declared files change and no provider, runner, CLI, database, Markdown publication or real runtime is activated.
 
 - [ ] **Step 1: Write RED contract tests**
 
@@ -1248,7 +1251,7 @@ assert.equal(validateReviewerResult({
 }, { allowedFamilyIds: [] }).outcome, "lesson");
 ```
 
-Reject invented source ids, unsupported severity/responsibility, unbounded arrays/strings, empty reusable method, obvious credential/control payloads and extra operational fields such as receipt/notification. Bound `applies_when` to 8 items × 160 chars, `facts` to 12 × 512, complaint/root-cause/class fields to 2,048 chars each, `method_changes` to 8 × 512, repeated-pattern evidence to 8 × 512 and recurrence ids to 16 × 128; every required string is trimmed and non-empty. An existing `family_id` is accepted only when it appears in the controller-supplied reflection catalog, and each `recurrence_of` id must resolve to that same family. Otherwise `family_id` must be null and `proposed_family_key` must normalize to lowercase ASCII letters/digits/hyphens. The controller derives a new stable id as `family-<first 20 hex chars of sha256(method_class + "\n" + proposed_family_key)>`.
+Reject invented source ids, unsupported severity/responsibility, unbounded arrays/strings, empty reusable method, obvious credential/control payloads and extra operational fields such as receipt/notification. Bound `applies_when` to 8 items × 160 chars, `facts` to 12 × 512, complaint/root-cause/class fields to 2,048 chars each, `method_changes` to 8 × 512, repeated-pattern evidence to 8 × 512 and recurrence ids to 16 × 128; every required string is trimmed and non-empty. An existing `family_id` is accepted only when it appears in `allowedFamilyIds`, requires `proposed_family_key:null`, and each prior reflection id in `recurrence_of` must map to that same family in the controller-supplied `recurrenceFamilyById`. Otherwise `family_id` must be null, `recurrence_of` must be empty and `proposed_family_key` must normalize to lowercase ASCII letters/digits/hyphens. The controller derives a new stable id as `family-<first 20 hex chars of sha256(method_class + "\n" + proposed_family_key)>`.
 
 - [ ] **Step 2: Run RED**
 
@@ -1260,7 +1263,7 @@ Expected: FAIL because the standalone result validator, schema and secure result
 
 Use one JSON Schema with `oneOf` for the two outcomes and `additionalProperties:false`. `validateReviewerResult` enforces the same limits in JavaScript so provider output cannot bypass schema validation.
 
-Rename the private output-file boundary to `readSecureReviewerResult(path)`. It accepts one 0600 regular file owned by the current uid, rejects zero or more than 256 KiB before JSON parsing, returns the parsed value to the separate semantic validator, and removes an owned regular result file in `finally` on success or parse/validation failure. It never follows/deletes a symlink and never renders or logs the content. Codex writes this path via `--output-last-message`; Claude/Gemini stdout envelopes are unwrapped and copied by the controller into the same exclusive 0600 boundary before validation. This is an internal provider result channel, not a user-visible receipt.
+Rename the private output-file boundary to `readSecureReviewerResult(path)`. It opens with no-follow semantics, then accepts one 0600 regular file owned by the current uid, rejects zero or more than 256 KiB before JSON parsing, decodes strict UTF-8, returns the parsed value to the separate semantic validator, and removes only the same owned regular inode in `finally` on success or parse/validation failure. It never follows or removes a symlink and never renders or logs the content. Codex writes this path via `--output-last-message`; Claude/Gemini stdout envelopes are unwrapped and copied by the controller into the same exclusive 0600 boundary before validation. This is an internal provider result channel, not a user-visible receipt.
 
 - [ ] **Step 4: Run new and unchanged reviewer tests, then commit**
 
