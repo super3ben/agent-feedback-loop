@@ -15,16 +15,17 @@
 ## Current task
 
 - Plan task: `Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证`
-- OpenSpec mappings: `1.1`–`6.3`, `7.1`, and `7.4` have current automated evidence; `7.2`, `7.3`, and `7.5` remain pending their explicitly separated real-provider/Linux/real-state checks
-- Stage: `implementation complete; frozen task review pending`
+- OpenSpec mappings: `1.1`–`7.5` have current build evidence; real Codex desktop visibility and production rollout remain explicitly outside this build boundary
+- Stage: `implementation and platform acceptance complete; frozen task review pending`
 - Task 15 base: `e19c815a540819be47f13552c0ff017999a06322`
-- Task 15 scope: one deterministic platform smoke plus E2E assertions and build evidence; no source, schema, scheduler, RAG, service, post-turn hook, control receipt, Windows, or real-state installation change
+- Task 15 scope: one deterministic platform smoke plus E2E assertions, build evidence, and one Codex-only private transport-schema bridge; no authoritative schema, scheduler, RAG, service, post-turn hook, control receipt, Windows, or real-state installation change
 - Task 15 RED: the first behavior-complete run passed 10/11 and failed only because the distinct recurrence sentence did not contain the detector's required negative-evaluation evidence; the fixture was corrected without changing runtime code
 - Task 15 targeted GREEN: the final `node --test test/e2e-smoke.test.mjs test/platform-smoke.test.mjs` passed 11/11 in 10.832 s on Darwin arm64 Node v26.0.0
-- Task 15 full GREEN: the final `npm test` passed 266/266 in 20.552 s; the v8/v9 legacy fixtures each prove dry-run side-effect freedom, first apply, idempotent second apply, and unchanged source hashes
-- Task 15 package proof: `npm pack --dry-run --json` returned `agent-feedback-loop@0.8.0`, 31 files, 72,116 packed bytes, and 296,057 unpacked bytes
+- Task 15 full GREEN: the final macOS `npm test` passed 268/268 in 14.636 s; the accepted Linux default-concurrency suite passed 267 with 0 failures and one intentional macOS-only skip in 11.772 s
+- Task 15 package proof: `npm pack --dry-run --json` returned `agent-feedback-loop@0.8.0`, 31 files, 72,830 packed bytes, and 298,867 unpacked bytes
 - Task 15 deterministic vertical proof: installed prompt hook returned in under two seconds with no control text, created one durable job, detached a real child process, atomically published immutable Markdown, injected only on a later matching prompt, classified a later same-family complaint as `recurrence_after_emission`, selected only the newest family method, rejected the neutral reviewer question, and emitted Top-4 from five severe families without a global hold
-- Pending coordinator gates: `AFL_REAL_PROVIDER=1` macOS run, official Node Linux container run, guarded real-state after snapshot/diff, and Task 15 frozen review; real Codex desktop visibility and production remain outside build acceptance
+- Task 15 coordinator gates: authenticated real Codex temporary-HOME smoke passed 1/1 in 37.911 s; official Node v24.18.0 Linux full suite plus installed smoke passed; all guarded real config/runtime/legacy-DB hash-size-mtime records were unchanged
+- Pending coordinator gate: Task 15 frozen review only; real Codex desktop visibility and production remain outside build acceptance
 
 ## Archived execution history
 

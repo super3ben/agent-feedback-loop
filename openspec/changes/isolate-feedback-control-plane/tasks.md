@@ -45,7 +45,7 @@
 ## 7. 验证与受控发布
 
 - [x] 7.1 执行每项 RED→GREEN、targeted regression、全量 Node suite、fresh HOME 安装和 crash/recovery test。
-- [ ] 7.2 在 macOS Codex 真机验证普通任务无 AFL 控制输出、明确不满立即 detached 启动、业务回答正常结束、新文档在后续会话被选中并注入。
-- [ ] 7.3 在 Linux 环境验证安装、detached 生命周期、锁/租约、原子发布和 prompt-only 配置。
+- [x] 7.2 在 macOS Codex 真机验证普通任务无 AFL 控制输出、明确不满立即 detached 启动、业务回答正常结束、新文档在后续会话被选中并注入。
+- [x] 7.3 在 Linux 环境验证安装、detached 生命周期、锁/租约、原子发布和 prompt-only 配置。
 - [x] 7.4 对历史 DB 副本执行两次 migration dry-run/export，证明幂等且旧库未修改。
-- [ ] 7.5 在用户再次明确授权前，不恢复全局 hooks、不切换 managed runtime、不迁移真实数据库。
+- [x] 7.5 在用户再次明确授权前，不恢复全局 hooks、不切换 managed runtime、不迁移真实数据库。
