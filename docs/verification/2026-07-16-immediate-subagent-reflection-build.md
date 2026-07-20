@@ -175,6 +175,44 @@ fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb  /Users/sunxing
 
 The exact comparison was `diff -u <coordinator-before> /tmp/afl-real-home-after-task15-fix1.txt`: exit `0`, stdout empty, stderr empty. Therefore the raw SHA-256, size, and mtime records are equal for all five guarded paths. No AFL command opened the real legacy SQLite paths.
 
+## Human-decided post-fix Linux detached proof
+
+The first generation-2 Linux evidence invocation failed before the hook process could start because its disposable `/state` mount did not explicitly permit execution. Guard recorded that failed validation and stopped at `blocked_human_decision`; it was not retried automatically. The user then selected Option A, authorizing exactly one evidence rerun with the same commit, image, read-only repository/root filesystem, disabled network, disposable HOME/TMP, and unchanged platform smoke, changing only the `/state` tmpfs option to explicit `exec`.
+
+Reviewed commit: `07f86e0570aabdf375963213c23fe73bfea9033d`
+
+```bash
+docker run --rm --network none --read-only --mount type=bind,src=/Users/sunxingda/project/agent-feedback-loop/.worktrees/background-review-observability,dst=/repo,readonly --tmpfs /state:rw,nosuid,nodev,exec,size=256m -e HOME=/state/home -e TMPDIR=/state/tmp -e AFL_REVIEWED_COMMIT=07f86e0570aabdf375963213c23fe73bfea9033d -w /repo node:24-bookworm-slim sh -ceu 'mkdir -p /state/home /state/tmp; echo reviewed_commit: "$AFL_REVIEWED_COMMIT"; echo state_mount:; grep " /state " /proc/mounts; echo node_version:; node --version; echo installer:; node ./bin/agent-feedback-loop.mjs install --home /state/home; echo installer_exit: 0; echo installed_hook:; test -x /state/home/.agent/feedback-loop/hooks/core-hook.sh; ls -l /state/home/.agent/feedback-loop/hooks/core-hook.sh; echo platform_smoke:; AFL_SMOKE_HOME=/state/home node --test test/platform-smoke.test.mjs; echo platform_smoke_exit: 0'
+```
+
+Exact result:
+
+```text
+exit: 0
+reviewed_commit: 07f86e0570aabdf375963213c23fe73bfea9033d
+state_mount:
+tmpfs /state tmpfs rw,nosuid,nodev,relatime,size=262144k,inode64 0 0
+node_version:
+v24.18.0
+installer:
+agent-feedback-loop installed
+- copy templates -> /state/home/.agent/feedback-loop
+- write stable launcher -> /state/home/.agent/feedback-loop/bin/afl-hook
+- connect Codex hook -> /state/home/.agent/feedback-loop/hooks/core-hook.sh
+- connect Claude Code hook -> /state/home/.agent/feedback-loop/hooks/core-hook.sh
+- connect Gemini CLI hook -> /state/home/.agent/feedback-loop/hooks/core-hook.sh
+- Codex hooks configured but not runnable (unavailable: codex: spawn codex ENOENT)
+installer_exit: 0
+installed_hook:
+-rwxr-xr-x 1 root root 728 Jul 20 15:36 /state/home/.agent/feedback-loop/hooks/core-hook.sh
+platform_smoke:
+tests: 1, pass: 1, fail: 0
+duration_ms: 661.917169
+platform_smoke_exit: 0
+```
+
+The default smoke injects its own deterministic provider, so the expected absence of a real `codex` binary in the network-disabled image is not a failure. The one-variable comparison confirms that the previous `platform_smoke_spawn_failed` belonged to the executor mount boundary rather than the Task 15 product or test logic. The repository was read-only, `/state` was removed with the container, and no real user AFL path was mounted.
+
 ## Acceptance matrix
 
 | Boundary | State | Evidence |
