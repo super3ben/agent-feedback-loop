@@ -1049,7 +1049,7 @@ git commit -m "feat: detect explicit retrospective feedback"
 
 ### Task 5: 让 prompt capture 事务创建一个即时 job
 
-- [ ] **Task 5 complete: 让 prompt capture 事务创建一个即时 job**
+- [x] **Task 5 complete: 让 prompt capture 事务创建一个即时 job**
 
 **Files:**
 - Modify: `src/capture.mjs:248-374`
@@ -1064,7 +1064,7 @@ git commit -m "feat: detect explicit retrospective feedback"
 - Produces: candidate transaction before any detached spawn call
 - Produces: `selectionPublishedBefore` fixed before capture/spawn so same-hook publications are ineligible
 
-- [ ] **Step 1: Write orchestration RED tests with injected launcher/writer**
+- [x] **Step 1: Write orchestration RED tests with injected launcher/writer**
 
 ```js
 const calls = [];
@@ -1086,13 +1086,13 @@ Add replay, different-session same-text, ordinary prompt and store-failure cases
 
 Add a never-resolving Promise launcher fixture and assert `handlePromptHook` does not await it; the production launcher contract is synchronous. Preserve `selectionPublishedBefore` on the selection input; Task 10 adds the direct-document race assertion when that path becomes active.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `node --test --test-name-pattern='explicit feedback commits one job before launch|hook replay reuses the job|same complaint in another session starts another review|prompt failures remain host-pass' test/cli.test.mjs test/e2e-smoke.test.mjs`
 
 Expected: FAIL because the current hook calls `submitDueReview()` and defaults ordinary traffic to a three-entry queue.
 
-- [ ] **Step 3: Extract and implement prompt-only orchestration**
+- [x] **Step 3: Extract and implement prompt-only orchestration**
 
 The function must set `selectionPublishedBefore = now()` before any spawn, resolve the direct transcript referent, evaluate the signal, capture current/referent evidence only for a real candidate, reserve launch after the durable job commit, and construct a host no-op even when a substep fails. Keep capture/store, launch/recovery, catalog/selection and host-response construction in separate fail-open boundaries so one failure cannot suppress later safe phases. Remove all `AGENT_FEEDBACK_LOOP_REVIEW_MIN_ENTRIES`, queue age and candidate receipt logic.
 
@@ -1119,7 +1119,7 @@ if (signal.candidate) {
 
 The normal CLI path must not reuse the current embedded legacy launcher: until Task 9 switches the runner protocol, inject a silent `runner_transition` no-op launcher and leave the durable job recoverable. This is an implementation-only transition in the isolated worktree, never a releasable/installable checkpoint. Task 9 replaces that no-op and the legacy `reviewer-run` together in one commit.
 
-- [ ] **Step 4: Run focused regression and commit**
+- [x] **Step 4: Run focused regression and commit**
 
 Run: `node --test test/cli.test.mjs test/e2e-smoke.test.mjs test/capture.test.mjs test/control-store.test.mjs test/store.test.mjs`
 
