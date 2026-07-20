@@ -207,6 +207,26 @@ test("per-document and total token budgets omit guidance without a hold", async 
   assert.equal(one.omissions.some((item) => item.reason === "token_budget"), true);
 });
 
+test("per-document token-budget omissions follow the exact rank before stable identity", async (t) => {
+  const overBudgetMethod = "核对架构边界".repeat(70);
+  const { documents } = await load(t, [
+    model(1, { final_severity: "Major", method_changes: [overBudgetMethod] }),
+    model(2, { final_severity: "Blocker", method_changes: [overBudgetMethod] })
+  ]);
+  const [lowerRank, higherRank] = documents;
+  const lowIdentity = "a".repeat(64);
+  const highIdentity = "b".repeat(64);
+  const result = select([
+    { ...higherRank, documentHash: highIdentity },
+    { ...lowerRank, documentHash: lowIdentity }
+  ], { budget: { ...BUDGET, maxDocumentTokens: 40 } });
+
+  assert.deepEqual(
+    result.omissions.filter((item) => item.reason === "token_budget").map((item) => item.documentHash),
+    [highIdentity, lowIdentity]
+  );
+});
+
 test("document hashes identify the exact Markdown bytes already loaded", async (t) => {
   const markdown = renderReflectionMarkdown(model(1));
   const projectDir = await projectFixture(t, [["one.md", markdown]]);

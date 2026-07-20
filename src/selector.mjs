@@ -245,19 +245,24 @@ export function selectReflections({
       omissions.push(omission(document, "prior_emission"));
       continue;
     }
+    ranked.push(document);
+  }
+  ranked.sort(compareRank);
+
+  const budgeted = [];
+  for (const document of ranked) {
     const guidance = documentGuidance(document);
     const tokenEstimate = estimateGuidanceTokens(guidance);
     if (tokenEstimate > limits.maxDocumentTokens) {
       omissions.push(omission(document, "token_budget"));
       continue;
     }
-    ranked.push({ ...document, guidance, tokenEstimate });
+    budgeted.push({ ...document, guidance, tokenEstimate });
   }
-  ranked.sort(compareRank);
 
   const selected = [];
   let tokenEstimate = 0;
-  for (const document of ranked) {
+  for (const document of budgeted) {
     if (selected.length >= limits.maxCards) {
       omissions.push(omission(document, "count_budget"));
       continue;
