@@ -121,6 +121,60 @@ The single full-suite skip is the explicitly macOS-only detached-parent test; th
 
 Finally, the coordinator repeated SHA-256, size, and mtime reads for the real Codex config, managed runtime pointer, and legacy SQLite DB/WAL/SHM. All five records matched the pre-Task-15 snapshot exactly. Global AFL hooks remained disabled; no real runtime selection or database migration occurred.
 
+## Task 15 acceptance-fix proof
+
+The generation-1 acceptance fix changed only the platform smoke and committed evidence. The deterministic provider now writes a private `started` marker and remains blocked on a private `release` marker. The test observes provider start, then proves the installed hook has already returned in under two seconds with one durable job and zero Markdown documents. Only after those assertions does it release the provider and observe terminal asynchronous publication.
+
+The cutoff scenario prepublishes a document whose `applies_when` exactly matches the current prompt. A test-only Node preload freezes the installed hook clock at `2030-01-02T03:04:05.000Z`, exactly equal to the canonical document's `published_at`. That prompt receives no guidance. An otherwise-equivalent prompt under a new session at `2030-01-02T03:04:05.001Z` receives that exact document hash.
+
+The five-family scenario now has five identifiable fixed fixtures. It asserts the exact four hashes and method strings in descending fixture order `4, 3, 2, 1`, asserts fixture `0` is absent, and repeats the equivalent prompt in a fresh session to prove identical membership and ordering without conflating prior-emission suppression.
+
+Focused and full GREEN evidence for this fix:
+
+```text
+node --test test/e2e-smoke.test.mjs test/platform-smoke.test.mjs
+exit: 0
+tests: 11, pass: 11, fail: 0
+duration: 10.915 s
+
+npm test
+exit: 0
+tests: 268, pass: 268, fail: 0
+duration: 15.876 s
+```
+
+The coordinator's raw snapshot, captured before any Task 15 command, was:
+
+```text
+89267dc7bf32b6c01246d873346e02d69eac448a7e79ae3ac955ef05c97d056d  /Users/sunxingda/.codex/config.toml
+/Users/sunxingda/.codex/config.toml 10977 1784546833
+cc15797080a2568b5fa0b25718b296a83c236474cf765c79e83c61c1fe79f81f  /Users/sunxingda/.agent/feedback-loop/current.json
+/Users/sunxingda/.agent/feedback-loop/current.json 389 1784122706
+7dd2945a81a94edfdf2dfea4d1a198add4f8446590d55f6b23182c71f7e582b9  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3 4911104 1784192533
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-wal
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-wal 0 1784200604
+fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-shm
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-shm 32768 1784200604
+```
+
+The acceptance-fix read-only after command produced:
+
+```text
+89267dc7bf32b6c01246d873346e02d69eac448a7e79ae3ac955ef05c97d056d  /Users/sunxingda/.codex/config.toml
+/Users/sunxingda/.codex/config.toml 10977 1784546833
+cc15797080a2568b5fa0b25718b296a83c236474cf765c79e83c61c1fe79f81f  /Users/sunxingda/.agent/feedback-loop/current.json
+/Users/sunxingda/.agent/feedback-loop/current.json 389 1784122706
+7dd2945a81a94edfdf2dfea4d1a198add4f8446590d55f6b23182c71f7e582b9  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3 4911104 1784192533
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-wal
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-wal 0 1784200604
+fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb  /Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-shm
+/Users/sunxingda/.agent/feedback-loop-data/store/feedback-loop.sqlite3-shm 32768 1784200604
+```
+
+The exact comparison was `diff -u <coordinator-before> /tmp/afl-real-home-after-task15-fix1.txt`: exit `0`, stdout empty, stderr empty. Therefore the raw SHA-256, size, and mtime records are equal for all five guarded paths. No AFL command opened the real legacy SQLite paths.
+
 ## Acceptance matrix
 
 | Boundary | State | Evidence |

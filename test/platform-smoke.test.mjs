@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { openControlStore } from "../src/control-store.mjs";
 import { install, pathsFor } from "../src/index.mjs";
@@ -18,7 +19,9 @@ import { resolveReviewerExecutable } from "../src/reviewer-provider.mjs";
 const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
 const REPEATED_FEEDBACK = "之前你仍然没有考虑用户目标，而是等我再次指出后才开始思考，应该先验证需求再改架构。";
 const NEUTRAL_REVIEWER_QUESTION = "reviewer job 是干嘛的？";
-const TOP_FOUR_PROMPT = "platform top four architecture modify architecture user value";
+const CUTOFF_PROMPT = "platform cutoff exact matching document";
+const CUTOFF_INSTANT = "2030-01-02T03:04:05.000Z";
+const TOP_FOUR_PROMPT = "topfour deterministic ranking fixture";
 const CONTROL_TEXT = /\[AFL\]|afl-receipt|Output this receipt|reviewer.*queued|hookPrompt|runner_transition/iu;
 const FIRST_METHOD = "method change alpha: verify user value before architecture";
 const SECOND_METHOD = "method change beta: compare emitted guidance with recurrence before architecture";
@@ -150,9 +153,9 @@ async function parsedReflections(projectDir) {
   })));
 }
 
-async function writeDeterministicProvider(file) {
+async function writeDeterministicProvider(file, { providerStarted, providerRelease }) {
   await writeFile(file, `#!/usr/bin/env node
-import { chmod, writeFile } from "node:fs/promises";
+import { access, chmod, writeFile } from "node:fs/promises";
 
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
@@ -162,6 +165,8 @@ for (const argument of ["exec", "--ephemeral", "--ignore-user-config", "--ignore
   if (!process.argv.includes(argument)) process.exit(20);
 }
 const context = JSON.parse(evidence[1]);
+await writeFile(${JSON.stringify(providerStarted)}, "started", { mode: 0o600 });
+while (!await access(${JSON.stringify(providerRelease)}).then(() => true, () => false)) await sleep(25);
 const prior = context.reflectionCatalog.find((item) => item.methodClass === "requirements_before_architecture") || null;
 const result = {
   outcome: "lesson",
@@ -181,7 +186,6 @@ const result = {
 };
 const outputIndex = process.argv.indexOf("--output-last-message");
 if (outputIndex < 0 || !process.argv[outputIndex + 1]) process.exit(22);
-await sleep(75);
 await writeFile(process.argv[outputIndex + 1], JSON.stringify({ result }), { mode: 0o600 });
 await chmod(process.argv[outputIndex + 1], 0o600);
 
@@ -190,6 +194,23 @@ function sleep(milliseconds) {
 }
 `, { mode: 0o700 });
   await chmod(file, 0o700);
+}
+
+async function writeFrozenClock(file) {
+  await writeFile(file, `const fixed = process.env.AFL_PLATFORM_NOW;
+if (fixed) {
+  const NativeDate = Date;
+  const fixedMilliseconds = NativeDate.parse(fixed);
+  if (!Number.isFinite(fixedMilliseconds)) throw new Error("invalid_platform_test_clock");
+  globalThis.Date = class FrozenDate extends NativeDate {
+    constructor(...args) {
+      if (args.length === 0) super(fixedMilliseconds);
+      else super(...args);
+    }
+    static now() { return fixedMilliseconds; }
+  };
+}
+`, { mode: 0o600 });
 }
 
 async function invokeInstalledHook({ home, paths, payload, env, realProvider }) {
@@ -216,7 +237,9 @@ function hostResponse(result) {
 
 async function publishAdditionalFamilies(projectDir, count) {
   const baseline = Date.now() - 5_000;
+  const families = [];
   for (let index = 0; index < count; index += 1) {
+    const method = `check platform boundary ${index}`;
     const model = validateReflectionModel({
       outcome: "lesson",
       final_severity: "Blocker",
@@ -229,7 +252,7 @@ async function publishAdditionalFamilies(projectDir, count) {
       user_complaint: `Platform boundary ${index} was missed.`,
       root_cause: `Platform boundary ${index} was not checked before execution.`,
       class_of_mistake: `platform boundary ${index} omitted`,
-      method_changes: [`check platform boundary ${index}`],
+      method_changes: [method],
       repeated_pattern_evidence: [],
       recurrence_of: []
     }, {
@@ -237,8 +260,42 @@ async function publishAdditionalFamilies(projectDir, count) {
       createdAt: new Date(baseline + index * 100).toISOString(),
       publishedAt: new Date(baseline + index * 100 + 1).toISOString()
     });
-    await publishReflectionDocument({ projectDir, model });
+    const published = await publishReflectionDocument({ projectDir, model });
+    families.push({ index, method, published });
   }
+  return families;
+}
+
+function guidanceHashes(guidance) {
+  return [...guidance.matchAll(/^document_hash: ([a-f0-9]{64})$/gmu)].map((match) => match[1]);
+}
+
+function guidanceMethods(guidance) {
+  return [...guidance.matchAll(/^1\. (.+)$/gmu)].map((match) => match[1]);
+}
+
+async function publishCutoffFamily(projectDir, publishedAt) {
+  const model = validateReflectionModel({
+    outcome: "lesson",
+    final_severity: "Critical",
+    responsibility: "agent_fault",
+    method_class: "platform_cutoff_boundary",
+    family_id: null,
+    proposed_family_key: "platform-cutoff-boundary",
+    applies_when: [CUTOFF_PROMPT],
+    facts: ["The exact prompt cutoff boundary was verified with a fixed clock."],
+    user_complaint: "The current-cutoff document was not isolated from later prompts.",
+    root_cause: "The platform test did not control the hook clock and publication timestamp together.",
+    class_of_mistake: "current cutoff boundary omitted",
+    method_changes: ["exclude exact-cutoff guidance until a later prompt"],
+    repeated_pattern_evidence: [],
+    recurrence_of: []
+  }, {
+    sourceIdentity: "task15-platform-cutoff-source",
+    createdAt: publishedAt,
+    publishedAt
+  });
+  return publishReflectionDocument({ projectDir, model });
 }
 
 test("installed prompt pipeline publishes and reuses reflection guidance on the host platform", async (t) => {
@@ -249,10 +306,12 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
   const home = await realpath(suppliedHome || await mkdtemp(path.join(tmpdir(), "afl-platform-home-")));
   const projectDir = await realpath(await mkdtemp(path.join(home, "afl-platform-project-")));
   const fakeBin = realProvider ? null : await realpath(await mkdtemp(path.join(home, "afl-platform-bin-")));
+  let providerRelease = null;
   const paths = pathsFor(home);
   if (ownsHome) await install({ home, codexHost: unavailableCodexHost() });
   else await access(paths.runtimeLauncher);
   t.after(async () => {
+    if (providerRelease) await writeFile(providerRelease, "release", { mode: 0o600 }).catch(() => {});
     if (ownsHome) await rm(home, { recursive: true, force: true });
     else await Promise.all([
       rm(projectDir, { recursive: true, force: true }),
@@ -267,8 +326,15 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
     }
   } else {
     const fakeProvider = path.join(fakeBin, "codex");
-    await writeDeterministicProvider(fakeProvider);
+    const providerStarted = path.join(fakeBin, "provider-started");
+    providerRelease = path.join(fakeBin, "provider-release");
+    const frozenClock = path.join(fakeBin, "frozen-clock.mjs");
+    await writeDeterministicProvider(fakeProvider, { providerStarted, providerRelease });
+    await writeFrozenClock(frozenClock);
     env.PATH = `${fakeBin}${path.delimiter}${process.env.PATH || ""}`;
+    env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import=${pathToFileURL(frozenClock).href}`].filter(Boolean).join(" ");
+    env.AFL_PLATFORM_PROVIDER_STARTED = providerStarted;
+    env.AFL_PLATFORM_PROVIDER_RELEASE = providerRelease;
   }
 
   const neutral = await invokeInstalledHook({
@@ -288,7 +354,7 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
   assert.equal(reviewJobs(paths).length, 0);
   assert.equal((await reflectionFiles(projectDir)).length, 0);
 
-  const firstPrompt = await invokeInstalledHook({
+  const firstPromptPending = invokeInstalledHook({
     home,
     paths,
     payload: hookPayload({
@@ -301,9 +367,20 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
     env,
     realProvider
   });
+  if (!realProvider) {
+    await waitFor(
+      () => access(env.AFL_PLATFORM_PROVIDER_STARTED).then(() => true, () => false),
+      { timeoutMs: 5_000, failureCode: "deterministic_provider_started_timeout" }
+    );
+  }
+  const firstPrompt = await firstPromptPending;
   assert.equal(firstPrompt.elapsedMs < 2_000, true);
   assert.deepEqual(hostResponse(firstPrompt), { continue: true });
   assert.equal(reviewJobs(paths).length, 1);
+  if (!realProvider) {
+    assert.equal((await reflectionFiles(projectDir)).length, 0);
+    await writeFile(providerRelease, "release", { mode: 0o600 });
+  }
 
   const firstDocuments = await waitFor(async () => {
     const documents = await parsedReflections(projectDir);
@@ -389,7 +466,49 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
   assert.match(latestGuidance, new RegExp(SECOND_METHOD, "u"));
   assert.doesNotMatch(latestGuidance, new RegExp(FIRST_METHOD, "u"));
 
-  await publishAdditionalFamilies(projectDir, 4);
+  const cutoffPublishedAt = CUTOFF_INSTANT;
+  const cutoffDocument = await publishCutoffFamily(projectDir, cutoffPublishedAt);
+  assert.equal(
+    parseReflectionMarkdown(await readFile(cutoffDocument.path, "utf8"), { path: cutoffDocument.path }).publishedAt,
+    cutoffPublishedAt
+  );
+  env.AFL_PLATFORM_NOW = cutoffPublishedAt;
+  const currentCutoffPrompt = await invokeInstalledHook({
+    home,
+    paths,
+    payload: hookPayload({
+      projectDir,
+      sessionId: "platform-cutoff-current-session",
+      eventId: "platform-cutoff-current-event",
+      turnId: "platform-cutoff-current-turn",
+      prompt: CUTOFF_PROMPT,
+      taskFingerprint: "platform-cutoff-task"
+    }),
+    env,
+    realProvider: false
+  });
+  assert.equal("hookSpecificOutput" in hostResponse(currentCutoffPrompt), false);
+
+  env.AFL_PLATFORM_NOW = new Date(Date.parse(cutoffPublishedAt) + 1).toISOString();
+  const laterCutoffPrompt = await invokeInstalledHook({
+    home,
+    paths,
+    payload: hookPayload({
+      projectDir,
+      sessionId: "platform-cutoff-later-session",
+      eventId: "platform-cutoff-later-event",
+      turnId: "platform-cutoff-later-turn",
+      prompt: CUTOFF_PROMPT,
+      taskFingerprint: "platform-cutoff-task"
+    }),
+    env,
+    realProvider: false
+  });
+  assert.match(hostResponse(laterCutoffPrompt).hookSpecificOutput.additionalContext, new RegExp(cutoffDocument.sha256, "u"));
+  delete env.AFL_PLATFORM_NOW;
+
+  const topFamilies = await publishAdditionalFamilies(projectDir, 5);
+  const expectedTopFour = [topFamilies[4], topFamilies[3], topFamilies[2], topFamilies[1]];
   const fiveFamilyPrompt = await invokeInstalledHook({
     home,
     paths,
@@ -406,6 +525,28 @@ test("installed prompt pipeline publishes and reuses reflection guidance on the 
   });
   const fiveFamilyResponse = hostResponse(fiveFamilyPrompt);
   assert.equal("hold" in fiveFamilyResponse, false);
-  assert.equal((fiveFamilyResponse.hookSpecificOutput.additionalContext.match(/document_hash:/gu) || []).length, 4);
+  const firstTopFourGuidance = fiveFamilyResponse.hookSpecificOutput.additionalContext;
+  assert.deepEqual(guidanceHashes(firstTopFourGuidance), expectedTopFour.map((family) => family.published.sha256));
+  assert.deepEqual(guidanceMethods(firstTopFourGuidance), expectedTopFour.map((family) => family.method));
+  assert.doesNotMatch(firstTopFourGuidance, new RegExp(topFamilies[0].published.sha256, "u"));
+
+  const repeatedFiveFamilyPrompt = await invokeInstalledHook({
+    home,
+    paths,
+    payload: hookPayload({
+      projectDir,
+      sessionId: "platform-top-four-session-later",
+      eventId: "platform-top-four-event-later",
+      turnId: "platform-top-four-turn-later",
+      prompt: TOP_FOUR_PROMPT,
+      taskFingerprint: "platform-top-four-task"
+    }),
+    env,
+    realProvider: false
+  });
+  const repeatedTopFourGuidance = hostResponse(repeatedFiveFamilyPrompt).hookSpecificOutput?.additionalContext || "";
+  assert.deepEqual(guidanceHashes(repeatedTopFourGuidance), expectedTopFour.map((family) => family.published.sha256));
+  assert.deepEqual(guidanceMethods(repeatedTopFourGuidance), expectedTopFour.map((family) => family.method));
+  assert.doesNotMatch(repeatedTopFourGuidance, new RegExp(topFamilies[0].published.sha256, "u"));
   assert.equal(reviewJobs(paths).length, 2);
 });
