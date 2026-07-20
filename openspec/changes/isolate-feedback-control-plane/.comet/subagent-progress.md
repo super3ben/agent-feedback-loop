@@ -117,7 +117,9 @@
 - Frozen RED evidence: exactly two selected tests failed 0/2 before production code; timezone-less input was not rejected and offset input was not normalized to UTC
 - Frozen GREEN evidence: the same two tests passed 2/2 under both `TZ=UTC` and `TZ=Asia/Shanghai`; disposable-HOME Task 1/legacy four-file regression passed 159/159; syntax, diff and two-file scope gates passed
 - Frozen behavior: a small entry helper requires an explicit timezone and returns UTC ISO before capture side effects; existing candidate SQL, schema v1, null timestamp fallback, five-minute window, native-turn fallback, ambiguity and ref semantics are unchanged
-- Next action: generate the single-closeout review package and dispatch one fresh reviewer constrained to the frozen Task 1 acceptance checklist. On pass, check off Task 1 and immediately continue Task 2
+- Frozen review package: `.superpowers/sdd/review-cf2c4c9..d37c91f.diff` contains the single implementation commit and two-file closeout diff
+- Frozen review dispatch: fresh reviewer `/root/task1_frozen_acceptance` is checking only persisted checklist A-G and regression evidence; it is prohibited from open-ended adjacent defect search or new probes
+- Next action: wait for the frozen verdict. On `PASS`, check off Step 27 and Task 1, persist any nonblocking backlog observations, and immediately continue Task 2
 
 ## Superseded implementation
 
