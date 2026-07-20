@@ -37,6 +37,11 @@
 - Frozen re-review result: `/root/task2_exhaustion_rereview` returned `APPROVED` (Critical 0, Important 0, backlog 0); I1 closed and checklist A-G passed. Report `.superpowers/sdd/isolate-feedback-control-plane-task-2-v2-rereview-1.md`
 - Task 2 completion: checked off after implementation `12275a6`, bounded fix `06c4389`, coordinator disposable reprobe and fresh frozen re-review. No OpenSpec checkbox is complete because mapped runtime/runner tasks remain pending
 - Next action: Task 3 removes Stop, receipt/notification and reconcile control-plane entrypoints while preserving prompt-only fail-open host schemas and unrelated user hooks
+- Task 3 base: `e3c237074313ed522885f69eede2726758e59aba`
+- Task 3 allowed scope: only files listed in `.superpowers/sdd/task-3-brief.md`; delete the six named obsolete runtime/test modules, modify the four runtime/template files and four focused test files, and append only to `.superpowers/sdd/task-3-report.md` without committing it
+- Task 3 safety boundary: all install/upgrade/doctor fixtures use disposable HOME; global hooks remain disabled, real runtime/config/database are not changed, and the task provides macOS local build evidence only
+- Task 3 frozen acceptance: managed configs are prompt-only; unrelated user Stop hooks survive upgrade; no Stop/receipt/notification/reconcile CLI or scheduler entrypoint remains; core wrapper is bounded fail-open with native no-op schema; stable resolution/symlink protections and control-store initialization remain
+- Task 3 review mode: `thorough`, subject to the global three-round circuit breaker and no adjacent later-task expansion
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
 - Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`
