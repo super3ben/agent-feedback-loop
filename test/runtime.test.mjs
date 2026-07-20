@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { install, pathsFor, uninstall } from "../src/index.mjs";
+import { RUNTIME_VERSION, install, pathsFor, uninstall } from "../src/index.mjs";
 import { listUserTables, openControlStore } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
@@ -101,8 +102,51 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.match(launcher, /current\.json/);
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
-  assert.equal(current.runtimeVersion, "0.7.6");
+  assert.equal(current.runtimeVersion, RUNTIME_VERSION);
   assert.equal(current.schemaVersion, 1);
+});
+
+test("package excludes removed control plane files", async () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+  const packed = await new Promise((resolve, reject) => {
+    execFile("npm", ["pack", "--dry-run", "--json"], { cwd: root }, (error, stdout, stderr) => {
+      if (error) reject(Object.assign(error, { stderr }));
+      else resolve(JSON.parse(stdout));
+    });
+  });
+  const files = packed[0].files.map((entry) => entry.path);
+
+  assert.equal(RUNTIME_VERSION, "0.8.0");
+  assert.equal(packageJson.version, RUNTIME_VERSION);
+  for (const missing of [
+    "src/receipt.mjs",
+    "src/notification-delivery.mjs",
+    "src/codex-reconcile.mjs",
+    "src/reconcile-scheduler.mjs",
+    "templates/hooks/stop-hook.sh"
+  ]) assert.equal(files.includes(missing), false, missing);
+  for (const required of [
+    "templates/schemas/reviewer-result.schema.json",
+    "src/reflection-document.mjs",
+    "src/feedback-signal.mjs"
+  ]) assert.equal(files.includes(required), true, required);
+});
+
+test("documentation describes only the immediate prompt pipeline", async () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const [english, chinese, rule] = await Promise.all([
+    readFile(path.join(root, "README.md"), "utf8"),
+    readFile(path.join(root, "README-zh.md"), "utf8"),
+    readFile(path.join(root, "templates", "rules", "feedback-loop.md"), "utf8")
+  ]);
+  const documentation = `${english}\n${chinese}\n${rule}`;
+
+  assert.match(documentation, /later matching prompt|后续匹配的提示/u);
+  assert.match(documentation, /legacy export|旧版导出/u);
+  assert.match(documentation, /hooks-disabled|关闭 hooks/u);
+  assert.doesNotMatch(documentation, /(?:runs|starts|installs).{0,80}(?:resident scheduler|KeepAlive LaunchAgent)|(?:运行|启动|安装).{0,40}(?:常驻.*调度|KeepAlive.*LaunchAgent)/ui);
+  assert.doesNotMatch(documentation, /(?:provides|emits|generates).{0,20}(?:session receipt|status output)|(?:提供|显示|生成).{0,20}(?:会话回执|状态输出)/ui);
 });
 
 test("installed prompt wrapper has no legacy queue or control transport", async () => {

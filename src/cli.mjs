@@ -1,4 +1,5 @@
 import os from "node:os";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -92,6 +93,35 @@ const PROMPT_SELECTION_LIMITS = Object.freeze({
   maxDocumentTokens: 320,
   maxTotalTokens: 900
 });
+const LOG_EVENTS = new Set([
+  "prompt_capture_completed",
+  "feedback_signal_evaluated",
+  "review_job_created",
+  "review_job_reused",
+  "review_spawn_attempted",
+  "review_job_claimed",
+  "review_job_recovered",
+  "review_completed_no_lesson",
+  "reflection_published",
+  "reflection_parse_omitted",
+  "reflection_selected",
+  "reflection_emitted",
+  "recurrence_after_emission"
+]);
+const LOG_FIELDS = new Set(["event", "job", "document", "family", "reason", "count", "bytes", "tokens", "attempt", "lease_epoch", "duration_ms", "result"]);
+const LOG_REASONS = new Set([
+  "invalid_cutoff", "detector_failed", "identity_unstable", "capture_failed", "store_failed",
+  "spawn_failed", "launch_failed", "recovery_failed", "selection_record_failed", "log_limit",
+  "selection_failed", "response_failed", "emission_record_failed", "invalid_input", "hook_failed",
+  "candidate", "not_candidate", "launch_reserved", "reserved", "terminal", "not_found", "cooldown",
+  "not_due", "provider_unavailable", "provider_timeout", "provider_invalid", "context_invalid",
+  "lease_lost", "publication_failed", "publication_collision", "reviewer_failed"
+]);
+const LOG_RESULTS = new Set(["reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted"]);
+const LOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const LOG_FAMILY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const LOG_HASH = /^[a-f0-9]{64}$/u;
+const LOG_MAX_INTEGER = 2_147_483_647;
 
 function boundedReason(error, fallback) {
   const value = String(error?.code || "").toLowerCase();
@@ -110,12 +140,36 @@ function opaqueLogValue(value, fallback) {
   return /^[a-zA-Z0-9_.:-]{1,128}$/u.test(normalized) ? normalized : fallback;
 }
 
-function promptDebug(stage, reason, opaqueId = null) {
+function hashOpaque(value) {
+  return createHash("sha256").update(String(value ?? ""), "utf8").digest("hex");
+}
+
+export function structuredLog(event, fields = {}, writer = (line) => process.stderr.write(line)) {
+  if (!LOG_EVENTS.has(event) || !fields || typeof fields !== "object" || Array.isArray(fields)) return false;
+  const safe = { event };
+  for (const [key, value] of Object.entries(fields)) {
+    if (!LOG_FIELDS.has(key) || key === "event") continue;
+    if (key === "job") {
+      if (typeof value === "string" && LOG_UUID.test(value)) safe.job = value;
+    } else if (key === "family") {
+      if (typeof value === "string" && LOG_FAMILY.test(value)) safe.family = value;
+    } else if (key === "document") {
+      if (typeof value === "string" && value) safe.document = LOG_HASH.test(value) ? value : hashOpaque(value);
+    } else if (key === "reason") {
+      safe.reason = typeof value === "string" && LOG_REASONS.has(value) ? value : "invalid_reason_code";
+    } else if (key === "result") {
+      safe.result = typeof value === "string" && LOG_RESULTS.has(value) ? value : "invalid_result_code";
+    } else if (Number.isSafeInteger(value) && value >= 0 && value <= LOG_MAX_INTEGER) {
+      safe[key] = value;
+    }
+  }
+  writer(`${JSON.stringify(safe)}\n`);
+  return true;
+}
+
+function promptLog(event, fields = {}) {
   if (process.env.AGENT_FEEDBACK_LOOP_DEBUG !== "1") return;
-  const safeStage = /^[a-z0-9_.-]{1,48}$/.test(String(stage)) ? String(stage) : "unknown";
-  const safeReason = /^[a-z0-9_.-]{1,64}$/.test(String(reason)) ? String(reason) : "unknown";
-  const safeId = /^[a-zA-Z0-9_.:-]{1,128}$/.test(String(opaqueId || "")) ? String(opaqueId) : "none";
-  console.error(`agent-feedback-loop: hook.stage=${safeStage} reason=${safeReason} id=${safeId}`);
+  structuredLog(event, fields);
 }
 
 function cutoffIso(value) {
@@ -168,7 +222,7 @@ export async function handlePromptHook({
     selectionPublishedBefore = cutoffIso(now());
   } catch (error) {
     selectionPublishedBefore = new Date().toISOString();
-    promptDebug("cutoff", boundedReason(error, "invalid_cutoff"));
+    promptLog("feedback_signal_evaluated", { reason: "invalid_cutoff" });
   }
 
   const result = {
@@ -201,15 +255,16 @@ export async function handlePromptHook({
     });
     result.candidate = signal.candidate === true;
     result.reason = signal.candidate ? "candidate" : "not_candidate";
+    promptLog("feedback_signal_evaluated", { reason: result.reason });
   } catch (error) {
     result.reason = "detector_failed";
-    promptDebug("detector", boundedReason(error, "detector_failed"));
+    promptLog("feedback_signal_evaluated", { reason: "detector_failed" });
   }
 
   if (signal?.candidate && event?.identity_unstable) {
     result.candidate = false;
     result.reason = "identity_unstable";
-    promptDebug("candidate", "identity_unstable");
+    promptLog("feedback_signal_evaluated", { reason: "identity_unstable" });
   } else if (signal?.candidate && event) {
     let sourceCapture = null;
     let referentCapture = null;
@@ -238,9 +293,10 @@ export async function handlePromptHook({
         },
         rawText: userText
       });
+      if (sourceCapture) promptLog("prompt_capture_completed", { result: "created" });
     } catch (error) {
       result.reason = "capture_failed";
-      promptDebug("capture", boundedReason(error, "capture_failed"));
+      promptLog("prompt_capture_completed", { reason: "capture_failed" });
     }
 
     if (sourceCapture) {
@@ -261,13 +317,17 @@ export async function handlePromptHook({
           projectId: event.project_id
         });
         result.jobId = candidate.jobId;
+        promptLog(candidate.created ? "review_job_created" : "review_job_reused", {
+          job: candidate.jobId,
+          result: candidate.created ? "created" : "reused"
+        });
         reservation = controlStore.reserveReviewLaunch({
           jobId: candidate.jobId,
           cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
         });
       } catch (error) {
         result.reason = "store_failed";
-        promptDebug("store", boundedReason(error, "store_failed"), candidate?.jobId);
+        promptLog("review_job_created", { reason: "store_failed", job: candidate?.jobId });
       }
 
       if (candidate && reservation?.launch) {
@@ -282,6 +342,11 @@ export async function handlePromptHook({
           }
           result.launchRequested = true;
           result.reason = "launch_reserved";
+          promptLog("review_spawn_attempted", {
+            job: candidate.jobId,
+            lease_epoch: reservation.launchEpoch,
+            reason: "launch_reserved"
+          });
         } catch (error) {
           try {
             controlStore.recordReviewLaunchFailure({
@@ -291,10 +356,11 @@ export async function handlePromptHook({
             });
           } catch {}
           result.reason = "launch_failed";
-          promptDebug("launch", boundedReason(error, "launch_failed"), candidate.jobId);
+          promptLog("review_spawn_attempted", { job: candidate.jobId, reason: "launch_failed" });
         }
       } else if (candidate && reservation) {
         result.reason = reservation.reason;
+        promptLog("review_spawn_attempted", { job: candidate.jobId, reason: reservation.reason });
       }
     }
   }
@@ -302,7 +368,7 @@ export async function handlePromptHook({
   try {
     recoverReviewers();
   } catch (error) {
-    promptDebug("recovery", boundedReason(error, "recovery_failed"), result.jobId);
+    promptLog("review_job_recovered", { reason: "recovery_failed", job: result.jobId });
   }
 
   result.selectionInput = {
@@ -330,7 +396,7 @@ export async function handlePromptHook({
       taskFingerprint: result.selectionInput.task.fingerprint
     });
   } catch {
-    promptDebug("selection_record_failed", "selection_record_failed");
+    promptLog("reflection_parse_omitted", { reason: "selection_record_failed" });
   }
   try {
     const catalog = await loadDocuments({
@@ -353,9 +419,9 @@ export async function handlePromptHook({
     });
     const selectionOmissions = [...catalog.omissions, ...selection.omissions];
     for (const item of selectionOmissions.slice(0, 8)) {
-      promptDebug("selection_omission", item.reason, item.opaqueId ?? item.documentHash);
+      promptLog("reflection_parse_omitted", { reason: item.reason, document: item.opaqueId ?? item.documentHash });
     }
-    if (selectionOmissions.length > 8) promptDebug("selection_omission", "log_limit", String(selectionOmissions.length));
+    if (selectionOmissions.length > 8) promptLog("reflection_parse_omitted", { reason: "log_limit", count: selectionOmissions.length });
     result.guidance = selection.guidance;
     result.selection = {
       selectedCount: selection.selected.length,
@@ -371,12 +437,13 @@ export async function handlePromptHook({
           contextEpoch: result.selectionInput.session.contextEpoch,
           taskFingerprint: result.selectionInput.task.fingerprint
         }));
+        promptLog("reflection_selected", { document: document.documentHash, family: document.familyId, result: "selected" });
       } catch {
-        promptDebug("selection_record_failed", "selection_record_failed", document.documentHash);
+        promptLog("reflection_parse_omitted", { reason: "selection_record_failed", document: document.documentHash });
       }
     }
   } catch (error) {
-    promptDebug("selection", boundedSelectionReason(error));
+    promptLog("reflection_parse_omitted", { reason: "selection_failed" });
     result.guidance = "";
     result.selection = { selectedCount: 0, omissionCount: 0, tokenEstimate: 0 };
   }
@@ -399,14 +466,15 @@ export async function handlePromptHook({
   } catch (error) {
     result.hostResponse = null;
     result.reason = "response_failed";
-    promptDebug("response", boundedReason(error, "response_failed"));
+    promptLog("reflection_emitted", { reason: "response_failed" });
   }
   if (responseWritten) {
     for (const emissionId of selectedEmissionIds) {
       try {
         controlStore.markReflectionEmitted({ emissionId });
+        promptLog("reflection_emitted", { result: "emitted" });
       } catch {
-        promptDebug("emission_record_failed", "emission_record_failed", String(emissionId));
+        promptLog("reflection_emitted", { reason: "emission_record_failed" });
       }
     }
   }
@@ -431,6 +499,17 @@ function printActions(result, title) {
   for (const action of result.actions) {
     console.log(`- ${action}`);
   }
+}
+
+export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", durationMs, writer } = {}) {
+  const fields = { job, duration_ms: durationMs };
+  if (outcome === "published") {
+    return structuredLog("reflection_published", { ...fields, result: "published" }, writer);
+  }
+  if (outcome === "reviewed_no_lesson") {
+    return structuredLog("review_completed_no_lesson", { ...fields, result: "reviewed_no_lesson" }, writer);
+  }
+  return structuredLog("review_spawn_attempted", { ...fields, result: "failed", reason }, writer);
 }
 
 export async function main(args) {
@@ -486,19 +565,22 @@ export async function main(args) {
         await configuredBlobs.remove(canaryHash);
         configuredStore.close();
         if (canaryText !== "synthetic-canary") throw new Error("configured encryption canary mismatch");
-        result.live = { status: "healthy", syntheticExcluded: true, configuredStore: "healthy", encryption: "healthy" };
-        result.capability.status = "healthy";
-        result.capability.reason = "isolated SQLite synthetic canary passed";
+        result.status.controlStore.live = {
+          status: "healthy",
+          syntheticExcluded: true,
+          configuredStore: "healthy",
+          encryption: "healthy"
+        };
       } catch (error) {
-        result.live = { status: "unhealthy", reason: error.message };
-        result.healthy = false;
+        result.status.controlStore.live = { status: "unhealthy", reason: "canary_failed" };
+        result.status.ready = false;
       } finally {
         await rm(tempHome, { recursive: true, force: true });
       }
     }
-    console.log(result.healthy ? "agent-feedback-loop healthy" : "agent-feedback-loop unhealthy");
+    console.log(result.status.ready ? "agent-feedback-loop healthy" : "agent-feedback-loop unhealthy");
     console.log(JSON.stringify(result, null, 2));
-    if (!result.healthy) process.exitCode = 1;
+    if (!result.status.ready) process.exitCode = 1;
     return;
   }
   if (command === "paths") {
@@ -540,9 +622,17 @@ export async function main(args) {
             env: process.env
           })
       });
-      console.error(`agent-feedback-loop: reviewer.job=${opaqueLogValue(jobId, "unknown")} provider=${opaqueLogValue(providerName, "unknown")} reason=${boundedReason({ code: result.outcome }, "reviewer_failed")} duration_ms=${Date.now() - startedAt}`);
+      reviewerTerminalLog({
+        outcome: result.outcome,
+        job: jobId,
+        durationMs: Date.now() - startedAt
+      });
     } catch (error) {
-      console.error(`agent-feedback-loop: reviewer.job=${opaqueLogValue(jobId, "unknown")} provider=${opaqueLogValue(providerName, "unknown")} reason=${boundedReason(error, "reviewer_failed")} duration_ms=${Date.now() - startedAt}`);
+      reviewerTerminalLog({
+        job: jobId,
+        reason: boundedReason(error, "reviewer_failed"),
+        durationMs: Date.now() - startedAt
+      });
       throw error;
     } finally {
       store.close();
@@ -566,7 +656,7 @@ export async function main(args) {
       rawPayload = await readPromptInput();
       payload = JSON.parse(rawPayload || "{}");
     } catch (error) {
-      promptDebug("input", boundedReason(error, "invalid_input"));
+      promptLog("feedback_signal_evaluated", { reason: "invalid_input" });
       await writeResponse();
       return;
     }
@@ -618,7 +708,7 @@ export async function main(args) {
         now: () => new Date()
       });
     } catch (error) {
-      promptDebug("hook", boundedReason(error, "hook_failed"));
+      promptLog("feedback_signal_evaluated", { reason: "hook_failed" });
       await writeResponse();
     } finally {
       controlStore?.close();

@@ -887,7 +887,7 @@ describe("agent-feedback-loop package", () => {
     assert.equal(result.actions.some((action) => /reconcil|scheduler|backstop/i.test(action)), false);
   });
 
-  it("doctor reports prompt-only status without scheduler or backstop fields", async () => {
+  it("doctor reports only the prompt and document pipeline", async () => {
     const home = await tempHome();
     await install({ home, codexHost: unavailableCodexHost() });
     const codexHost = {
@@ -909,15 +909,87 @@ describe("agent-feedback-loop package", () => {
 
     const health = await doctor({ home, cwd: home, codexHost, reviewerDetector });
 
-    assert.equal(health.healthy, false);
-    assert.equal(health.clis.codex.configured, true);
-    assert.equal(health.clis.codex.runnable, false);
-    assert.equal(health.clis.codex.promptTrustStatus, "modified");
-    assert.equal("backstopTrustStatus" in health.clis.codex, false);
-    assert.equal("scheduler" in health, false);
-    assert.equal("reconciliation" in health, false);
-    assert.equal(health.controlStore.exists, true);
-    assert.equal(health.legacyStopRemoved, true);
+    assert.deepEqual(Object.keys(health).sort(), ["status", "version"]);
+    assert.deepEqual(Object.keys(health.status).sort(), [
+      "controlStore",
+      "legacyStopRemoved",
+      "promptHook",
+      "ready",
+      "reflectionDirectory",
+      "reviewerProvider"
+    ]);
+    assert.equal(health.status.promptHook.configured, true);
+    assert.equal(health.status.promptHook.runnable, false);
+    assert.equal(health.status.controlStore.exists, true);
+    assert.equal(health.status.legacyStopRemoved, true);
+    assert.equal(health.status.ready, false);
+    assert.doesNotMatch(JSON.stringify(health), /scheduler|notification|maintenance|receipt/ui);
+  });
+
+  it("structured logs never contain content", () => {
+    const emitted = [];
+    const writer = (line) => emitted.push(line);
+    cliModule.structuredLog("prompt_capture_completed", {
+      reason: "secret-user-text",
+      document: "full-review-body",
+      job: "a5e1767b-5b8f-4ef5-9b2a-f2d620a7d526",
+      family: "family-method-boundary",
+      count: 2,
+      ignored: "method-body"
+    }, writer);
+    cliModule.structuredLog("not_an_event", { reason: "secret-user-text" }, writer);
+
+    assert.equal(emitted.length, 1);
+    assert.doesNotMatch(emitted[0], /secret-user-text|full-review-body|method-body/u);
+    const event = JSON.parse(emitted[0]);
+    assert.equal(event.event, "prompt_capture_completed");
+    assert.equal(event.reason, "invalid_reason_code");
+    assert.match(event.document, /^[a-f0-9]{64}$/u);
+    assert.deepEqual(Object.keys(event).sort(), ["count", "document", "event", "family", "job", "reason"]);
+
+    const terminal = [];
+    cliModule.reviewerTerminalLog({
+      outcome: "failed",
+      job: "a5e1767b-5b8f-4ef5-9b2a-f2d620a7d526",
+      reason: "provider_timeout",
+      durationMs: 7,
+      writer: (line) => terminal.push(line)
+    });
+    assert.deepEqual(JSON.parse(terminal[0]), {
+      event: "review_spawn_attempted",
+      job: "a5e1767b-5b8f-4ef5-9b2a-f2d620a7d526",
+      reason: "provider_timeout",
+      result: "failed",
+      duration_ms: 7
+    });
+  });
+
+  it("debug feedback evaluation emits normal bounded evidence", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const lines = [];
+    const originalWrite = process.stderr.write;
+    const originalDebug = process.env.AGENT_FEEDBACK_LOOP_DEBUG;
+    process.env.AGENT_FEEDBACK_LOOP_DEBUG = "1";
+    process.stderr.write = (line) => { lines.push(String(line)); return true; };
+    try {
+      await cliModule.handlePromptHook({
+        payload: explicitFeedbackPayload(),
+        cli: "codex",
+        controlStore: fixture.controlStore,
+        blobs: fixture.blobs,
+        launchReviewer() { return { attempted: true }; },
+        writeResponse: async () => ({ continue: true }),
+        now: () => new Date(PROMPT_CUTOFF)
+      });
+    } finally {
+      process.stderr.write = originalWrite;
+      if (originalDebug === undefined) delete process.env.AGENT_FEEDBACK_LOOP_DEBUG;
+      else process.env.AGENT_FEEDBACK_LOOP_DEBUG = originalDebug;
+      fixture.controlStore.close();
+    }
+    const events = lines.map((line) => JSON.parse(line));
+    assert.equal(events.some((event) => event.event === "feedback_signal_evaluated" && event.reason === "candidate"), true);
+    assert.doesNotMatch(lines.join(""), /private|secret-user-text|full-review-body/u);
   });
 
   it("installs prompt-only host config and uninstalls only AFL entries", async () => {

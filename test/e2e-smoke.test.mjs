@@ -235,9 +235,10 @@ test("CLI live doctor runs only an isolated temporary canary", async () => {
   }).catch((error) => error);
   const stdout = result.stdout || "";
   const parsed = JSON.parse(stdout.slice(stdout.indexOf("{\n")));
-  assert.equal(parsed.live.status, "healthy");
-  assert.equal(parsed.live.syntheticExcluded, true);
-  assert.equal(parsed.capability.status, "healthy");
+  assert.deepEqual(Object.keys(parsed).sort(), ["status", "version"]);
+  assert.equal(parsed.status.controlStore.live.status, "healthy");
+  assert.equal(parsed.status.controlStore.live.syntheticExcluded, true);
+  assert.equal(parsed.status.ready, false);
 });
 
 test("CLI exposes no receipt or reconcile control plane", async () => {

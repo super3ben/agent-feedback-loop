@@ -24,7 +24,7 @@ import { SCHEMA_VERSION } from "./control-schema.mjs";
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
-const RUNTIME_VERSION = "0.7.6";
+export const RUNTIME_VERSION = "0.8.0";
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
@@ -642,8 +642,7 @@ export async function doctor(options = {}) {
   const capability = runtimeCapability();
   const reviewerDetector = options.reviewerDetector || detectAllReviewerAdapters;
   const reviewers = await reviewerDetector();
-  const readyClis = [];
-  const unavailableClis = [];
+  let readyCliCount = 0;
   for (const cli of CLIS) {
     const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
     const operational = Boolean(clis[cli.id].runnable && reviewer.available);
@@ -653,32 +652,38 @@ export async function doctor(options = {}) {
       reviewerExecutable: reviewer.executable || reviewer.command || null,
       operational
     };
-    if (operational) readyClis.push(cli.id);
-    else unavailableClis.push(cli.id);
+    if (operational) readyCliCount += 1;
   }
-  const healthy = Object.values(files).every(Boolean)
+  const ready = Object.values(files).every(Boolean)
     && CLIS.every((cli) => clis[cli.id].runnable)
-    && readyClis.length > 0;
-  const degraded = unavailableClis.length > 0;
+    && readyCliCount > 0
+    && capability.status !== "unavailable";
   const legacyStopRemoved = CLIS.every((cli) => !clis[cli.id].legacyStopPresent);
   const reflectionDirectoryPath = path.join(options.cwd || process.cwd(), ".agent", "reflections");
-  return {
-    healthy,
-    degraded,
-    home,
-    files,
-    promptHook: { configured: CLIS.every((cli) => clis[cli.id].configured), runnable: CLIS.every((cli) => clis[cli.id].runnable) },
-    controlStore: { path: paths.controlDatabase, exists: await exists(paths.controlDatabase) },
-    reflectionDirectory: { path: reflectionDirectoryPath, exists: await exists(reflectionDirectoryPath) },
-    reviewerProvider: reviewers,
+  const status = {
+    promptHook: {
+      configured: CLIS.every((cli) => clis[cli.id].configured),
+      runnable: CLIS.every((cli) => clis[cli.id].runnable),
+      runtimeSelected: runtime.selected,
+      runtimeCapability: capability.status
+    },
+    controlStore: { exists: await exists(paths.controlDatabase) },
+    reflectionDirectory: { exists: await exists(reflectionDirectoryPath) },
+    reviewerProvider: Object.fromEntries(CLIS.map((cli) => {
+      const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
+      return [cli.id, {
+        available: Boolean(reviewer.available),
+        configured: Boolean(clis[cli.id].configured),
+        runnable: Boolean(clis[cli.id].runnable),
+        operational: Boolean(clis[cli.id].operational)
+      }];
+    })),
     legacyStopRemoved,
-    runtime,
-    clis,
-    reviewers,
-    operational: { readyClis, unavailableClis },
-    capability,
-    dataRoot: paths.dataRoot,
-    keyRoot: paths.keyRoot
+    ready
+  };
+  return {
+    version: RUNTIME_VERSION,
+    status
   };
 }
 
