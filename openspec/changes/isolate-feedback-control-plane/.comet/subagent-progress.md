@@ -16,7 +16,7 @@
 
 - Plan task: `Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证`
 - OpenSpec mappings: `1.1`–`7.5` have current build evidence; real Codex desktop visibility and production rollout remain explicitly outside this build boundary
-- Stage: `implementation and platform acceptance complete; frozen task review pending`
+- Stage: `Task 15 frozen complete; final whole-branch review pending`
 - Task 15 base: `e19c815a540819be47f13552c0ff017999a06322`
 - Task 15 scope: one deterministic platform smoke plus E2E assertions, build evidence, and one Codex-only private transport-schema bridge; no authoritative schema, scheduler, RAG, service, post-turn hook, control receipt, Windows, or real-state installation change
 - Task 15 RED: the first behavior-complete run passed 10/11 and failed only because the distinct recurrence sentence did not contain the detector's required negative-evaluation evidence; the fixture was corrected without changing runtime code
@@ -25,7 +25,8 @@
 - Task 15 package proof: `npm pack --dry-run --json` returned `agent-feedback-loop@0.8.0`, 31 files, 72,830 packed bytes, and 298,867 unpacked bytes
 - Task 15 deterministic vertical proof: installed prompt hook returned in under two seconds with no control text, created one durable job, detached a real child process, atomically published immutable Markdown, injected only on a later matching prompt, classified a later same-family complaint as `recurrence_after_emission`, selected only the newest family method, rejected the neutral reviewer question, and emitted Top-4 from five severe families without a global hold
 - Task 15 coordinator gates: authenticated real Codex temporary-HOME smoke passed 1/1 in 37.911 s; official Node v24.18.0 Linux full suite plus installed smoke passed; all guarded real config/runtime/legacy-DB hash-size-mtime records were unchanged
-- Pending coordinator gate: Task 15 frozen review only; real Codex desktop visibility and production remain outside build acceptance
+- Task 15 human-resolution proof: at exact product commit `07f86e0`, one explicitly authorized official Linux `/state:...exec` run passed the corrected coordinated-provider platform smoke 1/1; evidence commit `adea90d` changed only verification/report files. Final task review `isolate-feedback-control-plane-task-15-v2-human-resolution-review-1` returned APPROVED C0/I0/M0/B0, and Guard closed the stable Linux invariant while retaining failure and architecture-fix history
+- Pending coordinator gate: final whole-branch review only; real Codex desktop visibility and production remain outside build acceptance
 
 ## Archived execution history
 

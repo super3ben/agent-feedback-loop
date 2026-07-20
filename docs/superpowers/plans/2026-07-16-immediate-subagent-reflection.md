@@ -1876,7 +1876,7 @@ git commit -m "docs: describe the immediate reflection pipeline"
 
 ### Task 15: 完成端到端、macOS 和 Linux 候选发布验证
 
-- [ ] **Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证**
+- [x] **Task 15 complete: 完成端到端、macOS 和 Linux 候选发布验证**
 
 **Files:**
 - Modify: `test/e2e-smoke.test.mjs`
