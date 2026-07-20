@@ -16,10 +16,10 @@
 
 - Plan task: `Task 1 complete: 并行建立轻量 control DB，不破坏旧 runtime`
 - OpenSpec mappings: `1.2` audit and `4.4` lean SQLite are partial until their later mapped implementation tasks complete
-- Stage: `implementing`
+- Stage: `reviewing`
 - Dispatch: canonical identity implementer `/root/task1_canonical_identity_refactor` completed with `DONE_WITH_CONCERNS`
 - Implementation base: `add6b7ee6c02a11786c7d6e467c2bc7b6d8c1d72`
-- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`
+- Implementation commits: `4a1791af267d9775d2bd8217be6f8eb5dcd6c777`, `aa770c6`, `864240b5f011722172898d88523d9201a9a91d07`, `9e62862ae5bfb993820eaa9fa03fcd285a8151a8`, `44acbfd0709b2385cf818b1d792df9d66fc67926`, `5053ddaf21b18ece0de9714873dfc37ed7b66e37`, `d11cb8a503eb3f54e94bf40b9714d57d451aa834`, `535704d2f6370ec4b7d21cdab6905cd2b37bd7de`, `da19db100c9b4c52abe0a19c712b4d691267aed4`, `9fb6cd61881b3dea4cfdf6e9c718fa4498aabbdf`, `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d`
 - Changed files: `src/index.mjs`, `src/capture.mjs`, `src/control-schema.mjs`, `src/control-store.mjs`, `docs/verification/2026-07-16-legacy-control-plane-audit.md`, `test/runtime.test.mjs`, `test/control-store.test.mjs`
 - RED evidence: missing module/path; install did not initialize control DB; runtime accepted a mode `0644` DB; initial and second-round capture identity/path/lock/type probes reproduced the reviewed gaps
 - GREEN evidence: canonical blocker 4/4, omitted-context replay 1/1, identity/schema matrix 18/18, capture/control-store 61/61 and Task 1 focused 126/126; `node --check` and `git diff --check` passed. The single temporary-HOME full run was 253/254; its only unchanged legacy Stop hard-deadline fixture failed before creating the first signal file and passed an exact isolated rerun 1/1
@@ -88,7 +88,12 @@
 - Dirty-worktree attribution: `.superpowers/sdd/task-1-report.md` remains the prior agents' append-only in-scope handoff; the new implementer must append its own section and leave the report uncommitted
 - Fix base: `e08ed2c0bec45be2a1431a8858120efb3404f301`
 - Fix dispatch: fresh implementer `/root/task1_identity_coherence_fix` is executing the authorized review-10 correction with TDD; allowed production/test scope is exactly `src/control-store.mjs` and `test/control-store.test.mjs`
-- Next action: wait for the implementer result, verify its commit/report/scope, then dispatch one fresh independent Task 1 re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
+- Fix result: `/root/task1_identity_coherence_fix` returned `DONE`; commit `88c2c4bf4b1a148ef7ae0122b2a9afd8cd8e908d` changes only `src/control-store.mjs` and `test/control-store.test.mjs`; report appended at `.superpowers/sdd/task-1-report.md`
+- Fix RED evidence: the focused 22-test command passed 4 and failed 18, reproducing side-effecting alias conflicts, completeness-incoherent replay, candidate masking, and direct explicit-completeness mismatch
+- Fix GREEN evidence: the same focused command passed 22/22; disposable-HOME four-file Task 1/legacy regression passed 157/157; syntax, diff, SQL ordering, and two-file scope gates passed on macOS arm64 with Node v26.0.0
+- Fix behavior: all existing canonical alias groups share conflict validation; public/direct target selection shares compatibility with explicit completeness applied before `LIMIT 2`; successful alias observations are replayable while direct omitted completeness retains its legacy wildcard contract
+- Fix audit: an adversarial read-only child audit returned `NO_BLOCKER`; no real HOME, hooks, runtime pointer, feedback DB, schema, scheduler, notification, RAG, maintenance, or later task was touched
+- Next action: generate the full Task 1 review package through `88c2c4b` and dispatch one fresh independent re-review. Task 1 and all mapped OpenSpec tasks remain unchecked
 
 ## Superseded implementation
 
