@@ -1890,6 +1890,14 @@ git commit -m "docs: describe the immediate reflection pipeline"
 - Produces: reproducible build evidence without real HOME writes
 - Produces: a release-candidate boundary that still requires explicit user authorization before global hook/runtime/database changes
 
+**Frozen Task 15 preflight decisions:**
+
+- Keep one bounded platform smoke harness, not a second runtime framework. Its default deterministic mode uses a disposable local provider to exercise the installed prompt hook, real detached child, control DB, immutable Markdown publication, later-prompt selection/emission, recurrence and cutoff ordering on the host platform. `AFL_REAL_PROVIDER=1` is a separate opt-in acceptance path and a fake provider can never satisfy it.
+- `AFL_SMOKE_HOME` is the only controller HOME. The real-provider path may reuse the existing provider authentication environment while Codex remains `--ephemeral --ignore-user-config`, but it must not install into, migrate, or select the real AFL runtime. The guarded real config/runtime/legacy-DB files are read only and compared before/after without opening the legacy SQLite database through AFL.
+- The available real Linux executor is the local Docker Linux engine. Run an official Node image at `>=24.15.0`, mount the repository read-only, and give the test a disposable writable HOME/TMP directory. This is Linux container build proof, not a VM, desktop, production, or cross-provider claim.
+- Preserve the frozen user-value chain and no-output boundary: the completed-turn dissatisfaction creates one job and returns in under two seconds with no AFL control text; the reviewer publishes asynchronously; only a later matching prompt receives the method; a later confirmed same-family complaint publishes `recurrence_after_emission`; the next matching prompt selects only the newest family method. The neutral `reviewer job 是干嘛的？` prompt creates no job or document, five severe documents never create a hold, and a document published at the current cutoff is visible only on a later prompt.
+- Task 15 may add tests and the verification report and may make only a minimal integration correction if a previously approved interface is not wired. It must not add a scheduler, RAG/index, service, schema, Stop/receipt/notification path, database lesson body, real-HOME installation, Windows support, or desktop visibility claim.
+
 - [ ] **Step 1: Write the end-to-end RED scenarios before final integration fixes**
 
 Add subprocess tests using a temporary HOME and project:
