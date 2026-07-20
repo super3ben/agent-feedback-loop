@@ -422,6 +422,7 @@ feedback_signal_evaluated
 review_job_created | review_job_reused
 review_spawn_attempted
 review_job_claimed | review_job_recovered
+review_failed
 review_completed_no_lesson | reflection_published
 reflection_parse_omitted
 reflection_selected | reflection_emitted

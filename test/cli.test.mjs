@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -926,6 +927,73 @@ describe("agent-feedback-loop package", () => {
     assert.doesNotMatch(JSON.stringify(health), /scheduler|notification|maintenance|receipt/ui);
   });
 
+  it("doctor ready gates every runtime dependency", async () => {
+    const codexHost = {
+      async inspect() {
+        return {
+          available: true,
+          configured: true,
+          runnable: true,
+          status: "trusted",
+          prompt: { found: true, trustStatus: "trusted", enabled: true, runnable: true }
+        };
+      }
+    };
+    const reviewerDetector = async () => ({
+      codex: { cli: "codex", available: true, executable: "/opt/codex" },
+      claude: { cli: "claude", available: false, executable: null },
+      gemini: { cli: "gemini", available: false, executable: null }
+    });
+    const setup = async () => {
+      const home = await tempHome();
+      const paths = pathsFor(home);
+      await install({ home, codexHost: unavailableCodexHost() });
+      await mkdir(path.join(home, ".agent", "reflections"), { recursive: true, mode: 0o700 });
+      return { home, paths };
+    };
+    const inspect = (home) => doctor({ home, cwd: home, codexHost, reviewerDetector });
+
+    const healthy = await setup();
+    const baseline = await inspect(healthy.home);
+    assert.equal(baseline.status.controlStore.available, true);
+    assert.equal(baseline.status.reflectionDirectory.available, true);
+    assert.equal(baseline.status.ready, true);
+
+    const missingStore = await setup();
+    await rm(missingStore.paths.controlDatabase);
+    const storeStatus = await inspect(missingStore.home);
+    assert.equal(storeStatus.status.controlStore.available, false);
+    assert.equal(storeStatus.status.ready, false);
+
+    const unusableStore = await setup();
+    await rm(unusableStore.paths.controlDatabase);
+    await writeFile(unusableStore.paths.controlDatabase, "not a control database", "utf8");
+    const unusableStoreStatus = await inspect(unusableStore.home);
+    assert.equal(unusableStoreStatus.status.controlStore.exists, true);
+    assert.equal(unusableStoreStatus.status.controlStore.available, false);
+    assert.equal(unusableStoreStatus.status.ready, false);
+
+    const missingReflection = await setup();
+    await rm(path.join(missingReflection.home, ".agent", "reflections"), { recursive: true });
+    const reflectionStatus = await inspect(missingReflection.home);
+    assert.equal(reflectionStatus.status.reflectionDirectory.available, false);
+    assert.equal(reflectionStatus.status.ready, false);
+
+    const unusableReflection = await setup();
+    const reflectionPath = path.join(unusableReflection.home, ".agent", "reflections");
+    await rm(reflectionPath, { recursive: true });
+    await writeFile(reflectionPath, "not a reflection directory", "utf8");
+    const unusableReflectionStatus = await inspect(unusableReflection.home);
+    assert.equal(unusableReflectionStatus.status.reflectionDirectory.available, false);
+    assert.equal(unusableReflectionStatus.status.ready, false);
+
+    const legacyStop = await setup();
+    await writeFile(legacyStop.paths.codexConfig, `${await readFile(legacyStop.paths.codexConfig, "utf8")}\ncommand = "${path.join(legacyStop.paths.packRoot, "hooks", "stop-hook.sh")}"\n`, "utf8");
+    const legacyStatus = await inspect(legacyStop.home);
+    assert.equal(legacyStatus.status.legacyStopRemoved, false);
+    assert.equal(legacyStatus.status.ready, false);
+  });
+
   it("structured logs never contain content", () => {
     const emitted = [];
     const writer = (line) => emitted.push(line);
@@ -945,7 +1013,27 @@ describe("agent-feedback-loop package", () => {
     assert.equal(event.event, "prompt_capture_completed");
     assert.equal(event.reason, "invalid_reason_code");
     assert.match(event.document, /^[a-f0-9]{64}$/u);
+    assert.equal(event.family, createHash("sha256").update("family-method-boundary", "utf8").digest("hex"));
     assert.deepEqual(Object.keys(event).sort(), ["count", "document", "event", "family", "job", "reason"]);
+
+    const content = "secret-user-text/full-review-body/token/path";
+    const stringCases = [
+      ["job", content, (entry) => assert.equal("job" in entry, false)],
+      ["family", content, (entry) => assert.equal(entry.family, createHash("sha256").update(content, "utf8").digest("hex"))],
+      ["document", content, (entry) => assert.equal(entry.document, createHash("sha256").update(content, "utf8").digest("hex"))],
+      ["reason", content, (entry) => assert.equal(entry.reason, "invalid_reason_code")],
+      ["result", content, (entry) => assert.equal(entry.result, "invalid_result_code")]
+    ];
+    for (const [key, value, check] of stringCases) {
+      const lines = [];
+      cliModule.structuredLog("reflection_selected", { [key]: value }, (line) => lines.push(line));
+      assert.equal(lines.length, 1);
+      assert.doesNotMatch(lines[0], /secret-user-text|full-review-body|token\/path/u);
+      check(JSON.parse(lines[0]));
+    }
+    const invalidEvent = [];
+    assert.equal(cliModule.structuredLog(content, {}, (line) => invalidEvent.push(line)), false);
+    assert.deepEqual(invalidEvent, []);
 
     const terminal = [];
     cliModule.reviewerTerminalLog({
@@ -956,12 +1044,52 @@ describe("agent-feedback-loop package", () => {
       writer: (line) => terminal.push(line)
     });
     assert.deepEqual(JSON.parse(terminal[0]), {
-      event: "review_spawn_attempted",
+      event: "review_failed",
       job: "a5e1767b-5b8f-4ef5-9b2a-f2d620a7d526",
       reason: "provider_timeout",
       result: "failed",
       duration_ms: 7
     });
+  });
+
+  it("launcher diagnostics distinguish attempted and synchronous failed spawn", async () => {
+    const originalWrite = process.stderr.write;
+    const originalDebug = process.env.AGENT_FEEDBACK_LOOP_DEBUG;
+    process.env.AGENT_FEEDBACK_LOOP_DEBUG = "1";
+    const lines = [];
+    process.stderr.write = (line) => { lines.push(String(line)); return true; };
+    try {
+      for (const scenario of [
+        { attempted: true, reason: "spawn_attempted", expectedReason: "launch_reserved", expectedResult: "attempted" },
+        { attempted: false, reason: "spawn_failed", expectedReason: "spawn_failed", expectedResult: "failed" },
+        { attempted: false, reason: "unsupported_platform", expectedReason: "unsupported_platform", expectedResult: "failed" }
+      ]) {
+        const fixture = await promptOrchestrationFixture();
+        try {
+          const result = await cliModule.handlePromptHook({
+            payload: explicitFeedbackPayload({ event_id: `feedback-${scenario.reason}` }),
+            cli: "codex",
+            controlStore: fixture.controlStore,
+            blobs: fixture.blobs,
+            launchReviewer() { return { attempted: scenario.attempted, reason: scenario.reason }; },
+            writeResponse: async () => ({ continue: true }),
+            now: () => new Date(PROMPT_CUTOFF)
+          });
+          assert.equal(result.launchRequested, scenario.attempted);
+          assert.equal(result.reason, scenario.expectedReason);
+          const spawn = lines.map((line) => JSON.parse(line)).filter((event) => event.event === "review_spawn_attempted").at(-1);
+          assert.equal(spawn.result, scenario.expectedResult);
+          if (scenario.attempted) assert.equal("reason" in spawn, false);
+          else assert.equal(spawn.reason, scenario.expectedReason);
+        } finally {
+          fixture.controlStore.close();
+        }
+      }
+    } finally {
+      process.stderr.write = originalWrite;
+      if (originalDebug === undefined) delete process.env.AGENT_FEEDBACK_LOOP_DEBUG;
+      else process.env.AGENT_FEEDBACK_LOOP_DEBUG = originalDebug;
+    }
   });
 
   it("debug feedback evaluation emits normal bounded evidence", async () => {

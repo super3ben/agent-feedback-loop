@@ -18,7 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
 import { createCodexHost } from "./codex-host.mjs";
-import { initializeControlStore } from "./control-store.mjs";
+import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { SCHEMA_VERSION } from "./control-schema.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -557,6 +557,29 @@ async function isExecutable(file) {
   }
 }
 
+async function inspectControlStore(paths) {
+  const present = await exists(paths.controlDatabase);
+  if (!present) return { exists: false, available: false };
+  try {
+    const store = openControlStore({ paths });
+    store.close();
+    return { exists: true, available: true };
+  } catch {
+    return { exists: true, available: false };
+  }
+}
+
+async function inspectReflectionDirectory(directory) {
+  try {
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) return { exists: false, available: false };
+    await access(directory, constants.W_OK | constants.X_OK);
+    return { exists: true, available: true };
+  } catch {
+    return { exists: false, available: false };
+  }
+}
+
 export async function doctor(options = {}) {
   const home = options.home || os.homedir();
   const paths = pathsFor(home);
@@ -654,12 +677,19 @@ export async function doctor(options = {}) {
     };
     if (operational) readyCliCount += 1;
   }
+  const legacyStopRemoved = CLIS.every((cli) => !clis[cli.id].legacyStopPresent);
+  const reflectionDirectoryPath = path.join(options.cwd || process.cwd(), ".agent", "reflections");
+  const [controlStore, reflectionDirectory] = await Promise.all([
+    inspectControlStore(paths),
+    inspectReflectionDirectory(reflectionDirectoryPath)
+  ]);
   const ready = Object.values(files).every(Boolean)
     && CLIS.every((cli) => clis[cli.id].runnable)
     && readyCliCount > 0
-    && capability.status !== "unavailable";
-  const legacyStopRemoved = CLIS.every((cli) => !clis[cli.id].legacyStopPresent);
-  const reflectionDirectoryPath = path.join(options.cwd || process.cwd(), ".agent", "reflections");
+    && capability.status !== "unavailable"
+    && controlStore.available
+    && reflectionDirectory.available
+    && legacyStopRemoved;
   const status = {
     promptHook: {
       configured: CLIS.every((cli) => clis[cli.id].configured),
@@ -667,8 +697,8 @@ export async function doctor(options = {}) {
       runtimeSelected: runtime.selected,
       runtimeCapability: capability.status
     },
-    controlStore: { exists: await exists(paths.controlDatabase) },
-    reflectionDirectory: { exists: await exists(reflectionDirectoryPath) },
+    controlStore,
+    reflectionDirectory,
     reviewerProvider: Object.fromEntries(CLIS.map((cli) => {
       const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
       return [cli.id, {

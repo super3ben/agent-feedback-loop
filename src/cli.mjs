@@ -101,6 +101,7 @@ const LOG_EVENTS = new Set([
   "review_spawn_attempted",
   "review_job_claimed",
   "review_job_recovered",
+  "review_failed",
   "review_completed_no_lesson",
   "reflection_published",
   "reflection_parse_omitted",
@@ -114,14 +115,14 @@ const LOG_REASONS = new Set([
   "spawn_failed", "launch_failed", "recovery_failed", "selection_record_failed", "log_limit",
   "selection_failed", "response_failed", "emission_record_failed", "invalid_input", "hook_failed",
   "candidate", "not_candidate", "launch_reserved", "reserved", "terminal", "not_found", "cooldown",
-  "not_due", "provider_unavailable", "provider_timeout", "provider_invalid", "context_invalid",
+  "not_due", "unsupported_platform", "provider_unavailable", "provider_timeout", "provider_invalid", "context_invalid",
   "lease_lost", "publication_failed", "publication_collision", "reviewer_failed"
 ]);
-const LOG_RESULTS = new Set(["reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted"]);
+const LOG_RESULTS = new Set(["attempted", "reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted"]);
 const LOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const LOG_FAMILY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const LOG_HASH = /^[a-f0-9]{64}$/u;
 const LOG_MAX_INTEGER = 2_147_483_647;
+const LAUNCH_FAILURE_REASONS = new Set(["spawn_failed", "unsupported_platform", "invalid_input"]);
 
 function boundedReason(error, fallback) {
   const value = String(error?.code || "").toLowerCase();
@@ -152,7 +153,7 @@ export function structuredLog(event, fields = {}, writer = (line) => process.std
     if (key === "job") {
       if (typeof value === "string" && LOG_UUID.test(value)) safe.job = value;
     } else if (key === "family") {
-      if (typeof value === "string" && LOG_FAMILY.test(value)) safe.family = value;
+      if (typeof value === "string" && value) safe.family = LOG_HASH.test(value) ? value : hashOpaque(value);
     } else if (key === "document") {
       if (typeof value === "string" && value) safe.document = LOG_HASH.test(value) ? value : hashOpaque(value);
     } else if (key === "reason") {
@@ -170,6 +171,10 @@ export function structuredLog(event, fields = {}, writer = (line) => process.std
 function promptLog(event, fields = {}) {
   if (process.env.AGENT_FEEDBACK_LOOP_DEBUG !== "1") return;
   structuredLog(event, fields);
+}
+
+function launchFailureReason(value) {
+  return LAUNCH_FAILURE_REASONS.has(value) ? value : "spawn_failed";
 }
 
 function cutoffIso(value) {
@@ -333,20 +338,29 @@ export async function handlePromptHook({
       if (candidate && reservation?.launch) {
         try {
           const launch = launchReviewer(candidate.jobId, reservation.launchEpoch);
-          if (launch?.attempted === false) {
+          if (launch?.attempted !== false) {
+            result.launchRequested = true;
+            result.reason = "launch_reserved";
+            promptLog("review_spawn_attempted", {
+              job: candidate.jobId,
+              lease_epoch: reservation.launchEpoch,
+              result: "attempted"
+            });
+          } else {
+            const reason = launchFailureReason(launch?.reason);
             controlStore.recordReviewLaunchFailure({
               jobId: candidate.jobId,
               launchEpoch: reservation.launchEpoch,
-              reasonCode: boundedReason({ code: launch.reason }, "spawn_failed")
+              reasonCode: reason
+            });
+            result.reason = reason;
+            promptLog("review_spawn_attempted", {
+              job: candidate.jobId,
+              lease_epoch: reservation.launchEpoch,
+              result: "failed",
+              reason
             });
           }
-          result.launchRequested = true;
-          result.reason = "launch_reserved";
-          promptLog("review_spawn_attempted", {
-            job: candidate.jobId,
-            lease_epoch: reservation.launchEpoch,
-            reason: "launch_reserved"
-          });
         } catch (error) {
           try {
             controlStore.recordReviewLaunchFailure({
@@ -355,8 +369,8 @@ export async function handlePromptHook({
               reasonCode: "spawn_failed"
             });
           } catch {}
-          result.reason = "launch_failed";
-          promptLog("review_spawn_attempted", { job: candidate.jobId, reason: "launch_failed" });
+          result.reason = "spawn_failed";
+          promptLog("review_spawn_attempted", { job: candidate.jobId, result: "failed", reason: "spawn_failed" });
         }
       } else if (candidate && reservation) {
         result.reason = reservation.reason;
@@ -509,7 +523,7 @@ export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", 
   if (outcome === "reviewed_no_lesson") {
     return structuredLog("review_completed_no_lesson", { ...fields, result: "reviewed_no_lesson" }, writer);
   }
-  return structuredLog("review_spawn_attempted", { ...fields, result: "failed", reason }, writer);
+  return structuredLog("review_failed", { ...fields, result: "failed", reason }, writer);
 }
 
 export async function main(args) {
