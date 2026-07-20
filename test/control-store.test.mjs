@@ -67,6 +67,36 @@ function controlCaptureFixture() {
   };
 }
 
+function reviewJobFixture(initialNow = "2026-07-20T00:00:00.000Z") {
+  const { paths } = fixture();
+  let currentNow = new Date(initialNow);
+  const store = initializeControlStore({ paths, now: () => new Date(currentNow) });
+  let sequence = 0;
+  return {
+    paths,
+    store,
+    now() {
+      return new Date(currentNow);
+    },
+    advance(milliseconds) {
+      currentNow = new Date(currentNow.getTime() + milliseconds);
+      return new Date(currentNow);
+    },
+    capture(overrides = {}) {
+      sequence += 1;
+      const suffix = String(sequence).padStart(4, "0");
+      return store.captureSessionEvent(event({
+        event_uid: `review-event-${suffix}`,
+        session_uid: "review-session",
+        source_event_id: `review-source-${suffix}`,
+        content_hash: createHash("sha256").update(`review-${suffix}`).digest("hex"),
+        encrypted_raw_ref: `/private/blobs/review-${suffix}.enc`,
+        ...overrides
+      }));
+    }
+  };
+}
+
 function canonicalAliasEvent(overrides = {}) {
   return event({
     event_uid: "alias-matrix-event",
@@ -2330,4 +2360,319 @@ test("control store captures normalized hooks, replays observations, and rejects
   assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM pragma_table_info('session_events') WHERE (name LIKE '%text%' AND name != 'context_epoch') OR name IN ('report', 'card', 'lesson')").get().count, 0);
   assert.doesNotMatch(readFileSync(paths.controlDatabase, "utf8"), /control-unique-redacted-text/);
   store.close();
+});
+
+test("candidate identity is replay-idempotent", () => {
+  const { store, capture } = reviewJobFixture();
+  const source = capture({ event_uid: "candidate-source" });
+  const referent = capture({ event_uid: "candidate-referent", role: "assistant" });
+  const other = capture({ event_uid: "candidate-other" });
+  const candidate = {
+    sourceEventUid: source.eventUid,
+    referentEventUid: referent.eventUid,
+    sourceIdentity: "codex:s1:e1:r1",
+    projectId: "project-1"
+  };
+
+  const first = store.createReviewCandidate(candidate);
+  const replay = store.createReviewCandidate(candidate);
+  assert.equal(first.created, true);
+  assert.equal(replay.created, false);
+  assert.equal(replay.jobId, first.jobId);
+
+  for (const contradiction of [
+    { sourceEventUid: other.eventUid },
+    { referentEventUid: null },
+    { projectId: "project-2" }
+  ]) {
+    assert.throws(
+      () => store.createReviewCandidate({ ...candidate, ...contradiction }),
+      (error) => error?.code === "review_candidate_collision"
+    );
+  }
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count, 1);
+  store.close();
+});
+
+test("different sessions are never text-deduplicated", () => {
+  const { store, capture } = reviewJobFixture();
+  const sharedHash = createHash("sha256").update("same complaint").digest("hex");
+  const firstSource = capture({
+    event_uid: "session-one-source",
+    session_uid: "session-one",
+    source_event_id: "complaint",
+    content_hash: sharedHash
+  });
+  const secondSource = capture({
+    event_uid: "session-two-source",
+    session_uid: "session-two",
+    source_event_id: "complaint",
+    content_hash: sharedHash
+  });
+
+  const first = store.createReviewCandidate({
+    sourceEventUid: firstSource.eventUid,
+    sourceIdentity: "codex:session-one:complaint:none"
+  });
+  const second = store.createReviewCandidate({
+    sourceEventUid: secondSource.eventUid,
+    sourceIdentity: "codex:session-two:complaint:none"
+  });
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, true);
+  assert.notEqual(first.jobId, second.jobId);
+  store.close();
+});
+
+test("launch reservation is bounded", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "launch-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:launch:source:none"
+  });
+
+  const wake1 = fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 });
+  const wake2 = fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 });
+  assert.deepEqual([wake1.launch, wake2.launch], [true, false]);
+  assert.equal(wake1.launchEpoch, 1);
+  assert.equal(wake2.reason, "cooldown");
+
+  fixture.advance(5_001);
+  const wake3 = fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 });
+  assert.equal(wake3.launchEpoch, 2);
+  assert.deepEqual(
+    fixture.store.recordReviewLaunchFailure({ jobId: candidate.jobId, launchEpoch: 1, reasonCode: "spawn_failed" }),
+    { released: false }
+  );
+  assert.deepEqual(
+    fixture.store.recordReviewLaunchFailure({ jobId: candidate.jobId, launchEpoch: 2, reasonCode: "spawn_failed" }),
+    { released: true }
+  );
+  assert.equal(fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 5_000 }).launchEpoch, 3);
+  fixture.store.close();
+});
+
+test("stale reviewer owners cannot publish", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "fenced-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:fenced:source:none"
+  });
+
+  const ownerA = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-a", leaseMs: 1_000 });
+  assert.equal(ownerA.leaseEpoch, 1);
+  fixture.advance(1_001);
+  const ownerB = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-b", leaseMs: 30_000 });
+  assert.equal(ownerB.leaseEpoch, 2);
+  assert.equal(ownerB.job.attempt, 2);
+
+  assert.throws(
+    () => fixture.store.completeReviewPublished({
+      jobId: candidate.jobId,
+      ownerId: "owner-a",
+      leaseEpoch: ownerA.leaseEpoch,
+      path: "/tmp/stale.md",
+      sha256: "a".repeat(64)
+    }),
+    (error) => error?.code === "review_lease_lost"
+  );
+  assert.throws(
+    () => fixture.store.assertReviewLease({ jobId: candidate.jobId, ownerId: "owner-a", leaseEpoch: ownerA.leaseEpoch }),
+    (error) => error?.code === "review_lease_lost"
+  );
+
+  const renewed = fixture.store.renewReviewLease({
+    jobId: candidate.jobId,
+    ownerId: "owner-b",
+    leaseEpoch: ownerB.leaseEpoch,
+    leaseMs: 45_000
+  });
+  assert.equal(renewed.leaseEpoch, ownerB.leaseEpoch);
+  assert.equal(fixture.store.assertReviewLease({
+    jobId: candidate.jobId,
+    ownerId: "owner-b",
+    leaseEpoch: ownerB.leaseEpoch
+  }).job_id, candidate.jobId);
+  const completed = fixture.store.completeReviewPublished({
+    jobId: candidate.jobId,
+    ownerId: "owner-b",
+    leaseEpoch: ownerB.leaseEpoch,
+    path: "/tmp/current.md",
+    sha256: "b".repeat(64)
+  });
+  assert.equal(completed.state, "published");
+  assert.equal(fixture.store.claimReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-c"
+  }).job, null);
+  fixture.store.close();
+});
+
+test("review failures retry after 30 and 120 seconds then exhaust at attempt three", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "retry-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:retry:source:none"
+  });
+
+  const first = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-1" });
+  const failedOnce = fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-1",
+    leaseEpoch: first.leaseEpoch,
+    reasonCode: "provider_timeout"
+  });
+  assert.equal(failedOnce.state, "retryable");
+  assert.equal(Date.parse(failedOnce.next_attempt_at) - fixture.now().getTime(), 30_000);
+  assert.equal(fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "too-early" }).job, null);
+
+  fixture.advance(30_000);
+  const second = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-2" });
+  const failedTwice = fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-2",
+    leaseEpoch: second.leaseEpoch,
+    reasonCode: "provider_unavailable"
+  });
+  assert.equal(failedTwice.state, "retryable");
+  assert.equal(Date.parse(failedTwice.next_attempt_at) - fixture.now().getTime(), 120_000);
+
+  fixture.advance(120_000);
+  const third = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-3" });
+  const exhausted = fixture.store.failReviewJob({
+    jobId: candidate.jobId,
+    ownerId: "owner-3",
+    leaseEpoch: third.leaseEpoch,
+    reasonCode: "provider_invalid"
+  });
+  assert.equal(exhausted.state, "failed");
+  assert.equal(exhausted.next_attempt_at, null);
+  assert.equal(fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "owner-4" }).job, null);
+  assert.throws(
+    () => fixture.store.failReviewJob({
+      jobId: candidate.jobId,
+      ownerId: "owner-3",
+      leaseEpoch: third.leaseEpoch,
+      reasonCode: "provider_invalid"
+    }),
+    (error) => error?.code === "review_lease_lost"
+  );
+  fixture.store.close();
+});
+
+test("recoverable review jobs are due, stable and hard-capped at eight", () => {
+  const fixture = reviewJobFixture();
+  for (let index = 0; index < 10; index += 1) {
+    const source = fixture.capture({ event_uid: `recoverable-source-${index}` });
+    fixture.store.createReviewCandidate({
+      sourceEventUid: source.eventUid,
+      sourceIdentity: `codex:recoverable:${index}:none`
+    });
+  }
+  const expected = fixture.store.database.prepare(
+    "SELECT job_id FROM reviewer_jobs ORDER BY created_at, job_id LIMIT 8"
+  ).all().map((row) => row.job_id);
+  const actual = fixture.store.listRecoverableReviewJobs({ limit: 100, now: fixture.now() });
+  assert.equal(actual.length, 8);
+  assert.deepEqual(actual.map((row) => row.job_id), expected);
+
+  const reservation = fixture.store.reserveReviewLaunch({ jobId: actual[0].job_id, cooldownMs: 5_000 });
+  assert.equal(fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() })
+    .some((row) => row.job_id === actual[0].job_id), false);
+  assert.equal(fixture.store.recordReviewLaunchFailure({
+    jobId: actual[0].job_id,
+    launchEpoch: reservation.launchEpoch,
+    reasonCode: "spawn_failed"
+  }).released, true);
+  assert.equal(fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() })
+    .some((row) => row.job_id === actual[0].job_id), true);
+
+  const running = fixture.store.claimReviewJob({ jobId: actual[0].job_id, ownerId: "expiring", leaseMs: 1_000 });
+  assert.equal(fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() })
+    .some((row) => row.job_id === running.job.job_id), false);
+  fixture.advance(1_001);
+  assert.equal(fixture.store.listRecoverableReviewJobs({ limit: 8, now: fixture.now() })
+    .some((row) => row.job_id === running.job.job_id), true);
+  fixture.store.close();
+});
+
+test("review context is opaque, chronological and bounded", () => {
+  const fixture = reviewJobFixture();
+  const prior = fixture.capture({ event_uid: "context-prior", role: "assistant" });
+  fixture.advance(1);
+  const referent = fixture.capture({ event_uid: "context-referent", role: "assistant" });
+  fixture.advance(1);
+  const source = fixture.capture({
+    event_uid: "context-source",
+    role: "user",
+    referent_event_uid: referent.eventUid
+  });
+  fixture.advance(1);
+  const following = fixture.capture({ event_uid: "context-following", role: "assistant" });
+  fixture.advance(1);
+  fixture.capture({ event_uid: "context-following-omitted", role: "user" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    referentEventUid: referent.eventUid,
+    sourceIdentity: "codex:context:source:referent",
+    projectId: "project-context"
+  });
+
+  const context = fixture.store.getReviewContext({
+    jobId: candidate.jobId,
+    priorLimit: 1,
+    followingLimit: 1
+  });
+  assert.equal(context.source.event_uid, source.eventUid);
+  assert.equal(context.referent.event_uid, referent.eventUid);
+  assert.deepEqual(context.prior.map((row) => row.event_uid), [prior.eventUid]);
+  assert.deepEqual(context.following.map((row) => row.event_uid), [following.eventUid]);
+  for (const row of [context.source, context.referent, ...context.prior, ...context.following]) {
+    assert.deepEqual(Object.keys(row).sort(), [
+      "completeness",
+      "content_hash",
+      "created_at",
+      "encrypted_raw_ref",
+      "event_uid",
+      "referent_event_uid",
+      "role",
+      "session_uid",
+      "source_provider",
+      "source_timestamp"
+    ]);
+  }
+  const contextKeys = [];
+  JSON.stringify(context, (key, value) => {
+    if (key) contextKeys.push(key);
+    return value;
+  });
+  assert.deepEqual(
+    contextKeys.filter((key) => ["raw_text", "rawText", "prompt", "report", "method", "lesson", "card"].includes(key)),
+    []
+  );
+  fixture.store.close();
+});
+
+test("review no-lesson completion is terminal and fenced", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "no-lesson-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:no-lesson:source:none"
+  });
+  const claim = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "no-lesson-owner" });
+  const completed = fixture.store.completeReviewNoLesson({
+    jobId: candidate.jobId,
+    ownerId: "no-lesson-owner",
+    leaseEpoch: claim.leaseEpoch
+  });
+  assert.equal(completed.state, "reviewed_no_lesson");
+  assert.equal(completed.result_code, "reviewed_no_lesson");
+  assert.equal(fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 0 }).launch, false);
+  assert.equal(fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "late-owner" }).job, null);
+  fixture.store.close();
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -20,6 +20,12 @@ try {
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const MAX_CONTEXT_EPOCH = 2_147_483_647;
+const MAX_REVIEW_ATTEMPTS = 3;
+const DEFAULT_REVIEW_LEASE_MS = 185_000;
+const REVIEW_RETRY_DELAYS_MS = Object.freeze([30_000, 120_000]);
+const MAX_RECOVERABLE_REVIEW_JOBS = 8;
+const MAX_PRIOR_REVIEW_EVENTS = 6;
+const MAX_FOLLOWING_REVIEW_EVENTS = 2;
 const CAPTURE_IDENTITY_FIELDS = Object.freeze([
   "event_uid",
   "source_provider",
@@ -144,6 +150,36 @@ function assertString(value, field, maxLength = 4096) {
 function assertOptionalString(value, field, maxLength = 4096) {
   if (value === null || value === undefined) return null;
   return assertString(value, field, maxLength);
+}
+
+function assertMilliseconds(value, field) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a bounded non-negative integer`);
+  }
+  return value;
+}
+
+function assertLimit(value, field, defaultValue, maximum) {
+  const resolved = value ?? defaultValue;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    throw new TypeError(`${field} must be a bounded non-negative integer`);
+  }
+  return Math.min(resolved, maximum);
+}
+
+function explicitNow(value, fallback, field = "now") {
+  const resolved = value === undefined ? fallback() : value;
+  const date = new Date(resolved);
+  if (!Number.isFinite(date.getTime())) throw new TypeError(`${field} must be a valid date`);
+  return date;
+}
+
+function reviewCandidateCollision() {
+  return new ControlStoreError("review_candidate_collision", "review candidate collision");
+}
+
+function reviewLeaseLost() {
+  return new ControlStoreError("review_lease_lost", "review lease lost");
 }
 
 function observationKey(provider, sessionUid, contextEpoch, sourceNamespace, sourceId) {
@@ -678,8 +714,366 @@ function createStore(database, now) {
     });
   };
 
+  const reviewTimestamp = (value) => explicitNow(value, now);
+  const getReviewJob = (jobId) => database.prepare("SELECT * FROM reviewer_jobs WHERE job_id=?")
+    .get(assertString(jobId, "jobId", 512)) || null;
+  const insertReviewJobEvent = ({ jobId, eventType, reasonCode = null, leaseEpoch = null, timestamp }) => {
+    database.prepare(`INSERT INTO review_job_events
+      (job_id, event_type, reason_code, lease_epoch, created_at) VALUES (?, ?, ?, ?, ?)`).run(
+      jobId,
+      assertString(eventType, "eventType", 128),
+      assertOptionalString(reasonCode, "reasonCode", 128),
+      leaseEpoch,
+      timestamp
+    );
+  };
+  const eventContextColumns = `event_uid, session_uid, source_provider, role, referent_event_uid,
+    content_hash, encrypted_raw_ref, completeness, source_timestamp, created_at`;
+  const readContextEvent = (eventUid) => {
+    if (eventUid === null || eventUid === undefined) return null;
+    return database.prepare(`SELECT ${eventContextColumns} FROM session_events WHERE event_uid=?`)
+      .get(assertString(eventUid, "eventUid", 512)) || null;
+  };
+  const requireCurrentReviewLease = ({ jobId, ownerId, leaseEpoch, timestamp }) => {
+    const row = database.prepare(`SELECT * FROM reviewer_jobs
+      WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
+        AND lease_until IS NOT NULL AND lease_until>?`).get(jobId, ownerId, leaseEpoch, timestamp);
+    if (!row) throw reviewLeaseLost();
+    return row;
+  };
+
   return {
     database,
+    createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null }) {
+      const safeSourceEventUid = assertString(sourceEventUid, "sourceEventUid", 512);
+      const safeReferentEventUid = assertOptionalString(referentEventUid, "referentEventUid", 512);
+      const safeSourceIdentity = assertString(sourceIdentity, "sourceIdentity", 2048);
+      const safeProjectId = assertOptionalString(projectId, "projectId", 1024);
+      return transaction(() => {
+        const existing = database.prepare("SELECT * FROM reviewer_jobs WHERE source_identity=?")
+          .get(safeSourceIdentity);
+        if (existing) {
+          if (existing.source_event_uid !== safeSourceEventUid
+              || (existing.referent_event_uid ?? null) !== safeReferentEventUid
+              || (existing.project_id ?? null) !== safeProjectId) {
+            throw reviewCandidateCollision();
+          }
+          return { jobId: existing.job_id, created: false };
+        }
+        const timestamp = nowIso(now);
+        const jobId = randomUUID();
+        database.prepare(`INSERT INTO reviewer_jobs
+          (job_id, source_identity, source_event_uid, referent_event_uid, project_id, state, created_at)
+          VALUES (?, ?, ?, ?, ?, 'pending', ?)`).run(
+          jobId, safeSourceIdentity, safeSourceEventUid, safeReferentEventUid, safeProjectId, timestamp
+        );
+        insertReviewJobEvent({
+          jobId,
+          eventType: "candidate_created",
+          reasonCode: "explicit_feedback",
+          timestamp
+        });
+        return { jobId, created: true };
+      });
+    },
+    reserveReviewLaunch({ jobId, cooldownMs }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeCooldownMs = assertMilliseconds(cooldownMs, "cooldownMs");
+      const current = reviewTimestamp();
+      const timestamp = current.toISOString();
+      const nextLaunchAt = new Date(current.getTime() + safeCooldownMs).toISOString();
+      return transaction(() => {
+        const reserved = database.prepare(`UPDATE reviewer_jobs
+          SET launch_epoch=launch_epoch+1, next_launch_at=?
+          WHERE job_id=? AND attempt<?
+            AND (next_launch_at IS NULL OR next_launch_at<=?)
+            AND (
+              (state IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+              OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
+            )
+          RETURNING *`).get(
+          nextLaunchAt, safeJobId, MAX_REVIEW_ATTEMPTS, timestamp, timestamp, timestamp
+        );
+        if (reserved) {
+          insertReviewJobEvent({
+            jobId: safeJobId,
+            eventType: "launch_reserved",
+            leaseEpoch: Number(reserved.launch_epoch),
+            timestamp
+          });
+          return { launch: true, launchEpoch: Number(reserved.launch_epoch), reason: "reserved" };
+        }
+        const currentJob = getReviewJob(safeJobId);
+        if (!currentJob) return { launch: false, launchEpoch: null, reason: "not_found" };
+        if (["reviewed_no_lesson", "published", "failed"].includes(currentJob.state)
+            || Number(currentJob.attempt) >= MAX_REVIEW_ATTEMPTS) {
+          return { launch: false, launchEpoch: Number(currentJob.launch_epoch), reason: "terminal" };
+        }
+        if (currentJob.next_launch_at && currentJob.next_launch_at > timestamp) {
+          return { launch: false, launchEpoch: Number(currentJob.launch_epoch), reason: "cooldown" };
+        }
+        return { launch: false, launchEpoch: Number(currentJob.launch_epoch), reason: "not_due" };
+      });
+    },
+    recordReviewLaunchFailure({ jobId, launchEpoch, reasonCode }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeLaunchEpoch = assertOptionalEpoch(launchEpoch, "launchEpoch");
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        const released = database.prepare(`UPDATE reviewer_jobs
+          SET next_launch_at=NULL, error_code=?
+          WHERE job_id=? AND launch_epoch=? AND next_launch_at IS NOT NULL
+            AND attempt<? AND (
+              state IN ('pending','retryable')
+              OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
+            )
+          RETURNING job_id`).get(
+          safeReasonCode, safeJobId, safeLaunchEpoch, MAX_REVIEW_ATTEMPTS, timestamp
+        );
+        if (!released) return { released: false };
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "launch_failed",
+          reasonCode: safeReasonCode,
+          leaseEpoch: safeLaunchEpoch,
+          timestamp
+        });
+        return { released: true };
+      });
+    },
+    listRecoverableReviewJobs({ limit = MAX_RECOVERABLE_REVIEW_JOBS, now: at } = {}) {
+      const safeLimit = assertLimit(limit, "limit", MAX_RECOVERABLE_REVIEW_JOBS, MAX_RECOVERABLE_REVIEW_JOBS);
+      if (safeLimit === 0) return [];
+      const timestamp = reviewTimestamp(at).toISOString();
+      return database.prepare(`SELECT * FROM reviewer_jobs
+        WHERE attempt<? AND (next_launch_at IS NULL OR next_launch_at<=?) AND (
+          (state IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+          OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
+        )
+        ORDER BY created_at, job_id LIMIT ?`).all(
+        MAX_REVIEW_ATTEMPTS, timestamp, timestamp, timestamp, safeLimit
+      ).map((row) => ({ ...row }));
+    },
+    claimReviewJob({ jobId, ownerId, leaseMs = DEFAULT_REVIEW_LEASE_MS }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseMs = assertMilliseconds(leaseMs, "leaseMs");
+      const current = reviewTimestamp();
+      const timestamp = current.toISOString();
+      const leaseUntil = new Date(current.getTime() + safeLeaseMs).toISOString();
+      return transaction(() => {
+        const claimed = database.prepare(`UPDATE reviewer_jobs
+          SET state='running', owner_id=?, attempt=attempt+1, lease_epoch=lease_epoch+1,
+              lease_until=?, next_attempt_at=NULL, claimed_at=?, completed_at=NULL,
+              result_code=NULL, error_code=NULL
+          WHERE job_id=? AND attempt<? AND (
+            (state IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+            OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
+          )
+          RETURNING *`).get(
+          safeOwnerId, leaseUntil, timestamp, safeJobId, MAX_REVIEW_ATTEMPTS, timestamp, timestamp
+        );
+        if (claimed) {
+          insertReviewJobEvent({
+            jobId: safeJobId,
+            eventType: "claimed",
+            leaseEpoch: Number(claimed.lease_epoch),
+            timestamp
+          });
+          return { job: { ...claimed }, leaseEpoch: Number(claimed.lease_epoch) };
+        }
+        const exhausted = database.prepare(`UPDATE reviewer_jobs
+          SET state='failed', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+              completed_at=?, error_code='attempts_exhausted'
+          WHERE job_id=? AND attempt>=? AND (
+            (state IN ('pending','retryable') AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+            OR (state='running' AND lease_until IS NOT NULL AND lease_until<=?)
+          )
+          RETURNING *`).get(timestamp, safeJobId, MAX_REVIEW_ATTEMPTS, timestamp, timestamp);
+        if (exhausted) {
+          insertReviewJobEvent({
+            jobId: safeJobId,
+            eventType: "failed",
+            reasonCode: "attempts_exhausted",
+            leaseEpoch: Number(exhausted.lease_epoch),
+            timestamp
+          });
+        }
+        return { job: null, leaseEpoch: null };
+      });
+    },
+    assertReviewLease({ jobId, ownerId, leaseEpoch }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      return { ...requireCurrentReviewLease({
+        jobId: safeJobId,
+        ownerId: safeOwnerId,
+        leaseEpoch: safeLeaseEpoch,
+        timestamp: nowIso(now)
+      }) };
+    },
+    renewReviewLease({ jobId, ownerId, leaseEpoch, leaseMs = DEFAULT_REVIEW_LEASE_MS }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safeLeaseMs = assertMilliseconds(leaseMs, "leaseMs");
+      const current = reviewTimestamp();
+      const timestamp = current.toISOString();
+      const leaseUntil = new Date(current.getTime() + safeLeaseMs).toISOString();
+      return transaction(() => {
+        const renewed = database.prepare(`UPDATE reviewer_jobs SET lease_until=?
+          WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
+            AND lease_until IS NOT NULL AND lease_until>?
+          RETURNING *`).get(leaseUntil, safeJobId, safeOwnerId, safeLeaseEpoch, timestamp);
+        if (!renewed) throw reviewLeaseLost();
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "lease_renewed",
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { ...renewed, leaseEpoch: safeLeaseEpoch };
+      });
+    },
+    completeReviewNoLesson({ jobId, ownerId, leaseEpoch }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        const completed = database.prepare(`UPDATE reviewer_jobs
+          SET state='reviewed_no_lesson', owner_id=NULL, lease_until=NULL,
+              next_attempt_at=NULL, completed_at=?, result_code='reviewed_no_lesson', error_code=NULL
+          WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
+            AND lease_until IS NOT NULL AND lease_until>?
+          RETURNING *`).get(timestamp, safeJobId, safeOwnerId, safeLeaseEpoch, timestamp);
+        if (!completed) throw reviewLeaseLost();
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "reviewed_no_lesson",
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { ...completed };
+      });
+    },
+    completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256 }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safePublishedPath = assertString(publishedPath, "path", 4096);
+      const safeSha256 = assertString(sha256, "sha256", 64);
+      if (!/^[a-f0-9]{64}$/.test(safeSha256)) throw new TypeError("sha256 must be lowercase hexadecimal");
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        const completed = database.prepare(`UPDATE reviewer_jobs
+          SET state='published', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+              completed_at=?, result_code='published', error_code=NULL,
+              published_path=?, published_sha256=?
+          WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
+            AND lease_until IS NOT NULL AND lease_until>?
+          RETURNING *`).get(
+          timestamp, safePublishedPath, safeSha256,
+          safeJobId, safeOwnerId, safeLeaseEpoch, timestamp
+        );
+        if (!completed) throw reviewLeaseLost();
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "published",
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { ...completed };
+      });
+    },
+    failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
+      const current = reviewTimestamp();
+      const timestamp = current.toISOString();
+      const retryAfterFirst = new Date(current.getTime() + REVIEW_RETRY_DELAYS_MS[0]).toISOString();
+      const retryAfterSecond = new Date(current.getTime() + REVIEW_RETRY_DELAYS_MS[1]).toISOString();
+      return transaction(() => {
+        const failed = database.prepare(`UPDATE reviewer_jobs
+          SET state=CASE WHEN attempt>=? THEN 'failed' ELSE 'retryable' END,
+              owner_id=NULL, lease_until=NULL,
+              next_attempt_at=CASE attempt WHEN 1 THEN ? WHEN 2 THEN ? ELSE NULL END,
+              completed_at=CASE WHEN attempt>=? THEN ? ELSE NULL END,
+              result_code=NULL, error_code=?
+          WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
+            AND attempt BETWEEN 1 AND ? AND lease_until IS NOT NULL AND lease_until>?
+          RETURNING *`).get(
+          MAX_REVIEW_ATTEMPTS, retryAfterFirst, retryAfterSecond,
+          MAX_REVIEW_ATTEMPTS, timestamp, safeReasonCode,
+          safeJobId, safeOwnerId, safeLeaseEpoch, MAX_REVIEW_ATTEMPTS, timestamp
+        );
+        if (!failed) throw reviewLeaseLost();
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: failed.state === "failed" ? "failed" : "retry_scheduled",
+          reasonCode: safeReasonCode,
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { ...failed };
+      });
+    },
+    getReviewContext({ jobId, priorLimit = MAX_PRIOR_REVIEW_EVENTS, followingLimit = MAX_FOLLOWING_REVIEW_EVENTS }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safePriorLimit = assertLimit(priorLimit, "priorLimit", MAX_PRIOR_REVIEW_EVENTS, MAX_PRIOR_REVIEW_EVENTS);
+      const safeFollowingLimit = assertLimit(
+        followingLimit,
+        "followingLimit",
+        MAX_FOLLOWING_REVIEW_EVENTS,
+        MAX_FOLLOWING_REVIEW_EVENTS
+      );
+      const job = getReviewJob(safeJobId);
+      if (!job) return null;
+      const source = readContextEvent(job.source_event_uid);
+      if (!source) throw reviewCandidateCollision();
+      const referent = readContextEvent(job.referent_event_uid);
+      const prior = safePriorLimit === 0 ? [] : database.prepare(`SELECT ${eventContextColumns}
+        FROM session_events
+        WHERE session_uid=?
+          AND (created_at<? OR (created_at=? AND event_uid<?))
+          AND event_uid<>? AND (? IS NULL OR event_uid<>?)
+        ORDER BY created_at DESC, event_uid DESC LIMIT ?`).all(
+        source.session_uid,
+        source.created_at,
+        source.created_at,
+        source.event_uid,
+        source.event_uid,
+        job.referent_event_uid,
+        job.referent_event_uid,
+        safePriorLimit
+      ).reverse();
+      const following = safeFollowingLimit === 0 ? [] : database.prepare(`SELECT ${eventContextColumns}
+        FROM session_events
+        WHERE session_uid=?
+          AND (created_at>? OR (created_at=? AND event_uid>?))
+          AND event_uid<>? AND (? IS NULL OR event_uid<>?)
+        ORDER BY created_at, event_uid LIMIT ?`).all(
+        source.session_uid,
+        source.created_at,
+        source.created_at,
+        source.event_uid,
+        source.event_uid,
+        job.referent_event_uid,
+        job.referent_event_uid,
+        safeFollowingLimit
+      );
+      return {
+        job: { ...job },
+        source: { ...source },
+        referent: referent ? { ...referent } : null,
+        prior: prior.map((row) => ({ ...row })),
+        following: following.map((row) => ({ ...row }))
+      };
+    },
     assertCaptureAllowed(event) {
       return eventFields(event);
     },
