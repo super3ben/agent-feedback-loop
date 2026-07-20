@@ -783,7 +783,7 @@ git commit -m "fix: make public capture resolution atomic"
 
 Do not mark Task 1 complete in this plan. Record the implementation commit in the coordination artifact and dispatch a fresh Task 1 review covering all three review-8 findings as one transaction-boundary correction.
 
-- [ ] **Step 23: Write exactly two frozen timestamp regressions and observe RED**
+- [x] **Step 23: Write exactly two frozen timestamp regressions and observe RED**
 
 Add only these two behavior tests to `test/control-store.test.mjs`:
 
@@ -792,11 +792,11 @@ Add only these two behavior tests to `test/control-store.test.mjs`:
 
 Run only the two selected tests. The first must fail because the current bounded-string normalizer accepts timezone-less input; the second may already satisfy its replay assertion but must fail its UTC-normalization assertion. Do not add a general invalid-date matrix or widen the accepted timestamp language.
 
-- [ ] **Step 24: Implement the minimal entry normalization**
+- [x] **Step 24: Implement the minimal entry normalization**
 
 In `src/control-store.mjs`, add one small timestamp normalizer used by the existing `source_timestamp` / `sourceTimestamp` alias group. A non-null value must be a bounded RFC3339 string with explicit `Z` or `±HH:MM`; parse it once and return `new Date(epoch).toISOString()`. Timezone-less or unparsable input fails before `prepareCapture()` returns. Equivalent offset aliases compare after normalization. Keep the existing SQL, schema v1, direct null fallback, five-minute window, native-turn fallback and all other identity fields unchanged; do not add an epoch column, parsing framework, new service or second timestamp representation.
 
-- [ ] **Step 25: Run focused GREEN and the existing Task 1 regression**
+- [x] **Step 25: Run focused GREEN and the existing Task 1 regression**
 
 Run the exact two-test pattern from Step 23, then:
 
@@ -806,7 +806,7 @@ node --test test/control-store.test.mjs test/runtime.test.mjs test/capture.test.
 
 Expected: both frozen timestamp tests and the existing Task 1/legacy regression pass. Run the focused tests once under `TZ=UTC` and once under `TZ=Asia/Shanghai`; outcomes must be identical. Do not repeat the full npm suite unless these commands expose an unknown failure.
 
-- [ ] **Step 26: Run static/scope gates and commit**
+- [x] **Step 26: Run static/scope gates and commit**
 
 Run `node --check src/control-store.mjs`, `node --check test/control-store.test.mjs`, and `git diff --check`. Confirm the implementation commit contains only `src/control-store.mjs` and `test/control-store.test.mjs`; preserve `.superpowers/sdd/task-1-report.md` as the uncommitted append-only handoff. Commit as `fix: normalize capture timestamps`.
 
