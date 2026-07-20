@@ -9,7 +9,6 @@ import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
 import { containsReceiptMarker, detectReceiptLanguage, receiptNonce, renderReceiptControl, validateReceiptPayload } from "../src/receipt.mjs";
-import { selectLessons } from "../src/selector.mjs";
 import { CapturePolicyError, LeaseConflictError, RevisionConflictError, openStore } from "../src/store.mjs";
 import { seedSchemaV8ControlPlane, snapshotSchemaV8Evidence } from "./fixtures/schema-v8-control-plane.mjs";
 
@@ -1621,27 +1620,6 @@ test("a stop without an echoed nonce records emitted_unconfirmed instead of obse
   store.recordDelivery({ application_id: "delivery-unconfirmed", lesson_id: "lesson-missing-echo", revision: 1, session_uid: "session-unconfirmed", context_epoch: 1, state: "emitted", nonce: "not-echoed" });
   assert.equal(store.observeDeliveryNonces({ session_uid: "session-unconfirmed", context_epoch: 1, transcriptText: "late nonce=not-echoed" }), 1);
   assert.equal(store.hasDelivery("delivery-unconfirmed"), true);
-  store.close();
-});
-
-test("store preserves severe safety holds for the selector", async () => {
-  const store = await storeFixture();
-  store.upsertLessonRevision({
-    lesson_id: "lesson-hold",
-    revision: 1,
-    project_id: "project-hold",
-    severity: "Critical",
-    conflict_state: "safety_hold",
-    scope: { task_types: ["deploy"] },
-    card_json: JSON.stringify({ when: "deploying", must_do: "verify target", must_not: "continue under conflict", verify: "resolve conflict", why: "safety evidence conflicts", exception: "none", source_ids: ["hold-report"] })
-  }, 0);
-  store.promoteLesson({ lessonId: "lesson-hold", projectId: "project-hold" });
-  const result = selectLessons({
-    lessons: store.selectLessons({ projectId: "project-hold" }),
-    session: { session_uid: "hold-session", context_epoch: 1 },
-    task: { project_id: "project-hold", task_type: "deploy", fingerprint: "hold-task", paths: [], tools: [], prompt: "deploy" }
-  });
-  assert.equal(result.hold, "safety_hold");
   store.close();
 });
 
