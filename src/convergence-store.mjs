@@ -5,7 +5,6 @@ import {
   BREAKER_REASONS,
   DECISIONS,
   GRANT_PURPOSES,
-  evaluateConvergence,
   validateTransition
 } from "./convergence-policy.mjs";
 
@@ -31,6 +30,10 @@ const TRUSTED_EVIDENCE_CLASSES = new Set([
 const DECISION_SET = new Set(DECISIONS);
 const REASON_SET = new Set(BREAKER_REASONS);
 const GRANT_PURPOSE_SET = new Set(GRANT_PURPOSES);
+const MAX_PROBE_ATTEMPTS = 3;
+const ENFORCEMENTS = new Set([
+  "none", "warn_only", "stop_next_checkpoint", "stop_review_fix_dispatch", "stop_pre_mutation"
+]);
 const LOOP_STATUSES = new Set([
   "idle", "active_generation", "generation_closed", "reflection_required",
   "probe_pending", "probe_running", "reflection_resolved", "checkpoint_required",
@@ -42,6 +45,27 @@ const EVENT_TYPES = new Set([
   "reflection_claimed", "reflection_completed", "reflection_failed", "checkpoint_recorded",
   "grant_issued", "grant_consumed", "grant_revoked", "generation_closed",
   "task_resolved", "legacy_imported", "shadow_compared"
+]);
+const EVENT_FACT_FIELDS = new Map([
+  ["contract_projected", new Set()],
+  ["generation_opened", new Set(["generation", "purpose"])],
+  ["evidence_recorded", new Set(["evidenceClass"])],
+  ["review_recorded", new Set(["directionSignal", "failureCount", "severity", "verdict"])],
+  ["alias_declared", new Set(["aliasId"])],
+  ["distinct_declared", new Set(["reasonCode"])],
+  ["breaker_triggered", new Set()],
+  ["reflection_requested", new Set(["kind"])],
+  ["reflection_claimed", new Set(["attempt", "kind"])],
+  ["reflection_completed", new Set(["attempt", "kind"])],
+  ["reflection_failed", new Set(["attempt", "kind"])],
+  ["checkpoint_recorded", new Set(["fileDigest", "kind"])],
+  ["grant_issued", new Set(["generation", "purpose"])],
+  ["grant_consumed", new Set(["generation", "purpose"])],
+  ["grant_revoked", new Set(["generation", "purpose"])],
+  ["generation_closed", new Set()],
+  ["task_resolved", new Set()],
+  ["legacy_imported", new Set(["eventCount", "grantCount", "loopCount", "mappingVersion"])],
+  ["shadow_compared", new Set()]
 ]);
 
 function coded(code) {
@@ -123,6 +147,79 @@ function optionalString(value, field, maximum = 256) {
 
 function optionalDigest(value, field) {
   return value === null || value === undefined ? null : digest(value, field);
+}
+
+const EVALUATION_FIELDS = new Set([
+  "decision", "requestedDecision", "reasonCode", "enforcement", "probeRequired", "policyRevision"
+]);
+const EVALUATION_REQUEST_FIELDS = new Set([
+  "adapterCapability", "contract", "previousDecisionBasisDigest", "decisionBasisDigest",
+  "currentGeneration", "requestedGeneration", "failureCount", "lastGrantPurpose",
+  "acceptanceSatisfied", "addsArchitecture", "touchesExplicitExclusion", "oscillationDetected",
+  "sameInvariant", "explorationRequested", "explorationUsed", "riskHypothesis",
+  "falsificationTest", "evidenceQuality", "evidenceChanged", "fileSaveCount",
+  "semanticRecommendation"
+]);
+const EVALUATION_CONTRACT_FIELDS = new Set([
+  "sourceKind", "sourceRefDigest", "sourceRevision", "requirements", "exclusions",
+  "importance", "importanceAuthority", "revision"
+]);
+
+function validateDecisionProjection(evaluationRequest, evaluation) {
+  const request = exactObject(
+    evaluationRequest,
+    EVALUATION_REQUEST_FIELDS,
+    "decision_snapshot"
+  );
+  for (const field of EVALUATION_REQUEST_FIELDS) {
+    if (!Object.hasOwn(request, field)) throw coded("invalid_decision_snapshot");
+  }
+  const contract = exactObject(
+    request.contract,
+    EVALUATION_CONTRACT_FIELDS,
+    "decision_contract_snapshot"
+  );
+  const snapshot = Object.freeze({
+    adapterCapability: enumValue(request.adapterCapability, CAPABILITIES, "adapter_capability"),
+    contractRevision: digest(contract.revision, "contract_revision"),
+    previousDecisionBasisDigest: digest(
+      request.previousDecisionBasisDigest,
+      "previous_decision_basis_digest"
+    ),
+    decisionBasisDigest: digest(request.decisionBasisDigest, "decision_basis_digest"),
+    currentGeneration: integer(request.currentGeneration, "current_generation"),
+    requestedGeneration: integer(request.requestedGeneration, "requested_generation"),
+    failureCount: integer(request.failureCount, "failure_count")
+  });
+  const supplied = exactObject(evaluation, EVALUATION_FIELDS, "convergence_evaluation");
+  const decision = enumValue(supplied.decision, DECISION_SET, "decision");
+  const requestedDecision = enumValue(
+    supplied.requestedDecision,
+    DECISION_SET,
+    "requested_decision"
+  );
+  const reasonCode = enumValue(supplied.reasonCode, REASON_SET, "reason_code");
+  const enforcement = enumValue(supplied.enforcement, ENFORCEMENTS, "enforcement");
+  const probeRequired = boolean(supplied.probeRequired, "probe_required");
+  const policyRevision = identifier(supplied.policyRevision, "policy_revision");
+  const decisionShapeMatches = decision === requestedDecision
+    || (decision === "warn" && requestedDecision !== "pass" && requestedDecision !== "warn");
+  const enforcementShapeMatches = decision === "pass"
+    ? enforcement === "none"
+    : decision === "warn"
+      ? enforcement === "warn_only"
+      : enforcement.startsWith("stop_");
+  if (!decisionShapeMatches
+      || !enforcementShapeMatches
+      || probeRequired !== (requestedDecision === "reflection_required")) {
+    throw coded("invalid_convergence_evaluation");
+  }
+  return Object.freeze({
+    request: snapshot,
+    evaluation: Object.freeze({
+      decision, requestedDecision, reasonCode, enforcement, probeRequired, policyRevision
+    })
+  });
 }
 
 const TASK_FIELDS = new Set([
@@ -335,6 +432,25 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
     upsertConvergenceTask(input) {
       const value = validateTask(input);
       return transaction(() => {
+        const eventInput = {
+          eventUid: value.eventUid,
+          taskUid: value.taskUid,
+          eventType: "contract_projected",
+          sourceDigest: sha256(canonicalJson(value)),
+          resultDigest: value.contractRevision,
+          facts: {}
+        };
+        const replayEvent = database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?")
+          .get(value.eventUid);
+        if (replayEvent) {
+          const replay = appendEvent(eventInput);
+          if (replay.replay) {
+            const replayedTask = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?")
+              .get(value.taskUid);
+            if (!replayedTask) throw coded("event_collision");
+            return taskView(replayedTask);
+          }
+        }
         const existing = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?")
           .get(value.taskUid);
         if (existing && !sameTaskIdentity(existing, value)) throw coded("task_identity_collision");
@@ -345,14 +461,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           || existing.importance_authority !== value.importanceAuthority;
         if (!changed) return taskView(existing);
 
-        const appended = appendEvent({
-          eventUid: value.eventUid,
-          taskUid: value.taskUid,
-          eventType: "contract_projected",
-          sourceDigest: value.contractSourceRefDigest,
-          resultDigest: value.contractRevision,
-          facts: {}
-        });
+        const appended = appendEvent(eventInput);
         if (appended.replay && existing) return taskView(existing);
         const currentTime = timestamp(now);
         if (existing) {
@@ -419,29 +528,36 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           if (!replayMatches) throw coded("event_collision");
           return loopView(requireLoop(database, value.taskUid, value.fingerprint));
         }
-        const existing = database.prepare(`SELECT * FROM convergence_loops
-          WHERE task_uid=? AND boundary_id=? AND canonical_invariant_id=?`).get(
-          value.taskUid, value.boundaryId, value.canonicalInvariantId
-        );
-        if (existing && existing.fingerprint !== value.fingerprint) throw coded("fingerprint_collision");
+        const candidates = database.prepare(`SELECT * FROM convergence_loops
+          WHERE task_uid=? AND boundary_id=?`).all(value.taskUid, value.boundaryId);
+        const exact = candidates.find((row) => row.canonical_invariant_id === value.canonicalInvariantId);
+        const aliased = exact ?? candidates.find((row) => parseAliases(row.aliases_json)
+          .includes(value.canonicalInvariantId));
+        const existing = aliased ?? null;
+        if (exact && exact.fingerprint !== value.fingerprint) throw coded("fingerprint_collision");
         const byFingerprint = database.prepare("SELECT * FROM convergence_loops WHERE fingerprint=?")
           .get(value.fingerprint);
         if (byFingerprint && (!existing || byFingerprint.fingerprint !== existing.fingerprint)) {
           throw coded("fingerprint_collision");
         }
-        const failed = value.verdict === "changes_required";
+        const fingerprint = existing?.fingerprint ?? value.fingerprint;
+        const historicalEvidence = existing && database.prepare(`SELECT 1 FROM convergence_events
+          WHERE task_uid=? AND fingerprint=? AND event_type='review_recorded' AND evidence_digest=?
+          LIMIT 1`).get(value.taskUid, fingerprint, value.evidenceDigest);
+        const failed = value.verdict === "changes_required" && !historicalEvidence;
         const failureCount = Number(existing?.failure_count ?? 0) + (failed ? 1 : 0);
         const decision = failed && (failureCount >= 2 || value.directionSignal !== "none")
           ? "checkpoint_required"
-          : "pass";
+          : existing?.current_decision ?? "pass";
         const appended = appendEvent({
           eventUid: value.eventUid,
           taskUid: value.taskUid,
-          fingerprint: value.fingerprint,
+          fingerprint,
           generation: value.generation,
           eventType: "review_recorded",
           decision,
           evidenceDigest: value.evidenceDigest,
+          sourceDigest: sha256(value.fingerprint),
           resultDigest: value.decisionBasisDigest,
           facts: {
             directionSignal: value.directionSignal,
@@ -450,7 +566,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
             verdict: value.verdict
           }
         });
-        if (appended.replay) return loopView(requireLoop(database, value.taskUid, value.fingerprint));
+        if (appended.replay) return loopView(requireLoop(database, value.taskUid, fingerprint));
         const currentTime = timestamp(now);
         if (!existing) {
           database.prepare(`INSERT INTO convergence_loops
@@ -458,7 +574,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
              failure_count, fix_generation, decision_basis_digest, current_decision,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, 'generation_closed', ?, ?, ?, ?, ?, ?)`).run(
-            value.fingerprint, value.taskUid, value.boundaryId, value.canonicalInvariantId,
+            fingerprint, value.taskUid, value.boundaryId, value.canonicalInvariantId,
             failureCount, value.generation, value.decisionBasisDigest, decision,
             currentTime, currentTime
           );
@@ -466,10 +582,10 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           database.prepare(`UPDATE convergence_loops SET
             status='generation_closed', failure_count=?, current_decision=?,
             decision_basis_digest=?, updated_at=?, version=version+1 WHERE fingerprint=?`).run(
-            failureCount, decision, value.decisionBasisDigest, currentTime, value.fingerprint
+            failureCount, decision, value.decisionBasisDigest, currentTime, fingerprint
           );
         }
-        return loopView(requireLoop(database, value.taskUid, value.fingerprint));
+        return loopView(requireLoop(database, value.taskUid, fingerprint));
       });
     },
 
@@ -488,11 +604,12 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           .some((row) => row.canonical_invariant_id === alias || parseAliases(row.aliases_json).includes(alias));
         if (collision) throw coded("alias_collision");
         const aliases = parseAliases(loop.aliases_json);
-        if (loop.canonical_invariant_id === alias || aliases.includes(alias)) return { fingerprint };
-        if (aliases.length >= 128) throw coded("alias_limit");
         const appended = appendEvent({
           eventUid, taskUid, fingerprint, eventType: "alias_declared", facts: { aliasId: alias }
         });
+        if (appended.replay) return Object.freeze({ fingerprint });
+        if (loop.canonical_invariant_id === alias || aliases.includes(alias)) return { fingerprint };
+        if (aliases.length >= 128) throw coded("alias_limit");
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET aliases_json=?, updated_at=?, version=version+1
             WHERE fingerprint=?`).run(canonicalJson([...aliases, alias].sort()), timestamp(now), fingerprint);
@@ -567,10 +684,8 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const eventUid = identifier(value.eventUid, "event_uid");
       const taskUid = identifier(value.taskUid, "task_uid");
       const fingerprint = identifier(value.fingerprint, "fingerprint");
-      const evaluated = evaluateConvergence(value.evaluationRequest);
-      if (canonicalJson(value.evaluation) !== canonicalJson(evaluated)) throw coded("decision_not_evaluated");
-      const decision = enumValue(evaluated.decision, DECISION_SET, "decision");
-      const reasonCode = enumValue(evaluated.reasonCode, REASON_SET, "reason_code");
+      const projection = validateDecisionProjection(value.evaluationRequest, value.evaluation);
+      const { decision, reasonCode, policyRevision } = projection.evaluation;
       const expectedTarget = {
         pass: "generation_closed",
         warn: "generation_closed",
@@ -582,13 +697,28 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       }[decision];
       if (value.targetStatus !== expectedTarget) throw coded("decision_target_mismatch");
       return transaction(() => {
+        const task = requireTask(database, taskUid);
         const loop = requireLoop(database, taskUid, fingerprint);
-        validateTransition({ from: loop.status, eventType: "breaker_triggered", to: expectedTarget });
         const appended = appendEvent({
-          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
+          eventUid, taskUid, fingerprint, generation: projection.request.currentGeneration,
           eventType: "breaker_triggered", reasonCode, decision,
+          sourceDigest: sha256(canonicalJson({
+            evaluationRequest: value.evaluationRequest,
+            evaluation: value.evaluation
+          })),
           facts: {}
         });
+        if (appended.replay) return loopView(loop);
+        if (task.adapter_capability !== projection.request.adapterCapability
+            || task.contract_revision !== projection.request.contractRevision
+            || task.policy_revision !== sha256(policyRevision)
+            || Number(loop.failure_count) !== projection.request.failureCount
+            || Number(loop.fix_generation) !== projection.request.currentGeneration
+            || projection.request.requestedGeneration !== Number(loop.fix_generation) + 1
+            || loop.decision_basis_digest !== projection.request.decisionBasisDigest) {
+          throw coded("decision_snapshot_mismatch");
+        }
+        validateTransition({ from: loop.status, eventType: "breaker_triggered", to: expectedTarget });
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET status=?, current_decision=?,
             updated_at=?, version=version+1 WHERE fingerprint=?`).run(
@@ -610,14 +740,15 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const fileDigest = digest(value.fileDigest, "file_digest");
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
-        if (loop.status !== "checkpoint_required") throw coded("checkpoint_not_required");
-        validateTransition({
-          from: loop.status, eventType: "checkpoint_recorded", to: "direction_approved"
-        });
         const appended = appendEvent({
           eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
           eventType: "checkpoint_recorded", resultDigest: fileDigest,
           facts: { fileDigest, kind: checkpointKind }
+        });
+        if (appended.replay) return loopView(loop);
+        if (loop.status !== "checkpoint_required") throw coded("checkpoint_not_required");
+        validateTransition({
+          from: loop.status, eventType: "checkpoint_recorded", to: "direction_approved"
         });
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET status='direction_approved',
@@ -639,6 +770,12 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       if (value.purpose !== "pass") throw coded("generation_grant_required");
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
+        const appended = appendEvent({
+          eventUid, taskUid, fingerprint, generation: requestedGeneration,
+          eventType: "generation_opened", action: "pass",
+          facts: { generation: requestedGeneration, purpose: "pass" }
+        });
+        if (appended.replay) return loopView(loop);
         if (loop.current_decision !== "pass" || loop.status !== "generation_closed") {
           throw coded("generation_grant_required");
         }
@@ -647,11 +784,6 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         }
         validateTransition({
           from: loop.status, eventType: "generation_opened", to: "active_generation"
-        });
-        const appended = appendEvent({
-          eventUid, taskUid, fingerprint, generation: requestedGeneration,
-          eventType: "generation_opened", action: "pass",
-          facts: { generation: requestedGeneration, purpose: "pass" }
         });
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET status='active_generation',
@@ -674,16 +806,19 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const dueAt = isoTimestamp(value.dueAt, "due_at");
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
+        const appended = appendEvent({
+          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
+          eventType: "reflection_requested",
+          sourceDigest: sha256(canonicalJson({ dueAt, probeKind })),
+          facts: { kind: probeKind }
+        });
+        if (appended.replay) return loopView(loop);
         if (loop.status !== "reflection_required") throw coded("reflection_not_required");
         if (["pending", "retryable", "running"].includes(loop.probe_state)) {
           throw coded("probe_already_live");
         }
         validateTransition({
           from: loop.status, eventType: "reflection_requested", to: "probe_pending"
-        });
-        const appended = appendEvent({
-          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
-          eventType: "reflection_requested", facts: { kind: probeKind }
         });
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET status='probe_pending', probe_kind=?,
@@ -708,9 +843,48 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
         const currentTime = timestamp(now);
-        if (!["pending", "retryable"].includes(loop.probe_state)
-            || loop.probe_next_attempt_at === null
-            || Date.parse(loop.probe_next_attempt_at) > Date.parse(currentTime)) {
+        const currentMilliseconds = Date.parse(currentTime);
+        const expiredRunning = loop.probe_state === "running"
+          && loop.probe_lease_until !== null
+          && Date.parse(loop.probe_lease_until) <= currentMilliseconds;
+        const prior = database.prepare("SELECT * FROM convergence_events WHERE event_uid=?").get(eventUid);
+        const priorIsExhausted = prior?.event_type === "reflection_failed"
+          && prior.reason_code === "probe_attempts_exhausted";
+        const exhausted = priorIsExhausted
+          || (prior === undefined && expiredRunning
+            && Number(loop.probe_attempt) >= MAX_PROBE_ATTEMPTS);
+        const priorFacts = prior?.event_type === "reflection_claimed"
+          || priorIsExhausted ? JSON.parse(prior.facts_json) : null;
+        const attempt = priorFacts === null
+          ? Number(loop.probe_attempt) + 1
+          : Number(priorFacts.attempt);
+        const appended = appendEvent({
+          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
+          eventType: exhausted ? "reflection_failed" : "reflection_claimed",
+          reasonCode: exhausted ? "probe_attempts_exhausted" : null,
+          sourceDigest: sha256(canonicalJson({ leaseMs, ownerId })),
+          facts: {
+            attempt: exhausted ? Number(loop.probe_attempt) : attempt,
+            kind: loop.probe_kind
+          }
+        });
+        if (appended.replay) return loopView(loop);
+        if (exhausted) {
+          validateTransition({
+            from: loop.status,
+            eventType: "reflection_failed",
+            to: "checkpoint_required"
+          });
+          database.prepare(`UPDATE convergence_loops SET status='checkpoint_required',
+            probe_state='failed', probe_owner_id=NULL, probe_lease_until=NULL,
+            probe_next_attempt_at=NULL, updated_at=?, version=version+1
+            WHERE fingerprint=?`).run(currentTime, fingerprint);
+          return loopView(requireLoop(database, taskUid, fingerprint));
+        }
+        const scheduledAndDue = ["pending", "retryable"].includes(loop.probe_state)
+          && loop.probe_next_attempt_at !== null
+          && Date.parse(loop.probe_next_attempt_at) <= currentMilliseconds;
+        if (!scheduledAndDue && !expiredRunning) {
           throw coded("probe_not_due");
         }
         if (loop.probe_state === "pending") {
@@ -719,18 +893,13 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           });
         }
         const leaseEpoch = Number(loop.probe_lease_epoch) + 1;
-        const attempt = Number(loop.probe_attempt) + 1;
-        const appended = appendEvent({
-          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
-          eventType: "reflection_claimed", facts: { attempt, kind: loop.probe_kind }
-        });
         if (!appended.replay) {
           database.prepare(`UPDATE convergence_loops SET status='probe_running',
             probe_state='running', probe_attempt=?, probe_owner_id=?, probe_lease_epoch=?,
             probe_lease_until=?, probe_next_attempt_at=NULL, updated_at=?, version=version+1
             WHERE fingerprint=?`).run(
             attempt, ownerId, leaseEpoch,
-            new Date(Date.parse(currentTime) + leaseMs).toISOString(), currentTime, fingerprint
+            new Date(currentMilliseconds + leaseMs).toISOString(), currentTime, fingerprint
           );
         }
         return loopView(requireLoop(database, taskUid, fingerprint));
@@ -754,6 +923,13 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
         const currentTime = timestamp(now);
+        const appended = appendEvent({
+          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
+          eventType: "reflection_completed", action, resultDigest,
+          sourceDigest: sha256(canonicalJson({ leaseEpoch, ownerId })),
+          facts: { attempt: Number(loop.probe_attempt), kind: loop.probe_kind }
+        });
+        if (appended.replay) return loopView(loop);
         if (loop.probe_state !== "running" || loop.probe_owner_id !== ownerId
             || Number(loop.probe_lease_epoch) !== leaseEpoch
             || loop.probe_lease_until === null
@@ -761,11 +937,6 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           throw coded("probe_lease_lost");
         }
         validateTransition({ from: loop.status, eventType: "reflection_completed", to: outcome });
-        appendEvent({
-          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
-          eventType: "reflection_completed", action, resultDigest,
-          facts: { attempt: Number(loop.probe_attempt), kind: loop.probe_kind }
-        });
         database.prepare(`UPDATE convergence_loops SET status=?, probe_state='completed',
           probe_owner_id=NULL, probe_lease_until=NULL, probe_next_attempt_at=NULL,
           probe_result_digest=?, updated_at=?, version=version+1 WHERE fingerprint=?`).run(
@@ -791,6 +962,13 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
         const currentTime = timestamp(now);
+        const appended = appendEvent({
+          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
+          eventType: "reflection_failed", reasonCode,
+          sourceDigest: sha256(canonicalJson({ backoffMs, leaseEpoch, ownerId, retryable })),
+          facts: { attempt: Number(loop.probe_attempt), kind: loop.probe_kind }
+        });
+        if (appended.replay) return loopView(loop);
         if (loop.probe_state !== "running" || loop.probe_owner_id !== ownerId
             || Number(loop.probe_lease_epoch) !== leaseEpoch
             || loop.probe_lease_until === null
@@ -800,11 +978,6 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         const canRetry = retryable && Number(loop.probe_attempt) < 3;
         const target = canRetry ? "reflection_required" : "checkpoint_required";
         validateTransition({ from: loop.status, eventType: "reflection_failed", to: target });
-        appendEvent({
-          eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
-          eventType: "reflection_failed", reasonCode,
-          facts: { attempt: Number(loop.probe_attempt), kind: loop.probe_kind }
-        });
         database.prepare(`UPDATE convergence_loops SET status=?, probe_state=?,
           probe_owner_id=NULL, probe_lease_until=NULL, probe_next_attempt_at=?,
           updated_at=?, version=version+1 WHERE fingerprint=?`).run(
@@ -819,6 +992,24 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
     issueContinuationGrant(input) {
       const value = validateGrant(input);
       return transaction(() => {
+        const eventInput = {
+          eventUid: value.eventUid,
+          taskUid: value.taskUid,
+          fingerprint: value.fingerprint,
+          generation: value.currentGeneration,
+          eventType: "grant_issued",
+          action: value.purpose,
+          evidenceDigest: value.evidenceDigest,
+          sourceDigest: sha256(canonicalJson(value)),
+          resultDigest: value.scopeDigest,
+          facts: { generation: value.nextGeneration, purpose: value.purpose }
+        };
+        if (database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?").get(value.eventUid)) {
+          const replay = appendEvent(eventInput);
+          if (replay.replay) {
+            return Object.freeze({ grantId: value.grantId, replayed: true, tokenAvailable: false });
+          }
+        }
         const task = requireTask(database, value.taskUid);
         const loop = requireLoop(database, value.taskUid, value.fingerprint);
         const currentTime = timestamp(now);
@@ -851,17 +1042,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         const tokenBytes = randomBytesImpl(32);
         if (!Buffer.isBuffer(tokenBytes) || tokenBytes.length < 32) throw coded("invalid_random_token");
         const token = tokenBytes.toString("base64url");
-        appendEvent({
-          eventUid: value.eventUid,
-          taskUid: value.taskUid,
-          fingerprint: value.fingerprint,
-          generation: value.currentGeneration,
-          eventType: "grant_issued",
-          action: value.purpose,
-          evidenceDigest: value.evidenceDigest,
-          resultDigest: value.scopeDigest,
-          facts: { generation: value.nextGeneration, purpose: value.purpose }
-        });
+        appendEvent(eventInput);
         database.prepare(`INSERT INTO continuation_grants
           (grant_id, token_hash, task_uid, fingerprint, current_generation, next_generation,
            purpose, scope_digest, contract_revision, policy_revision, decision_basis_digest,
@@ -899,15 +1080,32 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const decisionBasisDigest = digest(value.decisionBasisDigest, "decision_basis_digest");
       const evidenceDigest = digest(value.evidenceDigest, "evidence_digest");
       return transaction(() => {
+        const eventInput = {
+          eventUid, taskUid, fingerprint, generation: nextGeneration,
+          eventType: "grant_consumed", action: purpose,
+          evidenceDigest,
+          sourceDigest: sha256(canonicalJson({
+            contractRevision,
+            currentGeneration,
+            decisionBasisDigest,
+            evidenceDigest,
+            nextGeneration,
+            policyRevision,
+            purpose,
+            scopeDigest,
+            tokenHash: sha256(token)
+          })),
+          resultDigest: scopeDigest,
+          facts: { generation: nextGeneration, purpose }
+        };
+        if (database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?").get(eventUid)) {
+          const replay = appendEvent(eventInput);
+          if (replay.replay) return Object.freeze({ fingerprint, generation: nextGeneration, purpose });
+        }
         const grant = database.prepare("SELECT * FROM continuation_grants WHERE token_hash=?")
           .get(sha256(token));
         if (!grant) throw coded("grant_not_found");
         if (grant.state === "consumed") {
-          const replay = database.prepare(`SELECT 1 FROM convergence_events
-            WHERE event_uid=? AND event_type='grant_consumed' AND fingerprint=?`).get(
-            eventUid, fingerprint
-          );
-          if (replay) return Object.freeze({ fingerprint, generation: nextGeneration, purpose });
           throw coded("grant_consumed");
         }
         if (grant.state === "revoked") throw coded("grant_revoked");
@@ -932,12 +1130,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         const currentTime = timestamp(now);
         if (Date.parse(grant.expires_at) <= Date.parse(currentTime)) throw coded("grant_expired");
         validateTransition({ from: loop.status, eventType: "grant_consumed", to: "active_generation" });
-        appendEvent({
-          eventUid, taskUid, fingerprint, generation: nextGeneration,
-          eventType: "grant_consumed", action: purpose,
-          evidenceDigest, resultDigest: scopeDigest,
-          facts: { generation: nextGeneration, purpose }
-        });
+        appendEvent(eventInput);
         const consumed = database.prepare(`UPDATE continuation_grants SET state='consumed',
           consumed_at=? WHERE grant_id=? AND state='active'`).run(currentTime, grant.grant_id);
         if (Number(consumed.changes) !== 1) throw coded("grant_consumed");
@@ -1038,10 +1231,12 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       ]);
       const mappedEvents = value.mappedEvents.map((raw) => {
         const event = exactObject(raw, mappedEventFields, "import_event");
-        const facts = exactObject(event.facts ?? {}, new Set([
-          "aliasId", "attempt", "directionSignal", "evidenceClass", "failureCount",
-          "fileDigest", "generation", "kind", "purpose", "reasonCode", "severity", "verdict"
-        ]), "event_facts");
+        const eventType = enumValue(event.eventType, EVENT_TYPES, "event_type");
+        const facts = exactObject(
+          event.facts ?? {},
+          EVENT_FACT_FIELDS.get(eventType),
+          "event_facts"
+        );
         for (const factValue of Object.values(facts)) {
           if (!(typeof factValue === "string" || Number.isSafeInteger(factValue))) {
             throw coded("invalid_event_fact");
@@ -1053,7 +1248,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           taskUid: task.taskUid,
           fingerprint: event.fingerprint == null ? null : identifier(event.fingerprint, "fingerprint"),
           generation: event.generation == null ? null : integer(event.generation, "generation"),
-          eventType: enumValue(event.eventType, EVENT_TYPES, "event_type"),
+          eventType,
           reasonCode: optionalString(event.reasonCode, "reason_code"),
           decision: event.decision == null ? null : enumValue(event.decision, DECISION_SET, "decision"),
           action: optionalString(event.action, "action"),
@@ -1089,10 +1284,25 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           revokedAt: grant.revokedAt == null ? null : isoTimestamp(grant.revokedAt, "revoked_at")
         });
       });
+      const activeGrantFingerprints = new Set();
+      for (const grant of grants) {
+        if (grant.state !== "active") continue;
+        if (activeGrantFingerprints.has(grant.fingerprint)) throw coded("active_grant_collision");
+        activeGrantFingerprints.add(grant.fingerprint);
+      }
+      const importContentDigest = sha256(canonicalJson({
+        eventUid,
+        mappingVersion,
+        task,
+        loops,
+        grants,
+        mappedEvents
+      }));
       return transaction(() => {
         const imported = database.prepare(`SELECT * FROM convergence_events
           WHERE event_type='legacy_imported' AND source_digest=?`).get(sourceDigest);
         if (imported) {
+          if (imported.result_digest !== importContentDigest) throw coded("import_collision");
           let facts;
           try { facts = JSON.parse(imported.facts_json); } catch { throw coded("import_collision"); }
           return Object.freeze({
@@ -1107,6 +1317,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
 
         appendEvent({
           eventUid, taskUid: task.taskUid, eventType: "legacy_imported", sourceDigest,
+          resultDigest: importContentDigest,
           facts: {
             eventCount: mappedEvents.length,
             grantCount: grants.length,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -68,8 +68,8 @@ const DIGEST = Object.freeze({
   lineage: "1".repeat(64),
   nativeTask: "2".repeat(64),
   contractRef: "3".repeat(64),
-  contract: "4".repeat(64),
-  policy: "5".repeat(64),
+  contract: "f703e687ef7b42b75da2a39b6f8c1572eb7346cef40cf446f9de96cafb6570e7",
+  policy: "bf67e66d36cbf9b12f8164ce93d66811c67eaf7e1f26c1c1dd20af528a2a4dfc",
   basis: "6".repeat(64),
   evidence: "7".repeat(64),
   scope: "8".repeat(64)
@@ -237,6 +237,33 @@ test("event replay is immutable and a changed digest for the same event id is re
   store.close();
 });
 
+test("task event identity binds every accepted canonical field before projection guards", () => {
+  const changes = {
+    taskUid: "task-2",
+    lineageDigest: "a".repeat(64),
+    adapterKind: "generic",
+    adapterCapability: "audit_only",
+    nativeTaskDigest: "b".repeat(64),
+    contractSourceKind: "explicit_user",
+    contractSourceRefDigest: "c".repeat(64),
+    contractRevision: "d".repeat(64),
+    policyRevision: "e".repeat(64),
+    importance: "important",
+    importanceAuthority: "explicit_user"
+  };
+  for (const [field, changed] of Object.entries(changes)) {
+    const { store } = convergenceFixture();
+    store.upsertConvergenceTask(taskInput());
+    assert.throws(
+      () => store.upsertConvergenceTask(taskInput({ [field]: changed })),
+      /event_collision/u,
+      field
+    );
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count, 1);
+    store.close();
+  }
+});
+
 test("event insertion failure rolls back the convergence projection", () => {
   const { store } = convergenceFixture();
   store.database.exec(`CREATE TEMP TRIGGER abort_convergence_event
@@ -258,11 +285,43 @@ test("reviews preserve one fingerprint across replay and closed regression gener
 
   store.database.prepare(`UPDATE convergence_loops
     SET status='terminal', current_decision='finish' WHERE fingerprint=?`).run("fingerprint-1");
-  const regression = store.recordConvergenceReview(reviewInput({ eventUid: "review-event-2" }));
+  const regression = store.recordConvergenceReview(reviewInput({
+    eventUid: "review-event-2",
+    evidenceDigest: "8".repeat(64)
+  }));
   assert.equal(regression.fingerprint, "fingerprint-1");
   assert.equal(regression.failureCount, 2);
   assert.deepEqual(regression.fixGenerations, [1]);
   assert.equal(regression.decision, "checkpoint_required");
+  store.close();
+});
+
+test("alias reviews resolve to canonical history and repeated evidence is not counted again", () => {
+  const { store } = convergenceFixture();
+  seedLoop(store);
+  store.addConvergenceAlias({
+    eventUid: "alias-history-declared",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    aliasInvariantId: "renamed-atomic-store"
+  });
+
+  const reviewed = store.recordConvergenceReview(reviewInput({
+    eventUid: "review-alias-repeated-evidence",
+    fingerprint: "fingerprint-escaped",
+    canonicalInvariantId: "renamed-atomic-store"
+  }));
+
+  assert.equal(reviewed.fingerprint, "fingerprint-1");
+  assert.equal(reviewed.failureCount, 1);
+  assert.equal(reviewed.currentGeneration, 1);
+  assert.deepEqual(reviewed.fixGenerations, [1]);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_loops WHERE task_uid='task-1'"
+  ).get().count, 1);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='review_recorded'"
+  ).get().count, 2);
   store.close();
 });
 
@@ -336,10 +395,23 @@ test("only trusted evidence changes the decision basis", () => {
   store.close();
 });
 
-test("breaker projection accepts only the exact already-evaluated decision and matching target", () => {
+test("decision projection validates an already-evaluated shape without deriving policy in the store", () => {
+  const source = readFileSync(new URL("../src/convergence-store.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /evaluateConvergence\s*\(/u);
+});
+
+test("breaker projection binds the evaluated snapshot and matching target", () => {
   const { store } = convergenceFixture();
   seedLoop(store);
-  const request = policyRequest();
+  store.recordConvergenceReview(reviewInput({
+    eventUid: "review-decision-second-failure",
+    evidenceDigest: "8".repeat(64)
+  }));
+  const request = policyRequest({
+    previousDecisionBasisDigest: DIGEST.basis,
+    decisionBasisDigest: DIGEST.basis,
+    evidenceChanged: false
+  });
   const evaluation = evaluateConvergence(request);
   const result = store.recordConvergenceDecision({
     eventUid: "decision-event-1",
@@ -352,14 +424,6 @@ test("breaker projection accepts only the exact already-evaluated decision and m
   assert.equal(result.decision, "checkpoint_required");
   assert.equal(result.status, "checkpoint_required");
   assert.throws(() => store.recordConvergenceDecision({
-    eventUid: "decision-event-2",
-    taskUid: "task-1",
-    fingerprint: "fingerprint-1",
-    evaluationRequest: request,
-    evaluation: { ...evaluation, decision: "human_decision" },
-    targetStatus: "human_decision"
-  }), /decision_not_evaluated/u);
-  assert.throws(() => store.recordConvergenceDecision({
     eventUid: "decision-event-3",
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
@@ -367,13 +431,47 @@ test("breaker projection accepts only the exact already-evaluated decision and m
     evaluation,
     targetStatus: "human_decision"
   }), /decision_target_mismatch/u);
+
+  const mismatches = [
+    { adapterCapability: "audit_only" },
+    { contract: { ...request.contract, revision: "a".repeat(64) } },
+    { failureCount: 1 },
+    { currentGeneration: 2 },
+    { requestedGeneration: 4 },
+    { decisionBasisDigest: "b".repeat(64), evidenceChanged: true }
+  ];
+  for (const [index, mismatch] of mismatches.entries()) {
+    assert.throws(() => store.recordConvergenceDecision({
+      eventUid: `decision-snapshot-mismatch-${index}`,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      evaluationRequest: { ...request, ...mismatch },
+      evaluation,
+      targetStatus: "checkpoint_required"
+    }), /decision_snapshot_mismatch/u);
+  }
+  assert.throws(() => store.recordConvergenceDecision({
+    eventUid: "decision-policy-mismatch",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    evaluationRequest: request,
+    evaluation: { ...evaluation, policyRevision: "convergence-policy-v2" },
+    targetStatus: "checkpoint_required"
+  }), /decision_snapshot_mismatch/u);
   store.close();
 });
 
 test("checkpoint records one direction generation and pass opens only the exact next generation", () => {
   const { store } = convergenceFixture();
   seedLoop(store);
-  const request = policyRequest();
+  store.recordConvergenceReview(reviewInput({
+    eventUid: "review-checkpoint-second-failure",
+    evidenceDigest: "8".repeat(64)
+  }));
+  const request = policyRequest({
+    decisionBasisDigest: DIGEST.basis,
+    evidenceChanged: false
+  });
   store.recordConvergenceDecision({
     eventUid: "decision-checkpoint",
     taskUid: "task-1",
@@ -412,6 +510,131 @@ test("checkpoint records one direction generation and pass opens only the exact 
   assert.equal(opened.status, "active_generation");
   store.close();
   second.store.close();
+});
+
+test("state-changing checkpoint generation and Probe writes replay before current-state guards", () => {
+  const checkpointFixture = convergenceFixture();
+  seedLoop(checkpointFixture.store);
+  checkpointFixture.store.recordConvergenceReview(reviewInput({
+    eventUid: "review-replay-checkpoint-second-failure",
+    evidenceDigest: "8".repeat(64)
+  }));
+  const request = policyRequest({
+    decisionBasisDigest: DIGEST.basis,
+    evidenceChanged: false
+  });
+  checkpointFixture.store.recordConvergenceDecision({
+    eventUid: "decision-replay-checkpoint",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    evaluationRequest: request,
+    evaluation: evaluateConvergence(request),
+    targetStatus: "checkpoint_required"
+  });
+  const checkpointInput = {
+    eventUid: "checkpoint-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    checkpointKind: "architecture_direction",
+    fileDigest: "f".repeat(64)
+  };
+  assert.deepEqual(
+    checkpointFixture.store.recordConvergenceCheckpoint(checkpointInput),
+    checkpointFixture.store.recordConvergenceCheckpoint(checkpointInput)
+  );
+  checkpointFixture.store.close();
+
+  const generationFixture = convergenceFixture();
+  seedLoop(generationFixture.store);
+  const generationInput = {
+    eventUid: "generation-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    requestedGeneration: 2,
+    purpose: "pass"
+  };
+  assert.deepEqual(
+    generationFixture.store.requestConvergenceGeneration(generationInput),
+    generationFixture.store.requestConvergenceGeneration(generationInput)
+  );
+  generationFixture.store.close();
+
+  const probeFixture = convergenceFixture();
+  requireReflection(probeFixture.store);
+  const probeRequest = {
+    eventUid: "probe-request-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    probeKind: "convergence_reflection",
+    dueAt: "2026-07-21T00:00:00.000Z"
+  };
+  assert.deepEqual(
+    probeFixture.store.requestConvergenceProbe(probeRequest),
+    probeFixture.store.requestConvergenceProbe(probeRequest)
+  );
+  const claim = {
+    eventUid: "probe-claim-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-replay",
+    leaseMs: 30_000
+  };
+  assert.deepEqual(
+    probeFixture.store.claimConvergenceProbe(claim),
+    probeFixture.store.claimConvergenceProbe(claim)
+  );
+  const completion = {
+    eventUid: "probe-completion-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-replay",
+    leaseEpoch: 1,
+    outcome: "reflection_resolved",
+    action: "continue_once",
+    resultDigest: "a".repeat(64)
+  };
+  assert.deepEqual(
+    probeFixture.store.completeConvergenceProbe(completion),
+    probeFixture.store.completeConvergenceProbe(completion)
+  );
+  assert.equal(probeFixture.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid LIKE '%replay'"
+  ).get().count, 3);
+  probeFixture.store.close();
+});
+
+test("Probe failure replay is idempotent after the lease state changes", () => {
+  const fixture = convergenceFixture();
+  requireReflection(fixture.store);
+  fixture.store.requestConvergenceProbe({
+    eventUid: "probe-request-failure-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    probeKind: "convergence_reflection",
+    dueAt: "2026-07-21T00:00:00.000Z"
+  });
+  fixture.store.claimConvergenceProbe({
+    eventUid: "probe-claim-failure-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-failure-replay",
+    leaseMs: 30_000
+  });
+  const failure = {
+    eventUid: "probe-failure-replay",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-failure-replay",
+    leaseEpoch: 1,
+    reasonCode: "provider_timeout",
+    retryable: true,
+    backoffMs: 1_000
+  };
+  assert.deepEqual(
+    fixture.store.failConvergenceProbe(failure),
+    fixture.store.failConvergenceProbe(failure)
+  );
+  fixture.store.close();
 });
 
 function requireReflection(store) {
@@ -523,6 +746,77 @@ test("Probe failure schedules bounded retry and a new claim fences the old epoch
   store.close();
 });
 
+test("expired running Probe leases are reclaimed and exhausted attempts become terminal", () => {
+  const fixture = convergenceFixture();
+  const { store } = fixture;
+  requireReflection(store);
+  store.requestConvergenceProbe({
+    eventUid: "probe-request-expired",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    probeKind: "convergence_reflection",
+    dueAt: "2026-07-21T00:00:00.000Z"
+  });
+  const first = store.claimConvergenceProbe({
+    eventUid: "probe-claim-expired-1",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-expired-1",
+    leaseMs: 1_000
+  });
+  fixture.advance(1_001);
+  const second = store.claimConvergenceProbe({
+    eventUid: "probe-claim-expired-2",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-expired-2",
+    leaseMs: 1_000
+  });
+  assert.equal(second.probeAttempt, 2);
+  assert.equal(second.probeLeaseEpoch, first.probeLeaseEpoch + 1);
+  assert.equal(second.probeOwnerId, "probe-owner-expired-2");
+  assert.throws(() => store.completeConvergenceProbe({
+    eventUid: "probe-complete-expired-owner",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-expired-1",
+    leaseEpoch: first.probeLeaseEpoch,
+    outcome: "reflection_resolved",
+    action: "continue_once",
+    resultDigest: "a".repeat(64)
+  }), /probe_lease_lost/u);
+
+  fixture.advance(1_001);
+  const third = store.claimConvergenceProbe({
+    eventUid: "probe-claim-expired-3",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-expired-3",
+    leaseMs: 1_000
+  });
+  assert.equal(third.probeAttempt, 3);
+  assert.equal(third.probeLeaseEpoch, 3);
+  fixture.advance(1_001);
+  const exhaustedInput = {
+    eventUid: "probe-claim-expired-exhausted",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-expired-4",
+    leaseMs: 1_000
+  };
+  const exhausted = store.claimConvergenceProbe(exhaustedInput);
+  assert.equal(exhausted.probeAttempt, 3);
+  assert.equal(exhausted.probeState, "failed");
+  assert.equal(exhausted.status, "checkpoint_required");
+  assert.equal(exhausted.probeOwnerId, null);
+  assert.deepEqual(store.claimConvergenceProbe(exhaustedInput), exhausted);
+  assert.equal(store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+    WHERE fingerprint='fingerprint-1' AND event_type='reflection_claimed'`).get().count, 3);
+  assert.equal(store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+    WHERE event_uid='probe-claim-expired-exhausted' AND event_type='reflection_failed'`).get().count, 1);
+  store.close();
+});
+
 test("grant consumption and generation open are one atomic single-use transition", () => {
   const { store } = convergenceFixture();
   seedLoop(store);
@@ -540,6 +834,67 @@ test("grant consumption and generation open are one atomic single-use transition
   );
   assert.equal(store.getConvergenceStatus({ taskUid: "task-1", fingerprint: "fingerprint-1" })
     .currentGeneration, 2);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='grant_consumed'"
+  ).get().count, 1);
+  store.close();
+});
+
+test("grant issue replay returns no secret and performs zero revocation or issuance mutation", () => {
+  const { store } = convergenceFixture();
+  seedLoop(store);
+  const issued = store.issueContinuationGrant(grantInput());
+  const before = {
+    events: store.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count,
+    grants: store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count,
+    version: store.getConvergenceStatus({ taskUid: "task-1", fingerprint: "fingerprint-1" }).version
+  };
+
+  const replay = store.issueContinuationGrant(grantInput());
+  assert.deepEqual(replay, {
+    grantId: "grant-1",
+    replayed: true,
+    tokenAvailable: false
+  });
+  assert.equal("token" in replay, false);
+  assert.deepEqual({
+    events: store.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count,
+    grants: store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count,
+    version: store.getConvergenceStatus({ taskUid: "task-1", fingerprint: "fingerprint-1" }).version
+  }, before);
+  assert.throws(
+    () => store.issueContinuationGrant(grantInput({ scopeDigest: "9".repeat(64) })),
+    /event_collision/u
+  );
+  assert.equal(store.database.prepare(
+    "SELECT state FROM continuation_grants WHERE grant_id='grant-1'"
+  ).get().state, "active");
+  assert.equal(typeof issued.token, "string");
+  store.close();
+});
+
+test("consumed grant replay compares the complete canonical binding", () => {
+  const { store } = convergenceFixture();
+  seedLoop(store);
+  const grant = store.issueContinuationGrant(grantInput());
+  const input = { token: grant.token, ...grantBinding() };
+  const consumed = store.consumeContinuationGrant(input);
+  assert.deepEqual(store.consumeContinuationGrant(input), consumed);
+  for (const changed of [
+    { nextGeneration: 3 },
+    { purpose: "simplify" },
+    { scopeDigest: "9".repeat(64) },
+    { contractRevision: "a".repeat(64) },
+    { policyRevision: "b".repeat(64) },
+    { decisionBasisDigest: "c".repeat(64) },
+    { evidenceDigest: "d".repeat(64) }
+  ]) {
+    assert.throws(
+      () => store.consumeContinuationGrant({ ...input, ...changed }),
+      /event_collision/u,
+      JSON.stringify(changed)
+    );
+  }
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='grant_consumed'"
   ).get().count, 1);
@@ -723,6 +1078,86 @@ test("transactional Guard import is idempotent by source digest and preserves re
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-review-summary'"
   ).get().count, 1);
+  store.close();
+});
+
+test("Guard import rejects changed canonical content for an existing source digest", () => {
+  const { store } = convergenceFixture();
+  const input = importInput();
+  delete input.task.eventUid;
+  const first = store.transactionalGuardImport(input);
+  assert.throws(() => store.transactionalGuardImport({
+    ...input,
+    mappingVersion: "guard-v2"
+  }), /import_collision/u);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='legacy_imported'"
+  ).get().count, 1);
+  assert.equal(first.eventCount, 1);
+  store.close();
+});
+
+test("Guard import facts are event-specific and reject cross-event fields", () => {
+  const { store } = convergenceFixture();
+  const input = importInput({
+    eventUid: "legacy-import-cross-facts",
+    sourceDigest: "c".repeat(64),
+    mappedEvents: [{
+      ...importInput().mappedEvents[0],
+      eventUid: "legacy-review-cross-facts",
+      facts: {
+        ...importInput().mappedEvents[0].facts,
+        aliasId: "not-valid-on-review"
+      }
+    }]
+  });
+  delete input.task.eventUid;
+  assert.throws(() => store.transactionalGuardImport(input), /unknown_event_facts_field/u);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-import-cross-facts'"
+  ).get().count, 0);
+  store.close();
+});
+
+test("Guard import rolls back when one fingerprint has multiple active grants", () => {
+  const { store } = convergenceFixture();
+  const importedGrant = (grantId, tokenHash) => ({
+    grantId,
+    tokenHash,
+    fingerprint: "legacy-fingerprint",
+    currentGeneration: 1,
+    nextGeneration: 2,
+    purpose: "local_fix",
+    scopeDigest: DIGEST.scope,
+    contractRevision: DIGEST.contract,
+    policyRevision: DIGEST.policy,
+    decisionBasisDigest: DIGEST.basis,
+    evidenceDigest: DIGEST.evidence,
+    state: "active",
+    issuedAt: "2026-07-21T00:00:00.000Z",
+    expiresAt: "2026-07-21T00:05:00.000Z",
+    consumedAt: null,
+    revokedAt: null
+  });
+  const input = importInput({
+    eventUid: "legacy-import-active-conflict",
+    sourceDigest: "d".repeat(64),
+    grants: [
+      importedGrant("legacy-grant-1", "1".repeat(64)),
+      importedGrant("legacy-grant-2", "2".repeat(64))
+    ]
+  });
+  delete input.task.eventUid;
+  assert.throws(() => store.transactionalGuardImport(input), /active_grant_collision/u);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-import-active-conflict'"
+  ).get().count, 0);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+  assert.equal(store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_tasks"
+  ).get().count, 0);
   store.close();
 });
 
