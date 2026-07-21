@@ -702,17 +702,11 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
     issued = resumed.grant;
     authorizedPurpose = resumed.purpose;
   } else {
-    const scopeDigest = digestDecisionBasis({
-      taskUid: task.taskUid, fingerprint, mode, generation: loop.currentGeneration
-    });
-    const evidenceDigest = checkpoint?.digest ?? loop.decisionBasisDigest;
     ({ grant: issued } = authorizeContinuation({
       store,
       task,
       loop,
       purpose: mode,
-      scopeDigest,
-      evidenceDigest,
       request: mode === "local_fix" ? decisionRequest({
         contract,
         loop,

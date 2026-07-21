@@ -800,6 +800,7 @@ test("status and lock-status are bounded Store projections and strict parsing re
 test("SDD adapter delegates grant authority to the convergence controller", async () => {
   const source = await readFile(new URL("../src/convergence-sdd-adapter.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /\.issueContinuationGrant\s*\(/u);
+  assert.doesNotMatch(source, /const scopeDigest = digestDecisionBasis/u);
   assert.match(source, /authorizeContinuation\s*\(/u);
 });
 

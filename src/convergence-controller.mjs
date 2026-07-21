@@ -17,6 +17,9 @@ const DIGEST = /^[a-f0-9]{64}$/u;
 const POST_PROBE_FIELDS = new Set([
   "store", "task", "loop", "request", "evidenceEventUid", "probeResultDigest", "now"
 ]);
+const CONTINUATION_FIELDS = new Set([
+  "store", "task", "loop", "purpose", "request", "now"
+]);
 
 function coded(code) {
   return Object.assign(new Error(code), { code });
@@ -203,7 +206,13 @@ function provenanceEvent(store, loop, eventUid) {
   });
 }
 
-function postProbeScope(loop, action, purpose) {
+function canonicalGrantScope({
+  loop,
+  purpose,
+  action,
+  checkpointBindingDigest = null,
+  explorationBindingDigest = null
+}) {
   const scope = {
     action,
     boundaryId: loop.boundaryId,
@@ -214,10 +223,24 @@ function postProbeScope(loop, action, purpose) {
     purpose,
     taskUid: loop.taskUid
   };
+  if (checkpointBindingDigest !== null) {
+    scope.checkpointBindingDigest = checkpointBindingDigest;
+  }
+  if (explorationBindingDigest !== null) {
+    scope.explorationBindingDigest = explorationBindingDigest;
+  }
   if (purpose === "rollback") {
     scope.rollbackTargetGeneration = Math.max(0, loop.currentGeneration - 1);
   }
   return sha256(scope);
+}
+
+function latestCheckpointBinding(store, loop) {
+  const row = store.database.prepare(`SELECT result_digest FROM convergence_events
+    WHERE task_uid=? AND fingerprint=? AND event_type='checkpoint_recorded'
+    ORDER BY id DESC LIMIT 1`).get(loop.taskUid, loop.fingerprint);
+  if (!row || !DIGEST.test(row.result_digest ?? "")) throw coded("continuation_not_authorized");
+  return row.result_digest;
 }
 
 function decisionTarget(decision) {
@@ -270,15 +293,13 @@ function issueAuthorizedContinuation({
   task,
   loop,
   purpose,
-  scopeDigest,
-  evidenceDigest,
+  evidenceDigest = null,
   policyDecision = null,
+  policyRequest = null,
   probeAction = null,
   now = () => new Date()
 } = {}) {
   const current = assertAuthority({ store, task, loop });
-  digest(scopeDigest, "invalid_scope_digest");
-  digest(evidenceDigest, "invalid_evidence_digest");
   const policyPass = policyDecision?.decision === "pass";
   const activePurpose = current.activeGrantId === null ? null : store.database.prepare(
     "SELECT purpose FROM continuation_grants WHERE grant_id=? AND state='active'"
@@ -294,6 +315,32 @@ function issueAuthorizedContinuation({
         : current.status === "reflection_resolved"
           && policyPass && PROBE_GRANT_PURPOSE.get(probeAction) === purpose;
   if (!allowed) throw coded("continuation_not_authorized");
+  const action = probeAction ?? {
+    architecture_fix: "architecture_fix",
+    exploration: "explore_hypothesis",
+    local_fix: "local_fix"
+  }[purpose];
+  if (action === undefined) throw coded("continuation_not_authorized");
+  const checkpointBindingDigest = purpose === "architecture_fix"
+    ? latestCheckpointBinding(store, current)
+    : null;
+  const explorationBindingDigest = purpose === "exploration"
+    ? sha256({
+        falsificationTest: policyRequest?.falsificationTest,
+        riskHypothesis: policyRequest?.riskHypothesis
+      })
+    : null;
+  const scopeDigest = canonicalGrantScope({
+    loop: current,
+    purpose,
+    action,
+    checkpointBindingDigest,
+    explorationBindingDigest
+  });
+  const canonicalEvidenceDigest = checkpointBindingDigest
+    ?? evidenceDigest
+    ?? current.decisionBasisDigest;
+  digest(canonicalEvidenceDigest, "invalid_evidence_digest");
   const identity = {
     taskUid: task.taskUid,
     fingerprint: current.fingerprint,
@@ -301,7 +348,7 @@ function issueAuthorizedContinuation({
     purpose,
     scopeDigest,
     decisionBasisDigest: current.decisionBasisDigest,
-    evidenceDigest
+    evidenceDigest: canonicalEvidenceDigest
   };
   const eventUid = controllerEvent("grant", identity);
   const grantId = controllerEvent("grant-id", identity);
@@ -322,31 +369,38 @@ function issueAuthorizedContinuation({
     contractRevision: task.contractRevision,
     policyRevision: task.policyRevision,
     decisionBasisDigest: current.decisionBasisDigest,
-    evidenceDigest,
+    evidenceDigest: canonicalEvidenceDigest,
     expiresAt
   });
   return Object.freeze({ action: "grant_issued", grant });
 }
 
 export function authorizeContinuation(input = {}) {
-  if (input?.purpose !== "local_fix" && input?.purpose !== "architecture_fix") {
+  const value = exactInput(input, CONTINUATION_FIELDS);
+  if (value.purpose !== "local_fix" && value.purpose !== "architecture_fix") {
     throw coded("continuation_not_authorized");
   }
-  if (input.purpose === "architecture_fix") return issueAuthorizedContinuation(input);
-  const current = assertAuthority(input);
-  if (!input.request || current.failureCount !== 1) throw coded("continuation_not_authorized");
-  assertLocalReviewAuthorization(input.store, current);
+  if (value.purpose === "architecture_fix") return issueAuthorizedContinuation(value);
+  const current = assertAuthority(value);
+  if (!value.request || current.failureCount !== 1) throw coded("continuation_not_authorized");
+  assertLocalReviewAuthorization(value.store, current);
   const request = evaluatedRequest({
-    store: input.store,
-    task: input.task,
+    store: value.store,
+    task: value.task,
     loop: current,
-    request: input.request,
+    request: value.request,
     evidenceQuality: "verified",
-    previousBasis: previousReviewBasis(input.store, current)
+    previousBasis: previousReviewBasis(value.store, current)
   });
   const policyDecision = evaluateConvergence(request);
   if (policyDecision.decision !== "pass") throw coded("continuation_not_authorized");
-  return issueAuthorizedContinuation({ ...input, loop: current, policyDecision });
+  return issueAuthorizedContinuation({
+    ...value,
+    loop: current,
+    evidenceDigest: current.decisionBasisDigest,
+    policyDecision,
+    policyRequest: request
+  });
 }
 
 export function evaluateAndAdvance({
@@ -362,23 +416,15 @@ export function evaluateAndAdvance({
   const decision = evaluateConvergence(evaluationRequest);
 
   if (decision.decision === "pass" && decision.reasonCode === "exploration_grant_available") {
-    const scopeDigest = sha256({
-      taskUid: task.taskUid,
-      fingerprint: current.fingerprint,
-      generation: current.currentGeneration,
-      purpose: "exploration",
-      riskHypothesis: evaluationRequest.riskHypothesis,
-      falsificationTest: evaluationRequest.falsificationTest
-    });
     return Object.freeze({
       ...issueAuthorizedContinuation({
         store,
         task,
         loop: current,
         purpose: "exploration",
-        scopeDigest,
         evidenceDigest: current.decisionBasisDigest,
         policyDecision: decision,
+        policyRequest: evaluationRequest,
         now
       }),
       decision
@@ -501,7 +547,6 @@ export function authorizeAfterProbe(rawInput = {}) {
       task,
       loop: current,
       purpose,
-      scopeDigest: postProbeScope(current, completed.action, purpose),
       evidenceDigest: provenance?.evidenceDigest ?? current.decisionBasisDigest,
       policyDecision: decision,
       probeAction: completed.action,

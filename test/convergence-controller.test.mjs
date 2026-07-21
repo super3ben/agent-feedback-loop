@@ -38,7 +38,11 @@ function harness({
   importance = "routine",
   importanceAuthority = "approved_plan",
   adapterCapability = "workflow_gate",
-  adapterKind = "sdd"
+  adapterKind = "sdd",
+  taskUid = "controller-task-1",
+  fingerprint = "controller-fingerprint-1",
+  boundaryId = "task-6",
+  canonicalInvariantId = "breaker-to-grant"
 } = {}) {
   const home = mkdtempSync(path.join(tmpdir(), "afl-controller-"));
   let currentTime = new Date("2026-07-21T00:00:00.000Z");
@@ -56,7 +60,7 @@ function harness({
   });
   let taskProjection = store.upsertConvergenceTask({
     eventUid: "controller-contract-1",
-    taskUid: "controller-task-1",
+    taskUid,
     lineageDigest: "1".repeat(64),
     adapterKind,
     adapterCapability,
@@ -79,24 +83,24 @@ function harness({
   } = {}) => store.recordConvergenceReview({
     eventUid: eventUid("review"),
     taskUid: taskProjection.taskUid,
-    fingerprint: "controller-fingerprint-1",
-    boundaryId: "task-6",
-    canonicalInvariantId: "breaker-to-grant",
+    fingerprint,
+    boundaryId,
+    canonicalInvariantId,
     verdict,
     severity,
     directionSignal,
     decisionBasisDigest: basis,
     evidenceDigest: evidence,
     generation: Number(store.database.prepare(
-      "SELECT fix_generation FROM convergence_loops WHERE fingerprint='controller-fingerprint-1'"
-    ).get()?.fix_generation ?? 0)
+      "SELECT fix_generation FROM convergence_loops WHERE fingerprint=?"
+    ).get(fingerprint)?.fix_generation ?? 0)
   });
   review();
 
   function loop() {
     return store.getConvergenceStatus({
       taskUid: taskProjection.taskUid,
-      fingerprint: "controller-fingerprint-1"
+      fingerprint
     });
   }
 
@@ -260,6 +264,95 @@ test("Probe continue advice alone cannot create a grant", async (t) => {
   assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
 });
 
+test("ordinary local authorization rejects a caller-selected scope before mutation", (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
+  const eventCount = h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count;
+
+  assert.throws(() => authorizeContinuation({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    purpose: "local_fix",
+    scopeDigest: "a".repeat(64),
+    evidenceDigest: h.loop().decisionBasisDigest,
+    request: h.request(),
+    now: h.now
+  }), (error) => error.code === "controller_invalid");
+
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count, eventCount);
+});
+
+test("ordinary local scope is controller-derived, complete, and replay-stable", (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
+  const before = h.loop();
+  const input = {
+    store: h.store,
+    task: h.task(),
+    loop: before,
+    purpose: "local_fix",
+    request: h.request(),
+    now: h.now
+  };
+
+  const first = authorizeContinuation(input);
+  const replay = authorizeContinuation({ ...input, loop: h.loop() });
+  const expected = digestDecisionBasis({
+    action: "local_fix",
+    boundaryId: before.boundaryId,
+    canonicalInvariantId: before.canonicalInvariantId,
+    currentGeneration: before.currentGeneration,
+    fingerprint: before.fingerprint,
+    nextGeneration: before.currentGeneration + 1,
+    purpose: "local_fix",
+    taskUid: before.taskUid
+  });
+
+  assert.equal(first.grant.scopeDigest, expected);
+  assert.equal(replay.grant.grantId, first.grant.grantId);
+  assert.equal(h.store.database.prepare(
+    "SELECT scope_digest FROM continuation_grants WHERE grant_id=?"
+  ).get(first.grant.grantId).scope_digest, expected);
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 1);
+});
+
+test("canonical local scope changes with every frozen loop identity field", (t) => {
+  const variants = [
+    {},
+    { taskUid: "controller-task-2" },
+    { fingerprint: "controller-fingerprint-2" },
+    { boundaryId: "task-6-other-boundary" },
+    { canonicalInvariantId: "other-invariant" }
+  ].map((options) => harness(options));
+  t.after(() => variants.forEach((h) => h.close()));
+
+  const scopes = variants.map((h) => {
+    h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
+    return authorizeContinuation({
+      store: h.store,
+      task: h.task(),
+      loop: h.loop(),
+      purpose: "local_fix",
+      request: h.request(),
+      now: h.now
+    }).grant.scopeDigest;
+  });
+
+  assert.equal(new Set(scopes).size, variants.length);
+});
+
 test("important task receives exactly one falsifiable exploration grant", (t) => {
   const h = harness({ importance: "important", importanceAuthority: "approved_spec" });
   t.after(() => h.close());
@@ -272,7 +365,7 @@ test("important task receives exactly one falsifiable exploration grant", (t) =>
     evidenceDigest: h.loop().decisionBasisDigest,
     policyDecision: { decision: "pass", reasonCode: "exploration_grant_available" },
     now: h.now
-  }), (error) => error.code === "continuation_not_authorized");
+  }), (error) => error.code === "controller_invalid");
   const first = h.evaluate({
     previousDecisionBasisDigest: BASIS_A,
     evidenceQuality: "verified",
@@ -282,6 +375,21 @@ test("important task receives exactly one falsifiable exploration grant", (t) =>
   });
   assert.equal(first.action, "grant_issued");
   assert.equal(first.grant.purpose, "exploration");
+  const explorationBindingDigest = digestDecisionBasis({
+    falsificationTest: "run two concurrent consumers",
+    riskHypothesis: "grant consumption may race"
+  });
+  assert.equal(first.grant.scopeDigest, digestDecisionBasis({
+    action: "explore_hypothesis",
+    boundaryId: h.loop().boundaryId,
+    canonicalInvariantId: h.loop().canonicalInvariantId,
+    currentGeneration: 0,
+    explorationBindingDigest,
+    fingerprint: h.loop().fingerprint,
+    nextGeneration: 1,
+    purpose: "exploration",
+    taskUid: h.loop().taskUid
+  }));
   h.consume(first.grant);
   h.review({ basis: BASIS_C });
 
@@ -309,10 +417,25 @@ for (const [advice, purpose, assessment] of [
     h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
     await h.completeProbe(result);
 
-    const authorized = h.afterProbe(result, { evidence: h.verifiedEvidence() });
+    const evidence = h.verifiedEvidence();
+    const before = h.loop();
+    const authorized = h.afterProbe(result, { evidence });
     assert.equal(authorized.action, "grant_issued");
     assert.equal(authorized.grant.purpose, purpose);
-    assert.equal(authorized.grant.scopeDigest.length, 64);
+    const scope = {
+      action: advice,
+      boundaryId: before.boundaryId,
+      canonicalInvariantId: before.canonicalInvariantId,
+      currentGeneration: before.currentGeneration,
+      fingerprint: before.fingerprint,
+      nextGeneration: before.currentGeneration + 1,
+      purpose,
+      taskUid: before.taskUid
+    };
+    if (purpose === "rollback") {
+      scope.rollbackTargetGeneration = Math.max(0, before.currentGeneration - 1);
+    }
+    assert.equal(authorized.grant.scopeDigest, digestDecisionBasis(scope));
     assert.equal(h.loop().status, "grant_ready");
   });
 }
@@ -444,7 +567,8 @@ test("completed Probe resumes from the real Store after restart and exact replay
   await h.completeProbe(result);
   const task = h.task();
   const request = h.request();
-  const fingerprint = h.loop().fingerprint;
+  const completedLoop = h.loop();
+  const fingerprint = completedLoop.fingerprint;
   const evidenceEventUid = h.store.database.prepare(`SELECT event_uid FROM convergence_events
     WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`
   ).get(fingerprint).event_uid;
@@ -470,8 +594,21 @@ test("completed Probe resumes from the real Store after restart and exact replay
 
   assert.equal(first.action, "grant_issued");
   assert.equal(first.grant.purpose, "local_fix");
+  assert.equal(first.grant.scopeDigest, digestDecisionBasis({
+    action: "continue_once",
+    boundaryId: completedLoop.boundaryId,
+    canonicalInvariantId: completedLoop.canonicalInvariantId,
+    currentGeneration: completedLoop.currentGeneration,
+    fingerprint: completedLoop.fingerprint,
+    nextGeneration: completedLoop.currentGeneration + 1,
+    purpose: "local_fix",
+    taskUid: completedLoop.taskUid
+  }));
   assert.equal(replay.action, first.action);
   assert.equal(replay.grant.grantId, first.grant.grantId);
+  assert.equal(reopened.database.prepare(
+    "SELECT scope_digest FROM continuation_grants WHERE grant_id=?"
+  ).get(first.grant.grantId).scope_digest, first.grant.scopeDigest);
   assert.equal(reopened.database.prepare(
     "SELECT COUNT(*) AS count FROM continuation_grants"
   ).get().count, 1);
@@ -635,6 +772,92 @@ test("second invariant failure requires checkpoint through the deterministic pol
   assert.equal(h.loop().status, "checkpoint_required");
 });
 
+test("exploration and architecture bindings change their canonical scopes", (t) => {
+  const explorationA = harness({ importance: "important", importanceAuthority: "approved_spec" });
+  const explorationB = harness({ importance: "important", importanceAuthority: "approved_spec" });
+  const architectureA = harness();
+  const architectureB = harness();
+  const all = [explorationA, explorationB, architectureA, architectureB];
+  t.after(() => all.forEach((h) => h.close()));
+
+  const explore = (h, suffix) => h.evaluate({
+    previousDecisionBasisDigest: BASIS_A,
+    evidenceQuality: "verified",
+    explorationRequested: true,
+    riskHypothesis: `grant race ${suffix}`,
+    falsificationTest: `concurrent consumers ${suffix}`
+  }).grant.scopeDigest;
+  assert.notEqual(explore(explorationA, "a"), explore(explorationB, "b"));
+
+  const architecture = (h, checkpointDigest) => {
+    h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
+    h.review({ verdict: "changes_required", severity: "important", basis: BASIS_D });
+    h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
+    h.store.recordConvergenceCheckpoint({
+      eventUid: h.eventUid("checkpoint"),
+      taskUid: h.task().taskUid,
+      fingerprint: h.loop().fingerprint,
+      checkpointKind: "architecture_direction",
+      fileDigest: checkpointDigest
+    });
+    return authorizeContinuation({
+      store: h.store,
+      task: h.task(),
+      loop: h.loop(),
+      purpose: "architecture_fix",
+      now: h.now
+    }).grant.scopeDigest;
+  };
+  assert.notEqual(
+    architecture(architectureA, digestDecisionBasis({ checkpoint: "a" })),
+    architecture(architectureB, digestDecisionBasis({ checkpoint: "b" }))
+  );
+});
+
+test("rollback target generation changes the canonical scope", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
+  const local = authorizeContinuation({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    purpose: "local_fix",
+    request: h.request(),
+    now: h.now
+  });
+  h.consume(local.grant);
+  h.review({ verdict: "approved", basis: BASIS_D });
+
+  const rollback = probeResult("rollback_to_generation", "wrong_direction");
+  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.completeProbe(rollback);
+  const generationOne = h.loop();
+  const first = h.afterProbe(rollback, { evidence: h.verifiedEvidence(BASIS_A) });
+  h.consume(first.grant);
+  h.review({ verdict: "approved", basis: BASIS_B });
+
+  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.completeProbe(rollback);
+  const generationTwo = h.loop();
+  const second = h.afterProbe(rollback, { evidence: h.verifiedEvidence(BASIS_C) });
+
+  assert.equal(generationOne.currentGeneration, 1);
+  assert.equal(generationTwo.currentGeneration, 2);
+  assert.notEqual(first.grant.scopeDigest, second.grant.scopeDigest);
+  assert.equal(second.grant.scopeDigest, digestDecisionBasis({
+    action: "rollback_to_generation",
+    boundaryId: generationTwo.boundaryId,
+    canonicalInvariantId: generationTwo.canonicalInvariantId,
+    currentGeneration: 2,
+    fingerprint: generationTwo.fingerprint,
+    nextGeneration: 3,
+    purpose: "rollback",
+    rollbackTargetGeneration: 1,
+    taskUid: generationTwo.taskUid
+  }));
+});
+
 test("architecture-fix failure reaches human decision through consumed-grant history", (t) => {
   const h = harness();
   t.after(() => h.close());
@@ -649,15 +872,25 @@ test("architecture-fix failure reaches human decision through consumed-grant his
     checkpointKind: "architecture_direction",
     fileDigest: checkpointDigest
   });
+  const beforeArchitecture = h.loop();
   const issued = authorizeContinuation({
     store: h.store,
     task: h.task(),
-    loop: h.loop(),
+    loop: beforeArchitecture,
     purpose: "architecture_fix",
-    scopeDigest: digestDecisionBasis({ scope: "architecture" }),
-    evidenceDigest: checkpointDigest,
     now: h.now
   });
+  assert.equal(issued.grant.scopeDigest, digestDecisionBasis({
+    action: "architecture_fix",
+    boundaryId: beforeArchitecture.boundaryId,
+    canonicalInvariantId: beforeArchitecture.canonicalInvariantId,
+    checkpointBindingDigest: checkpointDigest,
+    currentGeneration: beforeArchitecture.currentGeneration,
+    fingerprint: beforeArchitecture.fingerprint,
+    nextGeneration: beforeArchitecture.currentGeneration + 1,
+    purpose: "architecture_fix",
+    taskUid: beforeArchitecture.taskUid
+  }));
   h.consume(issued.grant);
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_A });
 
