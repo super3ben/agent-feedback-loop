@@ -104,6 +104,7 @@
 - Design: `docs/superpowers/specs/2026-07-21-convergence-kernel-guard-integration-design.md`
 - Task 1: complete (commits `ba0e087`, `5279d98`, `0d625ef`; frozen human-resolution review clean with Critical 0 / Important 0 / Minor 1). Both Guard loops are closed while retaining failure counts 2 and 1 plus one architecture-fix generation; the binding decision is JSON value semantics, with property descriptor flags non-semantic. Minor retained for final triage: negative lineage safety and concurrent-creation coverage.
 - Task 2: complete (commits `2a22080`, `71ec9be`; frozen re-review clean with Critical 0 / Important 0 / Minor 1). Guard invariant `CONV-POLICY-ROUTINE-EVIDENCE-FREE-REFLECTION` is closed with failure count 1 retained. Verification: policy 24/24, Task 1+2 38/38, full suite 310/310 on the current macOS Node runtime. Minor retained for final triage: tail trigger-priority collision coverage. Cross-task acceptance retained for Tasks 3/6: the Store/controller must bind `breaker_triggered` transitions to the already evaluated decision.
-- Task 3: in progress (schema v2 and atomic convergence store).
-- Tasks 4-9: pending.
+- Task 3: complete (commits `b1d96bd`, `3f68a46`, `0bc8e12`; final frozen re-review clean with Critical 0 / Important 0 / Minor 0 / Backlog 0). Five first-review invariants closed: decision, Probe, and import retained failure count 1/local-fix generation 1; loop history and event replay retained failure count 2 plus the single architecture-fix generation. The direction checkpoint replaced duplicate review identity paths with one canonical review envelope; no schema/runtime expansion. Verification: Task 3 three-file regression 122/122, full suite 338/338, disposable macOS atomic/concurrency/replay smoke passed. Computer Use Terminal remained host-policy blocked, so no UI proof is claimed.
+- Task 4: in progress (SDD workflow adapter and Guard command parity).
+- Tasks 5-9: pending.
 - Final whole-branch review: pending.
