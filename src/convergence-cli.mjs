@@ -1,6 +1,11 @@
+import { fileURLToPath } from "node:url";
+
 import { initializeControlStore } from "./control-store.mjs";
+import { launchDetachedConvergenceProbe } from "./convergence-probe-launcher.mjs";
 import { runGuardCommand } from "./convergence-sdd-adapter.mjs";
 import { pathsFor } from "./index.mjs";
+
+const CLI_FILE = fileURLToPath(new URL("./cli.mjs", import.meta.url));
 
 const EXIT_BY_CODE = Object.freeze({
   guard_invalid_arguments: 2,
@@ -49,7 +54,15 @@ export async function executeGuardCli(args) {
     const result = await runGuardCommand({
       args: parsed.commandArgs,
       repoRoot: parsed.repoRoot,
-      store
+      store,
+      launchProbe: ({ taskUid, fingerprint }) => launchDetachedConvergenceProbe({
+        platform: process.platform,
+        nodeExecutable: process.execPath,
+        cliFile: CLI_FILE,
+        home: parsed.home,
+        taskUid,
+        fingerprint
+      })
     });
     const { exitCode = 0, ...payload } = result;
     return Object.freeze({ payload, exitCode, stderrCode: null });

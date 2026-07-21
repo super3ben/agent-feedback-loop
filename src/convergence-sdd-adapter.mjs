@@ -9,7 +9,10 @@ import {
   ensureRepositoryLineage,
   projectContract
 } from "./convergence-identity.mjs";
-import { evaluateConvergence } from "./convergence-policy.mjs";
+import {
+  authorizeContinuation,
+  evaluateAndAdvance
+} from "./convergence-controller.mjs";
 
 const POLICY_REVISION = "convergence-policy-v1";
 const POLICY_REVISION_DIGEST = sha256(POLICY_REVISION);
@@ -239,7 +242,7 @@ function decisionRequest({ contract, loop, priorBasis, lastPurpose }) {
   };
 }
 
-async function recordReview({ parsed, repoRoot, store }) {
+async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
   const key = keyFrom(parsed.values);
   const { contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
   const severity = normalizeAuditText(parsed.values["--severity"]).toLowerCase();
@@ -332,15 +335,17 @@ async function recordReview({ parsed, repoRoot, store }) {
       priorBasis: prior?.decisionBasisDigest ?? loop.decisionBasisDigest,
       lastPurpose: lastGrantPurpose(store, loop.fingerprint)
     });
-    const evaluation = evaluateConvergence(request);
-    const targetStatus = evaluation.decision === "human_decision" ? "human_decision" : "checkpoint_required";
-    loop = store.recordConvergenceDecision({
-      eventUid: eventUid("decision", task.taskUid, loop.fingerprint, reviewRunId),
+    const advanced = evaluateAndAdvance({
+      store,
+      task,
+      loop,
+      request,
+      launchProbe,
+      now
+    });
+    loop = advanced.loop ?? store.getConvergenceStatus({
       taskUid: task.taskUid,
-      fingerprint: loop.fingerprint,
-      evaluationRequest: request,
-      evaluation,
-      targetStatus
+      fingerprint: loop.fingerprint
     });
   }
   const count = architectureFixCount(store, loop.fingerprint);
@@ -621,7 +626,7 @@ async function checkpoint({ parsed, repoRoot, store }) {
 
 async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   const key = keyFrom(parsed.values);
-  const { lineage, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
+  const { lineage, contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
   const mode = parsed.values["--mode"];
   if (!MODES.has(mode)) throw coded("guard_invalid_arguments");
   const loop = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
@@ -652,20 +657,20 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   }
   const scopeDigest = digestDecisionBasis({ taskUid: task.taskUid, fingerprint, mode, generation: loop.currentGeneration });
   const evidenceDigest = checkpoint?.digest ?? loop.decisionBasisDigest;
-  const issued = store.issueContinuationGrant({
-    eventUid: eventUid("grant", task.taskUid, fingerprint, mode, String(loop.currentGeneration)),
-    grantId: eventUid("grant-id", task.taskUid, fingerprint, mode, String(loop.currentGeneration)),
-    taskUid: task.taskUid,
-    fingerprint,
-    currentGeneration: loop.currentGeneration,
-    nextGeneration: loop.currentGeneration + 1,
+  const { grant: issued } = authorizeContinuation({
+    store,
+    task,
+    loop,
     purpose: mode,
     scopeDigest,
-    contractRevision: task.contractRevision,
-    policyRevision: task.policyRevision,
-    decisionBasisDigest: loop.decisionBasisDigest,
     evidenceDigest,
-    expiresAt: new Date(now().getTime() + 5 * 60_000).toISOString()
+    request: mode === "local_fix" ? decisionRequest({
+      contract,
+      loop,
+      priorBasis: loop.decisionBasisDigest,
+      lastPurpose: lastGrantPurpose(store, loop.fingerprint)
+    }) : undefined,
+    now
   });
   if (issued.replayed === true) {
     const artifactFile = await readPrivateArtifact(repoRoot, artifactTarget.target);
@@ -791,12 +796,20 @@ async function resolve({ parsed, repoRoot, store }) {
 }
 
 export async function runGuardCommand({
-  args, repoRoot, store, now = () => new Date(), artifactHooks: rawArtifactHooks
+  args,
+  repoRoot,
+  store,
+  now = () => new Date(),
+  launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
+  artifactHooks: rawArtifactHooks
 }) {
-  if (typeof repoRoot !== "string" || !store || typeof now !== "function") throw coded("guard_invalid_arguments");
+  if (typeof repoRoot !== "string" || !store || typeof now !== "function"
+      || typeof launchProbe !== "function") throw coded("guard_invalid_arguments");
   const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
-  if (parsed.command === "record-review") return recordReview({ parsed, repoRoot, store });
+  if (parsed.command === "record-review") {
+    return recordReview({ parsed, repoRoot, store, now, launchProbe });
+  }
   if (parsed.command === "status") return status({ parsed, repoRoot, store });
   if (parsed.command === "lock-status") return lockStatus(store);
   if (parsed.command === "add-alias") return addAlias({ parsed, store });

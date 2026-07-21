@@ -400,6 +400,7 @@ test("grant artifact is private, token-free on stdout, single-use, and parser-co
   assert.equal((await stat(grantFile)).mode & 0o777, 0o600);
   const artifact = JSON.parse(await readFile(grantFile, "utf8"));
   assert.equal(typeof artifact.continuation_grant.token, "string");
+  h.advance(1_000);
   const replayed = await h.authorize("local_fix", grantFile, null, "--receipt-file");
   assert.deepEqual(replayed, authorized);
   const replayedArtifact = JSON.parse(await readFile(grantFile, "utf8"));
@@ -644,4 +645,10 @@ test("status and lock-status are bounded Store projections and strict parsing re
   ]) {
     await assert.rejects(h.command(args), (error) => error.code === "guard_invalid_arguments");
   }
+});
+
+test("SDD adapter delegates grant authority to the convergence controller", async () => {
+  const source = await readFile(new URL("../src/convergence-sdd-adapter.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /\.issueContinuationGrant\s*\(/u);
+  assert.match(source, /authorizeContinuation\s*\(/u);
 });
