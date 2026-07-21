@@ -78,17 +78,20 @@ cutover、通用实时阻断或生产有效性。
 
 ## Guard 迁移与回滚
 
-先对仓库旧 Guard state 做无写入检查：
+身份初始化是独立且需显式授权的步骤。它只会在 Git common directory 中创建或复用
+owner-private 的 `afl-lineage-id`；不接受旧 state 或 HOME 输入，不创建 AFL control
+store、不导入 state、不切换权威，也不修改 hook。然后再对旧 Guard state 做无写入检查：
 
 ```sh
+agent-feedback-loop lineage-init --repo-root "$PWD" --apply
 agent-feedback-loop guard --repo-root "$PWD" import \
   --state-file .superpowers/sdd/review-loop-state.json --dry-run
 ```
 
-受控顺序是 dry-run、单独授权的 import、有界 shadow parity、单独授权的逐仓库
-cutover，以及完整 snapshot rollback。import、shadow、cutover、rollback 都是显式的
-机器可读命令，不做长期双写。真实 import/cutover、全局 SDD Skill 修改和 runtime
-canary 都需要各自的用户授权；安装不会自动执行。
+受控顺序是显式身份初始化、只读 dry-run、单独授权的 import、有界 shadow parity、
+单独授权的逐仓库 cutover，以及完整 snapshot rollback。import、shadow、cutover、
+rollback 都是显式的机器可读命令，不做长期双写。真实 import/cutover、全局 SDD
+Skill 修改和 runtime canary 都需要各自的用户授权；安装不会自动执行。
 
 旧反馈导出仍然显式且对源数据库只读：
 

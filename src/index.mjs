@@ -624,8 +624,25 @@ async function inspectInstalledConvergence({ paths, runtime, controlStore, revie
   const probeAvailable = runtimeAvailable
     && assets.prompt
     && assets.schema
+    && controlStore.available
+    && schemaCompatible
     && platformSupported
     && providerAvailable;
+  const probeUnavailableReason = !runtimeAvailable
+    ? "installed_runtime_unavailable"
+    : !assets.prompt
+      ? "probe_prompt_unavailable"
+      : !assets.schema
+        ? "probe_schema_asset_unavailable"
+        : !controlStore.available
+          ? "control_store_unavailable"
+          : !schemaCompatible
+            ? "control_schema_incompatible"
+            : !platformSupported
+              ? "platform_unsupported"
+              : !providerAvailable
+                ? "provider_unavailable"
+                : null;
   return {
     selected: runtime.selected,
     available: runtimeAvailable,
@@ -650,6 +667,7 @@ async function inspectInstalledConvergence({ paths, runtime, controlStore, revie
     probe: {
       available: probeAvailable,
       status: probeAvailable ? "configured_unverified" : "unavailable",
+      ...(probeAvailable ? {} : { reason: probeUnavailableReason }),
       provider: { available: providerAvailable, operational: providerOperational }
     },
     platform: {

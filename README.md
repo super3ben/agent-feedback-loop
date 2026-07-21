@@ -92,15 +92,21 @@ effectiveness.
 
 ## Guard migration and rollback
 
-Inspect a repository's legacy Guard state without writing AFL or legacy state:
+Repository identity initialization is a separate, explicitly authorized step. It
+creates or reuses only the owner-private `afl-lineage-id` in the Git common directory;
+it does not accept legacy state or HOME input and does not create an AFL control store,
+import state, change authority, or modify hooks. Then inspect the legacy Guard state
+without writing AFL or legacy state:
 
 ```sh
+agent-feedback-loop lineage-init --repo-root "$PWD" --apply
 agent-feedback-loop guard --repo-root "$PWD" import \
   --state-file .superpowers/sdd/review-loop-state.json --dry-run
 ```
 
-The controlled sequence is dry-run, explicitly authorized import, bounded shadow
-parity, explicitly authorized per-repository cutover, and exact snapshot rollback.
+The controlled sequence is explicit identity initialization, read-only dry-run,
+explicitly authorized import, bounded shadow parity, explicitly authorized
+per-repository cutover, and exact snapshot rollback.
 Import, shadow, cutover, and rollback are explicit machine-readable commands; no
 long-term dual write is used. Real import or cutover, global SDD Skill changes, and a
 runtime canary each require separate user authorization. Installation never performs

@@ -17,6 +17,7 @@ import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 import { executeGuardCli } from "./convergence-cli.mjs";
 import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
+import { ensureRepositoryLineage } from "./convergence-identity.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
@@ -85,6 +86,73 @@ function parseLegacyExportArgs(args) {
     throw Object.assign(new Error("legacy_export_invalid_arguments"), { code: "legacy_export_invalid_arguments" });
   }
   return { sourceDb, outputDir, dryRun };
+}
+
+function parseLineageInitArgs(args) {
+  let repoRoot = null;
+  let apply = false;
+  for (let index = 1; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--repo-root") {
+      const value = args[index + 1];
+      if (repoRoot !== null || typeof value !== "string" || !value || value.startsWith("--")) {
+        throw Object.assign(new Error("lineage_invalid_arguments"), { code: "lineage_invalid_arguments" });
+      }
+      repoRoot = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--apply") {
+      if (apply) {
+        throw Object.assign(new Error("lineage_invalid_arguments"), { code: "lineage_invalid_arguments" });
+      }
+      apply = true;
+      continue;
+    }
+    throw Object.assign(new Error("lineage_invalid_arguments"), { code: "lineage_invalid_arguments" });
+  }
+  if (repoRoot === null) {
+    throw Object.assign(new Error("lineage_invalid_arguments"), { code: "lineage_invalid_arguments" });
+  }
+  if (!apply) {
+    throw Object.assign(new Error("lineage_apply_required"), { code: "lineage_apply_required" });
+  }
+  return { repoRoot };
+}
+
+const LINEAGE_REPAIR_REQUIRED = new Set([
+  "invalid_lineage_id",
+  "lineage_not_owned",
+  "unsafe_lineage_file",
+  "unsafe_lineage_mode"
+]);
+
+async function executeLineageInitCli(args) {
+  try {
+    const { repoRoot } = parseLineageInitArgs(args);
+    const lineage = await ensureRepositoryLineage({ repoRoot });
+    return Object.freeze({
+      payload: Object.freeze({
+        status: "lineage_initialized",
+        created: lineage.created,
+        lineageDigest: createHash("sha256").update(lineage.lineageId, "utf8").digest("hex")
+      }),
+      exitCode: 0,
+      stderrCode: null
+    });
+  } catch (error) {
+    const code = boundedReason(error, "lineage_initialization_failed");
+    const exitCode = code === "lineage_invalid_arguments"
+      ? 2
+      : code === "lineage_apply_required" || LINEAGE_REPAIR_REQUIRED.has(code)
+        ? 5
+        : 6;
+    return Object.freeze({
+      payload: Object.freeze({ error: code }),
+      exitCode,
+      stderrCode: code
+    });
+  }
 }
 
 const PROMPT_INPUT_MAX_BYTES = 2 * 1024 * 1024;
@@ -521,6 +589,7 @@ Usage:
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
   agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
+  agent-feedback-loop lineage-init --repo-root <path> --apply
   agent-feedback-loop paths [--home <path>]
 `);
 }
@@ -572,6 +641,13 @@ async function executeConvergenceProbeRun({ home, taskUid, fingerprint }) {
 export async function main(args, {
   runConvergenceProbeCommand = executeConvergenceProbeRun
 } = {}) {
+  if (args[0] === "lineage-init") {
+    const machine = await executeLineageInitCli(args);
+    process.stdout.write(`${JSON.stringify(machine.payload)}\n`);
+    if (machine.stderrCode !== null) process.stderr.write(`${machine.stderrCode}\n`);
+    if (machine.exitCode !== 0) process.exitCode = machine.exitCode;
+    return;
+  }
   if (args[0] === "guard") {
     const machine = await executeGuardCli(args.slice(1));
     process.stdout.write(`${JSON.stringify(machine.payload)}\n`);

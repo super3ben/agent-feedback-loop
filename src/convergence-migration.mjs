@@ -1,19 +1,21 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
   chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink, writeFile
 } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 
-import { deriveTaskUid, digestDecisionBasis, projectContract } from "./convergence-identity.mjs";
+import {
+  deriveTaskUid,
+  digestDecisionBasis,
+  projectContract,
+  readRepositoryLineage
+} from "./convergence-identity.mjs";
 import {
   canonicalGuardParityValue,
   guardParitySetDigest
 } from "./convergence-store.mjs";
 
-const execFileAsync = promisify(execFile);
 const PLAN_PRIVATE = new WeakMap();
 const MAPPING_REVISION = "guard-v1-repository-v1";
 const POLICY_REVISION_DIGEST = sha256("convergence-policy-v2");
@@ -158,25 +160,6 @@ async function readOwnedGuardState({ repoRoot, stateFile, expectedSha256 = null,
   } finally {
     await handle.close();
   }
-}
-
-async function readExistingLineage(repoRoot) {
-  const { stdout } = await execFileAsync("git", ["-C", repoRoot, "rev-parse", "--git-common-dir"], {
-    encoding: "utf8", maxBuffer: 4096
-  });
-  const commonDir = path.resolve(repoRoot, stdout.trim());
-  const info = await lstat(commonDir).catch(() => { throw coded("lineage_not_initialized"); });
-  if (!info.isDirectory() || info.isSymbolicLink()) throw coded("lineage_unsafe");
-  own(info, "lineage_untrusted_owner");
-  const lineageFile = path.join(commonDir, "afl-lineage-id");
-  const fileInfo = await lstat(lineageFile).catch(() => { throw coded("lineage_not_initialized"); });
-  if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || (fileInfo.mode & 0o777) !== 0o600) {
-    throw coded("lineage_unsafe");
-  }
-  own(fileInfo, "lineage_untrusted_owner");
-  const lineageId = (await readFile(lineageFile, "utf8")).trim();
-  if (!/^[a-f0-9]{64}$/u.test(lineageId)) throw coded("lineage_unsafe");
-  return lineageId;
 }
 
 function legacyFingerprint(taskId, invariantId, boundary) {
@@ -517,7 +500,7 @@ export async function inspectGuardImport({ repoRoot, stateFile, store, logger = 
   const source = await readOwnedGuardState({ repoRoot, stateFile });
   let json;
   try { json = JSON.parse(source.bytes.toString("utf8")); } catch { throw coded("legacy_state_invalid"); }
-  const lineageId = await readExistingLineage(source.root);
+  const { lineageId } = await readRepositoryLineage({ repoRoot: source.root });
   const parsed = validateLegacyState(json, sha256(source.root));
   const taskIds = [...new Set(parsed.loops.map((loop) => loop.taskId))].sort();
   const taskMappings = taskIds.map((taskId) => {

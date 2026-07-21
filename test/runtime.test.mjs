@@ -185,6 +185,43 @@ test("doctor separates package installed capability and repository authority evi
   assert.equal(serialized.includes(home), false);
 });
 
+test("doctor marks Probe unavailable when the installed control schema is unusable", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-convergence-doctor-schema-"));
+  await install({ home });
+  const paths = pathsFor(home);
+  const controlStore = openControlStore({ paths });
+  controlStore.database.prepare("UPDATE schema_migrations SET version=999").run();
+  controlStore.close();
+
+  const health = await doctor({
+    home,
+    cwd: home,
+    reviewerDetector: async () => ({
+      codex: { available: true, executable: "codex" },
+      claude: { available: false, executable: null },
+      gemini: { available: false, executable: null }
+    })
+  });
+  const installed = health.status.convergence.installedRuntime;
+
+  assert.equal(installed.modules.available, true);
+  assert.deepEqual(installed.assets, { prompt: true, schema: true });
+  assert.equal(installed.provider.available, true);
+  assert.equal(installed.platform.status, "supported");
+  assert.equal(health.status.controlStore.available, false);
+  assert.equal(installed.schema.compatible, false);
+  assert.deepEqual(installed.probe, {
+    available: false,
+    status: "unavailable",
+    reason: "control_store_unavailable",
+    provider: {
+      available: installed.provider.available,
+      operational: installed.provider.operational
+    }
+  });
+  assert.doesNotMatch(JSON.stringify(installed), new RegExp(home.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+});
+
 test("documentation describes only the immediate prompt pipeline", async () => {
   const root = path.resolve(import.meta.dirname, "..");
   const [english, chinese, rule] = await Promise.all([
@@ -197,6 +234,8 @@ test("documentation describes only the immediate prompt pipeline", async () => {
   assert.match(documentation, /later matching prompt|后续匹配的提示/u);
   assert.match(documentation, /legacy export|旧版导出/u);
   assert.match(documentation, /hooks-disabled|关闭 hooks/u);
+  assert.match(documentation, /lineage-init --repo-root [^\n]+ --apply/u);
+  assert.match(documentation, /identity initialization|身份初始化/u);
   assert.doesNotMatch(documentation, /(?:runs|starts|installs).{0,80}(?:resident scheduler|KeepAlive LaunchAgent)|(?:运行|启动|安装).{0,40}(?:常驻.*调度|KeepAlive.*LaunchAgent)/ui);
   assert.doesNotMatch(documentation, /(?:provides|emits|generates).{0,20}(?:session receipt|status output)|(?:提供|显示|生成).{0,20}(?:会话回执|状态输出)/ui);
 });

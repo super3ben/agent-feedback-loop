@@ -23,8 +23,12 @@ authority, cut over a repository, start a service or scheduler, or create a lear
 reader. Real import/cutover, global Skill changes, and runtime canaries require separate
 operator authorization.
 
-Use Guard dry-run, import, shadow parity, explicit per-repository cutover, and exact
-rollback in that order. Do not dual-write authority. Independent convergence
+Use explicit repository identity initialization
+(`agent-feedback-loop lineage-init --repo-root "$PWD" --apply`) before the still
+read-only Guard dry-run, then import, shadow parity, explicit per-repository cutover,
+and exact rollback in that order. Identity initialization creates only the private Git
+common-directory lineage; it does not read legacy state, open a Store, or change
+authority or hooks. Do not dual-write authority. Independent convergence
 effectiveness-to-Markdown learning remains deferred until a named producer, bounded
 evidence envelope, and independent learning-job authority/result contract are approved.
 

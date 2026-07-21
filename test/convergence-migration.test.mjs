@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile
+  chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
 import { initializeControlStore } from "../src/control-store.mjs";
@@ -22,6 +23,9 @@ import { runGuardCommand } from "../src/convergence-sdd-adapter.mjs";
 import { pathsFor } from "../src/index.mjs";
 
 const cleanups = [];
+const execFileAsync = promisify(execFile);
+const ROOT = path.resolve(import.meta.dirname, "..");
+const BIN = path.join(ROOT, "bin", "agent-feedback-loop.mjs");
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const legacyFingerprint = (taskId, invariantId, boundary) => sha256(
   Buffer.from(JSON.stringify([taskId, invariantId, boundary]), "utf8")
@@ -51,14 +55,14 @@ function legacyLoop({ taskId, invariantId, boundary, events = [], overrides = {}
   };
 }
 
-async function migrationHarness() {
+async function migrationHarness({ initializeLineage = true, initializeStore = true } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "afl-convergence-migration-"));
   cleanups.push(root);
   const repoRoot = path.join(root, "repo");
   const home = path.join(root, "home");
   await mkdir(path.join(repoRoot, ".superpowers", "sdd"), { recursive: true, mode: 0o700 });
   execFileSync("git", ["init", "-q", repoRoot]);
-  await ensureRepositoryLineage({ repoRoot });
+  if (initializeLineage) await ensureRepositoryLineage({ repoRoot });
   const realRepo = await realpath(repoRoot);
   const stateFile = path.join(repoRoot, ".superpowers", "sdd", "review-loop-state.json");
   const review = {
@@ -114,11 +118,21 @@ async function migrationHarness() {
   };
   await writeFile(stateFile, `${JSON.stringify(state)}\n`, { mode: 0o600 });
   await chmod(stateFile, 0o600);
-  const store = initializeControlStore({
-    paths: pathsFor(home),
-    now: () => new Date("2026-07-21T00:00:00.000Z")
-  });
+  const store = initializeStore
+    ? initializeControlStore({
+      paths: pathsFor(home),
+      now: () => new Date("2026-07-21T00:00:00.000Z")
+    })
+    : null;
   return { root, repoRoot, home, stateFile, state, store, fingerprintA, fingerprintB };
+}
+
+function spawnCli(args, env) {
+  return spawnSync(process.execPath, [BIN, ...args], {
+    cwd: ROOT,
+    env: { ...process.env, ...env },
+    encoding: "utf8"
+  });
 }
 
 const PASSING_COMPARISONS = Object.freeze([
@@ -165,6 +179,153 @@ test("dry-run returns a bounded multi-task plan and performs no Store or source 
   assert.deepEqual(await readFile(h.stateFile), beforeBytes);
   assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count,
     beforeEvents);
+});
+
+test("public lineage-init creates only clone identity before a zero-write Guard dry-run", async () => {
+  const h = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const environment = { HOME: h.home, TMPDIR: h.root };
+  const stateBefore = await readFile(h.stateFile);
+  const stateInfoBefore = await stat(h.stateFile);
+  const gitCommonOutput = execFileSync("git", ["-C", h.repoRoot, "rev-parse", "--git-common-dir"], {
+    encoding: "utf8"
+  }).trim();
+  const commonDir = await realpath(path.resolve(h.repoRoot, gitCommonOutput));
+  const commonBefore = new Set(await readdir(commonDir));
+
+  const noLineage = spawnCli([
+    "guard", "--repo-root", h.repoRoot, "import",
+    "--state-file", h.stateFile, "--dry-run"
+  ], environment);
+  assert.equal(noLineage.status, 6);
+  assert.deepEqual(JSON.parse(noLineage.stdout), { error: "lineage_not_initialized" });
+  await assert.rejects(stat(path.join(commonDir, "afl-lineage-id")));
+  await assert.rejects(stat(h.home));
+
+  const initialized = spawnCli([
+    "lineage-init", "--repo-root", h.repoRoot, "--apply"
+  ], environment);
+  assert.equal(initialized.status, 0, initialized.stderr);
+  assert.equal(initialized.stderr, "");
+  const initializedPayload = JSON.parse(initialized.stdout);
+  assert.deepEqual(Object.keys(initializedPayload).sort(), ["created", "lineageDigest", "status"]);
+  assert.equal(initializedPayload.status, "lineage_initialized");
+  assert.equal(initializedPayload.created, true);
+  assert.match(initializedPayload.lineageDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(initialized.stdout.includes(h.repoRoot), false);
+  const lineageFile = path.join(commonDir, "afl-lineage-id");
+  const lineageBytes = await readFile(lineageFile, "utf8");
+  assert.match(lineageBytes, /^[a-f0-9]{64}\n$/u);
+  assert.equal(initialized.stdout.includes(lineageBytes.trim()), false);
+  assert.equal((await stat(lineageFile)).mode & 0o777, 0o600);
+  assert.deepEqual(
+    (await readdir(commonDir))
+      .filter((entry) => !commonBefore.has(entry)),
+    ["afl-lineage-id"]
+  );
+  assert.deepEqual(await readFile(h.stateFile), stateBefore);
+  assert.equal((await stat(h.stateFile)).ino, stateInfoBefore.ino);
+  await assert.rejects(stat(h.home));
+
+  const repeated = spawnCli([
+    "lineage-init", "--repo-root", h.repoRoot, "--apply"
+  ], environment);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.deepEqual(JSON.parse(repeated.stdout), { ...initializedPayload, created: false });
+  assert.equal(await readFile(lineageFile, "utf8"), lineageBytes);
+
+  const afterInitInfo = await stat(h.stateFile);
+  const dryRun = spawnCli([
+    "guard", "--repo-root", h.repoRoot, "import",
+    "--state-file", h.stateFile, "--dry-run"
+  ], environment);
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.equal(plan.status, "dry_run");
+  assert.equal(dryRun.stdout.includes(h.repoRoot), false);
+  assert.equal(dryRun.stdout.includes(lineageBytes.trim()), false);
+  assert.deepEqual(await readFile(h.stateFile), stateBefore);
+  assert.equal((await stat(h.stateFile)).ino, afterInitInfo.ino);
+  assert.equal(await readFile(lineageFile, "utf8"), lineageBytes);
+  await assert.rejects(stat(h.home));
+});
+
+test("concurrent public lineage-init calls converge and invalid existing identity fails closed", async () => {
+  const concurrent = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const environment = { ...process.env, HOME: concurrent.home, TMPDIR: concurrent.root };
+  const results = await Promise.all(Array.from({ length: 8 }, () => execFileAsync(process.execPath, [
+    BIN, "lineage-init", "--repo-root", concurrent.repoRoot, "--apply"
+  ], { cwd: ROOT, env: environment })));
+  const payloads = results.map((result) => JSON.parse(result.stdout));
+  assert.equal(payloads.filter((payload) => payload.created).length, 1);
+  assert.equal(new Set(payloads.map((payload) => payload.lineageDigest)).size, 1);
+
+  const invalid = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const invalidCommon = path.join(invalid.repoRoot, ".git");
+  await writeFile(path.join(invalidCommon, "afl-lineage-id"), "invalid\n", { mode: 0o600 });
+  const before = await readFile(path.join(invalidCommon, "afl-lineage-id"));
+  const refused = spawnCli([
+    "lineage-init", "--repo-root", invalid.repoRoot, "--apply"
+  ], { HOME: invalid.home, TMPDIR: invalid.root });
+  assert.equal(refused.status, 5);
+  assert.deepEqual(JSON.parse(refused.stdout), { error: "invalid_lineage_id" });
+  assert.equal(refused.stderr, "invalid_lineage_id\n");
+  assert.deepEqual(await readFile(path.join(invalidCommon, "afl-lineage-id")), before);
+  await assert.rejects(stat(invalid.home));
+});
+
+test("lineage-init rejects missing authority and state or HOME arguments without reading them", async () => {
+  const h = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const environment = { HOME: h.home, TMPDIR: h.root };
+  for (const [args, status] of [
+    [["lineage-init", "--repo-root", h.repoRoot], 5],
+    [["lineage-init", "--repo-root", h.repoRoot, "--apply", "--home", h.home], 2],
+    [["lineage-init", "--repo-root", h.repoRoot, "--apply", "--state-file", h.stateFile], 2],
+    [["lineage-init", "--repo-root", h.repoRoot, "--repo-root", h.repoRoot, "--apply"], 2],
+    [["lineage-init", "--apply"], 2]
+  ]) {
+    const result = spawnCli(args, environment);
+    assert.equal(result.status, status, `${args.join(" ")}: ${result.stderr}`);
+    assert.doesNotMatch(`${result.stdout}${result.stderr}`, new RegExp(h.repoRoot.replaceAll(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  }
+  await assert.rejects(stat(path.join(h.repoRoot, ".git", "afl-lineage-id")));
+  await assert.rejects(stat(h.home));
+});
+
+test("lineage-init ignores legacy state while dry-run rejects a repository binding mismatch", async () => {
+  const h = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  h.state.repository_id = "0".repeat(64);
+  await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
+  const stateBefore = await readFile(h.stateFile);
+  const environment = { HOME: h.home, TMPDIR: h.root };
+
+  const initialized = spawnCli([
+    "lineage-init", "--repo-root", h.repoRoot, "--apply"
+  ], environment);
+  assert.equal(initialized.status, 0, initialized.stderr);
+
+  const dryRun = spawnCli([
+    "guard", "--repo-root", h.repoRoot, "import",
+    "--state-file", h.stateFile, "--dry-run"
+  ], environment);
+  assert.equal(dryRun.status, 5);
+  assert.deepEqual(JSON.parse(dryRun.stdout), { error: "legacy_state_invalid" });
+  assert.deepEqual(await readFile(h.stateFile), stateBefore);
+  await assert.rejects(stat(h.home));
+});
+
+test("public lineage-init reports a bounded Git discovery failure without path disclosure", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "afl-convergence-not-git-"));
+  cleanups.push(root);
+  const home = path.join(root, "home");
+  const result = spawnCli([
+    "lineage-init", "--repo-root", root, "--apply"
+  ], { HOME: home, TMPDIR: root });
+
+  assert.equal(result.status, 6);
+  assert.deepEqual(JSON.parse(result.stdout), { error: "git_discovery_failed" });
+  assert.equal(result.stderr, "git_discovery_failed\n");
+  assert.equal(`${result.stdout}${result.stderr}`.includes(root), false);
+  await assert.rejects(stat(home));
 });
 
 test("apply atomically preserves both task associations and exactly one provenance event", async (t) => {

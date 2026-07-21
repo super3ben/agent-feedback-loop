@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, lstat, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { types } from "node:util";
 
@@ -210,30 +210,47 @@ function execFileText(execFileImpl, file, args) {
   });
 }
 
+async function resolveRepositoryLineageLocation({ repoRoot, execFileImpl = execFile } = {}) {
+  if (!SUPPORTED_PLATFORMS.has(process.platform)) throw coded("unsupported_platform");
+  const root = await ownedRealDirectory(repoRoot);
+  let output;
+  try {
+    output = await execFileText(execFileImpl, "git", ["-C", root, "rev-parse", "--git-common-dir"]);
+  } catch {
+    throw coded("git_discovery_failed");
+  }
+  const commonDir = await ownedRealDirectory(path.resolve(root, boundedText(output.trim(), "invalid_git_common_dir")));
+  return { commonDir, lineageFile: path.join(commonDir, "afl-lineage-id") };
+}
+
+export async function readRepositoryLineage({ repoRoot, execFileImpl = execFile } = {}) {
+  const { commonDir, lineageFile } = await resolveRepositoryLineageLocation({ repoRoot, execFileImpl });
+  const existing = await readPrivateRegularFileIfPresent(lineageFile);
+  if (existing === null) throw coded("lineage_not_initialized");
+  return { lineageId: validateLineage(existing), commonDir };
+}
+
 export async function ensureRepositoryLineage({
   repoRoot,
   execFileImpl = execFile,
   randomBytesImpl = randomBytes
 } = {}) {
-  if (!SUPPORTED_PLATFORMS.has(process.platform)) throw coded("unsupported_platform");
-  const root = await ownedRealDirectory(repoRoot);
-  const output = await execFileText(execFileImpl, "git", ["-C", root, "rev-parse", "--git-common-dir"]);
-  const commonDir = await ownedRealDirectory(path.resolve(root, boundedText(output.trim(), "invalid_git_common_dir")));
-  const lineageFile = path.join(commonDir, "afl-lineage-id");
+  const { commonDir, lineageFile } = await resolveRepositoryLineageLocation({ repoRoot, execFileImpl });
   const existing = await readPrivateRegularFileIfPresent(lineageFile);
-  if (existing !== null) return { lineageId: validateLineage(existing), commonDir };
+  if (existing !== null) return { lineageId: validateLineage(existing), commonDir, created: false };
 
   const bytes = randomBytesImpl(32);
   const lineageId = validateLineage(bytes?.toString("hex"));
+  let created = false;
   try {
     await writeFile(lineageFile, `${lineageId}\n`, { flag: "wx", mode: 0o600 });
-    await chmod(lineageFile, 0o600);
+    created = true;
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
   }
   const stored = await readPrivateRegularFileIfPresent(lineageFile);
   if (stored === null) throw coded("lineage_creation_failed");
-  return { lineageId: validateLineage(stored), commonDir };
+  return { lineageId: validateLineage(stored), commonDir, created };
 }
 
 export function deriveTaskUid({ lineageId, adapterKind, nativeTaskId } = {}) {
