@@ -360,6 +360,25 @@ test("canonical hard-link visibility after a prompt cutoff is omitted without ch
   assert.equal(laterAfterAdoption.documents[0].documentHash, published.sha256);
 });
 
+test("installed platform surface keeps convergence activation separate from prompt hooks", async (t) => {
+  assert.match(process.platform, /^(?:darwin|linux)$/u);
+  const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-convergence-platform-")));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await install({ home, codexHost: unavailableCodexHost() });
+  const paths = pathsFor(home);
+  const [codex, claude, gemini] = await Promise.all([
+    readFile(paths.codexConfig, "utf8"),
+    readFile(paths.claudeSettings, "utf8").then(JSON.parse),
+    readFile(paths.geminiSettings, "utf8").then(JSON.parse)
+  ]);
+
+  assert.doesNotMatch(codex, /hooks\.Stop|guard (?:import|shadow|cutover)|convergence-probe-run/iu);
+  assert.equal(Object.hasOwn(claude.hooks, "Stop"), false);
+  assert.equal(Object.hasOwn(gemini.hooks, "AfterAgent"), false);
+  assert.equal(await access(paths.convergenceProbePrompt).then(() => true, () => false), true);
+  assert.equal(await access(paths.convergenceProbeSchema).then(() => true, () => false), true);
+});
+
 test("installed prompt pipeline publishes and reuses reflection guidance on the host platform", async (t) => {
   assert.match(process.platform, /^(?:darwin|linux)$/u);
   const realProvider = process.env.AFL_REAL_PROVIDER === "1";

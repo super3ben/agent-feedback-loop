@@ -888,7 +888,7 @@ describe("agent-feedback-loop package", () => {
     assert.equal(result.actions.some((action) => /reconcil|scheduler|backstop/i.test(action)), false);
   });
 
-  it("doctor reports only the prompt and document pipeline", async () => {
+  it("doctor reports the prompt pipeline and bounded convergence capability families separately", async () => {
     const home = await tempHome();
     await install({ home, codexHost: unavailableCodexHost() });
     const codexHost = {
@@ -913,6 +913,7 @@ describe("agent-feedback-loop package", () => {
     assert.deepEqual(Object.keys(health).sort(), ["status", "version"]);
     assert.deepEqual(Object.keys(health.status).sort(), [
       "controlStore",
+      "convergence",
       "legacyStopRemoved",
       "promptHook",
       "ready",
@@ -922,6 +923,13 @@ describe("agent-feedback-loop package", () => {
     assert.equal(health.status.promptHook.configured, true);
     assert.equal(health.status.promptHook.runnable, false);
     assert.equal(health.status.controlStore.exists, true);
+    assert.equal(health.status.convergence.codePackage.available, true);
+    assert.equal(health.status.convergence.installedRuntime.probe.provider.available, true);
+    assert.equal(health.status.convergence.adapters.generic.capability, "audit_only");
+    assert.equal(health.status.convergence.adapters.openspec.capability, "checkpoint_gate");
+    assert.equal(health.status.convergence.adapters.sdd.capability, "workflow_gate");
+    assert.equal(health.status.convergence.repositoryAuthority.status, "unknown");
+    assert.equal(health.status.convergence.repositoryAuthority.checked, false);
     assert.equal(health.status.legacyStopRemoved, true);
     assert.equal(health.status.ready, false);
     assert.doesNotMatch(JSON.stringify(health), /scheduler|notification|maintenance|receipt/ui);

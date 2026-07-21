@@ -24,7 +24,21 @@ import { SCHEMA_VERSION } from "./control-schema.mjs";
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
-export const RUNTIME_VERSION = "0.8.0";
+export const RUNTIME_VERSION = "0.9.0";
+
+const CONVERGENCE_MODULES = Object.freeze([
+  "convergence-adapters.mjs",
+  "convergence-cli.mjs",
+  "convergence-controller.mjs",
+  "convergence-identity.mjs",
+  "convergence-migration.mjs",
+  "convergence-policy.mjs",
+  "convergence-probe-launcher.mjs",
+  "convergence-probe-result.mjs",
+  "convergence-probe-runner.mjs",
+  "convergence-sdd-adapter.mjs",
+  "convergence-store.mjs"
+]);
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
@@ -91,9 +105,12 @@ export function pathsFor(home = os.homedir()) {
     blobRoot: path.join(dataRoot, "blobs", "sha256"),
     safetyProjection: path.join(dataRoot, "safety", "guard.json.mac"),
     exportsRoot: path.join(dataRoot, "exports"),
+    continuationGrantRoot: path.join(dataRoot, "convergence", "grants"),
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
+    convergenceProbePrompt: path.join(packRoot, "prompts", "convergence-probe.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
     reviewerSchema: path.join(packRoot, "schemas", "reviewer-result.schema.json"),
+    convergenceProbeSchema: path.join(packRoot, "schemas", "convergence-probe-result.schema.json"),
     geminiReviewerPolicy: path.join(packRoot, "policies", "gemini-reviewer-deny-all.toml"),
     geminiReviewerSettings: path.join(packRoot, "settings", "gemini-reviewer.json"),
     coreHook: path.join(packRoot, "hooks", "core-hook.sh"),
@@ -579,6 +596,80 @@ async function inspectReflectionDirectory(directory) {
   }
 }
 
+async function inspectConvergencePackage() {
+  const moduleChecks = await Promise.all(CONVERGENCE_MODULES.map((name) =>
+    exists(path.join(SRC_DIR, name))));
+  const prompt = await exists(path.join(TEMPLATE_ROOT, "prompts", "convergence-probe.md"));
+  const schema = await exists(path.join(TEMPLATE_ROOT, "schemas", "convergence-probe-result.schema.json"));
+  return {
+    available: moduleChecks.every(Boolean) && prompt && schema,
+    version: RUNTIME_VERSION,
+    modules: { available: moduleChecks.every(Boolean), expected: CONVERGENCE_MODULES.length },
+    assets: { prompt, schema }
+  };
+}
+
+async function inspectInstalledConvergence({ paths, runtime, controlStore, reviewers, clis }) {
+  const moduleChecks = await Promise.all(CONVERGENCE_MODULES.map((name) =>
+    exists(path.join(paths.runtimeRoot, "src", name))));
+  const assets = {
+    prompt: await exists(paths.convergenceProbePrompt),
+    schema: await exists(paths.convergenceProbeSchema)
+  };
+  const platformSupported = new Set(["darwin", "linux"]).has(process.platform);
+  const providerAvailable = Object.values(reviewers).some((reviewer) => reviewer?.available === true);
+  const providerOperational = Object.values(clis).some((cli) => cli?.operational === true);
+  const runtimeAvailable = runtime.selected && moduleChecks.every(Boolean);
+  const schemaCompatible = controlStore.available && Number(runtime.schemaVersion) === SCHEMA_VERSION;
+  const probeAvailable = runtimeAvailable
+    && assets.prompt
+    && assets.schema
+    && platformSupported
+    && providerAvailable;
+  return {
+    selected: runtime.selected,
+    available: runtimeAvailable,
+    version: runtime.runtimeVersion ?? null,
+    modules: { available: moduleChecks.every(Boolean), expected: CONVERGENCE_MODULES.length },
+    assets,
+    schema: {
+      available: controlStore.available,
+      compatible: schemaCompatible,
+      expectedVersion: SCHEMA_VERSION,
+      installedVersion: Number.isSafeInteger(Number(runtime.schemaVersion))
+        ? Number(runtime.schemaVersion)
+        : null
+    },
+    provider: {
+      available: providerAvailable,
+      operational: providerOperational,
+      status: providerOperational
+        ? "configured_unverified"
+        : providerAvailable ? "available_unverified" : "unavailable"
+    },
+    probe: {
+      available: probeAvailable,
+      status: probeAvailable ? "configured_unverified" : "unavailable",
+      provider: { available: providerAvailable, operational: providerOperational }
+    },
+    platform: {
+      name: process.platform,
+      status: platformSupported ? "supported" : "unsupported",
+      executionEvidence: "doctor_static_check"
+    }
+  };
+}
+
+function convergenceAdapters({ codeAvailable, installedAvailable }) {
+  const common = { codeAvailable, installedAvailable, activated: false };
+  return {
+    generic: { ...common, capability: "audit_only", maximumEnforcement: "warn" },
+    openspec: { ...common, capability: "checkpoint_gate", maximumEnforcement: "checkpoint_required" },
+    comet: { ...common, capability: "checkpoint_gate", maximumEnforcement: "checkpoint_required" },
+    sdd: { ...common, capability: "workflow_gate", maximumEnforcement: "workflow_gate" }
+  };
+}
+
 export async function doctor(options = {}) {
   const home = options.home || os.homedir();
   const paths = pathsFor(home);
@@ -682,6 +773,10 @@ export async function doctor(options = {}) {
     inspectControlStore(paths),
     inspectReflectionDirectory(reflectionDirectoryPath)
   ]);
+  const codePackage = await inspectConvergencePackage();
+  const installedRuntime = await inspectInstalledConvergence({
+    paths, runtime, controlStore, reviewers, clis
+  });
   const ready = Object.values(files).every(Boolean)
     && CLIS.every((cli) => clis[cli.id].runnable)
     && readyCliCount > 0
@@ -707,6 +802,19 @@ export async function doctor(options = {}) {
         operational: Boolean(clis[cli.id].operational)
       }];
     })),
+    convergence: {
+      codePackage,
+      installedRuntime,
+      adapters: convergenceAdapters({
+        codeAvailable: codePackage.available,
+        installedAvailable: installedRuntime.available
+      }),
+      repositoryAuthority: {
+        checked: false,
+        status: "unknown",
+        reason: "repository_check_not_requested"
+      }
+    },
     legacyStopRemoved,
     ready
   };

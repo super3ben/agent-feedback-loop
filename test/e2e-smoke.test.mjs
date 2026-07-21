@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -13,6 +14,8 @@ import { captureObservedSession } from "../src/capture.mjs";
 import { install, pathsFor } from "../src/index.mjs";
 import { openControlStore } from "../src/control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
+import { ensureRepositoryLineage } from "../src/convergence-identity.mjs";
+import { launchDetachedConvergenceProbe } from "../src/convergence-probe-launcher.mjs";
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -264,6 +267,60 @@ test("parse and control-store failures return native prompt no-ops", async () =>
   );
   assert.equal(storeFailure.stdout, '{"continue":true}\n');
   assert.equal(storeFailure.stderr, "");
+});
+
+test("installed prompt output is native and silent when convergence assets or identity are unavailable", async (t) => {
+  const scenarios = ["schema_mismatch", "probe_spawn_failed", "identity_partial"];
+  for (const scenario of scenarios) {
+    const home = await mkdtemp(path.join(tmpdir(), `afl-convergence-${scenario}-`));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    await install({ home, codexHost: unavailableCodexHost() });
+    const paths = pathsFor(home);
+    const projectDir = scenario === "identity_partial"
+      ? path.join(home, "not-a-git-repository")
+      : home;
+    await mkdir(projectDir, { recursive: true, mode: 0o700 });
+    if (scenario === "schema_mismatch") {
+      const database = new DatabaseSync(paths.controlDatabase);
+      try {
+        database.prepare("UPDATE schema_migrations SET version=999").run();
+      } finally {
+        database.close();
+      }
+    } else if (scenario === "probe_spawn_failed") {
+      assert.deepEqual(launchDetachedConvergenceProbe({
+        platform: process.platform,
+        nodeExecutable: process.execPath,
+        cliFile: BIN,
+        home,
+        taskUid: "a".repeat(64),
+        fingerprint: "b".repeat(64),
+        spawnImpl() { throw new Error("injected_probe_spawn_failure"); }
+      }), { attempted: false, reason: "spawn_failed" });
+      await rm(paths.convergenceProbePrompt);
+      await rm(paths.convergenceProbeSchema);
+    } else {
+      await assert.rejects(() => ensureRepositoryLineage({ repoRoot: projectDir }));
+    }
+    const payload = JSON.stringify({
+      session_id: `convergence-${scenario}`,
+      turn_id: `turn-${scenario}`,
+      cwd: projectDir,
+      prompt: "reviewer job 是干嘛的？"
+    });
+    const env = { ...process.env, HOME: home, TMPDIR: home };
+    const cases = [
+      ["codex", ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"], "{\"continue\":true}\n"],
+      ["claude", ["--event", "UserPromptSubmit", "--cli", "claude"], "{}\n"],
+      ["gemini", ["--event", "BeforeAgent", "--cli", "gemini"], "{}\n"]
+    ];
+    for (const [cli, args, nativeNoOp] of cases) {
+      const result = await runHook(paths.coreHook, payload, env, args);
+      assert.equal(result.stdout, nativeNoOp, `${scenario}:${cli}`);
+      assert.equal(result.stderr, "", `${scenario}:${cli}`);
+      assert.doesNotMatch(`${result.stdout}${result.stderr}`, /AFL|Guard|grant|receipt|Probe|operational/iu);
+    }
+  }
 });
 
 test("CLI live doctor runs only an isolated temporary canary", async () => {

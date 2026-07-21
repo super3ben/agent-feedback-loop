@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { RUNTIME_VERSION, install, pathsFor, uninstall } from "../src/index.mjs";
+import { RUNTIME_VERSION, doctor, install, pathsFor, uninstall } from "../src/index.mjs";
 import { listUserTables, openControlStore } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
@@ -37,6 +37,10 @@ test("legacy database has no normal path alias", async () => {
   assert.equal(Object.hasOwn(paths, ["store", "File"].join("")), false);
   assert.match(paths.legacyDatabase, /store[\\/]feedback-loop\.sqlite3$/);
   assert.match(paths.controlDatabase, /store[\\/]control\.sqlite3$/);
+  assert.match(paths.convergenceProbePrompt, /prompts[\\/]convergence-probe\.md$/);
+  assert.match(paths.convergenceProbeSchema, /schemas[\\/]convergence-probe-result\.schema\.json$/);
+  assert.equal(path.relative(paths.dataRoot, paths.continuationGrantRoot).startsWith(".."), false);
+  assert.match(paths.continuationGrantRoot, /convergence[\\/]grants$/);
 });
 
 function staticRelativeImportGraph(entry) {
@@ -110,7 +114,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.equal(current.schemaVersion, 2);
 });
 
-test("package excludes removed control plane files", async () => {
+test("0.9.0 package includes every convergence module and exact Probe asset", async () => {
   const root = path.resolve(import.meta.dirname, "..");
   const packageJson = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
   const packed = await new Promise((resolve, reject) => {
@@ -121,7 +125,7 @@ test("package excludes removed control plane files", async () => {
   });
   const files = packed[0].files.map((entry) => entry.path);
 
-  assert.equal(RUNTIME_VERSION, "0.8.0");
+  assert.equal(RUNTIME_VERSION, "0.9.0");
   assert.equal(packageJson.version, RUNTIME_VERSION);
   for (const missing of [
     "src/receipt.mjs",
@@ -131,10 +135,54 @@ test("package excludes removed control plane files", async () => {
     "templates/hooks/stop-hook.sh"
   ]) assert.equal(files.includes(missing), false, missing);
   for (const required of [
+    "src/convergence-adapters.mjs",
+    "src/convergence-cli.mjs",
+    "src/convergence-controller.mjs",
+    "src/convergence-identity.mjs",
+    "src/convergence-migration.mjs",
+    "src/convergence-policy.mjs",
+    "src/convergence-probe-launcher.mjs",
+    "src/convergence-probe-result.mjs",
+    "src/convergence-probe-runner.mjs",
+    "src/convergence-sdd-adapter.mjs",
+    "src/convergence-store.mjs",
+    "templates/prompts/convergence-probe.md",
+    "templates/schemas/convergence-probe-result.schema.json",
     "templates/schemas/reviewer-result.schema.json",
     "src/reflection-document.mjs",
     "src/feedback-signal.mjs"
   ]) assert.equal(files.includes(required), true, required);
+});
+
+test("doctor separates package installed capability and repository authority evidence", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-convergence-doctor-"));
+  await install({ home });
+  const health = await doctor({ home, cwd: home });
+  const convergence = health.status.convergence;
+
+  assert.deepEqual(Object.keys(convergence).sort(), [
+    "adapters", "codePackage", "installedRuntime", "repositoryAuthority"
+  ]);
+  assert.equal(convergence.codePackage.available, true);
+  assert.equal(convergence.codePackage.version, RUNTIME_VERSION);
+  assert.equal(convergence.installedRuntime.selected, true);
+  assert.equal(convergence.installedRuntime.schema.expectedVersion, 2);
+  assert.equal(convergence.installedRuntime.schema.available, true);
+  assert.match(convergence.installedRuntime.platform.status, /^(?:supported|unsupported)$/u);
+  assert.deepEqual(Object.fromEntries(Object.entries(convergence.adapters).map(([name, value]) => [name, value.capability])), {
+    generic: "audit_only",
+    openspec: "checkpoint_gate",
+    comet: "checkpoint_gate",
+    sdd: "workflow_gate"
+  });
+  assert.deepEqual(convergence.repositoryAuthority, {
+    checked: false,
+    status: "unknown",
+    reason: "repository_check_not_requested"
+  });
+  const serialized = JSON.stringify(convergence);
+  assert.doesNotMatch(serialized, /real[-_ ]?time blocking|production_effective|cut.?over.{0,16}(?:true|active)|native_linux_verified/ui);
+  assert.equal(serialized.includes(home), false);
 });
 
 test("documentation describes only the immediate prompt pipeline", async () => {
