@@ -103,6 +103,7 @@
 - Plan: `docs/superpowers/plans/2026-07-21-convergence-kernel-guard-integration.md`
 - Design: `docs/superpowers/specs/2026-07-21-convergence-kernel-guard-integration-design.md`
 - Task 1: complete (commits `ba0e087`, `5279d98`, `0d625ef`; frozen human-resolution review clean with Critical 0 / Important 0 / Minor 1). Both Guard loops are closed while retaining failure counts 2 and 1 plus one architecture-fix generation; the binding decision is JSON value semantics, with property descriptor flags non-semantic. Minor retained for final triage: negative lineage safety and concurrent-creation coverage.
-- Task 2: in progress (deterministic convergence policy).
-- Tasks 3-9: pending.
+- Task 2: complete (commits `2a22080`, `71ec9be`; frozen re-review clean with Critical 0 / Important 0 / Minor 1). Guard invariant `CONV-POLICY-ROUTINE-EVIDENCE-FREE-REFLECTION` is closed with failure count 1 retained. Verification: policy 24/24, Task 1+2 38/38, full suite 310/310 on the current macOS Node runtime. Minor retained for final triage: tail trigger-priority collision coverage. Cross-task acceptance retained for Tasks 3/6: the Store/controller must bind `breaker_triggered` transitions to the already evaluated decision.
+- Task 3: in progress (schema v2 and atomic convergence store).
+- Tasks 4-9: pending.
 - Final whole-branch review: pending.
