@@ -8,7 +8,7 @@ import { renderReflectionMarkdown } from "../src/reflection-document.mjs";
 import * as selectorModule from "../src/selector.mjs";
 
 const { loadReflectionDocuments, selectReflections } = selectorModule;
-const CUTOFF = "2026-07-20T10:00:00.000Z";
+const CUTOFF = "2030-07-20T10:00:00.000Z";
 const SESSION = { sessionUid: "codex:default:session-1", contextEpoch: 2 };
 const TASK = { fingerprint: "task-1", paths: [], tools: [] };
 const BUDGET = { maxCards: 4, maxTotalTokens: 900, maxDocumentTokens: 320 };

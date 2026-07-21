@@ -508,7 +508,12 @@ export async function readReflectionCatalog({
       }
       parsed.documentHash = sha256(bytes);
       if (parsed.canonical) {
-        if (Date.parse(parsed.publishedAt) >= cutoffMs) {
+        const visibilityMs = Number(before.ctimeMs);
+        if (!Number.isFinite(visibilityMs)) {
+          omissions.push({ path: filePath, omission: "changed_during_read" });
+          continue;
+        }
+        if (Date.parse(parsed.publishedAt) >= cutoffMs || visibilityMs >= cutoffMs) {
           omissions.push({ path: filePath, omission: "published_after_cutoff" });
           continue;
         }

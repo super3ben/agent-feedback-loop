@@ -379,6 +379,21 @@ export async function handlePromptHook({
     }
   }
 
+  // A failed durable capture means this synchronous entrypoint cannot safely
+  // recover, select, or emit state that could contradict the failed write.
+  if (result.reason === "capture_failed") {
+    result.nativeResponse = { ...nativeResponse };
+    try {
+      await writePromptResponse({ cli, response: result.nativeResponse, writer: writeResponse });
+      result.hostResponse = result.nativeResponse;
+    } catch {
+      result.hostResponse = null;
+      result.reason = "response_failed";
+      promptLog("reflection_emitted", { reason: "response_failed" });
+    }
+    return result;
+  }
+
   try {
     recoverReviewers();
   } catch (error) {
@@ -678,7 +693,7 @@ export async function main(args) {
     const paths = pathsFor(options.home);
     let controlStore = null;
     try {
-      controlStore = openControlStore({ paths });
+      controlStore = openControlStore({ paths, busyTimeoutMs: 250 });
       const blobs = new EncryptedBlobStore({
         root: paths.blobRoot,
         keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })

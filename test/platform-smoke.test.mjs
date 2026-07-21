@@ -15,6 +15,7 @@ import {
   validateReflectionModel
 } from "../src/reflection-document.mjs";
 import { resolveReviewerExecutable } from "../src/reviewer-provider.mjs";
+import { loadReflectionDocuments } from "../src/selector.mjs";
 
 const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
 const REPEATED_FEEDBACK = "之前你仍然没有考虑用户目标，而是等我再次指出后才开始思考，应该先验证需求再改架构。";
@@ -297,6 +298,67 @@ async function publishCutoffFamily(projectDir, publishedAt) {
   });
   return publishReflectionDocument({ projectDir, model });
 }
+
+test("canonical hard-link visibility after a prompt cutoff is omitted without changing adoption identity", async (t) => {
+  assert.match(process.platform, /^(?:darwin|linux)$/u);
+  const projectDir = await realpath(await mkdtemp(path.join(tmpdir(), "afl-cutoff-visibility-")));
+  t.after(() => rm(projectDir, { recursive: true, force: true }));
+  const publishedAt = new Date(Date.now() - 2_000).toISOString();
+  let releasePublication;
+  const publicationHeld = new Promise((resolve) => { releasePublication = resolve; });
+  let publicationReached;
+  const publicationReady = new Promise((resolve) => { publicationReached = resolve; });
+  const model = validateReflectionModel({
+    outcome: "lesson",
+    final_severity: "Critical",
+    responsibility: "agent_fault",
+    method_class: "platform_cutoff_visibility",
+    family_id: null,
+    proposed_family_key: "platform-cutoff-visibility",
+    applies_when: [CUTOFF_PROMPT],
+    facts: ["Canonical visibility must be fenced separately from stable identity metadata."],
+    user_complaint: "A document published after this prompt started must not guide it.",
+    root_cause: "Published metadata precedes the hard-link visibility fence.",
+    class_of_mistake: "current cutoff visibility leak",
+    method_changes: ["Require target visibility before selection"],
+    repeated_pattern_evidence: [],
+    recurrence_of: []
+  }, {
+    sourceIdentity: "platform-cutoff-visibility-source",
+    createdAt: publishedAt,
+    publishedAt
+  });
+  const publishing = publishReflectionDocument({
+    projectDir,
+    model,
+    beforeRename: async () => {
+      publicationReached();
+      await publicationHeld;
+    }
+  });
+  await publicationReady;
+  const cutoff = new Date().toISOString();
+  await sleep(25);
+  releasePublication();
+  const published = await publishing;
+
+  const current = await loadReflectionDocuments({ projectDir, publishedBefore: cutoff });
+  assert.equal(current.documents.length, 0);
+  assert.equal(current.omissions.some((item) => item.reason === "published_after_cutoff"), true);
+
+  const laterCutoff = new Date(Date.now() + 1_000).toISOString();
+  const later = await loadReflectionDocuments({ projectDir, publishedBefore: laterCutoff });
+  assert.equal(later.documents.length, 1);
+  assert.equal(later.documents[0].path, published.path);
+  assert.equal(later.documents[0].documentHash, published.sha256);
+
+  const adopted = await publishReflectionDocument({ projectDir, model });
+  assert.deepEqual(adopted, { path: published.path, sha256: published.sha256, created: false });
+  const currentAfterAdoption = await loadReflectionDocuments({ projectDir, publishedBefore: cutoff });
+  const laterAfterAdoption = await loadReflectionDocuments({ projectDir, publishedBefore: laterCutoff });
+  assert.equal(currentAfterAdoption.documents.length, 0);
+  assert.equal(laterAfterAdoption.documents[0].documentHash, published.sha256);
+});
 
 test("installed prompt pipeline publishes and reuses reflection guidance on the host platform", async (t) => {
   assert.match(process.platform, /^(?:darwin|linux)$/u);

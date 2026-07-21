@@ -328,7 +328,6 @@ function codexHookBlock(paths, cli) {
     'type = "command"',
     `command = ${tomlString(hookCommand(paths, cli))}`,
     `timeout = ${cli.hookTimeout}`,
-    'statusMessage = "Injecting feedback reflection prompt"',
     CODEX_MARKER_END
   ].join("\n");
 }

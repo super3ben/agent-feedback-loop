@@ -672,6 +672,21 @@ test("runtime control capture waits for a short concurrent writer", async () => 
   store.close();
 });
 
+test("runtime busy timeout defaults to 5000ms and accepts only bounded non-negative overrides", () => {
+  const { paths } = fixture();
+  const initialized = initializeControlStore({ paths });
+  initialized.close();
+  const defaultStore = openControlStore({ paths });
+  assert.equal(Number(defaultStore.database.prepare("PRAGMA busy_timeout").get().timeout), 5_000);
+  defaultStore.close();
+  const promptStore = openControlStore({ paths, busyTimeoutMs: 250 });
+  assert.equal(Number(promptStore.database.prepare("PRAGMA busy_timeout").get().timeout), 250);
+  promptStore.close();
+  for (const busyTimeoutMs of [-1, 1.5, Number.NaN, "250", 60_001]) {
+    assert.throws(() => openControlStore({ paths, busyTimeoutMs }), /busyTimeoutMs/u);
+  }
+});
+
 test("captures bounded event metadata and resolves duplicate observations", () => {
   const { paths } = fixture();
   const store = initializeControlStore({ paths });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -296,6 +297,88 @@ test("installed hook manifests preserve native timeout units", async () => {
   const gemini = JSON.parse(await readFile(path.join(home, ".gemini", "settings.json"), "utf8"));
   assert.deepEqual(claude.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks).map((hook) => hook.timeout), [5]);
   assert.deepEqual(gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks).map((hook) => hook.timeout), [5000]);
+});
+
+test("Codex reinstall removes the legacy managed status message without replacing it", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-codex-silent-install-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const configPath = path.join(home, ".codex", "config.toml");
+  const legacyCoreHook = pathsFor(home).coreHook;
+  await mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
+  await writeFile(configPath, `# agent-feedback-loop:start
+[[hooks.UserPromptSubmit]]
+matcher = "*"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = ${JSON.stringify(`${legacyCoreHook} --event UserPromptSubmit --cli codex --continue`)}
+timeout = 5
+statusMessage = "Injecting feedback reflection prompt"
+# agent-feedback-loop:end
+`, { mode: 0o600 });
+
+  await install({ home, codexHost: unavailableCodexHost() });
+  const config = await readFile(configPath, "utf8");
+  assert.match(config, /\[\[hooks\.UserPromptSubmit\]\]/u);
+  assert.match(config, /command = .*core-hook\.sh/u);
+  assert.match(config, /timeout = 5/u);
+  assert.doesNotMatch(config, /statusMessage\s*=/u);
+  assert.doesNotMatch(config, /Injecting feedback reflection prompt/u);
+});
+
+test("installed explicit-feedback hook fails open within two seconds while a real control writer is held", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-busy-prompt-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
+  await install({ home, codexHost: unavailableCodexHost() });
+  const paths = pathsFor(home);
+  const holder = spawn(process.execPath, ["-e", `
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(process.env.AFL_TEST_CONTROL_STORE);
+    db.exec("BEGIN IMMEDIATE");
+    process.stdout.write("locked\\n");
+    setTimeout(() => { db.exec("COMMIT"); db.close(); }, 6500);
+  `], {
+    env: { ...process.env, AFL_TEST_CONTROL_STORE: paths.controlDatabase },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const holderExit = once(holder, "exit");
+  const [ready] = await once(holder.stdout, "data");
+  assert.match(String(ready), /locked/u);
+
+  const payload = JSON.stringify({
+    session_id: "busy-feedback-session",
+    event_id: "busy-feedback-event",
+    turn_id: "busy-feedback-turn",
+    cwd: projectDir,
+    timestamp: new Date().toISOString(),
+    prompt: EXPLICIT_FEEDBACK,
+    previous_assistant_message: {
+      role: "assistant",
+      id: "busy-feedback-assistant",
+      turn_id: "busy-feedback-previous-turn",
+      timestamp: new Date(Date.now() - 1_000).toISOString(),
+      content: [{ type: "output_text", text: "I changed the design before confirming the boundary." }]
+    }
+  });
+  const startedAt = Date.now();
+  const result = await runHook(paths.coreHook, payload, { ...process.env, HOME: home, TMPDIR: home }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(result.stdout, '{"continue":true}\n');
+  assert.equal(result.stderr, "");
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /\[AFL\]|afl-receipt|Output this receipt|reviewer.*queued|hookPrompt|runner_transition/iu);
+  assert.ok(elapsedMs < 2_000, `expected fail-open in <2s, received ${elapsedMs}ms`);
+  t.diagnostic(`held-writer hook response elapsed ${elapsedMs}ms; writer cleanup is awaited separately`);
+
+  const [exitCode] = await holderExit;
+  assert.equal(exitCode, 0);
+  const store = openControlStore({ paths });
+  try {
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count, 0);
+    assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+  } finally {
+    store.close();
+  }
 });
 
 test("detached reviewer outlives its macOS launcher parent without leaking output", {

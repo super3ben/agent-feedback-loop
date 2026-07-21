@@ -38,7 +38,8 @@ function sha256(value) {
 }
 
 async function reviewFixture(t, {
-  initialNow = "2026-07-20T00:00:00.000Z",
+  initialNow = "2030-07-20T00:00:00.000Z",
+  sourceTimestamp = "2026-07-20T08:09:10+08:00",
   sourceRawText = "The previous response ignored the requirement. Authorization: Bearer raw-secret"
 } = {}) {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-home-")));
@@ -96,7 +97,7 @@ async function reviewFixture(t, {
     role: "user",
     rawText: sourceRawText,
     referentEventUid,
-    sourceTimestamp: "2026-07-20T08:09:10+08:00"
+    sourceTimestamp
   });
   await capture({ role: "assistant", rawText: "following-1" });
   await capture({ role: "user", rawText: "following-2" });
@@ -194,7 +195,7 @@ test("runReviewJob publishes one stable Markdown document and only updates contr
 });
 
 test("same family after emission is negative evidence", async (t) => {
-  const fixture = await reviewFixture(t);
+  const fixture = await reviewFixture(t, { sourceTimestamp: "2030-07-20T01:00:00.000Z" });
   const prior = await publishPriorSameFamily(fixture);
   const emissionId = fixture.store.recordReflectionSelected({
     document: {
@@ -257,7 +258,7 @@ test("absence of recurrence remains unknown when publication has no emission", a
   assert.deepEqual(parsed.repeatedPatternEvidence, providerEvidence);
   assert.equal(fixture.store.findPriorFamilyEmission({
     familyId: prior.model.family_id,
-    before: "2026-07-20T00:09:10.000Z"
+    before: "2030-07-20T00:09:10.000Z"
   }), null);
 });
 

@@ -278,7 +278,7 @@ test("catalog reads direct regular Markdown in stable order with strict cutoffs"
 
   const catalog = await readReflectionCatalog({
     projectDir,
-    publishedBefore: "2026-07-20T00:11:00Z"
+    publishedBefore: "2030-07-20T00:11:00Z"
   });
   assert.deepEqual(catalog.documents.map((entry) => path.basename(entry.path)), [
     "a-legacy.md", "b-legacy.md", "c-canonical.md"
@@ -289,9 +289,9 @@ test("catalog reads direct regular Markdown in stable order with strict cutoffs"
     ["nested.md", "not_regular_file"]
   ]);
 
-  const equalCanonical = canonicalModel({ published_at: "2026-07-20T00:11:00.000Z" });
+  const equalCanonical = canonicalModel({ published_at: "2030-07-20T00:11:00.000Z" });
   await writeFile(path.join(reflectionDir, "c-canonical.md"), renderReflectionMarkdown(equalCanonical));
-  const cutoff = new Date("2026-07-20T00:11:00Z");
+  const cutoff = new Date("2030-07-20T00:11:00Z");
   await utimes(path.join(reflectionDir, "b-legacy.md"), cutoff, cutoff);
   const strict = await readReflectionCatalog({ projectDir, publishedBefore: cutoff.toISOString() });
   assert.deepEqual(strict.documents.map((entry) => path.basename(entry.path)), ["a-legacy.md"]);
@@ -377,7 +377,7 @@ test("publication is private, idempotent, verified, and refuses content collisio
   await assert.rejects(publishReflectionDocument({ projectDir, model: differentSlug }), /publication_collision/);
   assert.deepEqual((await readdir(path.dirname(published.path))).filter((name) => name.endsWith(".md")), [path.basename(published.path)]);
 
-  const catalog = await readReflectionCatalog({ projectDir, publishedBefore: "2026-07-20T00:12:00Z" });
+  const catalog = await readReflectionCatalog({ projectDir, publishedBefore: "2030-07-20T00:12:00Z" });
   assert.equal(catalog.documents.length, 1);
   assert.equal(catalog.documents[0].reflectionId, model.reflection_id);
   assert.equal(catalog.documents[0].documentHash, sha256(await readFile(published.path)));

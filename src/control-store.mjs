@@ -19,6 +19,7 @@ try {
 }
 
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
+const MAX_SQLITE_BUSY_TIMEOUT_MS = 60_000;
 const MAX_CONTEXT_EPOCH = 2_147_483_647;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const FAMILY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -1355,8 +1356,16 @@ function verifyControlSchema(database, requireSchemaVersion) {
   }
 }
 
-function configureConnection(database) {
-  database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}; PRAGMA foreign_keys = ON;`);
+function boundedBusyTimeoutMs(value = SQLITE_BUSY_TIMEOUT_MS) {
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_SQLITE_BUSY_TIMEOUT_MS) {
+    throw new TypeError("busyTimeoutMs must be a bounded non-negative integer");
+  }
+  return value;
+}
+
+function configureConnection(database, busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS) {
+  const timeoutMs = boundedBusyTimeoutMs(busyTimeoutMs);
+  database.exec(`PRAGMA busy_timeout = ${timeoutMs}; PRAGMA foreign_keys = ON;`);
 }
 
 export function initializeControlStore({ paths, now = () => new Date() }) {
@@ -1379,12 +1388,18 @@ export function initializeControlStore({ paths, now = () => new Date() }) {
   }
 }
 
-export function openControlStore({ paths, now = () => new Date(), requireSchemaVersion = SCHEMA_VERSION }) {
+export function openControlStore({
+  paths,
+  now = () => new Date(),
+  requireSchemaVersion = SCHEMA_VERSION,
+  busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS
+}) {
   requireDatabase();
   assertControlDatabasePath(paths);
+  const timeoutMs = boundedBusyTimeoutMs(busyTimeoutMs);
   const database = new DatabaseSync(paths.controlDatabase);
   try {
-    configureConnection(database);
+    configureConnection(database, timeoutMs);
     verifyControlSchema(database, requireSchemaVersion);
     return createStore(database, now);
   } catch (error) {

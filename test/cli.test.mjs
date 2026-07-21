@@ -152,7 +152,7 @@ function runWithInput(file, input, env, args = []) {
 }
 
 const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西";
-const PROMPT_CUTOFF = "2026-07-20T08:00:00.000Z";
+const PROMPT_CUTOFF = "2030-07-20T08:00:00.000Z";
 
 function explicitFeedbackPayload(overrides = {}) {
   const sessionId = overrides.session_id || "feedback-session-1";
@@ -324,7 +324,7 @@ describe("agent-feedback-loop package", () => {
     };
 
     const current = await cliModule.handlePromptHook({ ...input, now: () => new Date(PROMPT_CUTOFF) });
-    const next = await cliModule.handlePromptHook({ ...input, now: () => new Date("2026-07-20T08:00:00.001Z") });
+    const next = await cliModule.handlePromptHook({ ...input, now: () => new Date(Date.parse(PROMPT_CUTOFF) + 1) });
 
     assert.deepEqual(responses[0], { continue: true });
     assert.equal("hookSpecificOutput" in current.hostResponse, false);
