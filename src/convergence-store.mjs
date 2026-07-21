@@ -297,6 +297,28 @@ function validateReview(input) {
   });
 }
 
+function canonicalReviewEnvelope(value, canonicalLoop) {
+  return Object.freeze({
+    eventUid: value.eventUid,
+    taskUid: value.taskUid,
+    boundaryId: value.boundaryId,
+    submittedIdentity: Object.freeze({
+      fingerprint: value.fingerprint,
+      invariantId: value.canonicalInvariantId
+    }),
+    canonicalIdentity: Object.freeze({
+      fingerprint: canonicalLoop?.fingerprint ?? value.fingerprint,
+      invariantId: canonicalLoop?.canonical_invariant_id ?? value.canonicalInvariantId
+    }),
+    generation: value.generation,
+    severity: value.severity,
+    verdict: value.verdict,
+    directionSignal: value.directionSignal,
+    evidenceDigest: value.evidenceDigest,
+    decisionBasisDigest: value.decisionBasisDigest
+  });
+}
+
 function parseAliases(value) {
   let aliases;
   try { aliases = JSON.parse(value); } catch { throw coded("invalid_alias_projection"); }
@@ -511,36 +533,32 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const value = validateReview(input);
       return transaction(() => {
         requireTask(database, value.taskUid);
-        const replayEvent = database.prepare("SELECT * FROM convergence_events WHERE event_uid=?")
-          .get(value.eventUid);
-        if (replayEvent) {
-          let replayFacts;
-          try { replayFacts = JSON.parse(replayEvent.facts_json); } catch { throw coded("event_collision"); }
-          const replayMatches = replayEvent.task_uid === value.taskUid
-            && replayEvent.fingerprint === value.fingerprint
-            && Number(replayEvent.generation) === value.generation
-            && replayEvent.event_type === "review_recorded"
-            && replayEvent.evidence_digest === value.evidenceDigest
-            && replayEvent.result_digest === value.decisionBasisDigest
-            && replayFacts.directionSignal === value.directionSignal
-            && replayFacts.severity === value.severity
-            && replayFacts.verdict === value.verdict;
-          if (!replayMatches) throw coded("event_collision");
-          return loopView(requireLoop(database, value.taskUid, value.fingerprint));
-        }
         const candidates = database.prepare(`SELECT * FROM convergence_loops
           WHERE task_uid=? AND boundary_id=?`).all(value.taskUid, value.boundaryId);
         const exact = candidates.find((row) => row.canonical_invariant_id === value.canonicalInvariantId);
         const aliased = exact ?? candidates.find((row) => parseAliases(row.aliases_json)
           .includes(value.canonicalInvariantId));
         const existing = aliased ?? null;
+        const envelope = canonicalReviewEnvelope(value, existing);
+        const fingerprint = envelope.canonicalIdentity.fingerprint;
+        const envelopeDigest = sha256(canonicalJson(envelope));
+        const replayEvent = database.prepare("SELECT * FROM convergence_events WHERE event_uid=?")
+          .get(value.eventUid);
+        if (replayEvent) {
+          if (replayEvent.task_uid !== value.taskUid
+              || replayEvent.event_type !== "review_recorded"
+              || replayEvent.fingerprint !== fingerprint
+              || replayEvent.source_digest !== envelopeDigest) {
+            throw coded("event_collision");
+          }
+          return loopView(requireLoop(database, value.taskUid, fingerprint));
+        }
         if (exact && exact.fingerprint !== value.fingerprint) throw coded("fingerprint_collision");
         const byFingerprint = database.prepare("SELECT * FROM convergence_loops WHERE fingerprint=?")
           .get(value.fingerprint);
         if (byFingerprint && (!existing || byFingerprint.fingerprint !== existing.fingerprint)) {
           throw coded("fingerprint_collision");
         }
-        const fingerprint = existing?.fingerprint ?? value.fingerprint;
         const historicalEvidence = existing && database.prepare(`SELECT 1 FROM convergence_events
           WHERE task_uid=? AND fingerprint=? AND event_type='review_recorded' AND evidence_digest=?
           LIMIT 1`).get(value.taskUid, fingerprint, value.evidenceDigest);
@@ -557,7 +575,7 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           eventType: "review_recorded",
           decision,
           evidenceDigest: value.evidenceDigest,
-          sourceDigest: sha256(value.fingerprint),
+          sourceDigest: envelopeDigest,
           resultDigest: value.decisionBasisDigest,
           facts: {
             directionSignal: value.directionSignal,

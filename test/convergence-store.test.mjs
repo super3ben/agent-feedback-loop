@@ -296,9 +296,15 @@ test("reviews preserve one fingerprint across replay and closed regression gener
   store.close();
 });
 
-test("alias reviews resolve to canonical history and repeated evidence is not counted again", () => {
+test("canonical review envelope makes alias replay immutable across every accepted field", () => {
   const { store } = convergenceFixture();
   seedLoop(store);
+  store.upsertConvergenceTask(taskInput({
+    eventUid: "contract-event-task-2",
+    taskUid: "task-2",
+    lineageDigest: "a".repeat(64),
+    nativeTaskDigest: "b".repeat(64)
+  }));
   store.addConvergenceAlias({
     eventUid: "alias-history-declared",
     taskUid: "task-1",
@@ -306,11 +312,12 @@ test("alias reviews resolve to canonical history and repeated evidence is not co
     aliasInvariantId: "renamed-atomic-store"
   });
 
-  const reviewed = store.recordConvergenceReview(reviewInput({
+  const aliasReview = reviewInput({
     eventUid: "review-alias-repeated-evidence",
     fingerprint: "fingerprint-escaped",
     canonicalInvariantId: "renamed-atomic-store"
-  }));
+  });
+  const reviewed = store.recordConvergenceReview(aliasReview);
 
   assert.equal(reviewed.fingerprint, "fingerprint-1");
   assert.equal(reviewed.failureCount, 1);
@@ -322,6 +329,67 @@ test("alias reviews resolve to canonical history and repeated evidence is not co
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='review_recorded'"
   ).get().count, 2);
+
+  const state = () => ({
+    eventCount: store.database.prepare(
+      "SELECT COUNT(*) AS count FROM convergence_events"
+    ).get().count,
+    loopCount: store.database.prepare(
+      "SELECT COUNT(*) AS count FROM convergence_loops"
+    ).get().count,
+    reviewEvents: store.database.prepare(
+      "SELECT * FROM convergence_events WHERE event_type='review_recorded' ORDER BY id"
+    ).all(),
+    loop: store.database.prepare(
+      "SELECT * FROM convergence_loops WHERE fingerprint='fingerprint-1'"
+    ).get()
+  });
+  const aliasAcceptedState = state();
+  const problems = [];
+  const recordStateChange = (expected, label) => {
+    try {
+      assert.deepEqual(state(), expected);
+    } catch {
+      problems.push(`${label} mutated persisted state`);
+    }
+  };
+  try {
+    assert.deepEqual(store.recordConvergenceReview(aliasReview), reviewed);
+  } catch (error) {
+    problems.push(`exact alias retry: ${error.code ?? error.message}`);
+  }
+  recordStateChange(aliasAcceptedState, "exact alias retry");
+
+  const canonicalReview = reviewInput({
+    eventUid: "review-canonical-envelope-matrix"
+  });
+  store.recordConvergenceReview(canonicalReview);
+  const acceptedState = state();
+
+  const changes = {
+    taskUid: "task-2",
+    boundaryId: "different-boundary",
+    canonicalInvariantId: "renamed-atomic-store",
+    fingerprint: "another-submitted-fingerprint",
+    verdict: "approved",
+    severity: "critical",
+    directionSignal: "structural_blocked",
+    decisionBasisDigest: "9".repeat(64),
+    evidenceDigest: "a".repeat(64),
+    generation: 2
+  };
+  for (const [field, changed] of Object.entries(changes)) {
+    try {
+      store.recordConvergenceReview({ ...canonicalReview, [field]: changed });
+      problems.push(`${field}: changed request was accepted`);
+    } catch (error) {
+      if (error.code !== "event_collision") {
+        problems.push(`${field}: ${error.code ?? error.message}`);
+      }
+    }
+    recordStateChange(acceptedState, `${field}: collision`);
+  }
+  assert.deepEqual(problems, []);
   store.close();
 });
 
