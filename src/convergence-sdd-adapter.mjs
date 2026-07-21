@@ -20,7 +20,7 @@ const DIRECTION_SIGNALS = new Set(["none", "structural_blocked", "no_local_seam"
 const MODES = new Set(["local_fix", "architecture_fix"]);
 const FAILURE_ACTIONS = new Set(["direction_review", "stop"]);
 const ARTIFACT_HOOK_NAMES = new Set([
-  "afterArtifactOpen", "beforeArtifactUnlink", "beforeArtifactPublish"
+  "afterArtifactOpen", "beforeArtifactNeutralize", "beforeArtifactPublish"
 ]);
 const COMMAND_FLAGS = Object.freeze({
   "record-review": new Set([
@@ -507,7 +507,7 @@ async function openPrivateArtifact(repoRoot, file) {
   await assertSafeComponents(location.root, location.target, { includeLeaf: true });
   let handle;
   try {
-    handle = await open(location.target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(location.target, constants.O_RDWR | constants.O_NOFOLLOW);
   } catch (error) {
     if (["ELOOP", "EMLINK"].includes(error?.code)) throw coded("artifact_unsafe");
     throw error;
@@ -573,6 +573,17 @@ async function writePrivateJson(repoRoot, file, value, artifactHooks) {
     await unlink(temporary).catch(() => {});
   }
   return target;
+}
+
+async function neutralizeConsumedArtifact(opened, artifactHooks) {
+  try {
+    await artifactHooks.beforeArtifactNeutralize?.();
+    await opened.handle.truncate(0);
+    await opened.handle.sync();
+    await opened.handle.chmod(0o000);
+  } catch {
+    throw coded("artifact_neutralization_failed");
+  }
 }
 
 function parseCheckpoint(text, key) {
@@ -717,12 +728,10 @@ async function consumeGrant({ parsed, repoRoot, store, artifactHooks }) {
   const opened = await openPrivateArtifact(repoRoot, parsed.values["--grant-file"]);
   try {
     await artifactHooks.afterArtifactOpen?.();
-    await assertCurrentArtifact(opened, "artifact_replaced");
     let artifact;
     try { artifact = JSON.parse(await opened.handle.readFile("utf8")); } catch {
       throw coded("grant_artifact_invalid");
     }
-    await assertCurrentArtifact(opened, "artifact_replaced");
     const grant = artifact?.continuation_grant;
     if (artifact?.version !== 1 || !grant || typeof grant !== "object") throw coded("grant_artifact_invalid");
     const lineage = await ensureRepositoryLineage({ repoRoot });
@@ -734,7 +743,6 @@ async function consumeGrant({ parsed, repoRoot, store, artifactHooks }) {
       const checkpointFile = await readPrivateArtifact(repoRoot, path.join(repoRoot, grant.checkpointFile));
       if (sha256(checkpointFile.body) !== grant.checkpointDigest) throw coded("checkpoint_changed");
     }
-    await assertCurrentArtifact(opened, "artifact_replaced");
     const result = store.consumeContinuationGrant({
       eventUid: eventUid("consume", grant.grantId, parsed.values["--brief-ref"]),
       token: grant.token,
@@ -749,9 +757,7 @@ async function consumeGrant({ parsed, repoRoot, store, artifactHooks }) {
       decisionBasisDigest: grant.decisionBasisDigest,
       evidenceDigest: grant.evidenceDigest
     });
-    await artifactHooks.beforeArtifactUnlink?.();
-    await assertCurrentArtifact(opened, "artifact_replaced_after_consume");
-    await unlink(opened.target);
+    await neutralizeConsumedArtifact(opened, artifactHooks);
     return Object.freeze({
       action: "continuation_grant_consumed",
       exitCode: 0,

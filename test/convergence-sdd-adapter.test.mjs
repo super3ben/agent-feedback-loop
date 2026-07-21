@@ -404,6 +404,10 @@ test("grant artifact is private, token-free on stdout, single-use, and parser-co
   assert.deepEqual(replayed, authorized);
   const replayedArtifact = JSON.parse(await readFile(grantFile, "utf8"));
   assert.equal(replayedArtifact.continuation_grant.token, artifact.continuation_grant.token);
+  const duplicateFile = path.join(h.repoRoot, ".superpowers", "sdd", "compat-grant-copy.json");
+  await writeFile(duplicateFile, await readFile(grantFile), { mode: 0o600 });
+  await chmod(duplicateFile, 0o600);
+  const beforeConsume = await stat(grantFile);
   assert.equal(h.store.database.prepare(
     "SELECT COUNT(*) AS count FROM continuation_grants"
   ).get().count, 1);
@@ -416,7 +420,15 @@ test("grant artifact is private, token-free on stdout, single-use, and parser-co
     "consume-receipt", "--receipt-file", grantFile, "--brief-ref", "compat-fix-brief"
   ]);
   assert.equal(consumed.action, "continuation_grant_consumed");
-  await assert.rejects(stat(grantFile), (error) => error.code === "ENOENT");
+  const tombstone = await stat(grantFile);
+  assert.equal(tombstone.dev, beforeConsume.dev);
+  assert.equal(tombstone.ino, beforeConsume.ino);
+  assert.equal(tombstone.size, 0);
+  assert.equal(tombstone.mode & 0o777, 0o000);
+  await assert.rejects(
+    h.consume(duplicateFile, "compat-fix-brief-replay"),
+    (error) => error.code === "grant_consumed"
+  );
 });
 
 test("expired, changed, and checkpoint-stale grants fail closed without deleting evidence", async (t) => {
@@ -498,49 +510,63 @@ test("artifact lifecycle rejects symlink components and inode replacement withou
   await opened.review({ run: "review-opened-replacement" });
   const openedFile = path.join(opened.repoRoot, ".superpowers", "sdd", "opened.json");
   await opened.authorize("local_fix", openedFile);
+  const openedOriginal = await stat(openedFile);
   const parkedFile = `${openedFile}.parked`;
-  await assert.rejects(
-    opened.command(
-      ["consume-grant", "--grant-file", openedFile, "--brief-ref", "opened-replacement"],
-      {
-        async afterArtifactOpen() {
-          await rename(openedFile, parkedFile);
-          await symlink(parkedFile, openedFile);
-        }
+  const openedReplacement = "opened-replacement-must-survive\n";
+  const openedConsumed = await opened.command(
+    ["consume-grant", "--grant-file", openedFile, "--brief-ref", "opened-replacement"],
+    {
+      async afterArtifactOpen() {
+        await rename(openedFile, parkedFile);
+        await writeFile(openedFile, openedReplacement, { mode: 0o600 });
+        await chmod(openedFile, 0o600);
       }
-    ),
-    (error) => error.code === "artifact_replaced"
+    }
   );
-  assert.equal((await lstat(openedFile)).isSymbolicLink(), true);
-  assert.equal((await stat(parkedFile)).isFile(), true);
-  assert.equal(opened.store.database.prepare(
+  assert.equal(openedConsumed.action, "continuation_grant_consumed");
+  assert.equal(await readFile(openedFile, "utf8"), openedReplacement);
+  assert.equal((await stat(openedFile)).mode & 0o777, 0o600);
+  const parked = await stat(parkedFile);
+  assert.equal(parked.dev, openedOriginal.dev);
+  assert.equal(parked.ino, openedOriginal.ino);
+  assert.equal(parked.size, 0);
+  assert.equal(parked.mode & 0o777, 0o000);
+  assert.notEqual(opened.store.database.prepare(
     "SELECT consumed_at FROM continuation_grants"
   ).get().consumed_at, null);
 
-  const consumed = await harness("open-first-failure");
-  t.after(() => consumed.store.close());
-  await consumed.review({ run: "review-unlink-replacement" });
-  const consumedFile = path.join(consumed.repoRoot, ".superpowers", "sdd", "consumed.json");
-  await consumed.authorize("local_fix", consumedFile);
-  const consumedParked = `${consumedFile}.parked`;
-  const replacement = "replacement-must-survive\n";
-  await assert.rejects(
-    consumed.command(
-      ["consume-grant", "--grant-file", consumedFile, "--brief-ref", "unlink-replacement"],
-      {
-        async beforeArtifactUnlink() {
-          await rename(consumedFile, consumedParked);
-          await writeFile(consumedFile, replacement, { mode: 0o600 });
-          await chmod(consumedFile, 0o600);
-        }
+  const ancestor = await harness("open-first-failure");
+  t.after(() => ancestor.store.close());
+  await ancestor.review({ run: "review-ancestor-replacement" });
+  const ancestorDirectory = path.join(ancestor.repoRoot, ".superpowers", "sdd", "ancestor-artifacts");
+  const parkedAncestor = `${ancestorDirectory}.parked`;
+  const replacementDirectory = path.join(ancestor.repoRoot, ".superpowers", "sdd", "replacement-artifacts");
+  await mkdir(ancestorDirectory, { mode: 0o700 });
+  const ancestorFile = path.join(ancestorDirectory, "grant.json");
+  await ancestor.authorize("local_fix", ancestorFile);
+  const ancestorOriginal = await stat(ancestorFile);
+  const ancestorReplacement = "ancestor-replacement-must-survive\n";
+  const ancestorConsumed = await ancestor.command(
+    ["consume-grant", "--grant-file", ancestorFile, "--brief-ref", "ancestor-replacement"],
+    {
+      async afterArtifactOpen() {
+        await rename(ancestorDirectory, parkedAncestor);
+        await mkdir(replacementDirectory, { mode: 0o700 });
+        await writeFile(path.join(replacementDirectory, "grant.json"), ancestorReplacement, { mode: 0o600 });
+        await chmod(path.join(replacementDirectory, "grant.json"), 0o600);
+        await symlink(replacementDirectory, ancestorDirectory);
       }
-    ),
-    (error) => error.code === "artifact_replaced_after_consume"
+    }
   );
-  assert.equal(await readFile(consumedFile, "utf8"), replacement);
-  assert.notEqual(consumed.store.database.prepare(
-    "SELECT consumed_at FROM continuation_grants"
-  ).get().consumed_at, null);
+  assert.equal(ancestorConsumed.action, "continuation_grant_consumed");
+  assert.equal((await lstat(ancestorDirectory)).isSymbolicLink(), true);
+  assert.equal(await readFile(ancestorFile, "utf8"), ancestorReplacement);
+  assert.equal((await stat(ancestorFile)).mode & 0o777, 0o600);
+  const ancestorParked = await stat(path.join(parkedAncestor, "grant.json"));
+  assert.equal(ancestorParked.dev, ancestorOriginal.dev);
+  assert.equal(ancestorParked.ino, ancestorOriginal.ino);
+  assert.equal(ancestorParked.size, 0);
+  assert.equal(ancestorParked.mode & 0o777, 0o000);
 
   const publish = await harness("open-first-failure");
   t.after(() => publish.store.close());
@@ -564,6 +590,27 @@ test("artifact lifecycle rejects symlink components and inode replacement withou
     (await readdir(path.dirname(publishFile))).filter((name) => name.endsWith(".tmp")),
     []
   );
+});
+
+test("artifact neutralization failure is bounded after truthful Store consumption", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  await h.review({ run: "review-neutralization-failure" });
+  const grantFile = path.join(h.repoRoot, ".superpowers", "sdd", "neutralization-failure.json");
+  await h.authorize("local_fix", grantFile);
+
+  await assert.rejects(
+    h.command(
+      ["consume-grant", "--grant-file", grantFile, "--brief-ref", "neutralization-failure"],
+      { beforeArtifactNeutralize() { throw new Error("unbounded-test-error"); } }
+    ),
+    (error) => error.code === "artifact_neutralization_failed"
+  );
+  assert.notEqual(h.store.database.prepare(
+    "SELECT consumed_at FROM continuation_grants"
+  ).get().consumed_at, null);
+  assert.equal((await stat(grantFile)).mode & 0o777, 0o600);
+  assert.match(await readFile(grantFile, "utf8"), /"token"/u);
 });
 
 test("status and lock-status are bounded Store projections and strict parsing rejects extras", async (t) => {
