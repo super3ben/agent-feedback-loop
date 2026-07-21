@@ -1359,4 +1359,51 @@ describe("agent-feedback-loop package", () => {
     assert.match(result.stdout, /agent-feedback-loop/);
     assert.doesNotMatch(result.stdout, /capture[-]stop|reconcile(?:-daemon)?|receipt|reviewer-submit|notifier/i);
   });
+
+  it("guard is an explicit machine-only branch with bounded nonzero exits", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-guard-cli-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    try {
+      const valid = await execFileAsync(BIN, [
+        "guard", "--repo-root", repoRoot, "--home", home,
+        "record-review",
+        "--task-id", "task-4", "--invariant-id", "cli-writer", "--boundary", "cli-boundary",
+        "--review-run-id", "cli-review-1", "--severity", "Important",
+        "--verdict", "changes_required", "--commit", "deadbeef",
+        "--review-ref", "reviews/cli-1.md", "--hypothesis", "one writer is missing",
+        "--new-evidence", "cli-counterexample", "--falsification-test", "prove one writer",
+        "--failure-next-action", "direction_review"
+      ], { env: { ...process.env, HOME: root } });
+      assert.equal(valid.stderr, "");
+      assert.equal(valid.stdout.trim().split("\n").length, 1);
+      const body = JSON.parse(valid.stdout);
+      assert.equal(body.action, "local_fix_allowed");
+      assert.equal("exitCode" in body, false);
+
+      await assert.rejects(
+        execFileAsync(BIN, [
+          "guard", "--repo-root", repoRoot, "--home", home,
+          "record-review", "--unknown", "private-value"
+        ], { env: { ...process.env, HOME: root } }),
+        (error) => {
+          assert.equal(error.code, 2);
+          assert.deepEqual(JSON.parse(String(error.stdout)), { error: "guard_invalid_arguments" });
+          assert.equal(String(error.stderr), "guard_invalid_arguments\n");
+          assert.doesNotMatch(`${error.stdout}${error.stderr}`, /afl-guard-cli|private-value|repo/u);
+          return true;
+        }
+      );
+
+      const source = await readFile(path.join(ROOT, "src", "cli.mjs"), "utf8");
+      const mainBody = source.slice(source.indexOf("export async function main"));
+      assert.ok(mainBody.indexOf('args[0] === "guard"') < mainBody.indexOf("parseArgs(args)"));
+      const hookBody = source.slice(source.indexOf("export async function handlePromptHook"), source.indexOf("export function reviewerTerminalLog"));
+      assert.doesNotMatch(hookBody, /executeGuardCli|runGuardCommand/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

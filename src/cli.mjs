@@ -15,6 +15,7 @@ import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
+import { executeGuardCli } from "./convergence-cli.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
@@ -542,6 +543,13 @@ export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", 
 }
 
 export async function main(args) {
+  if (args[0] === "guard") {
+    const machine = await executeGuardCli(args.slice(1));
+    process.stdout.write(`${JSON.stringify(machine.payload)}\n`);
+    if (machine.stderrCode !== null) process.stderr.write(`${machine.stderrCode}\n`);
+    if (machine.exitCode !== 0) process.exitCode = machine.exitCode;
+    return;
+  }
   if (args[0] === "legacy-export") {
     let explicit;
     try {

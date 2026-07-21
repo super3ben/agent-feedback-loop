@@ -1,0 +1,11 @@
+{
+  "fixture": "architecture-failed",
+  "task_id": "task-4",
+  "invariant_id": "single-writer",
+  "boundary": "state-persistence",
+  "expected": {
+    "action": "human_decision_required",
+    "exit_code": 4,
+    "architecture_fix_count": 1
+  }
+}

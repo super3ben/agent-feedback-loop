@@ -1,0 +1,13 @@
+{
+  "fixture": "closed-regression",
+  "task_id": "task-4",
+  "invariant_id": "single-writer",
+  "boundary": "state-persistence",
+  "expected": {
+    "action": "direction_review_required",
+    "exit_code": 3,
+    "failure_count": 2,
+    "preserve_fingerprint": true,
+    "preserve_fix_generation": true
+  }
+}

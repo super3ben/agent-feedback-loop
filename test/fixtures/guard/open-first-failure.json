@@ -1,0 +1,11 @@
+{
+  "fixture": "open-first-failure",
+  "task_id": "task-4",
+  "invariant_id": "single-writer",
+  "boundary": "state-persistence",
+  "expected": {
+    "action": "local_fix_allowed",
+    "exit_code": 0,
+    "failure_count": 1
+  }
+}
