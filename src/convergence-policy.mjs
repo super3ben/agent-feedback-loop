@@ -347,7 +347,7 @@ function repeatedReviewInvariant(value) {
 
 function acceptanceSatisfiedScopeExpansion(value) {
   return value.acceptanceSatisfied && value.addsArchitecture
-    ? trigger("reflection_required", "acceptance_satisfied_scope_expansion", true)
+    ? trigger("reflection_required", "acceptance_satisfied_scope_expansion")
     : null;
 }
 

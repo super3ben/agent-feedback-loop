@@ -163,6 +163,26 @@ for (const [name, input, decision, reasonCode] of cases) {
   });
 }
 
+test("evidence-free accepted routine expansion preserves requested reflection across adapter seams", () => {
+  const shared = {
+    acceptanceSatisfied: true,
+    addsArchitecture: true,
+    evidenceChanged: false,
+    evidenceQuality: "none"
+  };
+  const workflow = routine(shared);
+  const audit = routine({ ...shared, adapterCapability: "audit_only" });
+
+  assert.deepEqual(
+    evaluateConvergence(workflow),
+    expectedDecision(workflow, "reflection_required", "acceptance_satisfied_scope_expansion")
+  );
+  assert.deepEqual(
+    evaluateConvergence(
+      audit
+    ), expectedDecision(audit, "warn", "acceptance_satisfied_scope_expansion", "reflection_required"));
+});
+
 test("trigger priority is frozen and selects the first matching observable fact", () => {
   const priorityCases = [
     [
