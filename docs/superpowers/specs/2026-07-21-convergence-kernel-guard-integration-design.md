@@ -375,7 +375,9 @@ append-only 事件：event ID、task/loop、generation、event type、reason cod
 
 事件类型首期冻结为：
 
-`contract_projected`、`generation_opened`、`evidence_recorded`、`review_recorded`、`alias_declared`、`distinct_declared`、`breaker_triggered`、`reflection_requested`、`reflection_claimed`、`reflection_completed`、`reflection_failed`、`checkpoint_recorded`、`grant_issued`、`grant_consumed`、`grant_revoked`、`generation_closed`、`task_resolved`、`legacy_imported`、`shadow_compared`。
+`contract_projected`、`generation_opened`、`evidence_recorded`、`review_recorded`、`alias_declared`、`distinct_declared`、`breaker_triggered`、`reflection_requested`、`reflection_claimed`、`reflection_completed`、`reflection_failed`、`checkpoint_recorded`、`grant_issued`、`grant_consumed`、`grant_revoked`、`generation_closed`、`task_resolved`、`legacy_imported`、`shadow_compared`、`guard_cutover`、`guard_rollback`。
+
+其中迁移控制事件绑定到一个确定性的 lineage 级 authority task；它只承载仓库级 provenance 与 authority transition，不伪装成旧 Guard 的业务 task，也不生成虚构的 review/checkpoint/grant 历史。当前 authority 由该 task 的最新 cutover/rollback 事件派生，不新增第五张表。
 
 ### 15.4 `continuation_grants`
 
@@ -404,7 +406,7 @@ append-only 事件：event ID、task/loop、generation、event type、reason cod
 
 ### 阶段 2：Import with provenance
 
-- 事务性导入真实投影和历史摘要；
+- 以一个 repository lineage 为事务聚合边界，一次导入该旧 state 中的全部真实 task 投影和历史摘要；
 - 记录 `legacy_imported`、源 schema/version/digest 与映射版本；
 - 保留原 fingerprint、failure count、fix generation 和 closed lifecycle；
 - 不臆造、回填或改写不存在的 review 事件。
@@ -421,6 +423,7 @@ append-only 事件：event ID、task/loop、generation、event type、reason cod
 
 - 用户对目标仓库显式批准；
 - 切换记录绑定 lineage、最后旧 state digest 与新 policy revision；
+- Store 的 `guard_cutover` 事件是 authority 切换的唯一提交点；文件快照只作为经过 digest 验证的完整回滚材料；
 - SDD adapter 从此只从 AFL SQLite 读取和写入；旧 state 变成只读归档；
 - 禁止长期 dual-write；回滚只能恢复到切换前完整快照，不能把两边事件拼接。
 

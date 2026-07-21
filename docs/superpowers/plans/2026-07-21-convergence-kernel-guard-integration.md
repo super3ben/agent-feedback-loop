@@ -821,12 +821,16 @@ git commit -m "feat: close the convergence breaker and grant loop"
 **Files:**
 - Create: `src/convergence-migration.mjs`
 - Create: `test/convergence-migration.test.mjs`
+- Modify: `src/convergence-store.mjs`
+- Modify: `test/convergence-store.test.mjs`
 - Modify: `src/convergence-cli.mjs`
+- Modify: `src/convergence-sdd-adapter.mjs`
 - Modify: `test/convergence-sdd-adapter.test.mjs`
 
 **Interfaces:**
 - Consumes: old Guard schema v1 JSON and new Kernel/store.
 - Produces: `inspectGuardImport(input)`, `applyGuardImport(plan)`, `compareGuardShadow(input)`, `cutoverGuard(input)`, `rollbackGuardCutover(input)`.
+- Extends the Store with one lineage-aggregate `transactionalGuardImport({ authorityTask, sourceSha256, mappingRevision, tasks })` and bounded `recordGuardShadowComparison`, `recordGuardCutover`, `recordGuardRollback`, and `getGuardAuthority` transitions.
 - Produces explicit commands: `guard import --dry-run|--apply`, `guard shadow`, `guard cutover --apply`, `guard rollback --apply`.
 
 - [ ] **Step 1: Write failing migration safety tests**
@@ -842,12 +846,13 @@ test("dry-run reports an exact bounded plan and performs no writes", async () =>
 });
 
 test("apply preserves real history and never invents review events", async () => {
-  const h = migrationHarness("closed-regression.json");
+  const h = migrationHarness("multi-task-regression.json");
   const imported = await applyGuardImport(await inspectGuardImport(h.input()));
-  assert.equal(imported.loop.fingerprint, h.fixture.fingerprint);
-  assert.equal(imported.loop.failureCount, h.fixture.failure_count);
+  assert.equal(imported.taskCount, 2);
+  assert.equal(imported.loopCount, h.fixture.expected_loop_count);
   assert.equal(imported.events.filter((event) => event.eventType === "review_recorded").length,
     h.fixture.real_review_events.length);
+  assert.equal(imported.events.filter((event) => event.eventType === "legacy_imported").length, 1);
 });
 
 test("cutover requires matching shadow parity and blocks long-term dual write", async () => {
@@ -860,13 +865,13 @@ test("cutover requires matching shadow parity and blocks long-term dual write", 
 });
 ```
 
-Add corrupt schema, symlink, owner/mode, source digest change, mismatch, idempotent import, already-consumed architecture grant, and rollback snapshot tests.
+Add corrupt schema, symlink, owner/mode, source digest change, mismatch, idempotent multi-task import, already-consumed architecture grant, complete rollback snapshot, failure injection, adapter authority routing, and unchanged-real-state tests.
 
 - [ ] **Step 2: Run migration tests and verify RED**
 
 Run: `node --test test/convergence-migration.test.mjs`
 
-Expected: FAIL with missing migration module.
+Expected: FAIL with missing migration module and missing repository-aggregate Store transitions.
 
 - [ ] **Step 3: Implement bounded import and provenance**
 
@@ -880,23 +885,26 @@ export async function inspectGuardImport({ repoRoot, stateFile, store }) {
 }
 
 export function applyGuardImport({ plan, store }) {
-  return store.transactionalGuardImport({ expectedSourceSha256: plan.sourceSha256,
-    mappingRevision: plan.mappingRevision, mappings: plan.mappings });
+  return store.transactionalGuardImport({ authorityTask: plan.authorityTask,
+    sourceSha256: plan.sourceSha256, mappingRevision: plan.mappingRevision,
+    tasks: plan.taskMappings });
 }
 ```
 
-Only real legacy events become review/checkpoint/grant events. Snapshot-only values become one `legacy_imported` provenance event plus the current projection; they are not expanded into fictional history. `compareGuardShadow` is pure and writes only a bounded parity event. `cutoverGuard` verifies source digest, no pending consumed atomic action, declared parity set, and explicit `--apply` before setting per-lineage authority.
+The Store validates one lineage/source SHA/mapping revision aggregate and commits every task group plus exactly one `legacy_imported` event atomically. Only real legacy events become review/checkpoint/grant events. Snapshot-only values become the current projection plus that single provenance event; they are not expanded into fictional history.
+
+Use the existing four tables: a deterministic lineage-level authority task owns `legacy_imported`, `shadow_compared`, `guard_cutover`, and `guard_rollback` events. `compareGuardShadow` computes only the declared decision/action/generation/eligibility parity set and records bounded digests through the Store. `cutoverGuard` holds a narrow authority-transition lock, verifies source digest, complete matching parity, no live legacy receipt or AFL grant/Probe, creates and fsyncs an owner-only complete snapshot, rechecks the source, and appends `guard_cutover` last as the commit point. Rollback validates and atomically restores that exact snapshot before appending `guard_rollback` last. The SDD adapter derives authority from the Store and never dual-writes.
 
 - [ ] **Step 4: Run migration and SDD parity tests**
 
-Run: `node --test test/convergence-migration.test.mjs test/convergence-sdd-adapter.test.mjs`
+Run: `node --test test/convergence-store.test.mjs test/convergence-migration.test.mjs test/convergence-sdd-adapter.test.mjs`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit Task 7**
 
 ```bash
-git add src/convergence-migration.mjs src/convergence-cli.mjs test/convergence-migration.test.mjs test/convergence-sdd-adapter.test.mjs
+git add src/convergence-migration.mjs src/convergence-store.mjs src/convergence-cli.mjs src/convergence-sdd-adapter.mjs test/convergence-migration.test.mjs test/convergence-store.test.mjs test/convergence-sdd-adapter.test.mjs
 git commit -m "feat: migrate Guard authority without dual writes"
 ```
 
