@@ -14,6 +14,7 @@ import {
   authorizeContinuation,
   evaluateAndAdvance
 } from "./convergence-controller.mjs";
+import { readGuardAdapterAuthority } from "./convergence-migration.mjs";
 
 const POLICY_REVISION = "convergence-policy-v2";
 const POLICY_REVISION_DIGEST = sha256(POLICY_REVISION);
@@ -380,13 +381,17 @@ function loopStatus(store, loop) {
   });
 }
 
-async function status({ parsed, repoRoot, store }) {
+async function status({ parsed, repoRoot, store, lineage, authority }) {
   const taskId = normalizeId(parsed.values["--task-id"]);
-  const { task } = await ensureTask({ store, repoRoot, taskId });
+  const task = authority.authority === "afl_sqlite"
+    ? (await ensureTask({ store, repoRoot, taskId })).task
+    : Object.freeze({ taskUid: deriveTaskUid({
+      lineageId: lineage.lineageId, adapterKind: "sdd", nativeTaskId: taskId
+    }) });
   const rows = store.database.prepare(`SELECT fingerprint FROM convergence_loops
     WHERE task_uid=? ORDER BY created_at, fingerprint`).all(task.taskUid);
   return Object.freeze({
-    authority: "afl_sqlite",
+    authority: authority.authority,
     task_id: task.taskUid,
     loops: Object.freeze(rows.map((row) => loopStatus(
       store,
@@ -396,11 +401,11 @@ async function status({ parsed, repoRoot, store }) {
   });
 }
 
-function lockStatus(store) {
+function lockStatus(store, authority) {
   const row = store.database.prepare("PRAGMA journal_mode").get();
   return Object.freeze({
-    authority: "afl_sqlite",
-    locked: false,
+    authority: authority.authority,
+    locked: authority.authority === "transition_locked",
     journal_mode: String(row?.journal_mode ?? "unknown").toLowerCase(),
     exitCode: 0
   });
@@ -846,17 +851,29 @@ export async function runGuardCommand({
   store,
   now = () => new Date(),
   launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
-  artifactHooks: rawArtifactHooks
+  artifactHooks: rawArtifactHooks,
+  authorityResolver = readGuardAdapterAuthority
 }) {
   if (typeof repoRoot !== "string" || !store || typeof now !== "function"
-      || typeof launchProbe !== "function") throw coded("guard_invalid_arguments");
+      || typeof launchProbe !== "function" || typeof authorityResolver !== "function") {
+    throw coded("guard_invalid_arguments");
+  }
   const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
+  const lineage = await ensureRepositoryLineage({ repoRoot });
+  const authority = await authorityResolver({ repoRoot, store, lineageId: lineage.lineageId });
+  if (!authority || !["afl_sqlite", "legacy_guard", "transition_locked"].includes(authority.authority)) {
+    throw coded("guard_authority_invalid");
+  }
+  if (parsed.command === "status") {
+    return status({ parsed, repoRoot, store, lineage, authority });
+  }
+  if (parsed.command === "lock-status") return lockStatus(store, authority);
+  if (authority.authority === "transition_locked") throw coded("guard_authority_locked");
+  if (authority.authority !== "afl_sqlite") throw coded("legacy_guard_authoritative");
   if (parsed.command === "record-review") {
     return recordReview({ parsed, repoRoot, store, now, launchProbe });
   }
-  if (parsed.command === "status") return status({ parsed, repoRoot, store });
-  if (parsed.command === "lock-status") return lockStatus(store);
   if (parsed.command === "add-alias") return addAlias({ parsed, store });
   if (parsed.command === "declare-distinct") return declareDistinct({ parsed, repoRoot, store });
   if (parsed.command === "checkpoint") return checkpoint({ parsed, repoRoot, store });

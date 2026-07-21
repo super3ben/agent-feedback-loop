@@ -44,7 +44,7 @@ const EVENT_TYPES = new Set([
   "alias_declared", "distinct_declared", "breaker_triggered", "reflection_requested",
   "reflection_claimed", "reflection_completed", "reflection_failed", "checkpoint_recorded",
   "grant_issued", "grant_consumed", "grant_revoked", "generation_closed",
-  "task_resolved", "legacy_imported", "shadow_compared"
+  "task_resolved", "legacy_imported", "shadow_compared", "guard_cutover", "guard_rollback"
 ]);
 const EVENT_FACT_FIELDS = new Map([
   ["contract_projected", new Set()],
@@ -64,8 +64,12 @@ const EVENT_FACT_FIELDS = new Map([
   ["grant_revoked", new Set(["generation", "purpose"])],
   ["generation_closed", new Set()],
   ["task_resolved", new Set()],
-  ["legacy_imported", new Set(["eventCount", "grantCount", "loopCount", "mappingVersion"])],
-  ["shadow_compared", new Set()]
+  ["legacy_imported", new Set([
+    "consumedGrantCount", "eventCount", "grantCount", "loopCount", "mappingVersion", "taskCount"
+  ])],
+  ["shadow_compared", new Set(["matched", "paritySetDigest"])],
+  ["guard_cutover", new Set(["mappingRevision", "paritySetDigest"])],
+  ["guard_rollback", new Set(["cutoverEventUid"])]
 ]);
 
 function coded(code) {
@@ -1205,156 +1209,177 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
 
     transactionalGuardImport(input) {
       const value = exactObject(input, new Set([
-        "eventUid", "sourceDigest", "mappingVersion", "task", "loops", "grants", "mappedEvents"
+        "eventUid", "authorityTask", "sourceSha256", "mappingRevision", "tasks"
       ]), "guard_import");
       const eventUid = identifier(value.eventUid, "event_uid");
-      const sourceDigest = digest(value.sourceDigest, "source_digest");
-      const mappingVersion = identifier(value.mappingVersion, "mapping_version");
-      const task = validateTask({
-        ...exactObject(value.task, new Set([...TASK_FIELDS].filter((field) => field !== "eventUid")), "import_task"),
-        eventUid
+      const sourceSha256 = digest(value.sourceSha256, "source_sha256");
+      const mappingRevision = identifier(value.mappingRevision, "mapping_revision");
+      const taskFields = new Set([...TASK_FIELDS].filter((field) => field !== "eventUid"));
+      const authorityTask = validateTask({
+        ...exactObject(value.authorityTask, taskFields, "authority_task"), eventUid
       });
-      if (!Array.isArray(value.loops) || value.loops.length > 128) throw coded("invalid_import_loops");
-      if (!Array.isArray(value.grants) || value.grants.length > 128) throw coded("invalid_import_grants");
-      if (!Array.isArray(value.mappedEvents) || value.mappedEvents.length > 512) {
-        throw coded("invalid_import_events");
-      }
+      if (!Array.isArray(value.tasks) || value.tasks.length > 128) throw coded("invalid_import_tasks");
       const loopFields = new Set([
         "fingerprint", "boundaryId", "canonicalInvariantId", "status", "failureCount",
         "fixGeneration", "decisionBasisDigest", "currentDecision", "directionGeneration", "aliases"
       ]);
-      const loops = value.loops.map((raw) => {
-        const loop = exactObject(raw, loopFields, "import_loop");
-        if (!Array.isArray(loop.aliases) || loop.aliases.length > 128) throw coded("invalid_alias_projection");
-        const aliases = loop.aliases.map((alias) => identifier(alias, "alias_invariant_id"));
-        return Object.freeze({
-          fingerprint: identifier(loop.fingerprint, "fingerprint"),
-          boundaryId: identifier(loop.boundaryId, "boundary_id"),
-          canonicalInvariantId: identifier(loop.canonicalInvariantId, "canonical_invariant_id"),
-          status: enumValue(loop.status, LOOP_STATUSES, "loop_status"),
-          failureCount: integer(loop.failureCount, "failure_count"),
-          fixGeneration: integer(loop.fixGeneration, "fix_generation"),
-          decisionBasisDigest: digest(loop.decisionBasisDigest, "decision_basis_digest"),
-          currentDecision: enumValue(loop.currentDecision, DECISION_SET, "decision"),
-          directionGeneration: integer(loop.directionGeneration, "direction_generation"),
-          aliases: Object.freeze([...new Set(aliases)].sort())
-        });
-      });
-      const identityKeys = new Set();
-      const fingerprints = new Set();
-      for (const loop of loops) {
-        const key = `${loop.boundaryId}\0${loop.canonicalInvariantId}`;
-        if (identityKeys.has(key) || fingerprints.has(loop.fingerprint)) throw coded("loop_identity_collision");
-        identityKeys.add(key);
-        fingerprints.add(loop.fingerprint);
-      }
-      const mappedEventFields = new Set([
+      const eventFields = new Set([
         "eventUid", "fingerprint", "generation", "eventType", "reasonCode", "decision",
         "action", "evidenceDigest", "sourceDigest", "resultDigest", "facts"
       ]);
-      const mappedEvents = value.mappedEvents.map((raw) => {
-        const event = exactObject(raw, mappedEventFields, "import_event");
-        const eventType = enumValue(event.eventType, EVENT_TYPES, "event_type");
-        const facts = exactObject(
-          event.facts ?? {},
-          EVENT_FACT_FIELDS.get(eventType),
-          "event_facts"
-        );
-        for (const factValue of Object.values(facts)) {
-          if (!(typeof factValue === "string" || Number.isSafeInteger(factValue))) {
-            throw coded("invalid_event_fact");
-          }
-          if (typeof factValue === "string" && factValue.length > 256) throw coded("invalid_event_fact");
-        }
-        return Object.freeze({
-          eventUid: identifier(event.eventUid, "event_uid"),
-          taskUid: task.taskUid,
-          fingerprint: event.fingerprint == null ? null : identifier(event.fingerprint, "fingerprint"),
-          generation: event.generation == null ? null : integer(event.generation, "generation"),
-          eventType,
-          reasonCode: optionalString(event.reasonCode, "reason_code"),
-          decision: event.decision == null ? null : enumValue(event.decision, DECISION_SET, "decision"),
-          action: optionalString(event.action, "action"),
-          evidenceDigest: optionalDigest(event.evidenceDigest, "evidence_digest"),
-          sourceDigest: optionalDigest(event.sourceDigest, "source_digest"),
-          resultDigest: optionalDigest(event.resultDigest, "result_digest"),
-          facts
-        });
-      });
       const grantFields = new Set([
         "grantId", "tokenHash", "fingerprint", "currentGeneration", "nextGeneration",
         "purpose", "scopeDigest", "contractRevision", "policyRevision", "decisionBasisDigest",
         "evidenceDigest", "state", "issuedAt", "expiresAt", "consumedAt", "revokedAt"
       ]);
-      const grants = value.grants.map((raw) => {
-        const grant = exactObject(raw, grantFields, "import_grant");
-        return Object.freeze({
-          grantId: identifier(grant.grantId, "grant_id"),
-          tokenHash: digest(grant.tokenHash, "token_hash"),
-          fingerprint: identifier(grant.fingerprint, "fingerprint"),
-          currentGeneration: integer(grant.currentGeneration, "current_generation"),
-          nextGeneration: integer(grant.nextGeneration, "next_generation", 1),
-          purpose: enumValue(grant.purpose, GRANT_PURPOSE_SET, "purpose"),
-          scopeDigest: digest(grant.scopeDigest, "scope_digest"),
-          contractRevision: digest(grant.contractRevision, "contract_revision"),
-          policyRevision: digest(grant.policyRevision, "policy_revision"),
-          decisionBasisDigest: digest(grant.decisionBasisDigest, "decision_basis_digest"),
-          evidenceDigest: digest(grant.evidenceDigest, "evidence_digest"),
-          state: enumValue(grant.state, new Set(["active", "consumed", "revoked"]), "grant_state"),
-          issuedAt: isoTimestamp(grant.issuedAt, "issued_at"),
-          expiresAt: isoTimestamp(grant.expiresAt, "expires_at"),
-          consumedAt: grant.consumedAt == null ? null : isoTimestamp(grant.consumedAt, "consumed_at"),
-          revokedAt: grant.revokedAt == null ? null : isoTimestamp(grant.revokedAt, "revoked_at")
+      const seenTaskUids = new Set([authorityTask.taskUid]);
+      const seenFingerprints = new Set();
+      const seenEventUids = new Set([eventUid]);
+      const seenGrantIds = new Set();
+      const seenTokenHashes = new Set();
+      const groups = value.tasks.map((rawGroup) => {
+        const group = exactObject(rawGroup, new Set(["task", "loops", "grants", "mappedEvents"]), "import_group");
+        const task = validateTask({ ...exactObject(group.task, taskFields, "import_task"), eventUid });
+        if (task.lineageDigest !== authorityTask.lineageDigest) throw coded("import_lineage_mismatch");
+        if (seenTaskUids.has(task.taskUid)) throw coded("task_identity_collision");
+        seenTaskUids.add(task.taskUid);
+        if (!Array.isArray(group.loops) || group.loops.length > 128) throw coded("invalid_import_loops");
+        if (!Array.isArray(group.grants) || group.grants.length > 128) throw coded("invalid_import_grants");
+        if (!Array.isArray(group.mappedEvents) || group.mappedEvents.length > 512) {
+          throw coded("invalid_import_events");
+        }
+        const identities = new Set();
+        const loops = group.loops.map((raw) => {
+          const loop = exactObject(raw, loopFields, "import_loop");
+          if (!Array.isArray(loop.aliases) || loop.aliases.length > 128) throw coded("invalid_alias_projection");
+          const aliases = loop.aliases.map((alias) => identifier(alias, "alias_invariant_id"));
+          const mapped = Object.freeze({
+            fingerprint: identifier(loop.fingerprint, "fingerprint"),
+            boundaryId: identifier(loop.boundaryId, "boundary_id"),
+            canonicalInvariantId: identifier(loop.canonicalInvariantId, "canonical_invariant_id"),
+            status: enumValue(loop.status, LOOP_STATUSES, "loop_status"),
+            failureCount: integer(loop.failureCount, "failure_count"),
+            fixGeneration: integer(loop.fixGeneration, "fix_generation"),
+            decisionBasisDigest: digest(loop.decisionBasisDigest, "decision_basis_digest"),
+            currentDecision: enumValue(loop.currentDecision, DECISION_SET, "decision"),
+            directionGeneration: integer(loop.directionGeneration, "direction_generation"),
+            aliases: Object.freeze([...new Set(aliases)].sort())
+          });
+          const identity = `${mapped.boundaryId}\0${mapped.canonicalInvariantId}`;
+          if (identities.has(identity) || seenFingerprints.has(mapped.fingerprint)) {
+            throw coded("loop_identity_collision");
+          }
+          identities.add(identity);
+          seenFingerprints.add(mapped.fingerprint);
+          return mapped;
         });
+        const groupFingerprints = new Set(loops.map((loop) => loop.fingerprint));
+        const mappedEvents = group.mappedEvents.map((raw) => {
+          const event = exactObject(raw, eventFields, "import_event");
+          const eventType = enumValue(event.eventType, EVENT_TYPES, "event_type");
+          if (["legacy_imported", "shadow_compared", "guard_cutover", "guard_rollback"].includes(eventType)) {
+            throw coded("invalid_import_event_type");
+          }
+          const facts = exactObject(event.facts ?? {}, EVENT_FACT_FIELDS.get(eventType), "event_facts");
+          for (const factValue of Object.values(facts)) {
+            if (!(typeof factValue === "string" || Number.isSafeInteger(factValue))
+                || (typeof factValue === "string" && factValue.length > 256)) {
+              throw coded("invalid_event_fact");
+            }
+          }
+          const fingerprint = event.fingerprint == null ? null : identifier(event.fingerprint, "fingerprint");
+          if (fingerprint !== null && !groupFingerprints.has(fingerprint)) throw coded("import_reference_mismatch");
+          const mapped = Object.freeze({
+            eventUid: identifier(event.eventUid, "event_uid"), taskUid: task.taskUid, fingerprint,
+            generation: event.generation == null ? null : integer(event.generation, "generation"),
+            eventType,
+            reasonCode: optionalString(event.reasonCode, "reason_code"),
+            decision: event.decision == null ? null : enumValue(event.decision, DECISION_SET, "decision"),
+            action: optionalString(event.action, "action"),
+            evidenceDigest: optionalDigest(event.evidenceDigest, "evidence_digest"),
+            sourceDigest: optionalDigest(event.sourceDigest, "source_digest"),
+            resultDigest: optionalDigest(event.resultDigest, "result_digest"), facts
+          });
+          if (seenEventUids.has(mapped.eventUid)) throw coded("event_identity_collision");
+          seenEventUids.add(mapped.eventUid);
+          return mapped;
+        });
+        const grants = group.grants.map((raw) => {
+          const grant = exactObject(raw, grantFields, "import_grant");
+          const mapped = Object.freeze({
+            grantId: identifier(grant.grantId, "grant_id"),
+            tokenHash: digest(grant.tokenHash, "token_hash"),
+            fingerprint: identifier(grant.fingerprint, "fingerprint"),
+            currentGeneration: integer(grant.currentGeneration, "current_generation"),
+            nextGeneration: integer(grant.nextGeneration, "next_generation", 1),
+            purpose: enumValue(grant.purpose, GRANT_PURPOSE_SET, "purpose"),
+            scopeDigest: digest(grant.scopeDigest, "scope_digest"),
+            contractRevision: digest(grant.contractRevision, "contract_revision"),
+            policyRevision: digest(grant.policyRevision, "policy_revision"),
+            decisionBasisDigest: digest(grant.decisionBasisDigest, "decision_basis_digest"),
+            evidenceDigest: digest(grant.evidenceDigest, "evidence_digest"),
+            state: enumValue(grant.state, new Set(["active", "consumed", "revoked"]), "grant_state"),
+            issuedAt: isoTimestamp(grant.issuedAt, "issued_at"),
+            expiresAt: isoTimestamp(grant.expiresAt, "expires_at"),
+            consumedAt: grant.consumedAt == null ? null : isoTimestamp(grant.consumedAt, "consumed_at"),
+            revokedAt: grant.revokedAt == null ? null : isoTimestamp(grant.revokedAt, "revoked_at")
+          });
+          if (!groupFingerprints.has(mapped.fingerprint)) throw coded("import_reference_mismatch");
+          if (seenGrantIds.has(mapped.grantId) || seenTokenHashes.has(mapped.tokenHash)) {
+            throw coded("grant_identity_collision");
+          }
+          seenGrantIds.add(mapped.grantId);
+          seenTokenHashes.add(mapped.tokenHash);
+          return mapped;
+        });
+        const active = new Set();
+        for (const grant of grants.filter((candidate) => candidate.state === "active")) {
+          if (active.has(grant.fingerprint)) throw coded("active_grant_collision");
+          active.add(grant.fingerprint);
+        }
+        return Object.freeze({ task, loops, grants, mappedEvents });
       });
-      const activeGrantFingerprints = new Set();
-      for (const grant of grants) {
-        if (grant.state !== "active") continue;
-        if (activeGrantFingerprints.has(grant.fingerprint)) throw coded("active_grant_collision");
-        activeGrantFingerprints.add(grant.fingerprint);
-      }
+      const counts = Object.freeze({
+        taskCount: groups.length,
+        loopCount: groups.reduce((sum, group) => sum + group.loops.length, 0),
+        grantCount: groups.reduce((sum, group) => sum + group.grants.length, 0),
+        consumedGrantCount: groups.reduce((sum, group) => sum
+          + group.grants.filter((grant) => grant.state === "consumed").length, 0),
+        eventCount: groups.reduce((sum, group) => sum + group.mappedEvents.length, 0)
+      });
       const importContentDigest = sha256(canonicalJson({
-        eventUid,
-        mappingVersion,
-        task,
-        loops,
-        grants,
-        mappedEvents
+        eventUid, authorityTask, sourceSha256, mappingRevision, groups
       }));
+      const result = () => Object.freeze({
+        imported: true,
+        authorityTaskUid: authorityTask.taskUid,
+        sourceSha256,
+        mappingRevision,
+        ...counts
+      });
       return transaction(() => {
         const imported = database.prepare(`SELECT * FROM convergence_events
-          WHERE event_type='legacy_imported' AND source_digest=?`).get(sourceDigest);
+          WHERE task_uid=? AND event_type='legacy_imported' AND source_digest=?`).get(
+            authorityTask.taskUid, sourceSha256
+          );
         if (imported) {
-          if (imported.result_digest !== importContentDigest) throw coded("import_collision");
           let facts;
           try { facts = JSON.parse(imported.facts_json); } catch { throw coded("import_collision"); }
-          return Object.freeze({
-            imported: true,
-            sourceDigest,
-            taskUid: imported.task_uid,
-            loopCount: Number(facts.loopCount),
-            grantCount: Number(facts.grantCount),
-            eventCount: Number(facts.eventCount)
-          });
+          if (imported.result_digest !== importContentDigest
+              || facts.mappingVersion !== mappingRevision) throw coded("import_collision");
+          return result();
         }
-
         appendEvent({
-          eventUid, taskUid: task.taskUid, eventType: "legacy_imported", sourceDigest,
-          resultDigest: importContentDigest,
-          facts: {
-            eventCount: mappedEvents.length,
-            grantCount: grants.length,
-            loopCount: loops.length,
-            mappingVersion
-          }
+          eventUid, taskUid: authorityTask.taskUid, eventType: "legacy_imported",
+          sourceDigest: sourceSha256, resultDigest: importContentDigest,
+          facts: { ...counts, mappingVersion: mappingRevision }
         });
-        for (const event of mappedEvents) appendEvent(event);
+        for (const group of groups) for (const event of group.mappedEvents) appendEvent(event);
         const currentTime = timestamp(now);
-        const existingTask = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?")
-          .get(task.taskUid);
-        if (existingTask && !sameTaskIdentity(existingTask, task)) throw coded("task_identity_collision");
-        if (!existingTask) {
-          database.prepare(`INSERT INTO convergence_tasks
+        for (const task of [authorityTask, ...groups.map((group) => group.task)]) {
+          const existing = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?").get(task.taskUid);
+          if (existing && !sameTaskIdentity(existing, task)) throw coded("task_identity_collision");
+          if (!existing) database.prepare(`INSERT INTO convergence_tasks
             (task_uid, lineage_digest, adapter_kind, adapter_capability, native_task_digest,
              contract_source_kind, contract_source_ref_digest, contract_revision, policy_revision,
              importance, importance_authority, state, created_at, updated_at)
@@ -1365,43 +1390,216 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
             task.importanceAuthority, currentTime, currentTime
           );
         }
-        for (const loop of loops) {
-          database.prepare(`INSERT INTO convergence_loops
+        for (const group of groups) {
+          for (const loop of group.loops) database.prepare(`INSERT INTO convergence_loops
             (fingerprint, task_uid, boundary_id, canonical_invariant_id, status, failure_count,
              fix_generation, decision_basis_digest, current_decision, direction_generation,
              aliases_json, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-            loop.fingerprint, task.taskUid, loop.boundaryId, loop.canonicalInvariantId,
+            loop.fingerprint, group.task.taskUid, loop.boundaryId, loop.canonicalInvariantId,
             loop.status, loop.failureCount, loop.fixGeneration, loop.decisionBasisDigest,
             loop.currentDecision, loop.directionGeneration, canonicalJson(loop.aliases),
             currentTime, currentTime
           );
-        }
-        for (const grant of grants) {
-          database.prepare(`INSERT INTO continuation_grants
-            (grant_id, token_hash, task_uid, fingerprint, current_generation, next_generation,
-             purpose, scope_digest, contract_revision, policy_revision, decision_basis_digest,
-             evidence_digest, state, issued_at, expires_at, consumed_at, revoked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-            grant.grantId, grant.tokenHash, task.taskUid, grant.fingerprint,
-            grant.currentGeneration, grant.nextGeneration, grant.purpose, grant.scopeDigest,
-            grant.contractRevision, grant.policyRevision, grant.decisionBasisDigest,
-            grant.evidenceDigest, grant.state, grant.issuedAt, grant.expiresAt,
-            grant.consumedAt, grant.revokedAt
-          );
-          if (grant.state === "active") {
-            database.prepare(`UPDATE convergence_loops SET active_grant_id=?, status='grant_ready'
-              WHERE fingerprint=?`).run(grant.grantId, grant.fingerprint);
+          for (const grant of group.grants) {
+            database.prepare(`INSERT INTO continuation_grants
+              (grant_id, token_hash, task_uid, fingerprint, current_generation, next_generation,
+               purpose, scope_digest, contract_revision, policy_revision, decision_basis_digest,
+               evidence_digest, state, issued_at, expires_at, consumed_at, revoked_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+              grant.grantId, grant.tokenHash, group.task.taskUid, grant.fingerprint,
+              grant.currentGeneration, grant.nextGeneration, grant.purpose, grant.scopeDigest,
+              grant.contractRevision, grant.policyRevision, grant.decisionBasisDigest,
+              grant.evidenceDigest, grant.state, grant.issuedAt, grant.expiresAt,
+              grant.consumedAt, grant.revokedAt
+            );
+            if (grant.state === "active") database.prepare(`UPDATE convergence_loops
+              SET active_grant_id=?, status='grant_ready' WHERE fingerprint=?`).run(
+              grant.grantId, grant.fingerprint
+            );
           }
         }
-        return Object.freeze({
-          imported: true,
-          sourceDigest,
-          taskUid: task.taskUid,
-          loopCount: loops.length,
-          grantCount: grants.length,
-          eventCount: mappedEvents.length
+        return result();
+      });
+    },
+
+    recordGuardShadowComparison(input) {
+      const value = exactObject(input, new Set([
+        "eventUid", "authorityTaskUid", "sourceSha256", "mappingRevision", "paritySetDigest",
+        "inputDigest", "legacyResultDigest", "kernelResultDigest", "matched"
+      ]), "guard_shadow");
+      const eventUid = identifier(value.eventUid, "event_uid");
+      const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
+      const sourceSha256 = digest(value.sourceSha256, "source_sha256");
+      const mappingRevision = identifier(value.mappingRevision, "mapping_revision");
+      const paritySetDigest = digest(value.paritySetDigest, "parity_set_digest");
+      const inputDigest = digest(value.inputDigest, "input_digest");
+      const legacyResultDigest = digest(value.legacyResultDigest, "legacy_result_digest");
+      const kernelResultDigest = digest(value.kernelResultDigest, "kernel_result_digest");
+      const matched = boolean(value.matched, "matched");
+      return transaction(() => {
+        const authority = requireTask(database, authorityTaskUid);
+        const imported = database.prepare(`SELECT facts_json FROM convergence_events
+          WHERE task_uid=? AND event_type='legacy_imported' AND source_digest=?
+          ORDER BY id DESC LIMIT 1`).get(authorityTaskUid, sourceSha256);
+        if (!imported || JSON.parse(imported.facts_json).mappingVersion !== mappingRevision) {
+          throw coded("guard_import_not_found");
+        }
+        appendEvent({
+          eventUid, taskUid: authorityTaskUid, eventType: "shadow_compared",
+          evidenceDigest: inputDigest, sourceDigest: legacyResultDigest,
+          resultDigest: kernelResultDigest, action: matched ? "matched" : "mismatch",
+          facts: { matched: matched ? 1 : 0, paritySetDigest }
         });
+        const rows = database.prepare(`SELECT facts_json FROM convergence_events
+          WHERE task_uid=? AND event_type='shadow_compared' ORDER BY id`).all(authorityTaskUid)
+          .map((row) => JSON.parse(row.facts_json))
+          .filter((facts) => facts.paritySetDigest === paritySetDigest);
+        return Object.freeze({
+          matched,
+          paritySetDigest,
+          comparisonCount: rows.length,
+          mismatchCount: rows.filter((facts) => Number(facts.matched) !== 1).length,
+          lineageDigest: authority.lineage_digest
+        });
+      });
+    },
+
+    recordGuardCutover(input) {
+      const value = exactObject(input, new Set([
+        "eventUid", "authorityTaskUid", "sourceSha256", "mappingRevision", "paritySetDigest",
+        "snapshotDigest", "decisionRefDigest"
+      ]), "guard_cutover");
+      const eventUid = identifier(value.eventUid, "event_uid");
+      const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
+      const sourceSha256 = digest(value.sourceSha256, "source_sha256");
+      const mappingRevision = identifier(value.mappingRevision, "mapping_revision");
+      const paritySetDigest = digest(value.paritySetDigest, "parity_set_digest");
+      const snapshotDigest = digest(value.snapshotDigest, "snapshot_digest");
+      const decisionRefDigest = digest(value.decisionRefDigest, "decision_ref_digest");
+      if (snapshotDigest !== sourceSha256) throw coded("cutover_snapshot_mismatch");
+      return transaction(() => {
+        const eventInput = {
+          eventUid, taskUid: authorityTaskUid, eventType: "guard_cutover",
+          action: "afl_sqlite", evidenceDigest: decisionRefDigest,
+          sourceDigest: sourceSha256, resultDigest: snapshotDigest,
+          facts: { mappingRevision, paritySetDigest }
+        };
+        const prior = database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?").get(eventUid);
+        const authority = requireTask(database, authorityTaskUid);
+        const imported = database.prepare(`SELECT facts_json FROM convergence_events
+          WHERE task_uid=? AND event_type='legacy_imported' AND source_digest=?
+          ORDER BY id DESC LIMIT 1`).get(authorityTaskUid, sourceSha256);
+        if (!imported || JSON.parse(imported.facts_json).mappingVersion !== mappingRevision) {
+          throw coded("guard_import_not_found");
+        }
+        const latest = database.prepare(`SELECT event_uid, event_type FROM convergence_events
+          WHERE task_uid=? AND event_type IN ('guard_cutover','guard_rollback')
+          ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
+        if (prior) {
+          appendEvent(eventInput);
+          if (latest?.event_uid !== eventUid || latest.event_type !== "guard_cutover") {
+            throw coded("guard_cutover_superseded");
+          }
+          return Object.freeze({ authority: "afl_sqlite", cutoverEventUid: eventUid, snapshotDigest });
+        }
+        if (latest?.event_type === "guard_cutover") throw coded("guard_already_cut_over");
+        const comparisons = database.prepare(`SELECT facts_json FROM convergence_events
+          WHERE task_uid=? AND event_type='shadow_compared' ORDER BY id`).all(authorityTaskUid)
+          .map((row) => JSON.parse(row.facts_json))
+          .filter((facts) => facts.paritySetDigest === paritySetDigest);
+        if (comparisons.length < 4 || comparisons.some((facts) => Number(facts.matched) !== 1)) {
+          throw coded("shadow_parity_incomplete");
+        }
+        const liveGrant = database.prepare(`SELECT 1 FROM continuation_grants g
+          JOIN convergence_tasks t ON t.task_uid=g.task_uid
+          WHERE t.lineage_digest=? AND g.state='active' LIMIT 1`).get(authority.lineage_digest);
+        const liveProbe = database.prepare(`SELECT 1 FROM convergence_loops l
+          JOIN convergence_tasks t ON t.task_uid=l.task_uid
+          WHERE t.lineage_digest=? AND l.probe_state IN ('pending','retryable','running') LIMIT 1`)
+          .get(authority.lineage_digest);
+        if (liveGrant || liveProbe) throw coded("guard_live_action");
+        appendEvent(eventInput);
+        return Object.freeze({ authority: "afl_sqlite", cutoverEventUid: eventUid, snapshotDigest });
+      });
+    },
+
+    recordGuardRollback(input) {
+      const value = exactObject(input, new Set([
+        "eventUid", "authorityTaskUid", "cutoverEventUid", "snapshotDigest", "decisionRefDigest"
+      ]), "guard_rollback");
+      const eventUid = identifier(value.eventUid, "event_uid");
+      const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
+      const cutoverEventUid = identifier(value.cutoverEventUid, "cutover_event_uid");
+      const snapshotDigest = digest(value.snapshotDigest, "snapshot_digest");
+      const decisionRefDigest = digest(value.decisionRefDigest, "decision_ref_digest");
+      return transaction(() => {
+        const eventInput = {
+          eventUid, taskUid: authorityTaskUid, eventType: "guard_rollback",
+          action: "legacy_guard", evidenceDigest: decisionRefDigest,
+          resultDigest: snapshotDigest, facts: { cutoverEventUid }
+        };
+        const prior = database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?").get(eventUid);
+        requireTask(database, authorityTaskUid);
+        const cutover = database.prepare(`SELECT * FROM convergence_events
+          WHERE task_uid=? AND event_uid=? AND event_type='guard_cutover'`).get(
+            authorityTaskUid, cutoverEventUid
+          );
+        if (!cutover || cutover.result_digest !== snapshotDigest) throw coded("cutover_snapshot_mismatch");
+        const latest = database.prepare(`SELECT event_uid, event_type FROM convergence_events
+          WHERE task_uid=? AND event_type IN ('guard_cutover','guard_rollback')
+          ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
+        if (prior) {
+          appendEvent(eventInput);
+          if (latest?.event_uid !== eventUid || latest.event_type !== "guard_rollback") {
+            throw coded("guard_rollback_superseded");
+          }
+          return Object.freeze({ authority: "legacy_guard", rollbackEventUid: eventUid, snapshotDigest });
+        }
+        if (latest?.event_uid !== cutoverEventUid || latest.event_type !== "guard_cutover") {
+          throw coded("guard_not_cut_over");
+        }
+        appendEvent(eventInput);
+        return Object.freeze({ authority: "legacy_guard", rollbackEventUid: eventUid, snapshotDigest });
+      });
+    },
+
+    getGuardAuthority(input) {
+      const value = exactObject(input, new Set(["authorityTaskUid"]), "guard_authority");
+      const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
+      const task = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?").get(authorityTaskUid);
+      if (!task) return Object.freeze({
+        authority: "afl_sqlite", imported: false, sourceSha256: null,
+        mappingRevision: null, paritySetDigest: null, snapshotDigest: null, cutoverEventUid: null
+      });
+      const imported = database.prepare(`SELECT * FROM convergence_events
+        WHERE task_uid=? AND event_type='legacy_imported' ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
+      if (!imported) throw coded("guard_authority_invalid");
+      const importFacts = JSON.parse(imported.facts_json);
+      const latest = database.prepare(`SELECT * FROM convergence_events
+        WHERE task_uid=? AND event_type IN ('guard_cutover','guard_rollback')
+        ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
+      if (!latest) return Object.freeze({
+        authority: "legacy_guard", imported: true, sourceSha256: imported.source_digest,
+        mappingRevision: importFacts.mappingVersion, paritySetDigest: null,
+        snapshotDigest: null, cutoverEventUid: null
+      });
+      if (latest.event_type === "guard_cutover") {
+        const facts = JSON.parse(latest.facts_json);
+        return Object.freeze({
+          authority: "afl_sqlite", imported: true, sourceSha256: latest.source_digest,
+          mappingRevision: facts.mappingRevision, paritySetDigest: facts.paritySetDigest,
+          snapshotDigest: latest.result_digest, cutoverEventUid: latest.event_uid
+        });
+      }
+      const facts = JSON.parse(latest.facts_json);
+      const cutover = database.prepare("SELECT * FROM convergence_events WHERE event_uid=?")
+        .get(facts.cutoverEventUid);
+      const cutoverFacts = cutover ? JSON.parse(cutover.facts_json) : {};
+      return Object.freeze({
+        authority: "legacy_guard", imported: true, sourceSha256: imported.source_digest,
+        mappingRevision: importFacts.mappingVersion, paritySetDigest: cutoverFacts.paritySetDigest ?? null,
+        snapshotDigest: latest.result_digest, cutoverEventUid: facts.cutoverEventUid
       });
     },
 

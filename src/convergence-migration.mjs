@@ -1,0 +1,690 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  chmod, lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink, writeFile
+} from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
+
+import { deriveTaskUid, projectContract } from "./convergence-identity.mjs";
+
+const execFileAsync = promisify(execFile);
+const PLAN_PRIVATE = new WeakMap();
+const MAPPING_REVISION = "guard-v1-repository-v1";
+const POLICY_REVISION_DIGEST = sha256("convergence-policy-v2");
+const AUTHORITY_NATIVE_ID = "guard-authority";
+const MAX_STATE_BYTES = 1024 * 1024;
+const LEGACY_KEYS = new Set([
+  "version", "repository_id", "updated_at", "aliases", "distinct_declarations", "loops"
+]);
+const LOOP_KEYS = new Set([
+  "task_id", "canonical_invariant_id", "boundary", "status", "failure_count",
+  "seen_review_run_ids", "local_fix_generations", "architecture_fix_count", "checkpoint",
+  "active_receipt", "direction_signal", "last_evidence_sha256", "events"
+]);
+const LEGACY_STATUSES = new Set([
+  "open", "closed", "blocked_direction_review", "blocked_architecture_review",
+  "architecture_fix_ready", "architecture_fix_in_progress", "blocked_human_decision"
+]);
+const PARITY_FIELDS = Object.freeze([
+  "authorization_eligibility", "decision", "failure_generation", "next_required_action"
+]);
+
+function coded(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+function plain(value, code, allowed) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype) throw coded(code);
+  for (const key of Object.keys(value)) if (!allowed.has(key)) throw coded(code);
+  return value;
+}
+
+function boundedText(value, code, maximum = 256) {
+  if (typeof value !== "string" || value.includes("\0") || value.length < 1 || value.length > maximum) {
+    throw coded(code);
+  }
+  return value;
+}
+
+function normalizedId(value, code = "legacy_state_invalid") {
+  const normalized = boundedText(value, code).normalize("NFKC").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._:-]{0,255}$/u.test(normalized)) throw coded(code);
+  return normalized;
+}
+
+function exactDigest(value, code = "legacy_state_invalid") {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) throw coded(code);
+  return value;
+}
+
+function timestamp(value, code = "legacy_state_invalid") {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw coded(code);
+  return new Date(value).toISOString();
+}
+
+function own(info, code) {
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw coded(code);
+}
+
+async function secureRepoRoot(repoRoot) {
+  if (typeof repoRoot !== "string" || repoRoot.includes("\0")) throw coded("repo_root_invalid");
+  const input = path.resolve(repoRoot);
+  const info = await lstat(input).catch(() => { throw coded("repo_root_invalid"); });
+  if (!info.isDirectory() || info.isSymbolicLink()) throw coded("repo_root_unsafe");
+  own(info, "repo_root_untrusted_owner");
+  return realpath(input);
+}
+
+async function assertSafePath(root, target, includeLeaf = true) {
+  const relative = path.relative(root, target);
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relative)) throw coded("legacy_state_outside_repo");
+  const parts = relative.split(path.sep);
+  let current = root;
+  const limit = includeLeaf ? parts.length : parts.length - 1;
+  for (let index = 0; index < limit; index += 1) {
+    current = path.join(current, parts[index]);
+    const info = await lstat(current).catch(() => { throw coded("legacy_state_missing"); });
+    if (info.isSymbolicLink() || (index < parts.length - 1 && !info.isDirectory())) {
+      throw coded("legacy_state_unsafe");
+    }
+    own(info, "legacy_state_untrusted_owner");
+  }
+}
+
+function resolvedStateTarget(rootInput, root, stateFile) {
+  const requested = path.resolve(rootInput, stateFile);
+  return requested !== rootInput && requested.startsWith(`${rootInput}${path.sep}`)
+    ? path.join(root, path.relative(rootInput, requested))
+    : requested;
+}
+
+async function readOwnedGuardState({ repoRoot, stateFile, expectedSha256 = null, mode = "source" }) {
+  const rootInput = path.resolve(repoRoot);
+  const root = await secureRepoRoot(repoRoot);
+  const target = resolvedStateTarget(rootInput, root, stateFile);
+  await assertSafePath(root, target);
+  let handle;
+  try {
+    handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (["ELOOP", "EMLINK"].includes(error?.code)) throw coded("legacy_state_unsafe");
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.isSymbolicLink()) throw coded("legacy_state_unsafe");
+    own(info, "legacy_state_untrusted_owner");
+    const permissions = info.mode & 0o777;
+    const allowedModes = mode === "snapshot" ? new Set([0o400]) : new Set([0o400, 0o600]);
+    if (!allowedModes.has(permissions)) throw coded(`${mode}_unsafe_mode`);
+    if (info.size < 2 || info.size > MAX_STATE_BYTES) throw coded(`${mode}_size_invalid`);
+    const bytes = await handle.readFile();
+    const current = await lstat(target).catch(() => { throw coded(`${mode}_replaced`); });
+    if (!current.isFile() || current.isSymbolicLink() || current.dev !== info.dev || current.ino !== info.ino) {
+      throw coded(`${mode}_replaced`);
+    }
+    const sourceSha256 = sha256(bytes);
+    if (expectedSha256 !== null && sourceSha256 !== expectedSha256) throw coded(`${mode}_digest_changed`);
+    return Object.freeze({ root, target, bytes, sourceSha256, dev: info.dev, ino: info.ino });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readExistingLineage(repoRoot) {
+  const { stdout } = await execFileAsync("git", ["-C", repoRoot, "rev-parse", "--git-common-dir"], {
+    encoding: "utf8", maxBuffer: 4096
+  });
+  const commonDir = path.resolve(repoRoot, stdout.trim());
+  const info = await lstat(commonDir).catch(() => { throw coded("lineage_not_initialized"); });
+  if (!info.isDirectory() || info.isSymbolicLink()) throw coded("lineage_unsafe");
+  own(info, "lineage_untrusted_owner");
+  const lineageFile = path.join(commonDir, "afl-lineage-id");
+  const fileInfo = await lstat(lineageFile).catch(() => { throw coded("lineage_not_initialized"); });
+  if (!fileInfo.isFile() || fileInfo.isSymbolicLink() || (fileInfo.mode & 0o777) !== 0o600) {
+    throw coded("lineage_unsafe");
+  }
+  own(fileInfo, "lineage_untrusted_owner");
+  const lineageId = (await readFile(lineageFile, "utf8")).trim();
+  if (!/^[a-f0-9]{64}$/u.test(lineageId)) throw coded("lineage_unsafe");
+  return lineageId;
+}
+
+function legacyFingerprint(taskId, invariantId, boundary) {
+  return sha256(Buffer.from(JSON.stringify([taskId, invariantId, boundary]), "utf8"));
+}
+
+function validateLegacyState(value, repositoryId) {
+  const state = plain(value, "legacy_state_invalid", LEGACY_KEYS);
+  if (state.version !== 1 || state.repository_id !== repositoryId
+      || typeof state.aliases !== "object" || state.aliases === null || Array.isArray(state.aliases)
+      || !Array.isArray(state.distinct_declarations)
+      || typeof state.loops !== "object" || state.loops === null || Array.isArray(state.loops)) {
+    throw coded("legacy_state_invalid");
+  }
+  timestamp(state.updated_at);
+  if (Object.keys(state.loops).length > 128 || Object.keys(state.aliases).length > 128
+      || state.distinct_declarations.length > 128) throw coded("legacy_state_too_large");
+  const aliases = Object.entries(state.aliases).map(([alias, canonical]) => [
+    normalizedId(alias), normalizedId(canonical)
+  ]);
+  const distinct = state.distinct_declarations.map((raw) => {
+    const item = plain(raw, "legacy_state_invalid", new Set([
+      "task_id", "boundary", "invariant_id", "reason", "declared_at"
+    ]));
+    return Object.freeze({
+      taskId: normalizedId(item.task_id), boundary: normalizedId(item.boundary),
+      invariantId: normalizedId(item.invariant_id), reason: boundedText(item.reason, "legacy_state_invalid", 4096),
+      declaredAt: timestamp(item.declared_at)
+    });
+  });
+  const loops = Object.entries(state.loops).map(([fingerprint, raw]) => {
+    exactDigest(fingerprint);
+    const loop = plain(raw, "legacy_state_invalid", LOOP_KEYS);
+    const taskId = normalizedId(loop.task_id);
+    const invariantId = normalizedId(loop.canonical_invariant_id);
+    const boundary = normalizedId(loop.boundary);
+    if (legacyFingerprint(taskId, invariantId, boundary) !== fingerprint
+        || !LEGACY_STATUSES.has(loop.status)
+        || !Number.isSafeInteger(loop.failure_count) || loop.failure_count < 0 || loop.failure_count > 3
+        || !Array.isArray(loop.seen_review_run_ids) || !Array.isArray(loop.local_fix_generations)
+        || !Number.isSafeInteger(loop.architecture_fix_count)
+        || loop.architecture_fix_count < 0 || loop.architecture_fix_count > 1
+        || !Array.isArray(loop.events) || loop.events.length > 512) throw coded("legacy_state_invalid");
+    for (const run of loop.seen_review_run_ids) boundedText(run, "legacy_state_invalid");
+    for (const generation of loop.local_fix_generations) {
+      if (!Number.isSafeInteger(generation) || generation < 1 || generation > 3) throw coded("legacy_state_invalid");
+    }
+    if (loop.last_evidence_sha256 !== null) exactDigest(loop.last_evidence_sha256);
+    if (!new Set(["none", "structural_blocked", "no_local_seam"]).has(loop.direction_signal)) {
+      throw coded("legacy_state_invalid");
+    }
+    if (loop.checkpoint !== null) {
+      const checkpoint = plain(loop.checkpoint, "legacy_state_invalid", new Set([
+        "path", "sha256", "recorded_at", "kind"
+      ]));
+      boundedText(checkpoint.path, "legacy_state_invalid", 4096);
+      exactDigest(checkpoint.sha256);
+      timestamp(checkpoint.recorded_at);
+      if (!new Set(["direction", "legacy_architecture"]).has(checkpoint.kind)) throw coded("legacy_state_invalid");
+    }
+    if (loop.active_receipt !== null) {
+      const receipt = loop.active_receipt;
+      if (typeof receipt !== "object" || Array.isArray(receipt)) throw coded("legacy_state_invalid");
+      exactDigest(receipt.receipt_id);
+      if (!new Set(["local_fix", "architecture_fix"]).has(receipt.mode)) throw coded("legacy_state_invalid");
+      timestamp(receipt.issued_at);
+      if (receipt.consumed_at !== null) timestamp(receipt.consumed_at);
+    }
+    return Object.freeze({ fingerprint, taskId, invariantId, boundary, ...loop });
+  });
+  return Object.freeze({ aliases, distinct, loops });
+}
+
+function taskProjection({ lineageId, taskId, authority = false }) {
+  const nativeTaskId = authority ? AUTHORITY_NATIVE_ID : taskId;
+  const sourceRef = authority ? "guard-v1-authority" : `sdd-task:${taskId}`;
+  const contract = projectContract({
+    sourceKind: "approved_plan", sourceRef, sourceRevision: "sdd-task-v1",
+    requirements: [], exclusions: [], importance: "routine", importanceAuthority: "approved_plan"
+  });
+  return Object.freeze({
+    taskUid: deriveTaskUid({ lineageId, adapterKind: "sdd", nativeTaskId }),
+    lineageDigest: sha256(lineageId), adapterKind: "sdd", adapterCapability: "workflow_gate",
+    nativeTaskDigest: sha256(nativeTaskId), contractSourceKind: contract.sourceKind,
+    contractSourceRefDigest: contract.sourceRefDigest, contractRevision: contract.revision,
+    policyRevision: POLICY_REVISION_DIGEST, importance: contract.importance,
+    importanceAuthority: contract.importanceAuthority
+  });
+}
+
+export function guardAuthorityTaskUid(lineageId) {
+  return deriveTaskUid({ lineageId, adapterKind: "sdd", nativeTaskId: AUTHORITY_NATIVE_ID });
+}
+
+function mapStatus(loop) {
+  return {
+    open: ["generation_closed", "pass"], closed: ["terminal", "finish"],
+    blocked_direction_review: ["checkpoint_required", "checkpoint_required"],
+    blocked_architecture_review: ["checkpoint_required", "checkpoint_required"],
+    architecture_fix_ready: ["direction_approved", "checkpoint_required"],
+    architecture_fix_in_progress: ["active_generation", "pass"],
+    blocked_human_decision: ["human_decision", "human_decision"]
+  }[loop.status];
+}
+
+function eventUid(sourceSha256, fingerprint, index, action) {
+  return `legacy:${sourceSha256.slice(0, 12)}:${fingerprint.slice(0, 16)}:${index}:${action}`;
+}
+
+function eventDigest(event) {
+  return sha256(Buffer.from(canonicalJson(event), "utf8"));
+}
+
+function mapGroup({ sourceSha256, task, loops, aliases, distinct }) {
+  const mappedLoops = [];
+  const grants = [];
+  const mappedEvents = [];
+  let unsupportedEventCount = 0;
+  for (const loop of loops) {
+    const [status, currentDecision] = mapStatus(loop);
+    const basis = loop.last_evidence_sha256 ?? eventDigest({
+      fingerprint: loop.fingerprint, failureCount: loop.failure_count, status: loop.status
+    });
+    const loopAliases = aliases.filter(([, canonical]) => canonical === loop.invariantId)
+      .map(([alias]) => alias);
+    mappedLoops.push(Object.freeze({
+      fingerprint: loop.fingerprint, boundaryId: loop.boundary,
+      canonicalInvariantId: loop.invariantId, status, failureCount: loop.failure_count,
+      fixGeneration: loop.local_fix_generations.length + loop.architecture_fix_count,
+      decisionBasisDigest: basis, currentDecision,
+      directionGeneration: loop.checkpoint === null ? 0 : 1, aliases: loopAliases
+    }));
+    let failureCount = 0;
+    let localGrantIndex = 0;
+    let architectureGrantIndex = 0;
+    const grantByReceipt = new Map();
+    loop.events.forEach((raw, index) => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw coded("legacy_state_invalid");
+      const action = normalizedId(raw.action);
+      const uid = eventUid(sourceSha256, loop.fingerprint, index, action);
+      const sourceDigest = eventDigest(raw);
+      if (action === "review_recorded") {
+        const severity = String(raw.severity ?? "").toLowerCase();
+        const verdict = String(raw.verdict ?? "").toLowerCase();
+        if (!new Set(["minor", "important", "critical"]).has(severity)
+            || !new Set(["approved", "changes_required"]).has(verdict)) throw coded("legacy_state_invalid");
+        if (verdict === "changes_required" && severity !== "minor") failureCount = Math.min(failureCount + 1, 3);
+        mappedEvents.push(Object.freeze({
+          eventUid: uid, fingerprint: loop.fingerprint,
+          generation: Math.min(localGrantIndex + architectureGrantIndex, 3), eventType: "review_recorded",
+          reasonCode: null, decision: null, action: null,
+          evidenceDigest: raw.new_evidence_sha256 ?? sourceDigest, sourceDigest,
+          resultDigest: raw.new_evidence_sha256 ?? sourceDigest,
+          facts: { directionSignal: raw.direction_signal ?? "none", failureCount, severity, verdict }
+        }));
+      } else if (action === "checkpoint_recorded") {
+        if (loop.checkpoint === null) throw coded("legacy_state_invalid");
+        mappedEvents.push(Object.freeze({
+          eventUid: uid, fingerprint: loop.fingerprint,
+          generation: localGrantIndex + architectureGrantIndex, eventType: "checkpoint_recorded",
+          reasonCode: null, decision: null, action: null, evidenceDigest: null,
+          sourceDigest, resultDigest: loop.checkpoint.sha256,
+          facts: { fileDigest: loop.checkpoint.sha256, kind: loop.checkpoint.kind }
+        }));
+      } else if (action === "fix_authorized") {
+        const receiptId = exactDigest(raw.receipt_id);
+        const purpose = localGrantIndex < loop.local_fix_generations.length
+          ? "local_fix" : "architecture_fix";
+        const currentGeneration = purpose === "local_fix"
+          ? loop.local_fix_generations[localGrantIndex++] - 1
+          : loop.local_fix_generations.length + architectureGrantIndex++;
+        const issuedAt = timestamp(raw.at);
+        const grant = {
+          grantId: `legacy-grant:${receiptId.slice(0, 32)}`, tokenHash: sha256(receiptId),
+          fingerprint: loop.fingerprint, currentGeneration, nextGeneration: currentGeneration + 1,
+          purpose, scopeDigest: sourceDigest, contractRevision: task.contractRevision,
+          policyRevision: task.policyRevision, decisionBasisDigest: basis,
+          evidenceDigest: sourceDigest, state: "revoked", issuedAt, expiresAt: issuedAt,
+          consumedAt: null, revokedAt: issuedAt
+        };
+        grantByReceipt.set(receiptId, grant);
+        grants.push(grant);
+        mappedEvents.push(Object.freeze({
+          eventUid: uid, fingerprint: loop.fingerprint, generation: currentGeneration,
+          eventType: "grant_issued", reasonCode: null, decision: null, action: purpose,
+          evidenceDigest: sourceDigest, sourceDigest, resultDigest: sourceDigest,
+          facts: { generation: currentGeneration + 1, purpose }
+        }));
+      } else if (action === "receipt_consumed") {
+        const receiptId = exactDigest(raw.receipt_id);
+        const grant = grantByReceipt.get(receiptId);
+        if (!grant) throw coded("legacy_state_invalid");
+        grant.state = "consumed";
+        grant.consumedAt = timestamp(raw.at);
+        grant.revokedAt = null;
+        grant.expiresAt = grant.consumedAt;
+        mappedEvents.push(Object.freeze({
+          eventUid: uid, fingerprint: loop.fingerprint, generation: grant.nextGeneration,
+          eventType: "grant_consumed", reasonCode: null, decision: null, action: grant.purpose,
+          evidenceDigest: grant.evidenceDigest, sourceDigest,
+          resultDigest: grant.scopeDigest, facts: { generation: grant.nextGeneration, purpose: grant.purpose }
+        }));
+      } else if (action === "human_resolution") {
+        mappedEvents.push(Object.freeze({
+          eventUid: uid, fingerprint: loop.fingerprint,
+          generation: loop.local_fix_generations.length + loop.architecture_fix_count,
+          eventType: "task_resolved", reasonCode: "legacy_human_resolution",
+          decision: "finish", action: "closed", evidenceDigest: null,
+          sourceDigest, resultDigest: null, facts: {}
+        }));
+      } else {
+        unsupportedEventCount += 1;
+      }
+    });
+    if (loop.active_receipt !== null) {
+      const active = grantByReceipt.get(loop.active_receipt.receipt_id);
+      if (active) {
+        active.state = loop.active_receipt.consumed_at === null ? "active" : "consumed";
+        active.consumedAt = loop.active_receipt.consumed_at === null
+          ? null : timestamp(loop.active_receipt.consumed_at);
+        active.revokedAt = null;
+      }
+    }
+  }
+  for (const declaration of distinct.filter((item) => item.taskId === loops[0]?.taskId)) {
+    const loop = loops.find((candidate) => candidate.boundary === declaration.boundary
+      && candidate.invariantId === declaration.invariantId);
+    if (!loop) continue;
+    const sourceDigest = eventDigest(declaration);
+    mappedEvents.push(Object.freeze({
+      eventUid: `legacy-distinct:${sourceDigest.slice(0, 40)}`, fingerprint: loop.fingerprint,
+      generation: 0, eventType: "distinct_declared", reasonCode: normalizedId(
+        declaration.reason.replaceAll(/[^a-zA-Z0-9._:-]+/gu, "-")
+      ), decision: null, action: null, evidenceDigest: sourceDigest,
+      sourceDigest, resultDigest: null, facts: { reasonCode: normalizedId(
+        declaration.reason.replaceAll(/[^a-zA-Z0-9._:-]+/gu, "-")
+      ) }
+    }));
+  }
+  return Object.freeze({ task, loops: mappedLoops, grants, mappedEvents, unsupportedEventCount });
+}
+
+export async function inspectGuardImport({ repoRoot, stateFile, store, logger = () => {} }) {
+  if (!store || typeof store.transactionalGuardImport !== "function" || typeof logger !== "function") {
+    throw coded("guard_import_invalid_arguments");
+  }
+  const source = await readOwnedGuardState({ repoRoot, stateFile });
+  let json;
+  try { json = JSON.parse(source.bytes.toString("utf8")); } catch { throw coded("legacy_state_invalid"); }
+  const lineageId = await readExistingLineage(source.root);
+  const parsed = validateLegacyState(json, sha256(source.root));
+  const taskIds = [...new Set(parsed.loops.map((loop) => loop.taskId))].sort();
+  const taskMappings = taskIds.map((taskId) => {
+    const task = taskProjection({ lineageId, taskId });
+    return mapGroup({
+      sourceSha256: source.sourceSha256, task,
+      loops: parsed.loops.filter((loop) => loop.taskId === taskId),
+      aliases: parsed.aliases, distinct: parsed.distinct
+    });
+  });
+  const authorityTask = taskProjection({ lineageId, taskId: AUTHORITY_NATIVE_ID, authority: true });
+  const rawEventCount = parsed.loops.reduce((sum, loop) => sum + loop.events.length, 0);
+  const consumedGrants = taskMappings.reduce((sum, group) => sum
+    + group.grants.filter((grant) => grant.state === "consumed").length, 0);
+  const unsupportedEventCount = taskMappings.reduce((sum, group) => sum + group.unsupportedEventCount, 0);
+  const plan = deepFreeze({
+    sourceSha256: source.sourceSha256,
+    mappingRevision: MAPPING_REVISION,
+    authorityTaskUid: authorityTask.taskUid,
+    counts: { tasks: taskMappings.length, loops: parsed.loops.length,
+      events: rawEventCount, consumedGrants },
+    items: taskMappings.map((group) => ({
+      taskUid: group.task.taskUid, loopCount: group.loops.length,
+      eventCount: group.mappedEvents.length, grantCount: group.grants.length
+    })),
+    warnings: unsupportedEventCount === 0
+      ? [] : [`unsupported_legacy_events:${unsupportedEventCount}`]
+  });
+  PLAN_PRIVATE.set(plan, Object.freeze({
+    repoRoot: source.root, stateFile: source.target, authorityTask, taskMappings,
+    legacyLiveAction: parsed.loops.some((loop) => loop.active_receipt !== null)
+  }));
+  logger(Object.freeze({ action: "inspect", sourceSha256: source.sourceSha256,
+    taskCount: taskMappings.length, loopCount: parsed.loops.length }));
+  return plan;
+}
+
+function privatePlan(plan) {
+  const value = PLAN_PRIVATE.get(plan);
+  if (!value) throw coded("guard_import_plan_invalid");
+  return value;
+}
+
+export async function applyGuardImport({ plan, store, logger = () => {} }) {
+  const internal = privatePlan(plan);
+  await readOwnedGuardState({
+    repoRoot: internal.repoRoot, stateFile: internal.stateFile, expectedSha256: plan.sourceSha256
+  });
+  const result = store.transactionalGuardImport({
+    eventUid: `legacy-import:${plan.authorityTaskUid.slice(0, 24)}:${plan.sourceSha256.slice(0, 24)}`,
+    authorityTask: internal.authorityTask, sourceSha256: plan.sourceSha256,
+    mappingRevision: plan.mappingRevision,
+    tasks: internal.taskMappings.map(({ task, loops, grants, mappedEvents }) => ({
+      task, loops, grants, mappedEvents
+    }))
+  });
+  logger(Object.freeze({ action: "apply", authorityTaskUid: plan.authorityTaskUid,
+    sourceSha256: plan.sourceSha256, taskCount: result.taskCount }));
+  return result;
+}
+
+function canonicalParity(field, value) {
+  if (field === "decision") {
+    return ({ direction_review_required: "checkpoint_required", architecture_review_required: "checkpoint_required",
+      blocked_direction_review: "checkpoint_required" })[value] ?? value;
+  }
+  if (field === "next_required_action") {
+    return ({ direction_review: "checkpoint", architecture_review: "checkpoint" })[value] ?? value;
+  }
+  if (field === "failure_generation") {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 3) throw coded("shadow_input_invalid");
+    return value;
+  }
+  if (field === "authorization_eligibility") {
+    if (typeof value !== "boolean") throw coded("shadow_input_invalid");
+    return value;
+  }
+  return boundedText(value, "shadow_input_invalid");
+}
+
+export async function compareGuardShadow({ plan, store, comparisons, logger = () => {} }) {
+  privatePlan(plan);
+  if (!Array.isArray(comparisons) || comparisons.length !== PARITY_FIELDS.length) {
+    throw coded("shadow_input_invalid");
+  }
+  const byField = new Map();
+  for (const raw of comparisons) {
+    const item = plain(raw, "shadow_input_invalid", new Set(["field", "legacy", "kernel"]));
+    if (!PARITY_FIELDS.includes(item.field) || byField.has(item.field)) throw coded("shadow_input_invalid");
+    byField.set(item.field, item);
+  }
+  if (PARITY_FIELDS.some((field) => !byField.has(field))) throw coded("shadow_input_invalid");
+  const paritySetDigest = sha256(Buffer.from(canonicalJson(PARITY_FIELDS), "utf8"));
+  let result;
+  for (const field of PARITY_FIELDS) {
+    const item = byField.get(field);
+    const legacy = canonicalParity(field, item.legacy);
+    const kernel = canonicalParity(field, item.kernel);
+    const inputDigest = sha256(Buffer.from(canonicalJson({ field, legacy: item.legacy, kernel: item.kernel }), "utf8"));
+    result = store.recordGuardShadowComparison({
+      eventUid: `shadow:${plan.authorityTaskUid.slice(0, 16)}:${inputDigest.slice(0, 40)}`,
+      authorityTaskUid: plan.authorityTaskUid, sourceSha256: plan.sourceSha256,
+      mappingRevision: plan.mappingRevision, paritySetDigest, inputDigest,
+      legacyResultDigest: sha256(Buffer.from(canonicalJson(legacy), "utf8")),
+      kernelResultDigest: sha256(Buffer.from(canonicalJson(kernel), "utf8")),
+      matched: canonicalJson(legacy) === canonicalJson(kernel)
+    });
+  }
+  logger(Object.freeze({ action: "shadow", authorityTaskUid: plan.authorityTaskUid,
+    paritySetDigest, comparisonCount: result.comparisonCount, mismatchCount: result.mismatchCount }));
+  return Object.freeze({ paritySetDigest, comparisonCount: result.comparisonCount,
+    mismatchCount: result.mismatchCount, matched: result.mismatchCount === 0 });
+}
+
+function transitionPaths(stateFile) {
+  return Object.freeze({
+    authorityLock: path.join(path.dirname(stateFile), "review-loop-authority.lock"),
+    legacyLock: path.join(path.dirname(stateFile), "review-loop-state.lock"),
+    snapshot: path.join(path.dirname(stateFile), ".review-loop-state.afl-cutover.snapshot")
+  });
+}
+
+async function acquireDirectoryLock(target, code) {
+  try { await mkdir(target, { mode: 0o700 }); } catch (error) {
+    if (error?.code === "EEXIST") throw coded(code);
+    throw error;
+  }
+  const owner = path.join(target, "owner.json");
+  await writeFile(owner, `${JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() })}\n`, {
+    flag: "wx", mode: 0o600
+  });
+  return async () => {
+    await unlink(owner).catch(() => {});
+    await rmdir(target).catch(() => {});
+  };
+}
+
+async function withTransitionLocks(stateFile, operation) {
+  const paths = transitionPaths(stateFile);
+  const releaseAuthority = await acquireDirectoryLock(paths.authorityLock, "guard_authority_locked");
+  let releaseLegacy;
+  try {
+    releaseLegacy = await acquireDirectoryLock(paths.legacyLock, "legacy_state_locked");
+    return await operation(paths);
+  } finally {
+    await releaseLegacy?.();
+    await releaseAuthority();
+  }
+}
+
+async function writeSnapshot(repoRoot, snapshot, bytes, expectedDigest) {
+  try {
+    const existing = await readOwnedGuardState({
+      repoRoot, stateFile: snapshot,
+      expectedSha256: expectedDigest, mode: "snapshot"
+    });
+    return existing.sourceSha256;
+  } catch (error) {
+    if (!new Set(["legacy_state_missing", "ENOENT"]).has(error?.code)) throw error;
+  }
+  const handle = await open(snapshot, "wx", 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.chmod(0o400);
+  } finally {
+    await handle.close();
+  }
+  const directory = await open(path.dirname(snapshot), constants.O_RDONLY);
+  try { await directory.sync(); } finally { await directory.close(); }
+  return expectedDigest;
+}
+
+export async function cutoverGuard({
+  repoRoot, stateFile, plan, store, paritySetDigest, decisionRef, apply,
+  hooks = {}, logger = () => {}
+}) {
+  const internal = privatePlan(plan);
+  if (apply !== true) throw coded("guard_apply_required");
+  exactDigest(paritySetDigest, "parity_set_digest_invalid");
+  const decisionRefDigest = sha256(Buffer.from(boundedText(decisionRef, "decision_ref_invalid", 4096), "utf8"));
+  const rootInput = path.resolve(repoRoot);
+  const root = await secureRepoRoot(repoRoot);
+  if (internal.repoRoot !== root
+      || internal.stateFile !== resolvedStateTarget(rootInput, root, stateFile)) {
+    throw coded("guard_import_plan_mismatch");
+  }
+  return withTransitionLocks(internal.stateFile, async (paths) => {
+    const first = await readOwnedGuardState({ repoRoot, stateFile, expectedSha256: plan.sourceSha256 });
+    if (internal.legacyLiveAction) throw coded("legacy_live_action");
+    await hooks.beforeSnapshot?.();
+    await writeSnapshot(internal.repoRoot, paths.snapshot, first.bytes, first.sourceSha256);
+    await hooks.afterSnapshot?.();
+    await readOwnedGuardState({ repoRoot, stateFile, expectedSha256: plan.sourceSha256 });
+    const eventUidValue = `guard-cutover:${plan.authorityTaskUid.slice(0, 16)}:${plan.sourceSha256.slice(0, 16)}:${decisionRefDigest.slice(0, 16)}`;
+    const result = store.recordGuardCutover({
+      eventUid: eventUidValue, authorityTaskUid: plan.authorityTaskUid,
+      sourceSha256: plan.sourceSha256, mappingRevision: plan.mappingRevision,
+      paritySetDigest, snapshotDigest: first.sourceSha256, decisionRefDigest
+    });
+    logger(Object.freeze({ action: "cutover", authorityTaskUid: plan.authorityTaskUid,
+      sourceSha256: plan.sourceSha256, cutoverEventUid: result.cutoverEventUid }));
+    return result;
+  });
+}
+
+export async function rollbackGuardCutover({
+  repoRoot, stateFile, store, authorityTaskUid, cutoverEventUid, decisionRef, apply,
+  hooks = {}, logger = () => {}
+}) {
+  if (apply !== true) throw coded("guard_apply_required");
+  boundedText(cutoverEventUid, "cutover_event_uid_invalid");
+  const rootInput = path.resolve(repoRoot);
+  const root = await secureRepoRoot(repoRoot);
+  const stateTarget = resolvedStateTarget(rootInput, root, stateFile);
+  const authority = store.getGuardAuthority({ authorityTaskUid });
+  if (authority.authority !== "afl_sqlite" || authority.cutoverEventUid !== cutoverEventUid) {
+    throw coded("guard_not_cut_over");
+  }
+  const decisionRefDigest = sha256(Buffer.from(boundedText(decisionRef, "decision_ref_invalid", 4096), "utf8"));
+  return withTransitionLocks(stateTarget, async (paths) => {
+    const current = await readOwnedGuardState({
+      repoRoot: root, stateFile: stateTarget, expectedSha256: authority.sourceSha256
+    });
+    const snapshot = await readOwnedGuardState({
+      repoRoot: root, stateFile: paths.snapshot, expectedSha256: authority.snapshotDigest, mode: "snapshot"
+    });
+    await hooks.beforeRestore?.();
+    if (!current.bytes.equals(snapshot.bytes)) {
+      const temporary = path.join(path.dirname(stateTarget), `.review-loop-state.rollback.${process.pid}.tmp`);
+      const handle = await open(temporary, "wx", 0o600);
+      try { await handle.writeFile(snapshot.bytes); await handle.sync(); } finally { await handle.close(); }
+      await rename(temporary, stateTarget);
+      await chmod(stateTarget, 0o600);
+      const directory = await open(path.dirname(stateTarget), constants.O_RDONLY);
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+    await hooks.afterRestore?.();
+    await readOwnedGuardState({
+      repoRoot: root, stateFile: stateTarget, expectedSha256: authority.snapshotDigest
+    });
+    const result = store.recordGuardRollback({
+      eventUid: `guard-rollback:${cutoverEventUid.slice(-32)}:${decisionRefDigest.slice(0, 16)}`,
+      authorityTaskUid, cutoverEventUid, snapshotDigest: authority.snapshotDigest,
+      decisionRefDigest
+    });
+    logger(Object.freeze({ action: "rollback", authorityTaskUid,
+      rollbackEventUid: result.rollbackEventUid, snapshotDigest: authority.snapshotDigest }));
+    return result;
+  });
+}
+
+export async function readGuardAdapterAuthority({ repoRoot, store, lineageId }) {
+  const root = await secureRepoRoot(repoRoot);
+  const lock = transitionPaths(path.join(root, ".superpowers", "sdd", "review-loop-state.json")).authorityLock;
+  try {
+    const info = await lstat(lock);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw coded("guard_authority_locked");
+    own(info, "guard_authority_locked");
+    return Object.freeze({ authority: "transition_locked", authorityTaskUid: guardAuthorityTaskUid(lineageId) });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const authorityTaskUid = guardAuthorityTaskUid(lineageId);
+  return Object.freeze({ authorityTaskUid, ...store.getGuardAuthority({ authorityTaskUid }) });
+}
+
+export { MAPPING_REVISION };

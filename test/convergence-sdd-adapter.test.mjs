@@ -797,6 +797,59 @@ test("status and lock-status are bounded Store projections and strict parsing re
   }
 });
 
+test("SDD adapter routes every official read and write through persisted Guard authority", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const authorityResolver = (authority) => async () => Object.freeze({ authority });
+
+  const legacyStatus = await runGuardCommand({
+    args: ["status", "--task-id", h.state.task_id],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    authorityResolver: authorityResolver("legacy_guard")
+  });
+  assert.equal(legacyStatus.authority, "legacy_guard");
+  assert.deepEqual(legacyStatus.loops, []);
+  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 0);
+  await assert.rejects(runGuardCommand({
+    args: [
+      "record-review", ...h.key,
+      "--review-run-id", "legacy-authority-review",
+      "--severity", "Important",
+      "--verdict", "approved",
+      "--commit", "legacy-authority-commit",
+      "--review-ref", "reviews/legacy-authority.md"
+    ],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    authorityResolver: authorityResolver("legacy_guard")
+  }), (error) => error.code === "legacy_guard_authoritative");
+
+  const locked = await runGuardCommand({
+    args: ["lock-status"],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    authorityResolver: authorityResolver("transition_locked")
+  });
+  assert.equal(locked.authority, "transition_locked");
+  assert.equal(locked.locked, true);
+  await assert.rejects(runGuardCommand({
+    args: ["add-alias", "--alias", "legacy-name", "--canonical", "canonical-name"],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    authorityResolver: authorityResolver("transition_locked")
+  }), (error) => error.code === "guard_authority_locked");
+
+  const aflStatus = await runGuardCommand({
+    args: ["status", "--task-id", h.state.task_id],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    authorityResolver: authorityResolver("afl_sqlite")
+  });
+  assert.equal(aflStatus.authority, "afl_sqlite");
+  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 1);
+});
+
 test("SDD adapter delegates grant authority to the convergence controller", async () => {
   const source = await readFile(new URL("../src/convergence-sdd-adapter.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /\.issueContinuationGrant\s*\(/u);

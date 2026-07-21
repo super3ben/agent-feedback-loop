@@ -1155,40 +1155,48 @@ test("resolve retains loop history and refuses a live grant or Probe", () => {
 });
 
 function importInput(overrides = {}) {
+  const { eventUid: _taskEventUid, ...importedTask } = taskInput();
+  const { eventUid: _authorityEventUid, ...authorityTask } = taskInput({
+    taskUid: "guard-authority-task",
+    adapterKind: "sdd",
+    adapterCapability: "workflow_gate",
+    nativeTaskDigest: "a".repeat(64),
+    contractSourceRefDigest: "b".repeat(64)
+  });
   return {
     eventUid: "legacy-import-1",
-    sourceDigest: "b".repeat(64),
-    mappingVersion: "guard-v1",
-    task: {
-      ...taskInput(),
-      eventUid: undefined
-    },
-    loops: [{
-      fingerprint: "legacy-fingerprint",
-      boundaryId: "legacy-task-3",
-      canonicalInvariantId: "legacy-invariant",
-      status: "terminal",
-      failureCount: 2,
-      fixGeneration: 1,
-      decisionBasisDigest: DIGEST.basis,
-      currentDecision: "finish",
-      directionGeneration: 1,
-      aliases: ["legacy-alias"]
-    }],
-    grants: [],
-    mappedEvents: [{
-      eventUid: "legacy-review-summary",
-      fingerprint: "legacy-fingerprint",
-      generation: 1,
-      eventType: "review_recorded",
-      decision: "checkpoint_required",
-      evidenceDigest: DIGEST.evidence,
-      facts: {
-        directionSignal: "none",
+    authorityTask,
+    sourceSha256: "b".repeat(64),
+    mappingRevision: "guard-v1",
+    tasks: [{
+      task: importedTask,
+      loops: [{
+        fingerprint: "legacy-fingerprint",
+        boundaryId: "legacy-task-3",
+        canonicalInvariantId: "legacy-invariant",
+        status: "terminal",
         failureCount: 2,
-        severity: "important",
-        verdict: "changes_required"
-      }
+        fixGeneration: 1,
+        decisionBasisDigest: DIGEST.basis,
+        currentDecision: "finish",
+        directionGeneration: 1,
+        aliases: ["legacy-alias"]
+      }],
+      grants: [],
+      mappedEvents: [{
+        eventUid: "legacy-review-summary",
+        fingerprint: "legacy-fingerprint",
+        generation: 1,
+        eventType: "review_recorded",
+        decision: "checkpoint_required",
+        evidenceDigest: DIGEST.evidence,
+        facts: {
+          directionSignal: "none",
+          failureCount: 2,
+          severity: "important",
+          verdict: "changes_required"
+        }
+      }]
     }],
     ...overrides
   };
@@ -1197,11 +1205,11 @@ function importInput(overrides = {}) {
 test("transactional Guard import is idempotent by source digest and preserves real mapped history", () => {
   const { store } = convergenceFixture();
   const input = importInput();
-  delete input.task.eventUid;
   const first = store.transactionalGuardImport(input);
   const replay = store.transactionalGuardImport(input);
   assert.deepEqual(replay, first);
   assert.equal(first.imported, true);
+  assert.equal(first.taskCount, 1);
   assert.equal(first.loopCount, 1);
   const status = store.getConvergenceStatus({
     taskUid: "task-1",
@@ -1222,11 +1230,10 @@ test("transactional Guard import is idempotent by source digest and preserves re
 test("Guard import rejects changed canonical content for an existing source digest", () => {
   const { store } = convergenceFixture();
   const input = importInput();
-  delete input.task.eventUid;
   const first = store.transactionalGuardImport(input);
   assert.throws(() => store.transactionalGuardImport({
     ...input,
-    mappingVersion: "guard-v2"
+    mappingRevision: "guard-v2"
   }), /import_collision/u);
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='legacy_imported'"
@@ -1239,17 +1246,19 @@ test("Guard import facts are event-specific and reject cross-event fields", () =
   const { store } = convergenceFixture();
   const input = importInput({
     eventUid: "legacy-import-cross-facts",
-    sourceDigest: "c".repeat(64),
-    mappedEvents: [{
-      ...importInput().mappedEvents[0],
-      eventUid: "legacy-review-cross-facts",
-      facts: {
-        ...importInput().mappedEvents[0].facts,
-        aliasId: "not-valid-on-review"
-      }
+    sourceSha256: "c".repeat(64),
+    tasks: [{
+      ...importInput().tasks[0],
+      mappedEvents: [{
+        ...importInput().tasks[0].mappedEvents[0],
+        eventUid: "legacy-review-cross-facts",
+        facts: {
+          ...importInput().tasks[0].mappedEvents[0].facts,
+          aliasId: "not-valid-on-review"
+        }
+      }]
     }]
   });
-  delete input.task.eventUid;
   assert.throws(() => store.transactionalGuardImport(input), /unknown_event_facts_field/u);
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-import-cross-facts'"
@@ -1279,13 +1288,15 @@ test("Guard import rolls back when one fingerprint has multiple active grants", 
   });
   const input = importInput({
     eventUid: "legacy-import-active-conflict",
-    sourceDigest: "d".repeat(64),
-    grants: [
-      importedGrant("legacy-grant-1", "1".repeat(64)),
-      importedGrant("legacy-grant-2", "2".repeat(64))
-    ]
+    sourceSha256: "d".repeat(64),
+    tasks: [{
+      ...importInput().tasks[0],
+      grants: [
+        importedGrant("legacy-grant-1", "1".repeat(64)),
+        importedGrant("legacy-grant-2", "2".repeat(64))
+      ]
+    }]
   });
-  delete input.task.eventUid;
   assert.throws(() => store.transactionalGuardImport(input), /active_grant_collision/u);
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-import-active-conflict'"
@@ -1303,13 +1314,15 @@ test("failed Guard import rolls back its event task and loop projections togethe
   const { store } = convergenceFixture();
   const input = importInput({
     eventUid: "legacy-import-bad",
-    sourceDigest: "c".repeat(64),
-    loops: [
-      importInput().loops[0],
-      { ...importInput().loops[0], fingerprint: "legacy-fingerprint-2" }
-    ]
+    sourceSha256: "c".repeat(64),
+    tasks: [{
+      ...importInput().tasks[0],
+      loops: [
+        importInput().tasks[0].loops[0],
+        { ...importInput().tasks[0].loops[0], fingerprint: "legacy-fingerprint-2" }
+      ]
+    }]
   });
-  delete input.task.eventUid;
   assert.throws(() => store.transactionalGuardImport(input), /loop_identity_collision/u);
   assert.equal(store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_uid='legacy-import-bad'"
@@ -1318,4 +1331,131 @@ test("failed Guard import rolls back its event task and loop projections togethe
     "SELECT COUNT(*) AS count FROM convergence_tasks WHERE task_uid='task-1'"
   ).get().count, 0);
   store.close();
+});
+
+function recordPassingGuardShadow(store, input, paritySetDigest = "c".repeat(64)) {
+  for (const [index, field] of [
+    "decision", "next_required_action", "failure_generation", "authorization_eligibility"
+  ].entries()) {
+    store.recordGuardShadowComparison({
+      eventUid: `guard-shadow-${index}`,
+      authorityTaskUid: input.authorityTask.taskUid,
+      sourceSha256: input.sourceSha256,
+      mappingRevision: input.mappingRevision,
+      paritySetDigest,
+      inputDigest: `${index + 1}`.repeat(64),
+      legacyResultDigest: `${index + 5}`.repeat(64),
+      kernelResultDigest: `${index + 5}`.repeat(64),
+      matched: true
+    });
+  }
+  return paritySetDigest;
+}
+
+test("Store owns persisted Guard shadow, cutover, rollback, and authority replay", () => {
+  const { store } = convergenceFixture();
+  const input = importInput();
+  store.transactionalGuardImport(input);
+  assert.deepEqual(store.getGuardAuthority({ authorityTaskUid: input.authorityTask.taskUid }), {
+    authority: "legacy_guard",
+    imported: true,
+    sourceSha256: input.sourceSha256,
+    mappingRevision: input.mappingRevision,
+    paritySetDigest: null,
+    snapshotDigest: null,
+    cutoverEventUid: null
+  });
+
+  const paritySetDigest = recordPassingGuardShadow(store, input);
+  const cutover = {
+    eventUid: "guard-cutover-1",
+    authorityTaskUid: input.authorityTask.taskUid,
+    sourceSha256: input.sourceSha256,
+    mappingRevision: input.mappingRevision,
+    paritySetDigest,
+    snapshotDigest: input.sourceSha256,
+    decisionRefDigest: "e".repeat(64)
+  };
+  const cutoverResult = store.recordGuardCutover(cutover);
+  assert.deepEqual(store.recordGuardCutover(cutover), cutoverResult);
+  assert.equal(store.getGuardAuthority({ authorityTaskUid: input.authorityTask.taskUid }).authority,
+    "afl_sqlite");
+
+  const rollback = {
+    eventUid: "guard-rollback-1",
+    authorityTaskUid: input.authorityTask.taskUid,
+    cutoverEventUid: cutover.eventUid,
+    snapshotDigest: cutover.snapshotDigest,
+    decisionRefDigest: "f".repeat(64)
+  };
+  const rollbackResult = store.recordGuardRollback(rollback);
+  assert.deepEqual(store.recordGuardRollback(rollback), rollbackResult);
+  const restored = store.getGuardAuthority({ authorityTaskUid: input.authorityTask.taskUid });
+  assert.equal(restored.authority, "legacy_guard");
+  assert.equal(restored.cutoverEventUid, cutover.eventUid);
+  assert.equal(store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+    WHERE event_type IN ('guard_cutover','guard_rollback')`).get().count, 2);
+  store.close();
+});
+
+test("Store refuses Guard cutover on incomplete parity or live continuation authority", () => {
+  const first = convergenceFixture();
+  const input = importInput();
+  first.store.transactionalGuardImport(input);
+  first.store.recordGuardShadowComparison({
+    eventUid: "guard-shadow-mismatch",
+    authorityTaskUid: input.authorityTask.taskUid,
+    sourceSha256: input.sourceSha256,
+    mappingRevision: input.mappingRevision,
+    paritySetDigest: "c".repeat(64),
+    inputDigest: "1".repeat(64),
+    legacyResultDigest: "2".repeat(64),
+    kernelResultDigest: "3".repeat(64),
+    matched: false
+  });
+  assert.throws(() => first.store.recordGuardCutover({
+    eventUid: "guard-cutover-mismatch",
+    authorityTaskUid: input.authorityTask.taskUid,
+    sourceSha256: input.sourceSha256,
+    mappingRevision: input.mappingRevision,
+    paritySetDigest: "c".repeat(64),
+    snapshotDigest: input.sourceSha256,
+    decisionRefDigest: "e".repeat(64)
+  }), /shadow_parity_incomplete/u);
+  first.store.close();
+
+  const second = convergenceFixture();
+  const importedGrant = {
+    grantId: "legacy-live-grant",
+    tokenHash: "1".repeat(64),
+    fingerprint: "legacy-fingerprint",
+    currentGeneration: 1,
+    nextGeneration: 2,
+    purpose: "local_fix",
+    scopeDigest: DIGEST.scope,
+    contractRevision: DIGEST.contract,
+    policyRevision: DIGEST.policy,
+    decisionBasisDigest: DIGEST.basis,
+    evidenceDigest: DIGEST.evidence,
+    state: "active",
+    issuedAt: "2026-07-21T00:00:00.000Z",
+    expiresAt: "2026-07-21T00:05:00.000Z",
+    consumedAt: null,
+    revokedAt: null
+  };
+  const liveInput = importInput({
+    tasks: [{ ...importInput().tasks[0], grants: [importedGrant] }]
+  });
+  second.store.transactionalGuardImport(liveInput);
+  const paritySetDigest = recordPassingGuardShadow(second.store, liveInput);
+  assert.throws(() => second.store.recordGuardCutover({
+    eventUid: "guard-cutover-live",
+    authorityTaskUid: liveInput.authorityTask.taskUid,
+    sourceSha256: liveInput.sourceSha256,
+    mappingRevision: liveInput.mappingRevision,
+    paritySetDigest,
+    snapshotDigest: liveInput.sourceSha256,
+    decisionRefDigest: "e".repeat(64)
+  }), /guard_live_action/u);
+  second.store.close();
 });
