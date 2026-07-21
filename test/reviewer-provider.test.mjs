@@ -7,6 +7,15 @@ import { test } from "node:test";
 import { buildReviewerInvocation, resolveReviewerExecutable, runProcessWithInput, runReviewerProvider } from "../src/reviewer-provider.mjs";
 
 const RESULT = { outcome: "no_lesson" };
+const PROBE_RESULT = Object.freeze({
+  assessment: "overdesigned",
+  action: "simplify_current_generation",
+  unmet_user_value: "No user-visible convergence protection is missing",
+  wrong_assumption: "A resident scheduler is needed",
+  unnecessary_scope: ["resident scheduler"],
+  minimal_next_step: "Use the existing detached one-shot provider",
+  falsification_test: "Demonstrate an unlaunchable candidate without a resident process"
+});
 const LESSON_RESULT = Object.freeze({
   outcome: "lesson",
   final_severity: "Major",
@@ -237,6 +246,95 @@ test("Gemini reviewer uses headless JSON with an explicit deny-all tool policy",
   assert.ok(observed.args.includes("plan"));
   assert.equal(observed.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, files.geminiSettingsFile);
   assert.doesNotMatch(observed.args.join(" "), /ignore prior instructions/);
+});
+
+test("each provider keeps isolation while convergence_probe selects only its package contract", async () => {
+  for (const cli of ["codex", "claude", "gemini"]) {
+    const files = await inputFiles();
+    const {
+      promptFile: _promptFile,
+      schemaFile: _schemaFile,
+      ...providerFiles
+    } = files;
+    let observed;
+    const result = await runReviewerProvider({
+      cli,
+      executable: `/opt/${cli}`,
+      ...providerFiles,
+      resultKind: "convergence_probe",
+      context: { status: { decisionBasisDigest: "a".repeat(64) } },
+      runProcess: async (input) => {
+        observed = input;
+        if (cli === "codex") {
+          const resultFile = input.args[input.args.indexOf("--output-last-message") + 1];
+          await writeFile(resultFile, JSON.stringify({ result: PROBE_RESULT }), { mode: 0o600 });
+          return { stdout: "ignored chatter", stderr: "ignored detail" };
+        }
+        if (cli === "claude") {
+          return {
+            stdout: JSON.stringify({ type: "result", structured_output: PROBE_RESULT }),
+            stderr: ""
+          };
+        }
+        return {
+          stdout: JSON.stringify({ response: JSON.stringify(PROBE_RESULT), stats: {} }),
+          stderr: ""
+        };
+      }
+    });
+
+    assert.deepEqual(result, PROBE_RESULT);
+    assert.match(observed.input, /Reflection Probe/u);
+    assert.match(observed.input, /seven fields/u);
+    assert.doesNotMatch(observed.input, /chain-of-thought.*provide/iu);
+    assert.equal(observed.env.UNRELATED_SECRET, undefined);
+    if (cli === "codex") {
+      assert.ok(observed.args.includes("--ephemeral"));
+      assert.ok(observed.args.includes("--ignore-user-config"));
+      assert.ok(observed.args.includes("--ignore-rules"));
+      assert.ok(observed.args.includes("read-only"));
+    } else if (cli === "claude") {
+      assert.ok(observed.args.includes("--safe-mode"));
+      assert.ok(observed.args.includes("--no-session-persistence"));
+      assert.equal(observed.args[observed.args.indexOf("--tools") + 1], "");
+      const schema = JSON.parse(observed.args[observed.args.indexOf("--json-schema") + 1]);
+      assert.deepEqual(schema.required, Object.keys(PROBE_RESULT));
+      assert.equal(schema.additionalProperties, false);
+    } else {
+      assert.equal(observed.args[observed.args.indexOf("--extensions") + 1], "none");
+      assert.equal(observed.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, files.geminiSettingsFile);
+    }
+  }
+});
+
+test("explicit result kinds reject caller-selected prompt or schema paths", async () => {
+  const files = await inputFiles();
+  let called = false;
+  await assert.rejects(
+    runReviewerProvider({
+      cli: "claude",
+      executable: "/opt/claude",
+      ...files,
+      resultKind: "lesson",
+      context: {},
+      runProcess: async () => {
+        called = true;
+        return { stdout: JSON.stringify({ structured_output: RESULT }), stderr: "" };
+      }
+    }),
+    (error) => error.code === "provider_invalid"
+  );
+  assert.equal(called, false);
+  await assert.rejects(
+    runReviewerProvider({
+      cli: "claude",
+      executable: "/opt/claude",
+      resultKind: "arbitrary_path",
+      context: {},
+      runProcess: async () => ({ stdout: "{}", stderr: "" })
+    }),
+    (error) => error.code === "provider_invalid"
+  );
 });
 
 test("reviewer executable resolution honors a provider-specific override without shell parsing", async () => {

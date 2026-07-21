@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "assessment": {
+      "type": "string",
+      "enum": [
+        "aligned_and_necessary",
+        "wrong_direction",
+        "overdesigned",
+        "overoptimized",
+        "insufficient_evidence",
+        "scope_drift",
+        "acceptance_already_satisfied"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "continue_once",
+        "simplify_current_generation",
+        "rollback_to_generation",
+        "direction_checkpoint",
+        "human_decision",
+        "finish_now"
+      ]
+    },
+    "unmet_user_value": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+    },
+    "wrong_assumption": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+    },
+    "unnecessary_scope": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+      }
+    },
+    "minimal_next_step": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+    },
+    "falsification_test": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+    }
+  },
+  "required": [
+    "assessment",
+    "action",
+    "unmet_user_value",
+    "wrong_assumption",
+    "unnecessary_scope",
+    "minimal_next_step",
+    "falsification_test"
+  ]
+}

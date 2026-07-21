@@ -16,6 +16,7 @@ import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provi
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 import { executeGuardCli } from "./convergence-cli.mjs";
+import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
@@ -542,7 +543,35 @@ export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", 
   return structuredLog("review_failed", { ...fields, result: "failed", reason }, writer);
 }
 
-export async function main(args) {
+async function executeConvergenceProbeRun({ home, taskUid, fingerprint }) {
+  const paths = pathsFor(home);
+  const store = openControlStore({ paths });
+  try {
+    const providerName = "codex";
+    const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
+    await runConvergenceProbeJob({
+      store,
+      taskUid,
+      fingerprint,
+      ownerId: `probe-${process.pid}`,
+      provider: (context, { resultKind }) => runReviewerProvider({
+        cli: providerName,
+        executable,
+        context,
+        resultKind,
+        policyFile: paths.geminiReviewerPolicy,
+        geminiSettingsFile: paths.geminiReviewerSettings,
+        env: process.env
+      })
+    });
+  } finally {
+    store.close();
+  }
+}
+
+export async function main(args, {
+  runConvergenceProbeCommand = executeConvergenceProbeRun
+} = {}) {
   if (args[0] === "guard") {
     const machine = await executeGuardCli(args.slice(1));
     process.stdout.write(`${JSON.stringify(machine.payload)}\n`);
@@ -622,6 +651,14 @@ export async function main(args) {
   }
   if (command === "paths") {
     console.log(JSON.stringify(pathsFor(options.home), null, 2));
+    return;
+  }
+  if (command === "convergence-probe-run") {
+    await runConvergenceProbeCommand({
+      home: options.home,
+      taskUid: optionValue(options.args, "--task-uid"),
+      fingerprint: optionValue(options.args, "--fingerprint")
+    });
     return;
   }
   if (command === "reviewer-run") {

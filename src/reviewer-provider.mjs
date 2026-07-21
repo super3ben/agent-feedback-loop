@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { readSecureReviewerResult } from "./reviewer-result-file.mjs";
 
@@ -13,6 +14,21 @@ const PROVIDER_OVERRIDES = Object.freeze({
   codex: "AGENT_FEEDBACK_LOOP_CODEX_COMMAND",
   claude: "AGENT_FEEDBACK_LOOP_CLAUDE_COMMAND",
   gemini: "AGENT_FEEDBACK_LOOP_GEMINI_COMMAND"
+});
+const SOURCE_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_TEMPLATE_ROOT = path.join(path.dirname(SOURCE_ROOT), "templates");
+const INSTALLED_TEMPLATE_ROOT = path.resolve(SOURCE_ROOT, "../../..");
+const RESULT_KINDS = Object.freeze({
+  lesson: Object.freeze({
+    prompt: path.join("prompts", "reflection-agent.md"),
+    schema: path.join("schemas", "reviewer-result.schema.json"),
+    discriminator: "outcome"
+  }),
+  convergence_probe: Object.freeze({
+    prompt: path.join("prompts", "convergence-probe.md"),
+    schema: path.join("schemas", "convergence-probe-result.schema.json"),
+    discriminator: "assessment"
+  })
 });
 
 function providerError(code, cause) {
@@ -86,6 +102,20 @@ function parseJsonText(text) {
   return JSON.parse(unfenced);
 }
 
+async function ownedResultFiles(resultKind) {
+  const contract = RESULT_KINDS[resultKind];
+  if (!contract) throw providerError("provider_invalid");
+  for (const root of [PACKAGE_TEMPLATE_ROOT, INSTALLED_TEMPLATE_ROOT]) {
+    const promptFile = path.join(root, contract.prompt);
+    const schemaFile = path.join(root, contract.schema);
+    try {
+      await Promise.all([access(promptFile, constants.R_OK), access(schemaFile, constants.R_OK)]);
+      return { promptFile, schemaFile, discriminator: contract.discriminator };
+    } catch {}
+  }
+  throw providerError("provider_unavailable");
+}
+
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -120,16 +150,18 @@ function codexTransportSchema(schemaText) {
   } catch (error) {
     throw providerError("provider_invalid", error);
   }
-  if (!isPlainObject(logicalSchema)
-      || !Array.isArray(logicalSchema.oneOf)
-      || logicalSchema.oneOf.length !== 2) {
+  if (!isPlainObject(logicalSchema)) throw providerError("provider_invalid");
+  const logicalBranches = Array.isArray(logicalSchema.oneOf)
+    ? logicalSchema.oneOf
+    : [logicalSchema];
+  if (logicalBranches.length < 1 || logicalBranches.some((branch) => !isPlainObject(branch))) {
     throw providerError("provider_invalid");
   }
   return {
     type: "object",
     properties: {
       result: {
-        anyOf: logicalSchema.oneOf.map(projectCodexSchemaNode)
+        anyOf: logicalBranches.map(projectCodexSchemaNode)
       }
     },
     required: ["result"],
@@ -146,20 +178,21 @@ function unwrapCodexTransportResult(value) {
   return value.result;
 }
 
-function unwrapResult(value) {
-  if (value && typeof value === "object" && !Array.isArray(value) && typeof value.outcome === "string") return value;
+function logicalResult(value, discriminator) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && typeof value[discriminator] === "string";
+}
+
+function unwrapResult(value, discriminator) {
+  if (logicalResult(value, discriminator)) return value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   for (const key of ["structured_output", "result", "response", "output", "content"]) {
     const candidate = value[key];
-    if (candidate && typeof candidate === "object" && !Array.isArray(candidate) && typeof candidate.outcome === "string") {
-      return candidate;
-    }
+    if (logicalResult(candidate, discriminator)) return candidate;
     if (typeof candidate === "string") {
       try {
         const parsed = parseJsonText(candidate);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && typeof parsed.outcome === "string") {
-          return parsed;
-        }
+        if (logicalResult(parsed, discriminator)) return parsed;
       } catch {}
     }
   }
@@ -280,14 +313,14 @@ export function runProcessWithInput({ command, args, cwd, env, input, timeoutMs 
   });
 }
 
-async function normalizeStdoutResult(stdout, resultFile) {
+async function normalizeStdoutResult(stdout, resultFile, discriminator) {
   let parsed;
   try {
     parsed = parseJsonText(stdout);
   } catch (error) {
     throw providerError("provider_invalid", error);
   }
-  const result = unwrapResult(parsed);
+  const result = unwrapResult(parsed, discriminator);
   if (!result) throw providerError("provider_invalid");
   await writeFile(resultFile, JSON.stringify(result), { mode: 0o600, flag: "w" });
   await chmod(resultFile, 0o600);
@@ -299,6 +332,7 @@ export async function runReviewerProvider({
   context,
   promptFile,
   schemaFile,
+  resultKind,
   policyFile = null,
   geminiSettingsFile = null,
   timeoutMs = 180_000,
@@ -307,6 +341,14 @@ export async function runReviewerProvider({
 }) {
   if (!PROVIDER_COMMANDS[cli]) throw new Error(`unsupported reviewer provider: ${cli}`);
   if (!executable) throw providerError("provider_unavailable");
+  let discriminator = "outcome";
+  if (resultKind !== undefined) {
+    if (promptFile !== undefined || schemaFile !== undefined) throw providerError("provider_invalid");
+    const owned = await ownedResultFiles(resultKind);
+    promptFile = owned.promptFile;
+    schemaFile = owned.schemaFile;
+    discriminator = owned.discriminator;
+  }
   const [contract, schemaText] = await Promise.all([
     readPrivateFile(promptFile, "reviewer prompt"),
     readPrivateFile(schemaFile, "reviewer schema")
@@ -366,7 +408,7 @@ export async function runReviewerProvider({
       ? { ...isolatedEnv, GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsFile }
       : isolatedEnv;
     const output = await runProcess({ ...invocation, cwd: workDir, env: providerEnv, input, timeoutMs });
-    if (cli !== "codex") await normalizeStdoutResult(output.stdout, resultFile);
+    if (cli !== "codex") await normalizeStdoutResult(output.stdout, resultFile, discriminator);
     try {
       const secureResult = await readSecureReviewerResult(resultFile);
       return cli === "codex" ? unwrapCodexTransportResult(secureResult) : secureResult;
