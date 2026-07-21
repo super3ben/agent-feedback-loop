@@ -683,7 +683,6 @@ test("state-changing checkpoint generation and Probe writes replay before curren
     fingerprint: "fingerprint-1",
     ownerId: "probe-owner-replay",
     leaseEpoch: 1,
-    outcome: "reflection_resolved",
     action: "continue_once",
     resultDigest: "a".repeat(64)
   };
@@ -778,7 +777,6 @@ test("Probe claims are lease-epoch fenced and completion clears the live owner",
     fingerprint: "fingerprint-1",
     ownerId: "probe-owner-1",
     leaseEpoch: 2,
-    outcome: "reflection_resolved",
     action: "continue_once",
     resultDigest: "a".repeat(64)
   }), /probe_lease_lost/u);
@@ -788,7 +786,6 @@ test("Probe claims are lease-epoch fenced and completion clears the live owner",
     fingerprint: "fingerprint-1",
     ownerId: "probe-owner-1",
     leaseEpoch: 1,
-    outcome: "reflection_resolved",
     action: "continue_once",
     resultDigest: "a".repeat(64)
   });
@@ -796,6 +793,54 @@ test("Probe claims are lease-epoch fenced and completion clears the live owner",
   assert.equal(completed.probeOwnerId, null);
   assert.equal(completed.status, "reflection_resolved");
   store.close();
+});
+
+test("hard-looking Probe advice stays neutral and immutable at the Store authority boundary", () => {
+  for (const action of ["direction_checkpoint", "human_decision", "finish_now"]) {
+    const fixture = convergenceFixture();
+    const { store } = fixture;
+    requireReflection(store);
+    store.requestConvergenceProbe({
+      eventUid: `probe-request-neutral-${action}`,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      probeKind: "convergence_reflection",
+      dueAt: "2026-07-21T00:00:00.000Z"
+    });
+    store.claimConvergenceProbe({
+      eventUid: `probe-claim-neutral-${action}`,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      ownerId: `probe-owner-neutral-${action}`,
+      leaseMs: 30_000
+    });
+    const completion = {
+      eventUid: `probe-complete-neutral-${action}`,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      ownerId: `probe-owner-neutral-${action}`,
+      leaseEpoch: 1,
+      action,
+      resultDigest: "a".repeat(64)
+    };
+
+    const completed = store.completeConvergenceProbe(completion);
+    const event = store.database.prepare(`SELECT action, result_digest
+      FROM convergence_events WHERE event_uid=?`).get(completion.eventUid);
+
+    assert.equal(completed.status, "reflection_resolved", action);
+    assert.equal(completed.probeState, "completed", action);
+    assert.equal(completed.probeOwnerId, null, action);
+    assert.equal(completed.probeLeaseUntil, null, action);
+    assert.equal(completed.probeResultDigest, completion.resultDigest, action);
+    assert.equal(event.action, action);
+    assert.equal(event.result_digest, completion.resultDigest);
+    assert.equal(store.database.prepare(
+      "SELECT COUNT(*) AS count FROM continuation_grants WHERE fingerprint=?"
+    ).get("fingerprint-1").count, 0, action);
+    assert.deepEqual(store.completeConvergenceProbe(completion), completed, action);
+    store.close();
+  }
 });
 
 test("Probe failure schedules bounded retry and a new claim fences the old epoch", () => {
@@ -875,7 +920,6 @@ test("expired running Probe leases are reclaimed and exhausted attempts become t
     fingerprint: "fingerprint-1",
     ownerId: "probe-owner-expired-1",
     leaseEpoch: first.probeLeaseEpoch,
-    outcome: "reflection_resolved",
     action: "continue_once",
     resultDigest: "a".repeat(64)
   }), /probe_lease_lost/u);

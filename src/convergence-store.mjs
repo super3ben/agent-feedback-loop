@@ -929,15 +929,13 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
     completeConvergenceProbe(input) {
       const value = exactObject(input, new Set([
         "eventUid", "taskUid", "fingerprint", "ownerId", "leaseEpoch",
-        "outcome", "action", "resultDigest"
+        "action", "resultDigest"
       ]), "convergence_probe_completion");
       const eventUid = identifier(value.eventUid, "event_uid");
       const taskUid = identifier(value.taskUid, "task_uid");
       const fingerprint = identifier(value.fingerprint, "fingerprint");
       const ownerId = identifier(value.ownerId, "owner_id");
       const leaseEpoch = integer(value.leaseEpoch, "lease_epoch", 1);
-      const outcomes = new Set(["reflection_resolved", "checkpoint_required", "human_decision", "terminal"]);
-      const outcome = enumValue(value.outcome, outcomes, "outcome");
       const action = identifier(value.action, "action");
       const resultDigest = digest(value.resultDigest, "result_digest");
       return transaction(() => {
@@ -956,11 +954,14 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
             || Date.parse(loop.probe_lease_until) <= Date.parse(currentTime)) {
           throw coded("probe_lease_lost");
         }
-        validateTransition({ from: loop.status, eventType: "reflection_completed", to: outcome });
-        database.prepare(`UPDATE convergence_loops SET status=?, probe_state='completed',
+        validateTransition({
+          from: loop.status, eventType: "reflection_completed", to: "reflection_resolved"
+        });
+        database.prepare(`UPDATE convergence_loops SET status='reflection_resolved',
+          probe_state='completed',
           probe_owner_id=NULL, probe_lease_until=NULL, probe_next_attempt_at=NULL,
           probe_result_digest=?, updated_at=?, version=version+1 WHERE fingerprint=?`).run(
-          outcome, resultDigest, currentTime, fingerprint
+          resultDigest, currentTime, fingerprint
         );
         return loopView(requireLoop(database, taskUid, fingerprint));
       });

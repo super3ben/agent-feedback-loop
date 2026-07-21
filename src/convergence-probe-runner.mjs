@@ -25,15 +25,6 @@ const STATUS_FIELDS = Object.freeze([
   "probeResultDigest",
   "version"
 ]);
-const COMPLETION_OUTCOME = new Map([
-  ["continue_once", "reflection_resolved"],
-  ["simplify_current_generation", "reflection_resolved"],
-  ["rollback_to_generation", "reflection_resolved"],
-  ["direction_checkpoint", "checkpoint_required"],
-  ["human_decision", "human_decision"],
-  ["finish_now", "terminal"]
-]);
-
 function coded(code) {
   return Object.assign(new Error(code), { code });
 }
@@ -190,7 +181,6 @@ export async function runConvergenceProbeJob({
     fingerprint,
     ownerId,
     leaseEpoch,
-    outcome: COMPLETION_OUTCOME.get(result.action),
     action: result.action,
     resultDigest: digestValue
   });

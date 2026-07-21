@@ -119,7 +119,6 @@ test("runner consumes one real Store lease and completes through its owner and e
       fingerprint: "fingerprint-1",
       ownerId: "probe-owner-1",
       leaseEpoch: 4,
-      outcome: "reflection_resolved",
       action: "simplify_current_generation",
       resultDigest: "<digest>"
     }
@@ -132,16 +131,16 @@ test("runner consumes one real Store lease and completes through its owner and e
   assert.equal(JSON.stringify(providerCall[0]).includes("must-not-reach-provider"), false);
 });
 
-test("runner maps terminal recommendations only at the Store completion boundary", async () => {
-  const cases = [
-    ["continue_once", "reflection_resolved"],
-    ["simplify_current_generation", "reflection_resolved"],
-    ["rollback_to_generation", "reflection_resolved"],
-    ["direction_checkpoint", "checkpoint_required"],
-    ["human_decision", "human_decision"],
-    ["finish_now", "terminal"]
+test("runner preserves all six recommendations only as completion advice", async () => {
+  const actions = [
+    "continue_once",
+    "simplify_current_generation",
+    "rollback_to_generation",
+    "direction_checkpoint",
+    "human_decision",
+    "finish_now"
   ];
-  for (const [action, expected] of cases) {
+  for (const action of actions) {
     const harness = storeHarness();
     await runConvergenceProbeJob({
       store: harness.store,
@@ -150,7 +149,9 @@ test("runner maps terminal recommendations only at the Store completion boundary
       ownerId: "probe-owner-1",
       provider: async () => ({ ...RESULT, action })
     });
-    assert.equal(harness.calls.find(([name]) => name === "complete")[1].outcome, expected);
+    const completion = harness.calls.find(([name]) => name === "complete")[1];
+    assert.equal(completion.action, action);
+    assert.equal(Object.hasOwn(completion, "outcome"), false);
   }
 });
 
