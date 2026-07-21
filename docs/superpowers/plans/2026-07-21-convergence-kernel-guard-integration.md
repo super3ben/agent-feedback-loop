@@ -37,7 +37,6 @@
 - `src/convergence-controller.mjs` — Breaker → Probe → policy decision → one-shot grant orchestration.
 - `src/convergence-migration.mjs` — old Guard dry-run import, apply, shadow parity, explicit cutover, and rollback metadata.
 - `src/convergence-adapters.mjs` — OpenSpec/Comet checkpoint projection and generic audit-only projection.
-- `src/convergence-learning.mjs` — task-resolution effectiveness evidence and Markdown-learning handoff without automatic policy creation.
 - `src/convergence-cli.mjs` — strict parser and machine-readable output for explicit `guard` commands.
 - `templates/prompts/convergence-probe.md` — bounded Reflection Probe contract.
 - `templates/schemas/convergence-probe-result.schema.json` — provider-visible result schema.
@@ -63,7 +62,6 @@
 - `test/convergence-controller.test.mjs`
 - `test/convergence-migration.test.mjs`
 - `test/convergence-adapters.test.mjs`
-- `test/convergence-learning.test.mjs`
 - `test/fixtures/guard/open-first-failure.json`
 - `test/fixtures/guard/second-failure-direction.json`
 - `test/fixtures/guard/closed-regression.json`
@@ -910,22 +908,17 @@ git commit -m "feat: migrate Guard authority without dual writes"
 
 ---
 
-### Task 8: Checkpoint/Audit Adapters and Learning Feedback
+### Task 8: Capability-Bounded Checkpoint and Audit Adapters
 
 **Files:**
 - Create: `src/convergence-adapters.mjs`
-- Create: `src/convergence-learning.mjs`
 - Create: `test/convergence-adapters.test.mjs`
-- Create: `test/convergence-learning.test.mjs`
-- Modify: `src/convergence-probe-runner.mjs`
-- Modify: `src/convergence-cli.mjs`
 
 **Interfaces:**
 - Produces: `projectOpenSpecCheckpoint(input)`, `projectCometCheckpoint(input)`, `projectGenericAudit(input)`.
-- Produces: `recordConvergenceEffectiveness(input)` and `buildConvergenceLearningContext(input)`.
-- Adds explicit commands: `guard checkpoint-evaluate`, `guard audit`, `guard resolve-effectiveness`.
+- Pure projections only: no Store write, source-spec write, CLI side effect, background job, policy mutation, or grant surface.
 
-- [ ] **Step 1: Write failing capability and learning tests**
+- [ ] **Step 1: Write failing capability-boundary tests**
 
 ```js
 test("OpenSpec may hold the next task but generic audit cannot claim a mutation block", () => {
@@ -935,24 +928,15 @@ test("OpenSpec may hold the next task but generic audit cannot claim a mutation 
   assert.equal(generic.adapterCapability, "audit_only");
   assert.equal(generic.maximumEnforcement, "warn");
 });
-
-test("verified effectiveness can become learning context but never a hard policy", () => {
-  const event = recordConvergenceEffectiveness({ outcome: "true_positive",
-    evidenceDigest: "a".repeat(64), removedScopeCount: 2, falsePositive: false });
-  const context = buildConvergenceLearningContext([event]);
-  assert.equal(context.facts[0].includes("2"), true);
-  assert.equal(Object.hasOwn(context, "policy"), false);
-  assert.equal(Object.hasOwn(context, "grant"), false);
-});
 ```
 
-Add fixtures proving inferred contract fields remain advisory, unapproved OpenSpec revisions cannot gate, false positives are retained, and recurrence after an emitted Markdown method is negative evidence.
+Add exact-key fixtures proving inferred contract fields remain advisory; unapproved, stale, or mismatched OpenSpec/Comet revisions cannot gate; approved native task/revision identity is preserved; and generic prompt/tool observations remain `audit_only` with maximum `warn` enforcement.
 
-- [ ] **Step 2: Run adapter/learning tests and verify RED**
+- [ ] **Step 2: Run adapter tests and verify RED**
 
-Run: `node --test test/convergence-adapters.test.mjs test/convergence-learning.test.mjs`
+Run: `node --test test/convergence-adapters.test.mjs`
 
-Expected: FAIL with missing modules.
+Expected: FAIL with the missing adapter module.
 
 - [ ] **Step 3: Implement capability-bounded projections**
 
@@ -972,39 +956,21 @@ export function projectGenericAudit(input) {
 
 Comet uses the same checkpoint capability but its native task ID and revision come from the active change/task artifact. No adapter writes source specifications.
 
-- [ ] **Step 4: Implement effectiveness recording and learning handoff**
+- [ ] **Step 4: Run adapter and affected convergence regressions**
 
-```js
-export function recordConvergenceEffectiveness(input) {
-  const outcome = exactEnum(input.outcome,
-    ["true_positive", "false_positive", "useful_complexity", "recurrence", "unknown"]);
-  return Object.freeze({ outcome, evidenceDigest: exactSha256(input.evidenceDigest),
-    removedScopeCount: boundedCount(input.removedScopeCount), falsePositive: Boolean(input.falsePositive) });
-}
-
-export function buildConvergenceLearningContext(events) {
-  const verified = events.filter(hasVerifiedEvidence).slice(-8);
-  return Object.freeze({
-    facts: verified.map(renderBoundedFact),
-    candidateKind: "convergence_effectiveness",
-    authority: "advisory_learning"
-  });
-}
-```
-
-At `resolve-effectiveness`, store the structured event. When the outcome has verified evidence, enqueue one `learning` Probe on the same loop after all decision Probes are terminal. The learning Probe uses the existing lesson result validator and Markdown publisher, but its source identity is a digest of task/loop/effectiveness event. Its published method remains advisory and cannot mutate `policy_revision`.
-
-- [ ] **Step 5: Run adapter, learning, reviewer, and selector tests**
-
-Run: `node --test test/convergence-adapters.test.mjs test/convergence-learning.test.mjs test/convergence-probe.test.mjs test/reviewer-runner.test.mjs test/selector.test.mjs`
+Run: `node --test test/convergence-adapters.test.mjs test/convergence-identity.test.mjs test/convergence-policy.test.mjs test/convergence-controller.test.mjs`
 
 Expected: PASS.
+
+- [ ] **Step 5: Verify the deferred-learning exclusion**
+
+Assert this task adds no production reference to `resolve-effectiveness`, `recordConvergenceEffectiveness`, or a `learning` Probe kind. The existing dissatisfaction reviewer remains the only automatic Markdown producer. Independent Guard-outcome learning is backlog until a named producer supplies a bounded evidence envelope and a separately approved learning-job authority/result contract.
 
 - [ ] **Step 6: Commit Task 8**
 
 ```bash
-git add src/convergence-adapters.mjs src/convergence-learning.mjs src/convergence-probe-runner.mjs src/convergence-cli.mjs test/convergence-adapters.test.mjs test/convergence-learning.test.mjs test/convergence-probe.test.mjs
-git commit -m "feat: add bounded adapters and convergence learning"
+git add src/convergence-adapters.mjs test/convergence-adapters.test.mjs
+git commit -m "feat: add capability-bounded convergence adapters"
 ```
 
 ---

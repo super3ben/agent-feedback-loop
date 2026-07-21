@@ -441,6 +441,8 @@ append-only 事件：event ID、task/loop、generation、event type、reason cod
 
 reviewer 可据此生成普通 Markdown 方法经验，例如“验收已满足后，新增 scheduler 前先要求生产证据”。这些经验在后续任务中增强 warning 与 Probe guidance，但不能静默成为 hard policy。
 
+首期不实现独立的 convergence effectiveness → Markdown 自动发布。当前没有命名的 `resolve-effectiveness` 生产者，也没有能让后台模型核验实际事实的 evidence envelope；digest 与计数只证明身份和摘要，不足以支撑诚实的 lesson。现有由真实用户不满事件触发的即时 reviewer 仍是唯一自动 Markdown 学习生产者。未来只有在真实 workflow producer、带内容且有隐私边界的 evidence envelope、独立 learning-job authority/source-neutral result contract 均得到批准后，才可新增 Guard outcome 学习；不得复用 decision Probe 状态或伪造 session event。
+
 新的 deterministic trigger 必须经过独立变更：真实复发证据、明确 predicate、正负 fixture、false-positive 分析、用户批准和 policy revision。这样实现“自我成长”，同时避免模型自我扩权。
 
 ## 19. 错误处理与恢复
