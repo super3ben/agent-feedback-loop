@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -18,6 +19,9 @@ const VERDICTS = new Set(["approved", "changes_required"]);
 const DIRECTION_SIGNALS = new Set(["none", "structural_blocked", "no_local_seam"]);
 const MODES = new Set(["local_fix", "architecture_fix"]);
 const FAILURE_ACTIONS = new Set(["direction_review", "stop"]);
+const ARTIFACT_HOOK_NAMES = new Set([
+  "afterArtifactOpen", "beforeArtifactUnlink", "beforeArtifactPublish"
+]);
 const COMMAND_FLAGS = Object.freeze({
   "record-review": new Set([
     "--task-id", "--invariant-id", "--boundary", "--review-run-id", "--severity",
@@ -79,6 +83,13 @@ function normalizeId(value, code = "guard_invalid_arguments") {
   return normalized;
 }
 
+function normalizeAuditText(value, code = "guard_invalid_arguments") {
+  if (typeof value !== "string" || value.includes("\0")) throw coded(code);
+  const normalized = value.trim();
+  if (normalized.length === 0 || normalized.length > 4096) throw coded(code);
+  return normalized;
+}
+
 function parseArgs(args) {
   if (!Array.isArray(args) || args.length < 1 || !Object.hasOwn(COMMAND_FLAGS, args[0])) {
     throw coded("guard_invalid_arguments");
@@ -106,6 +117,20 @@ function parseArgs(args) {
   return Object.freeze({ command, values });
 }
 
+function validatedArtifactHooks(hooks) {
+  if (hooks === undefined) return Object.freeze({});
+  if (hooks === null || typeof hooks !== "object" || Array.isArray(hooks)
+      || Object.getPrototypeOf(hooks) !== Object.prototype) {
+    throw coded("guard_invalid_arguments");
+  }
+  for (const [name, hook] of Object.entries(hooks)) {
+    if (!ARTIFACT_HOOK_NAMES.has(name) || typeof hook !== "function") {
+      throw coded("guard_invalid_arguments");
+    }
+  }
+  return hooks;
+}
+
 function keyFrom(values) {
   return Object.freeze({
     taskId: normalizeId(values["--task-id"]),
@@ -114,8 +139,8 @@ function keyFrom(values) {
   });
 }
 
-function fingerprintFor(key) {
-  return sha256(`${key.taskId}\0${key.invariantId}\0${key.boundary}`);
+function fingerprintFor(taskUid, key) {
+  return sha256(`${taskUid}\0${key.invariantId}\0${key.boundary}`);
 }
 
 function eventUid(kind, ...parts) {
@@ -136,7 +161,6 @@ function summary(loop, action, exitCode, architectureFixCount = 0) {
     boundary: loop.boundaryId,
     status: loop.status,
     failure_count: loop.failureCount,
-    fix_generations: loop.fixGenerations,
     architecture_fix_count: architectureFixCount,
     direction_signal: loop.decision === "checkpoint_required" ? "required" : "none"
   });
@@ -218,22 +242,40 @@ function decisionRequest({ contract, loop, priorBasis, lastPurpose }) {
 async function recordReview({ parsed, repoRoot, store }) {
   const key = keyFrom(parsed.values);
   const { contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
-  const severity = parsed.values["--severity"].trim().toLowerCase();
-  const verdict = parsed.values["--verdict"];
-  const directionSignal = parsed.values["--direction-signal"] ?? "none";
+  const severity = normalizeAuditText(parsed.values["--severity"]).toLowerCase();
+  const verdict = normalizeAuditText(parsed.values["--verdict"]).toLowerCase();
+  const directionSignal = Object.hasOwn(parsed.values, "--direction-signal")
+    ? normalizeAuditText(parsed.values["--direction-signal"]).toLowerCase()
+    : "none";
+  const commit = normalizeAuditText(parsed.values["--commit"]);
+  const reviewRef = normalizeAuditText(parsed.values["--review-ref"]);
   if (!REVIEW_SEVERITIES.has(severity) || !VERDICTS.has(verdict)
       || !DIRECTION_SIGNALS.has(directionSignal)) throw coded("guard_invalid_arguments");
   const countedFailure = verdict === "changes_required" && severity !== "minor";
+  const evidenceFlags = ["--hypothesis", "--new-evidence", "--falsification-test"];
   if (countedFailure) {
-    for (const flag of ["--hypothesis", "--new-evidence", "--falsification-test", "--failure-next-action"]) {
+    for (const flag of [...evidenceFlags, "--failure-next-action"]) {
       if (!Object.hasOwn(parsed.values, flag)) throw coded("review_evidence_required");
     }
-    if (!FAILURE_ACTIONS.has(parsed.values["--failure-next-action"])) throw coded("guard_invalid_arguments");
+  }
+  const auditEvidence = Object.fromEntries(evidenceFlags.map((flag) => [flag,
+    Object.hasOwn(parsed.values, flag)
+      ? normalizeAuditText(parsed.values[flag], countedFailure ? "review_evidence_required" : "guard_invalid_arguments")
+      : null
+  ]));
+  const failureNextAction = Object.hasOwn(parsed.values, "--failure-next-action")
+    ? normalizeAuditText(
+      parsed.values["--failure-next-action"],
+      countedFailure ? "review_evidence_required" : "guard_invalid_arguments"
+    ).toLowerCase()
+    : null;
+  if (failureNextAction !== null && !FAILURE_ACTIONS.has(failureNextAction)) {
+    throw coded("guard_invalid_arguments");
   }
   const reviewRunId = normalizeId(parsed.values["--review-run-id"]);
-  const fingerprint = fingerprintFor(key);
   const prior = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
-  const reviewUid = reviewEventUid(task.taskUid, prior?.fingerprint ?? fingerprint, reviewRunId);
+  const fingerprint = prior?.fingerprint ?? fingerprintFor(task.taskUid, key);
+  const reviewUid = reviewEventUid(task.taskUid, fingerprint, reviewRunId);
   const replayEvent = store.database.prepare(
     "SELECT 1 FROM convergence_events WHERE event_uid=?"
   ).get(reviewUid);
@@ -242,8 +284,23 @@ async function recordReview({ parsed, repoRoot, store }) {
       WHERE task_uid=? AND boundary_id=? LIMIT 1`).get(task.taskUid, key.boundary);
     if (candidates) throw coded("invariant_classification_required");
   }
+  const auditEnvelope = Object.freeze({
+    reviewRunId,
+    taskId: key.taskId,
+    invariantId: key.invariantId,
+    boundary: key.boundary,
+    severity,
+    verdict,
+    commit,
+    reviewRef,
+    hypothesis: auditEvidence["--hypothesis"],
+    newEvidence: auditEvidence["--new-evidence"],
+    falsificationTest: auditEvidence["--falsification-test"],
+    failureNextAction,
+    directionSignal
+  });
   const evidenceDigest = countedFailure
-    ? sha256(parsed.values["--new-evidence"].trim())
+    ? sha256(auditEnvelope.newEvidence)
     : sha256(`${verdict}:${reviewRunId}`);
   if (countedFailure && prior && !replayEvent) {
     const historical = store.database.prepare(`SELECT 1 FROM convergence_events
@@ -251,7 +308,7 @@ async function recordReview({ parsed, repoRoot, store }) {
         AND evidence_digest=? LIMIT 1`).get(task.taskUid, prior.fingerprint, evidenceDigest);
     if (historical) throw coded("evidence_not_new");
   }
-  const basis = digestDecisionBasis({ evidenceDigest, reviewRunId, verdict });
+  const basis = digestDecisionBasis(auditEnvelope);
   let loop = store.recordConvergenceReview({
     eventUid: reviewUid,
     taskUid: task.taskUid,
@@ -266,6 +323,7 @@ async function recordReview({ parsed, repoRoot, store }) {
     generation: prior?.currentGeneration ?? 0
   });
   if (verdict === "approved") return summary(loop, "closed", 0, architectureFixCount(store, loop.fingerprint));
+  if (!countedFailure) return summary(loop, "review_recorded", 0, architectureFixCount(store, loop.fingerprint));
 
   if (loop.failureCount >= 2 || directionSignal !== "none") {
     const request = decisionRequest({
@@ -304,7 +362,6 @@ function loopStatus(store, loop) {
     boundary: loop.boundaryId,
     status: loop.status,
     failure_count: loop.failureCount,
-    fix_generations: loop.fixGenerations,
     architecture_fix_count: architectureFixCount(store, loop.fingerprint),
     seen_review_run_ids: Object.freeze(seenReviewRunIds),
     aliases: loop.aliases,
@@ -371,7 +428,7 @@ async function declareDistinct({ parsed, repoRoot, store }) {
   if (!candidates) throw coded("distinct_declaration_unnecessary");
   const reason = normalizeId(parsed.values["--reason"]);
   const evidenceDigest = sha256(parsed.values["--evidence"].trim());
-  const fingerprint = fingerprintFor(key);
+  const fingerprint = fingerprintFor(task.taskUid, key);
   const loop = store.declareConvergenceDistinct({
     eventUid: eventUid("distinct", task.taskUid, fingerprint, reason, evidenceDigest),
     taskUid: task.taskUid,
@@ -385,29 +442,112 @@ async function declareDistinct({ parsed, repoRoot, store }) {
   return Object.freeze({ action: "distinct_declared", exitCode: 0, ...loopStatus(store, loop) });
 }
 
-async function safeRepositoryFile(repoRoot, file, { expectedMode = 0o600 } = {}) {
-  const root = await realpath(repoRoot);
-  const resolved = await realpath(file);
-  if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) throw coded("artifact_outside_repo");
-  const info = await lstat(file);
+function assertArtifactOwned(info) {
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    throw coded("artifact_not_owned");
+  }
+}
+
+async function repositoryTarget(repoRoot, file) {
+  if (typeof file !== "string" || file.length === 0 || file.includes("\0")) {
+    throw coded("guard_invalid_arguments");
+  }
+  const rootInput = path.resolve(repoRoot);
+  const rootInfo = await lstat(rootInput);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw coded("artifact_unsafe");
+  assertArtifactOwned(rootInfo);
+  const root = await realpath(rootInput);
+  const requested = path.resolve(rootInput, file);
+  let target;
+  if (requested !== rootInput && requested.startsWith(`${rootInput}${path.sep}`)) {
+    target = path.join(root, path.relative(rootInput, requested));
+  } else if (requested !== root && requested.startsWith(`${root}${path.sep}`)) {
+    target = requested;
+  } else {
+    throw coded("artifact_outside_repo");
+  }
+  return Object.freeze({ root, target });
+}
+
+async function assertSafeComponents(root, target, { includeLeaf = false } = {}) {
+  const relative = path.relative(root, target);
+  const components = relative.split(path.sep);
+  const limit = includeLeaf ? components.length : components.length - 1;
+  let current = root;
+  for (let index = 0; index < limit; index += 1) {
+    current = path.join(current, components[index]);
+    const info = await lstat(current);
+    if (info.isSymbolicLink() || (index < components.length - 1 && !info.isDirectory())) {
+      throw coded("artifact_unsafe");
+    }
+    assertArtifactOwned(info);
+  }
+}
+
+function assertPrivateRegular(info) {
   if (!info.isFile() || info.isSymbolicLink()) throw coded("artifact_unsafe");
-  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw coded("artifact_not_owned");
-  if ((info.mode & 0o777) !== expectedMode) throw coded("artifact_unsafe_mode");
-  return resolved;
+  assertArtifactOwned(info);
+  if ((info.mode & 0o777) !== 0o600) throw coded("artifact_unsafe_mode");
 }
 
 async function privateArtifactTarget(repoRoot, file) {
-  const root = await realpath(repoRoot);
-  const parent = await realpath(path.dirname(file));
-  if (parent !== root && !parent.startsWith(`${root}${path.sep}`)) throw coded("artifact_outside_repo");
-  const info = await lstat(parent);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw coded("artifact_unsafe");
-  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw coded("artifact_not_owned");
-  return path.join(parent, path.basename(file));
+  const location = await repositoryTarget(repoRoot, file);
+  await assertSafeComponents(location.root, location.target);
+  try {
+    const existing = await lstat(location.target);
+    assertPrivateRegular(existing);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return location;
 }
 
-async function writePrivateJson(repoRoot, file, value) {
-  const target = await privateArtifactTarget(repoRoot, file);
+async function openPrivateArtifact(repoRoot, file) {
+  const location = await repositoryTarget(repoRoot, file);
+  await assertSafeComponents(location.root, location.target, { includeLeaf: true });
+  let handle;
+  try {
+    handle = await open(location.target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (["ELOOP", "EMLINK"].includes(error?.code)) throw coded("artifact_unsafe");
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    assertPrivateRegular(info);
+    return Object.freeze({ ...location, handle, dev: info.dev, ino: info.ino });
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function assertCurrentArtifact(opened, code) {
+  let info;
+  try {
+    info = await lstat(opened.target);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw coded(code);
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink() || info.dev !== opened.dev || info.ino !== opened.ino) {
+    throw coded(code);
+  }
+  assertPrivateRegular(info);
+}
+
+async function readPrivateArtifact(repoRoot, file) {
+  const opened = await openPrivateArtifact(repoRoot, file);
+  try {
+    await assertCurrentArtifact(opened, "artifact_replaced");
+    return Object.freeze({ target: opened.target, root: opened.root, body: await opened.handle.readFile("utf8") });
+  } finally {
+    await opened.handle.close();
+  }
+}
+
+async function writePrivateJson(repoRoot, file, value, artifactHooks) {
+  const { target } = await privateArtifactTarget(repoRoot, file);
   try {
     await lstat(target);
     throw coded("grant_artifact_exists");
@@ -418,17 +558,19 @@ async function writePrivateJson(repoRoot, file, value) {
   const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.chmod(0o600);
     await handle.sync();
   } finally {
     await handle.close();
   }
   try {
-    await chmod(temporary, 0o600);
-    await rename(temporary, target);
-    await chmod(target, 0o600);
+    await artifactHooks.beforeArtifactPublish?.();
+    await link(temporary, target);
   } catch (error) {
-    await unlink(temporary).catch(() => {});
+    if (error?.code === "EEXIST") throw coded("grant_artifact_exists");
     throw error;
+  } finally {
+    await unlink(temporary).catch(() => {});
   }
   return target;
 }
@@ -450,9 +592,10 @@ function parseCheckpoint(text, key) {
 async function checkpoint({ parsed, repoRoot, store }) {
   const key = keyFrom(parsed.values);
   const { task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
-  const fingerprint = fingerprintFor(key);
-  const file = await safeRepositoryFile(repoRoot, parsed.values["--file"]);
-  const body = await readFile(file, "utf8");
+  const prior = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
+  const fingerprint = prior?.fingerprint ?? fingerprintFor(task.taskUid, key);
+  const file = await readPrivateArtifact(repoRoot, parsed.values["--file"]);
+  const body = file.body;
   parseCheckpoint(body, key);
   const fileDigest = sha256(body);
   const loop = store.recordConvergenceCheckpoint({
@@ -465,31 +608,33 @@ async function checkpoint({ parsed, repoRoot, store }) {
   return summary(loop, "architecture_fix_allowed", 0, architectureFixCount(store, fingerprint));
 }
 
-async function authorizeFix({ parsed, repoRoot, store, now }) {
+async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   const key = keyFrom(parsed.values);
   const { lineage, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
   const mode = parsed.values["--mode"];
   if (!MODES.has(mode)) throw coded("guard_invalid_arguments");
-  const fingerprint = fingerprintFor(key);
-  const loop = store.getConvergenceStatus({ taskUid: task.taskUid, fingerprint });
+  const loop = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
+  if (!loop) throw coded("loop_not_found");
+  const fingerprint = loop.fingerprint;
   if (mode === "local_fix" && (loop.failureCount !== 1 || loop.currentGeneration !== 0)) {
     throw coded(loop.decision === "checkpoint_required" ? "direction_review_required" : "transition_invalid");
   }
   if (mode === "architecture_fix" && !["direction_approved", "grant_ready"].includes(loop.status)) {
     throw coded(loop.decision === "human_decision" ? "human_decision_required" : "direction_review_required");
   }
+  const artifactTarget = await privateArtifactTarget(repoRoot, parsed.values["--grant-file"]);
   let checkpoint = null;
   if (mode === "architecture_fix") {
     if (!Object.hasOwn(parsed.values, "--checkpoint-file")) throw coded("guard_invalid_arguments");
     const row = store.database.prepare(`SELECT result_digest FROM convergence_events
       WHERE fingerprint=? AND event_type='checkpoint_recorded' ORDER BY id DESC LIMIT 1`).get(fingerprint);
     if (!row) throw coded("checkpoint_invalid");
-    const checkpointFile = await safeRepositoryFile(repoRoot, parsed.values["--checkpoint-file"]);
-    const checkpointBody = await readFile(checkpointFile, "utf8");
+    const checkpointFile = await readPrivateArtifact(repoRoot, parsed.values["--checkpoint-file"]);
+    const checkpointBody = checkpointFile.body;
     if (sha256(checkpointBody) !== row.result_digest) throw coded("checkpoint_changed");
     checkpoint = {
       digest: row.result_digest,
-      file: path.relative(await realpath(repoRoot), checkpointFile)
+      file: path.relative(checkpointFile.root, checkpointFile.target)
     };
   } else if (Object.hasOwn(parsed.values, "--checkpoint-file")) {
     throw coded("guard_invalid_arguments");
@@ -512,9 +657,9 @@ async function authorizeFix({ parsed, repoRoot, store, now }) {
     expiresAt: new Date(now().getTime() + 5 * 60_000).toISOString()
   });
   if (issued.replayed === true) {
-    const artifactFile = await safeRepositoryFile(repoRoot, parsed.values["--grant-file"]);
+    const artifactFile = await readPrivateArtifact(repoRoot, artifactTarget.target);
     let existing;
-    try { existing = JSON.parse(await readFile(artifactFile, "utf8")); } catch {
+    try { existing = JSON.parse(artifactFile.body); } catch {
       throw coded("grant_artifact_unrecoverable");
     }
     const existingGrant = existing?.continuation_grant;
@@ -556,7 +701,7 @@ async function authorizeFix({ parsed, repoRoot, store, now }) {
       checkpointFile: checkpoint?.file ?? null
     }
   };
-  await writePrivateJson(repoRoot, parsed.values["--grant-file"], artifact);
+  await writePrivateJson(repoRoot, artifactTarget.target, artifact, artifactHooks);
   return Object.freeze({
     action: `${mode}_authorized`,
     exitCode: 0,
@@ -568,49 +713,59 @@ async function authorizeFix({ parsed, repoRoot, store, now }) {
   });
 }
 
-async function consumeGrant({ parsed, repoRoot, store }) {
-  const artifactFile = await safeRepositoryFile(repoRoot, parsed.values["--grant-file"]);
-  let artifact;
-  try { artifact = JSON.parse(await readFile(artifactFile, "utf8")); } catch { throw coded("grant_artifact_invalid"); }
-  const grant = artifact?.continuation_grant;
-  if (artifact?.version !== 1 || !grant || typeof grant !== "object") throw coded("grant_artifact_invalid");
-  const lineage = await ensureRepositoryLineage({ repoRoot });
-  if (grant.lineageDigest !== sha256(lineage.lineageId)) throw coded("grant_repository_mismatch");
-  if (grant.purpose === "architecture_fix") {
-    if (typeof grant.checkpointFile !== "string" || typeof grant.checkpointDigest !== "string") {
+async function consumeGrant({ parsed, repoRoot, store, artifactHooks }) {
+  const opened = await openPrivateArtifact(repoRoot, parsed.values["--grant-file"]);
+  try {
+    await artifactHooks.afterArtifactOpen?.();
+    await assertCurrentArtifact(opened, "artifact_replaced");
+    let artifact;
+    try { artifact = JSON.parse(await opened.handle.readFile("utf8")); } catch {
       throw coded("grant_artifact_invalid");
     }
-    const checkpointFile = await safeRepositoryFile(repoRoot, path.join(repoRoot, grant.checkpointFile));
-    if (sha256(await readFile(checkpointFile, "utf8")) !== grant.checkpointDigest) {
-      throw coded("checkpoint_changed");
+    await assertCurrentArtifact(opened, "artifact_replaced");
+    const grant = artifact?.continuation_grant;
+    if (artifact?.version !== 1 || !grant || typeof grant !== "object") throw coded("grant_artifact_invalid");
+    const lineage = await ensureRepositoryLineage({ repoRoot });
+    if (grant.lineageDigest !== sha256(lineage.lineageId)) throw coded("grant_repository_mismatch");
+    if (grant.purpose === "architecture_fix") {
+      if (typeof grant.checkpointFile !== "string" || typeof grant.checkpointDigest !== "string") {
+        throw coded("grant_artifact_invalid");
+      }
+      const checkpointFile = await readPrivateArtifact(repoRoot, path.join(repoRoot, grant.checkpointFile));
+      if (sha256(checkpointFile.body) !== grant.checkpointDigest) throw coded("checkpoint_changed");
     }
+    await assertCurrentArtifact(opened, "artifact_replaced");
+    const result = store.consumeContinuationGrant({
+      eventUid: eventUid("consume", grant.grantId, parsed.values["--brief-ref"]),
+      token: grant.token,
+      taskUid: grant.taskUid,
+      fingerprint: grant.fingerprint,
+      currentGeneration: grant.currentGeneration,
+      nextGeneration: grant.nextGeneration,
+      purpose: grant.purpose,
+      scopeDigest: grant.scopeDigest,
+      contractRevision: grant.contractRevision,
+      policyRevision: grant.policyRevision,
+      decisionBasisDigest: grant.decisionBasisDigest,
+      evidenceDigest: grant.evidenceDigest
+    });
+    await artifactHooks.beforeArtifactUnlink?.();
+    await assertCurrentArtifact(opened, "artifact_replaced_after_consume");
+    await unlink(opened.target);
+    return Object.freeze({
+      action: "continuation_grant_consumed",
+      exitCode: 0,
+      continuation_grant: Object.freeze({
+        consumed: true,
+        fingerprint: result.fingerprint,
+        generation: result.generation,
+        purpose: result.purpose,
+        brief_ref: parsed.values["--brief-ref"]
+      })
+    });
+  } finally {
+    await opened.handle.close();
   }
-  const result = store.consumeContinuationGrant({
-    eventUid: eventUid("consume", grant.grantId, parsed.values["--brief-ref"]),
-    token: grant.token,
-    taskUid: grant.taskUid,
-    fingerprint: grant.fingerprint,
-    currentGeneration: grant.currentGeneration,
-    nextGeneration: grant.nextGeneration,
-    purpose: grant.purpose,
-    scopeDigest: grant.scopeDigest,
-    contractRevision: grant.contractRevision,
-    policyRevision: grant.policyRevision,
-    decisionBasisDigest: grant.decisionBasisDigest,
-    evidenceDigest: grant.evidenceDigest
-  });
-  await unlink(artifactFile);
-  return Object.freeze({
-    action: "continuation_grant_consumed",
-    exitCode: 0,
-    continuation_grant: Object.freeze({
-      consumed: true,
-      fingerprint: result.fingerprint,
-      generation: result.generation,
-      purpose: result.purpose,
-      brief_ref: parsed.values["--brief-ref"]
-    })
-  });
 }
 
 async function resolve({ parsed, repoRoot, store }) {
@@ -629,8 +784,11 @@ async function resolve({ parsed, repoRoot, store }) {
   return Object.freeze({ action: "closed", exitCode: 0, ...loopStatus(store, resolved) });
 }
 
-export async function runGuardCommand({ args, repoRoot, store, now = () => new Date() }) {
+export async function runGuardCommand({
+  args, repoRoot, store, now = () => new Date(), artifactHooks: rawArtifactHooks
+}) {
   if (typeof repoRoot !== "string" || !store || typeof now !== "function") throw coded("guard_invalid_arguments");
+  const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
   if (parsed.command === "record-review") return recordReview({ parsed, repoRoot, store });
   if (parsed.command === "status") return status({ parsed, repoRoot, store });
@@ -638,9 +796,11 @@ export async function runGuardCommand({ args, repoRoot, store, now = () => new D
   if (parsed.command === "add-alias") return addAlias({ parsed, store });
   if (parsed.command === "declare-distinct") return declareDistinct({ parsed, repoRoot, store });
   if (parsed.command === "checkpoint") return checkpoint({ parsed, repoRoot, store });
-  if (parsed.command === "authorize-fix") return authorizeFix({ parsed, repoRoot, store, now });
+  if (parsed.command === "authorize-fix") {
+    return authorizeFix({ parsed, repoRoot, store, now, artifactHooks });
+  }
   if (parsed.command === "consume-grant" || parsed.command === "consume-receipt") {
-    return consumeGrant({ parsed, repoRoot, store });
+    return consumeGrant({ parsed, repoRoot, store, artifactHooks });
   }
   if (parsed.command === "resolve") return resolve({ parsed, repoRoot, store });
   throw coded("guard_invalid_arguments");

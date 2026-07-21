@@ -562,7 +562,9 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         const historicalEvidence = existing && database.prepare(`SELECT 1 FROM convergence_events
           WHERE task_uid=? AND fingerprint=? AND event_type='review_recorded' AND evidence_digest=?
           LIMIT 1`).get(value.taskUid, fingerprint, value.evidenceDigest);
-        const failed = value.verdict === "changes_required" && !historicalEvidence;
+        const failed = value.verdict === "changes_required"
+          && (value.severity === "important" || value.severity === "critical")
+          && !historicalEvidence;
         const failureCount = Number(existing?.failure_count ?? 0) + (failed ? 1 : 0);
         const decision = failed && (failureCount >= 2 || value.directionSignal !== "none")
           ? "checkpoint_required"

@@ -296,6 +296,32 @@ test("reviews preserve one fingerprint across replay and closed regression gener
   store.close();
 });
 
+test("minor changes-required reviews are recorded without consuming a failure generation", () => {
+  const { store } = convergenceFixture();
+  store.upsertConvergenceTask(taskInput());
+
+  const minor = store.recordConvergenceReview(reviewInput({ severity: "minor" }));
+  assert.equal(minor.failureCount, 0);
+  assert.equal(minor.currentGeneration, 1);
+  const event = store.database.prepare(
+    "SELECT facts_json FROM convergence_events WHERE event_uid='review-event-1'"
+  ).get();
+  assert.deepEqual(JSON.parse(event.facts_json), {
+    directionSignal: "none",
+    failureCount: 0,
+    severity: "minor",
+    verdict: "changes_required"
+  });
+
+  const important = store.recordConvergenceReview(reviewInput({
+    eventUid: "review-event-important",
+    severity: "important",
+    evidenceDigest: "8".repeat(64)
+  }));
+  assert.equal(important.failureCount, 1);
+  store.close();
+});
+
 test("canonical review envelope makes alias replay immutable across every accepted field", () => {
   const { store } = convergenceFixture();
   seedLoop(store);

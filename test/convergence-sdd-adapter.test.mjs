@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -38,11 +40,16 @@ async function harness(name) {
     "--invariant-id", state.invariant_id,
     "--boundary", state.boundary
   ];
-  const command = (args) => runGuardCommand({ args, repoRoot, store, now });
-  const review = ({ run, verdict = "changes_required", evidence = `evidence-${run}` }) => command([
+  const command = (args, artifactHooks) => runGuardCommand({ args, repoRoot, store, now, artifactHooks });
+  const review = ({
+    run,
+    verdict = "changes_required",
+    evidence = `evidence-${run}`,
+    severity = "Important"
+  }) => command([
     "record-review", ...key,
     "--review-run-id", run,
-    "--severity", "Important",
+    "--severity", severity,
     "--verdict", verdict,
     "--commit", `commit-${run}`,
     "--review-ref", `reviews/${run}.md`,
@@ -126,6 +133,24 @@ test("first failure authorizes one local fix and the second requires direction r
   assert.equal(second.failure_count, secondFixture.expected.failure_count);
 });
 
+test("minor changes-required is audited without authorizing or consuming failure count", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+
+  const minor = await h.review({ run: "review-minor", severity: "Minor" });
+  assert.equal(minor.action, "review_recorded");
+  assert.equal(minor.failure_count, 0);
+  const grantFile = path.join(h.repoRoot, ".superpowers", "sdd", "minor-grant.json");
+  await assert.rejects(
+    h.authorize("local_fix", grantFile),
+    (error) => error.code === "transition_invalid"
+  );
+
+  const important = await h.review({ run: "review-important", severity: "Important" });
+  assert.equal(important.action, "local_fix_allowed");
+  assert.equal(important.failure_count, 1);
+});
+
 test("closed regression keeps identity and architecture failure goes human", async (t) => {
   const regressionFixture = await fixture("closed-regression");
   const architectureFixture = await fixture("architecture-failed");
@@ -143,7 +168,6 @@ test("closed regression keeps identity and architecture failure goes human", asy
   assert.equal(regression.action, regressionFixture.expected.action);
   assert.equal(regression.exitCode, regressionFixture.expected.exit_code);
   assert.equal(regression.failure_count, regressionFixture.expected.failure_count);
-  assert.deepEqual(regression.fix_generations, [1]);
 
   const checkpoint = await checkpointFile(h.repoRoot, h.key);
   await h.command(["checkpoint", ...h.key, "--file", checkpoint]);
@@ -172,6 +196,115 @@ test("exact review replay is idempotent and a changed review-run collides", asyn
   const status = await h.command(["status", "--task-id", h.state.task_id]);
   assert.equal(status.loops[0].failure_count, 1);
   assert.deepEqual(status.loops[0].seen_review_run_ids, ["stable-review"]);
+});
+
+test("review replay binds the complete normalized audit envelope before mutation", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const base = [
+    "record-review", ...h.key,
+    "--review-run-id", "audit-review",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "commit-a",
+    "--review-ref", "reviews/audit.md",
+    "--hypothesis", "hypothesis-a",
+    "--new-evidence", "evidence-audit",
+    "--falsification-test", "falsification-a",
+    "--failure-next-action", "direction_review",
+    "--direction-signal", "none"
+  ];
+  const first = await h.command(base);
+  const normalizedReplay = base.map((value, index) => {
+    const previous = base[index - 1];
+    return ["--severity", "--verdict", "--commit", "--review-ref", "--hypothesis",
+      "--new-evidence", "--falsification-test", "--failure-next-action", "--direction-signal"]
+      .includes(previous) ? `  ${value}  ` : value;
+  });
+  assert.deepEqual(await h.command(normalizedReplay), first);
+
+  const state = () => ({
+    events: h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count,
+    loops: h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_loops").get().count,
+    status: h.store.getConvergenceStatus({ taskUid: first.task_id, fingerprint: first.fingerprint })
+  });
+  const before = state();
+  const changes = new Map([
+    ["--severity", "Critical"],
+    ["--verdict", "approved"],
+    ["--commit", "commit-b"],
+    ["--review-ref", "reviews/changed.md"],
+    ["--hypothesis", "hypothesis-b"],
+    ["--new-evidence", "evidence-changed"],
+    ["--falsification-test", "falsification-b"],
+    ["--failure-next-action", "stop"],
+    ["--direction-signal", "structural_blocked"]
+  ]);
+  for (const [flag, changed] of changes) {
+    const args = [...base];
+    args[args.indexOf(flag) + 1] = changed;
+    await assert.rejects(h.command(args), (error) => error.code === "event_collision", flag);
+    assert.deepEqual(state(), before, `${flag} collision mutated Store state`);
+  }
+
+  for (const flag of ["--hypothesis", "--new-evidence", "--falsification-test"]) {
+    const args = [...base];
+    args[args.indexOf(flag) + 1] = "   ";
+    args[args.indexOf("--review-run-id") + 1] = `empty-${flag.slice(2)}`;
+    await assert.rejects(h.command(args), (error) => error.code === "review_evidence_required", flag);
+  }
+  for (const flag of ["--commit", "--review-ref"]) {
+    const args = [...base];
+    args[args.indexOf(flag) + 1] = "   ";
+    args[args.indexOf("--review-run-id") + 1] = `empty-${flag.slice(2)}`;
+    await assert.rejects(h.command(args), (error) => error.code === "guard_invalid_arguments", flag);
+  }
+});
+
+test("the same SDD loop coordinates remain isolated across repository lineages", async (t) => {
+  const state = await fixture("open-first-failure");
+  const root = await mkdtemp(path.join(tmpdir(), "afl-sdd-repository-scope-"));
+  cleanups.push(root);
+  const home = path.join(root, "shared-home");
+  const store = initializeControlStore({
+    paths: pathsFor(home),
+    now: () => new Date("2026-07-21T00:00:00.000Z")
+  });
+  t.after(() => store.close());
+  const repos = [path.join(root, "repo-a"), path.join(root, "repo-b")];
+  for (const repoRoot of repos) {
+    await mkdir(repoRoot, { mode: 0o700 });
+    execFileSync("git", ["init", "-q", repoRoot]);
+  }
+  const args = [
+    "record-review",
+    "--task-id", state.task_id,
+    "--invariant-id", state.invariant_id,
+    "--boundary", state.boundary,
+    "--review-run-id", "shared-review",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "shared-commit",
+    "--review-ref", "reviews/shared.md",
+    "--hypothesis", "the same coordinates can exist in independent repositories",
+    "--new-evidence", "repository-specific evidence",
+    "--falsification-test", "prove each lineage has an independent loop",
+    "--failure-next-action", "direction_review"
+  ];
+
+  const first = await runGuardCommand({ args, repoRoot: repos[0], store });
+  const second = await runGuardCommand({ args, repoRoot: repos[1], store });
+  assert.notEqual(first.task_id, second.task_id);
+  assert.notEqual(first.fingerprint, second.fingerprint);
+  for (const [index, result] of [first, second].entries()) {
+    const projection = await runGuardCommand({
+      args: ["status", "--task-id", state.task_id],
+      repoRoot: repos[index],
+      store
+    });
+    assert.deepEqual(projection.loops.map((loop) => loop.fingerprint), [result.fingerprint]);
+    assert.equal(projection.loops[0].failure_count, 1);
+  }
 });
 
 test("alias rewrite retains canonical identity and distinct findings require reason plus evidence", async (t) => {
@@ -332,15 +465,125 @@ test("expired, changed, and checkpoint-stale grants fail closed without deleting
   );
 });
 
+test("artifact lifecycle rejects symlink components and inode replacement without clobbering evidence", async (t) => {
+  const linked = await harness("open-first-failure");
+  t.after(() => linked.store.close());
+  await linked.review({ run: "review-linked" });
+  const realDirectory = path.join(linked.repoRoot, ".superpowers", "sdd", "real-artifacts");
+  const linkedDirectory = path.join(linked.repoRoot, ".superpowers", "sdd", "linked-artifacts");
+  await mkdir(realDirectory, { mode: 0o700 });
+  await symlink(realDirectory, linkedDirectory);
+  await assert.rejects(
+    linked.authorize("local_fix", path.join(linkedDirectory, "grant.json")),
+    (error) => error.code === "artifact_unsafe"
+  );
+  assert.equal(linked.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+  const leafSource = path.join(realDirectory, "leaf-source.json");
+  const leafLink = path.join(linked.repoRoot, ".superpowers", "sdd", "leaf-link.json");
+  await writeFile(leafSource, "{}\n", { mode: 0o600 });
+  await chmod(leafSource, 0o600);
+  await symlink(leafSource, leafLink);
+  await assert.rejects(
+    linked.authorize("local_fix", leafLink),
+    (error) => error.code === "artifact_unsafe"
+  );
+  assert.equal(linked.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+
+  const opened = await harness("open-first-failure");
+  t.after(() => opened.store.close());
+  await opened.review({ run: "review-opened-replacement" });
+  const openedFile = path.join(opened.repoRoot, ".superpowers", "sdd", "opened.json");
+  await opened.authorize("local_fix", openedFile);
+  const parkedFile = `${openedFile}.parked`;
+  await assert.rejects(
+    opened.command(
+      ["consume-grant", "--grant-file", openedFile, "--brief-ref", "opened-replacement"],
+      {
+        async afterArtifactOpen() {
+          await rename(openedFile, parkedFile);
+          await symlink(parkedFile, openedFile);
+        }
+      }
+    ),
+    (error) => error.code === "artifact_replaced"
+  );
+  assert.equal((await lstat(openedFile)).isSymbolicLink(), true);
+  assert.equal((await stat(parkedFile)).isFile(), true);
+  assert.equal(opened.store.database.prepare(
+    "SELECT consumed_at FROM continuation_grants"
+  ).get().consumed_at, null);
+
+  const consumed = await harness("open-first-failure");
+  t.after(() => consumed.store.close());
+  await consumed.review({ run: "review-unlink-replacement" });
+  const consumedFile = path.join(consumed.repoRoot, ".superpowers", "sdd", "consumed.json");
+  await consumed.authorize("local_fix", consumedFile);
+  const consumedParked = `${consumedFile}.parked`;
+  const replacement = "replacement-must-survive\n";
+  await assert.rejects(
+    consumed.command(
+      ["consume-grant", "--grant-file", consumedFile, "--brief-ref", "unlink-replacement"],
+      {
+        async beforeArtifactUnlink() {
+          await rename(consumedFile, consumedParked);
+          await writeFile(consumedFile, replacement, { mode: 0o600 });
+          await chmod(consumedFile, 0o600);
+        }
+      }
+    ),
+    (error) => error.code === "artifact_replaced_after_consume"
+  );
+  assert.equal(await readFile(consumedFile, "utf8"), replacement);
+  assert.notEqual(consumed.store.database.prepare(
+    "SELECT consumed_at FROM continuation_grants"
+  ).get().consumed_at, null);
+
+  const publish = await harness("open-first-failure");
+  t.after(() => publish.store.close());
+  await publish.review({ run: "review-publish-race" });
+  const publishFile = path.join(publish.repoRoot, ".superpowers", "sdd", "publish.json");
+  const sentinel = "concurrent-owner\n";
+  await assert.rejects(
+    publish.command(
+      ["authorize-fix", ...publish.key, "--mode", "local_fix", "--grant-file", publishFile],
+      {
+        async beforeArtifactPublish() {
+          await writeFile(publishFile, sentinel, { flag: "wx", mode: 0o600 });
+          await chmod(publishFile, 0o600);
+        }
+      }
+    ),
+    (error) => error.code === "grant_artifact_exists"
+  );
+  assert.equal(await readFile(publishFile, "utf8"), sentinel);
+  assert.deepEqual(
+    (await readdir(path.dirname(publishFile))).filter((name) => name.endsWith(".tmp")),
+    []
+  );
+});
+
 test("status and lock-status are bounded Store projections and strict parsing rejects extras", async (t) => {
   const h = await harness("open-first-failure");
   t.after(() => h.store.close());
-  await h.review({ run: "review-status" });
+  const recorded = await h.review({ run: "review-status" });
+  assert.deepEqual(Object.keys(recorded).sort(), [
+    "action", "architecture_fix_count", "boundary", "canonical_invariant_id",
+    "direction_signal", "exitCode", "failure_count", "fingerprint", "status", "task_id"
+  ]);
 
   const statusResult = await h.command(["status", "--task-id", h.state.task_id]);
+  assert.deepEqual(Object.keys(statusResult).sort(), ["authority", "exitCode", "loops", "task_id"]);
   assert.equal(statusResult.authority, "afl_sqlite");
   assert.equal(statusResult.loops.length, 1);
   assert.equal(statusResult.loops[0].failure_count, 1);
+  assert.deepEqual(Object.keys(statusResult.loops[0]).sort(), [
+    "aliases", "architecture_fix_count", "boundary", "canonical_invariant_id", "decision",
+    "failure_count", "fingerprint", "seen_review_run_ids", "status", "task_id"
+  ]);
   const lock = await h.command(["lock-status"]);
   assert.equal(lock.authority, "afl_sqlite");
   assert.equal(lock.locked, false);
