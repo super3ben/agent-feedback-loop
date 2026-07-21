@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, lstat, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { types } from "node:util";
 
 const AUTHORITY_VALUES = Object.freeze([
   "explicit_user", "approved_spec", "approved_plan", "verified_runtime",
@@ -66,26 +67,72 @@ function sha256(value) {
   return createHash("sha256").update(boundedText(value), "utf8").digest("hex");
 }
 
-function stableJson(value) {
+function isDataDescriptor(descriptor) {
+  return descriptor !== undefined
+    && Object.hasOwn(descriptor, "value")
+    && !Object.hasOwn(descriptor, "get")
+    && !Object.hasOwn(descriptor, "set");
+}
+
+function stableJson(value, ancestors = new Set()) {
   if (value === null || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "string") return JSON.stringify(boundedText(value));
+  if (typeof value === "string") return JSON.stringify(boundedText(value, "invalid_decision_basis"));
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw coded("invalid_decision_basis");
     return JSON.stringify(value);
   }
-  if (Array.isArray(value)) {
-    if (value.length > MAX_COLLECTION_LENGTH) throw coded("value_too_large");
-    const items = [];
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.hasOwn(value, index)) throw coded("invalid_decision_basis");
-      items.push(stableJson(value[index]));
-    }
-    return `[${items.join(",")}]`;
+  if (typeof value !== "object" || types.isProxy(value) || ancestors.has(value)) {
+    throw coded("invalid_decision_basis");
   }
-  const record = plainRecord(value, "invalid_decision_basis");
-  const keys = Object.keys(record);
-  if (keys.length > MAX_COLLECTION_LENGTH) throw coded("value_too_large");
-  return `{${keys.sort().map((key) => `${JSON.stringify(boundedKey(key))}:${stableJson(record[key])}`).join(",")}}`;
+
+  ancestors.add(value);
+  try {
+    const ownKeys = Reflect.ownKeys(value);
+    const descriptors = new Map(ownKeys.map((key) => [key, Object.getOwnPropertyDescriptor(value, key)]));
+
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) throw coded("invalid_decision_basis");
+      const lengthDescriptor = descriptors.get("length");
+      if (!isDataDescriptor(lengthDescriptor)
+        || lengthDescriptor.enumerable
+        || lengthDescriptor.configurable
+        || !Number.isSafeInteger(lengthDescriptor.value)
+        || lengthDescriptor.value < 0) {
+        throw coded("invalid_decision_basis");
+      }
+      const length = lengthDescriptor.value;
+      if (length > MAX_COLLECTION_LENGTH) throw coded("value_too_large");
+      if (ownKeys.length !== length + 1) throw coded("invalid_decision_basis");
+
+      const elementDescriptors = [];
+      const allowedKeys = new Set(["length"]);
+      for (let index = 0; index < length; index += 1) {
+        const key = String(index);
+        const descriptor = descriptors.get(key);
+        if (!isDataDescriptor(descriptor) || !descriptor.enumerable) throw coded("invalid_decision_basis");
+        allowedKeys.add(key);
+        elementDescriptors.push(descriptor);
+      }
+      for (const key of ownKeys) {
+        if (typeof key !== "string" || !allowedKeys.has(key)) {
+          throw coded("invalid_decision_basis");
+        }
+      }
+      return `[${elementDescriptors.map((descriptor) => stableJson(descriptor.value, ancestors)).join(",")}]`;
+    }
+
+    if (Object.getPrototypeOf(value) !== Object.prototype) throw coded("invalid_decision_basis");
+    if (ownKeys.length > MAX_COLLECTION_LENGTH) throw coded("value_too_large");
+    const entries = ownKeys.map((key) => {
+      if (typeof key !== "string") throw coded("invalid_decision_basis");
+      const descriptor = descriptors.get(key);
+      if (!isDataDescriptor(descriptor) || !descriptor.enumerable) throw coded("invalid_decision_basis");
+      return [boundedKey(key), descriptor];
+    }).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, descriptor]) => `${JSON.stringify(key)}:${stableJson(descriptor.value, ancestors)}`).join(",")}}`;
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function framedDigest(values) {
@@ -194,7 +241,7 @@ export function deriveTaskUid({ lineageId, adapterKind, nativeTaskId } = {}) {
 }
 
 export function digestDecisionBasis(input) {
-  return sha256(stableJson(plainRecord(input, "invalid_decision_basis")));
+  return sha256(stableJson(input));
 }
 
 export function projectContract(input) {

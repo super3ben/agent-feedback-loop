@@ -86,11 +86,93 @@ test("task UIDs and decision digests frame values to avoid ambiguous concatenati
   );
 });
 
+test("decision-basis digests accept strict JSON scalar and array roots", () => {
+  for (const basis of [null, true, 7, "approve", ["evidence", { verified: true }]]) {
+    assert.match(digestDecisionBasis(basis), /^[a-f0-9]{64}$/u);
+  }
+});
+
 test("decision-basis digests reject sparse arrays instead of colliding with empty arrays", () => {
   assert.throws(
     () => digestDecisionBasis({ items: new Array(1) }),
     (error) => error?.code === "invalid_decision_basis"
   );
+});
+
+test("decision-basis digests reject decorated arrays instead of erasing own properties", () => {
+  const items = [];
+  items.semantic_tag = "must-not-disappear";
+
+  assert.throws(
+    () => digestDecisionBasis({ items }),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("decision-basis digests reject symbol keys", () => {
+  const basis = { decision: "approve" };
+  basis[Symbol("semantic-tag")] = "must-not-disappear";
+
+  assert.throws(
+    () => digestDecisionBasis(basis),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("decision-basis digests reject non-enumerable properties", () => {
+  const basis = { decision: "approve" };
+  Object.defineProperty(basis, "semanticTag", { value: "must-not-disappear" });
+
+  assert.throws(
+    () => digestDecisionBasis(basis),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("decision-basis digests reject accessors without invoking them", () => {
+  let getterCalls = 0;
+  const basis = {};
+  Object.defineProperty(basis, "decision", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "approve";
+    }
+  });
+
+  assert.throws(
+    () => digestDecisionBasis(basis),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+  assert.equal(getterCalls, 0);
+});
+
+test("decision-basis digests reject cycles", () => {
+  const basis = { decision: "approve" };
+  basis.parent = basis;
+
+  assert.throws(
+    () => digestDecisionBasis(basis),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("decision-basis digests reject unsupported prototypes", () => {
+  const basis = Object.assign(Object.create(null), { decision: "approve" });
+
+  assert.throws(
+    () => digestDecisionBasis(basis),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("decision-basis digests reject unsupported scalar types", () => {
+  for (const value of [undefined, 1n, Symbol("decision"), () => "approve"]) {
+    assert.throws(
+      () => digestDecisionBasis({ value }),
+      (error) => error?.code === "invalid_decision_basis"
+    );
+  }
 });
 
 test("exported authority registry cannot mutate contract normalization in a fresh process", async () => {
