@@ -86,6 +86,38 @@ test("task UIDs and decision digests frame values to avoid ambiguous concatenati
   );
 });
 
+test("decision-basis digests reject sparse arrays instead of colliding with empty arrays", () => {
+  assert.throws(
+    () => digestDecisionBasis({ items: new Array(1) }),
+    (error) => error?.code === "invalid_decision_basis"
+  );
+});
+
+test("exported authority registry cannot mutate contract normalization in a fresh process", async () => {
+  const moduleUrl = new URL("../src/convergence-identity.mjs", import.meta.url).href;
+  const script = `
+    import { CONTRACT_AUTHORITIES, projectContract } from ${JSON.stringify(moduleUrl)};
+    const input = {
+      sourceKind: "user_request",
+      sourceRef: "turn-7",
+      sourceRevision: "rev-1",
+      importanceAuthority: "semantic_guess"
+    };
+    const before = projectContract(input);
+    CONTRACT_AUTHORITIES.add("semantic_guess");
+    console.log(JSON.stringify({
+      containsMutation: CONTRACT_AUTHORITIES.has("semantic_guess"),
+      projectionUnchanged: JSON.stringify(projectContract(input)) === JSON.stringify(before)
+    }));
+  `;
+  const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "--eval", script]);
+
+  assert.deepEqual(JSON.parse(stdout), {
+    containsMutation: false,
+    projectionUnchanged: true
+  });
+});
+
 test("projection rejects unsafe identifiers and retains only known clause authorities", () => {
   assert.throws(() => projectContract({
     sourceKind: "user\u0000request",

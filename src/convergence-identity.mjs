@@ -3,10 +3,20 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, lstat, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-export const CONTRACT_AUTHORITIES = Object.freeze(new Set([
+const AUTHORITY_VALUES = Object.freeze([
   "explicit_user", "approved_spec", "approved_plan", "verified_runtime",
   "review_finding", "inferred_advisory"
-]));
+]);
+const AUTHORITY_WHITELIST = new Set(AUTHORITY_VALUES);
+
+export const CONTRACT_AUTHORITIES = Object.freeze({
+  has(value) {
+    return AUTHORITY_WHITELIST.has(value);
+  },
+  add() {
+    return CONTRACT_AUTHORITIES;
+  }
+});
 
 const HARD_AUTHORITIES = new Set(["explicit_user", "approved_spec", "approved_plan", "verified_runtime"]);
 const SUPPORTED_PLATFORMS = new Set(["darwin", "linux"]);
@@ -65,7 +75,12 @@ function stableJson(value) {
   }
   if (Array.isArray(value)) {
     if (value.length > MAX_COLLECTION_LENGTH) throw coded("value_too_large");
-    return `[${value.map(stableJson).join(",")}]`;
+    const items = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) throw coded("invalid_decision_basis");
+      items.push(stableJson(value[index]));
+    }
+    return `[${items.join(",")}]`;
   }
   const record = plainRecord(value, "invalid_decision_basis");
   const keys = Object.keys(record);
@@ -82,7 +97,7 @@ function framedDigest(values) {
 }
 
 function normalizeAuthority(value) {
-  return CONTRACT_AUTHORITIES.has(value) ? value : "inferred_advisory";
+  return AUTHORITY_WHITELIST.has(value) ? value : "inferred_advisory";
 }
 
 function normalizeClauses(clauses) {
