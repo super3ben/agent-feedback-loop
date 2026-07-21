@@ -7,7 +7,11 @@ import {
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { deriveTaskUid, projectContract } from "./convergence-identity.mjs";
+import { deriveTaskUid, digestDecisionBasis, projectContract } from "./convergence-identity.mjs";
+import {
+  canonicalGuardParityValue,
+  guardParitySetDigest
+} from "./convergence-store.mjs";
 
 const execFileAsync = promisify(execFile);
 const PLAN_PRIVATE = new WeakMap();
@@ -147,7 +151,10 @@ async function readOwnedGuardState({ repoRoot, stateFile, expectedSha256 = null,
     }
     const sourceSha256 = sha256(bytes);
     if (expectedSha256 !== null && sourceSha256 !== expectedSha256) throw coded(`${mode}_digest_changed`);
-    return Object.freeze({ root, target, bytes, sourceSha256, dev: info.dev, ino: info.ino });
+    return Object.freeze({
+      root, target, bytes, sourceSha256, dev: info.dev, ino: info.ino,
+      uid: info.uid, permissions, type: "regular"
+    });
   } finally {
     await handle.close();
   }
@@ -279,6 +286,88 @@ function eventUid(sourceSha256, fingerprint, index, action) {
   return `legacy:${sourceSha256.slice(0, 12)}:${fingerprint.slice(0, 16)}:${index}:${action}`;
 }
 
+function liveReviewRunId(value) {
+  const normalized = String(value ?? "").trim().toLowerCase().replaceAll(/[^a-z0-9._:-]+/gu, "-");
+  if (!/^[a-z0-9][a-z0-9._:-]{0,255}$/u.test(normalized)) throw coded("legacy_state_invalid");
+  return normalized;
+}
+
+function auditText(value, required = true) {
+  if ((value === null || value === undefined) && !required) return null;
+  const normalized = boundedText(value, "legacy_state_invalid", 4096).trim();
+  if (normalized.length === 0) throw coded("legacy_state_invalid");
+  return normalized;
+}
+
+function liveReviewMapping({ task, loop, raw, finalGeneration, historicalFailureCount }) {
+  const reviewRunId = liveReviewRunId(raw.review_run_id);
+  const severity = String(raw.severity ?? "").toLowerCase();
+  const verdict = String(raw.verdict ?? "").toLowerCase();
+  const countedFailure = verdict === "changes_required" && severity !== "minor";
+  if (!new Set(["minor", "important", "critical"]).has(severity)
+      || !new Set(["approved", "changes_required"]).has(verdict)) throw coded("legacy_state_invalid");
+  const directionSignal = String(raw.direction_signal ?? "none").toLowerCase();
+  if (!new Set(["none", "structural_blocked", "no_local_seam"]).has(directionSignal)) {
+    throw coded("legacy_state_invalid");
+  }
+  const hypothesis = auditText(raw.hypothesis, countedFailure);
+  const newEvidence = auditText(raw.new_evidence, countedFailure);
+  const falsificationTest = auditText(raw.falsification_test, countedFailure);
+  const failureNextAction = raw.failure_next_action === null || raw.failure_next_action === undefined
+    ? null : auditText(raw.failure_next_action).toLowerCase();
+  if (countedFailure && !new Set(["direction_review", "stop"]).has(failureNextAction)) {
+    throw coded("legacy_state_invalid");
+  }
+  const auditEnvelope = Object.freeze({
+    reviewRunId,
+    taskId: loop.taskId,
+    invariantId: loop.invariantId,
+    boundary: loop.boundary,
+    severity,
+    verdict,
+    commit: auditText(raw.commit),
+    reviewRef: auditText(raw.review_ref),
+    hypothesis,
+    newEvidence,
+    falsificationTest,
+    failureNextAction,
+    directionSignal
+  });
+  const evidenceDigest = countedFailure
+    ? sha256(newEvidence)
+    : sha256(`${verdict}:${reviewRunId}`);
+  if (countedFailure && raw.new_evidence_sha256 !== evidenceDigest) throw coded("legacy_state_invalid");
+  const decisionBasisDigest = digestDecisionBasis(auditEnvelope);
+  const uid = `review:${task.taskUid.slice(0, 16)}:${loop.fingerprint}:${reviewRunId}`;
+  const envelope = Object.freeze({
+    eventUid: uid,
+    taskUid: task.taskUid,
+    boundaryId: loop.boundary,
+    submittedIdentity: Object.freeze({
+      fingerprint: loop.fingerprint,
+      invariantId: loop.invariantId
+    }),
+    canonicalIdentity: Object.freeze({
+      fingerprint: loop.fingerprint,
+      invariantId: loop.invariantId
+    }),
+    generation: finalGeneration,
+    severity,
+    verdict,
+    directionSignal,
+    evidenceDigest,
+    decisionBasisDigest
+  });
+  const decision = countedFailure
+    && (historicalFailureCount >= 2 || directionSignal !== "none")
+    ? "checkpoint_required"
+    : "pass";
+  return Object.freeze({
+    uid, severity, verdict, directionSignal, evidenceDigest, decisionBasisDigest,
+    envelopeDigest: sha256(canonicalJson(envelope)), decision
+  });
+}
+
 function eventDigest(event) {
   return sha256(Buffer.from(canonicalJson(event), "utf8"));
 }
@@ -306,24 +395,33 @@ function mapGroup({ sourceSha256, task, loops, aliases, distinct }) {
     let localGrantIndex = 0;
     let architectureGrantIndex = 0;
     const grantByReceipt = new Map();
+    const finalGeneration = loop.local_fix_generations.length + loop.architecture_fix_count;
     loop.events.forEach((raw, index) => {
       if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw coded("legacy_state_invalid");
       const action = normalizedId(raw.action);
-      const uid = eventUid(sourceSha256, loop.fingerprint, index, action);
+      let uid = eventUid(sourceSha256, loop.fingerprint, index, action);
       const sourceDigest = eventDigest(raw);
       if (action === "review_recorded") {
-        const severity = String(raw.severity ?? "").toLowerCase();
-        const verdict = String(raw.verdict ?? "").toLowerCase();
-        if (!new Set(["minor", "important", "critical"]).has(severity)
-            || !new Set(["approved", "changes_required"]).has(verdict)) throw coded("legacy_state_invalid");
-        if (verdict === "changes_required" && severity !== "minor") failureCount = Math.min(failureCount + 1, 3);
+        const countedFailure = String(raw.verdict ?? "").toLowerCase() === "changes_required"
+          && String(raw.severity ?? "").toLowerCase() !== "minor";
+        if (countedFailure) failureCount = Math.min(failureCount + 1, 3);
+        const review = liveReviewMapping({
+          task, loop, raw, finalGeneration, historicalFailureCount: failureCount
+        });
+        uid = review.uid;
         mappedEvents.push(Object.freeze({
           eventUid: uid, fingerprint: loop.fingerprint,
           generation: Math.min(localGrantIndex + architectureGrantIndex, 3), eventType: "review_recorded",
-          reasonCode: null, decision: null, action: null,
-          evidenceDigest: raw.new_evidence_sha256 ?? sourceDigest, sourceDigest,
-          resultDigest: raw.new_evidence_sha256 ?? sourceDigest,
-          facts: { directionSignal: raw.direction_signal ?? "none", failureCount, severity, verdict }
+          reasonCode: null, decision: review.decision, action: null,
+          evidenceDigest: review.evidenceDigest, sourceDigest: review.envelopeDigest,
+          resultDigest: review.decisionBasisDigest,
+          facts: {
+            directionSignal: review.directionSignal,
+            failureCount,
+            legacyImported: 1,
+            severity: review.severity,
+            verdict: review.verdict
+          }
         }));
       } else if (action === "checkpoint_recorded") {
         if (loop.checkpoint === null) throw coded("legacy_state_invalid");
@@ -481,23 +579,12 @@ export async function applyGuardImport({ plan, store, logger = () => {} }) {
   return result;
 }
 
-function canonicalParity(field, value) {
-  if (field === "decision") {
-    return ({ direction_review_required: "checkpoint_required", architecture_review_required: "checkpoint_required",
-      blocked_direction_review: "checkpoint_required" })[value] ?? value;
+function canonicalParity(field, side, value) {
+  try {
+    return canonicalGuardParityValue(field, side, value);
+  } catch {
+    throw coded("shadow_input_invalid");
   }
-  if (field === "next_required_action") {
-    return ({ direction_review: "checkpoint", architecture_review: "checkpoint" })[value] ?? value;
-  }
-  if (field === "failure_generation") {
-    if (!Number.isSafeInteger(value) || value < 0 || value > 3) throw coded("shadow_input_invalid");
-    return value;
-  }
-  if (field === "authorization_eligibility") {
-    if (typeof value !== "boolean") throw coded("shadow_input_invalid");
-    return value;
-  }
-  return boundedText(value, "shadow_input_invalid");
 }
 
 export async function compareGuardShadow({ plan, store, comparisons, logger = () => {} }) {
@@ -512,17 +599,27 @@ export async function compareGuardShadow({ plan, store, comparisons, logger = ()
     byField.set(item.field, item);
   }
   if (PARITY_FIELDS.some((field) => !byField.has(field))) throw coded("shadow_input_invalid");
-  const paritySetDigest = sha256(Buffer.from(canonicalJson(PARITY_FIELDS), "utf8"));
+  let paritySetDigest;
+  try {
+    paritySetDigest = guardParitySetDigest({
+      sourceSha256: plan.sourceSha256,
+      mappingRevision: plan.mappingRevision,
+      comparisons: PARITY_FIELDS.map((field) => byField.get(field))
+    });
+  } catch {
+    throw coded("shadow_input_invalid");
+  }
   let result;
   for (const field of PARITY_FIELDS) {
     const item = byField.get(field);
-    const legacy = canonicalParity(field, item.legacy);
-    const kernel = canonicalParity(field, item.kernel);
+    const legacy = canonicalParity(field, "legacy", item.legacy);
+    const kernel = canonicalParity(field, "kernel", item.kernel);
     const inputDigest = sha256(Buffer.from(canonicalJson({ field, legacy: item.legacy, kernel: item.kernel }), "utf8"));
     result = store.recordGuardShadowComparison({
-      eventUid: `shadow:${plan.authorityTaskUid.slice(0, 16)}:${inputDigest.slice(0, 40)}`,
+      eventUid: `shadow:${plan.authorityTaskUid.slice(0, 12)}:${paritySetDigest.slice(0, 12)}:${inputDigest.slice(0, 32)}`,
       authorityTaskUid: plan.authorityTaskUid, sourceSha256: plan.sourceSha256,
-      mappingRevision: plan.mappingRevision, paritySetDigest, inputDigest,
+      mappingRevision: plan.mappingRevision, paritySetDigest, field,
+      legacyValue: item.legacy, kernelValue: item.kernel, inputDigest,
       legacyResultDigest: sha256(Buffer.from(canonicalJson(legacy), "utf8")),
       kernelResultDigest: sha256(Buffer.from(canonicalJson(kernel), "utf8")),
       matched: canonicalJson(legacy) === canonicalJson(kernel)
@@ -576,7 +673,7 @@ async function writeSnapshot(repoRoot, snapshot, bytes, expectedDigest) {
       repoRoot, stateFile: snapshot,
       expectedSha256: expectedDigest, mode: "snapshot"
     });
-    return existing.sourceSha256;
+    return existing;
   } catch (error) {
     if (!new Set(["legacy_state_missing", "ENOENT"]).has(error?.code)) throw error;
   }
@@ -590,7 +687,15 @@ async function writeSnapshot(repoRoot, snapshot, bytes, expectedDigest) {
   }
   const directory = await open(path.dirname(snapshot), constants.O_RDONLY);
   try { await directory.sync(); } finally { await directory.close(); }
-  return expectedDigest;
+  return readOwnedGuardState({
+    repoRoot, stateFile: snapshot, expectedSha256: expectedDigest, mode: "snapshot"
+  });
+}
+
+function exactSnapshotMetadata(snapshot, authority) {
+  if (snapshot.dev !== authority.snapshotDev || snapshot.ino !== authority.snapshotIno
+      || snapshot.uid !== authority.snapshotUid || snapshot.permissions !== authority.snapshotMode
+      || snapshot.type !== authority.snapshotType) throw coded("snapshot_identity_changed");
 }
 
 export async function cutoverGuard({
@@ -611,14 +716,32 @@ export async function cutoverGuard({
     const first = await readOwnedGuardState({ repoRoot, stateFile, expectedSha256: plan.sourceSha256 });
     if (internal.legacyLiveAction) throw coded("legacy_live_action");
     await hooks.beforeSnapshot?.();
-    await writeSnapshot(internal.repoRoot, paths.snapshot, first.bytes, first.sourceSha256);
+    const snapshot = await writeSnapshot(
+      internal.repoRoot, paths.snapshot, first.bytes, first.sourceSha256
+    );
     await hooks.afterSnapshot?.();
     await readOwnedGuardState({ repoRoot, stateFile, expectedSha256: plan.sourceSha256 });
+    const verifiedSnapshot = await readOwnedGuardState({
+      repoRoot: internal.repoRoot,
+      stateFile: paths.snapshot,
+      expectedSha256: snapshot.sourceSha256,
+      mode: "snapshot"
+    });
+    exactSnapshotMetadata(verifiedSnapshot, {
+      snapshotDev: snapshot.dev,
+      snapshotIno: snapshot.ino,
+      snapshotUid: snapshot.uid,
+      snapshotMode: snapshot.permissions,
+      snapshotType: snapshot.type
+    });
     const eventUidValue = `guard-cutover:${plan.authorityTaskUid.slice(0, 16)}:${plan.sourceSha256.slice(0, 16)}:${decisionRefDigest.slice(0, 16)}`;
     const result = store.recordGuardCutover({
       eventUid: eventUidValue, authorityTaskUid: plan.authorityTaskUid,
       sourceSha256: plan.sourceSha256, mappingRevision: plan.mappingRevision,
-      paritySetDigest, snapshotDigest: first.sourceSha256, decisionRefDigest
+      paritySetDigest, snapshotDigest: verifiedSnapshot.sourceSha256,
+      snapshotDev: verifiedSnapshot.dev, snapshotIno: verifiedSnapshot.ino,
+      snapshotMode: verifiedSnapshot.permissions, snapshotType: verifiedSnapshot.type,
+      snapshotUid: verifiedSnapshot.uid, decisionRefDigest
     });
     logger(Object.freeze({ action: "cutover", authorityTaskUid: plan.authorityTaskUid,
       sourceSha256: plan.sourceSha256, cutoverEventUid: result.cutoverEventUid }));
@@ -641,21 +764,29 @@ export async function rollbackGuardCutover({
   }
   const decisionRefDigest = sha256(Buffer.from(boundedText(decisionRef, "decision_ref_invalid", 4096), "utf8"));
   return withTransitionLocks(stateTarget, async (paths) => {
-    const current = await readOwnedGuardState({
-      repoRoot: root, stateFile: stateTarget, expectedSha256: authority.sourceSha256
-    });
     const snapshot = await readOwnedGuardState({
       repoRoot: root, stateFile: paths.snapshot, expectedSha256: authority.snapshotDigest, mode: "snapshot"
     });
+    exactSnapshotMetadata(snapshot, authority);
+    const current = await readOwnedGuardState({ repoRoot: root, stateFile: stateTarget });
     await hooks.beforeRestore?.();
     if (!current.bytes.equals(snapshot.bytes)) {
       const temporary = path.join(path.dirname(stateTarget), `.review-loop-state.rollback.${process.pid}.tmp`);
       const handle = await open(temporary, "wx", 0o600);
-      try { await handle.writeFile(snapshot.bytes); await handle.sync(); } finally { await handle.close(); }
-      await rename(temporary, stateTarget);
-      await chmod(stateTarget, 0o600);
-      const directory = await open(path.dirname(stateTarget), constants.O_RDONLY);
-      try { await directory.sync(); } finally { await directory.close(); }
+      let renamed = false;
+      try {
+        await handle.writeFile(snapshot.bytes);
+        await handle.sync();
+        await handle.close();
+        await rename(temporary, stateTarget);
+        renamed = true;
+        await chmod(stateTarget, 0o600);
+        const directory = await open(path.dirname(stateTarget), constants.O_RDONLY);
+        try { await directory.sync(); } finally { await directory.close(); }
+      } finally {
+        await handle.close().catch(() => {});
+        if (!renamed) await unlink(temporary).catch(() => {});
+      }
     }
     await hooks.afterRestore?.();
     await readOwnedGuardState({
@@ -664,6 +795,8 @@ export async function rollbackGuardCutover({
     const result = store.recordGuardRollback({
       eventUid: `guard-rollback:${cutoverEventUid.slice(-32)}:${decisionRefDigest.slice(0, 16)}`,
       authorityTaskUid, cutoverEventUid, snapshotDigest: authority.snapshotDigest,
+      snapshotDev: snapshot.dev, snapshotIno: snapshot.ino, snapshotMode: snapshot.permissions,
+      snapshotType: snapshot.type, snapshotUid: snapshot.uid,
       decisionRefDigest
     });
     logger(Object.freeze({ action: "rollback", authorityTaskUid,

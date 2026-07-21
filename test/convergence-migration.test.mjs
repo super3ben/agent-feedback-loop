@@ -128,6 +128,30 @@ const PASSING_COMPARISONS = Object.freeze([
   Object.freeze({ field: "authorization_eligibility", legacy: false, kernel: false })
 ]);
 
+function reviewArgs(event, { commit = event.commit } = {}) {
+  const args = [
+    "record-review",
+    "--task-id", "task-a",
+    "--invariant-id", "single-writer",
+    "--boundary", "state-store",
+    "--review-run-id", event.review_run_id,
+    "--severity", event.severity,
+    "--verdict", event.verdict,
+    "--commit", commit,
+    "--review-ref", event.review_ref
+  ];
+  for (const [flag, field] of [
+    ["--hypothesis", "hypothesis"],
+    ["--new-evidence", "new_evidence"],
+    ["--falsification-test", "falsification_test"],
+    ["--failure-next-action", "failure_next_action"],
+    ["--direction-signal", "direction_signal"]
+  ]) {
+    if (event[field] !== null && event[field] !== undefined) args.push(flag, event[field]);
+  }
+  return args;
+}
+
 test("dry-run returns a bounded multi-task plan and performs no Store or source write", async (t) => {
   const h = await migrationHarness();
   t.after(() => h.store.close());
@@ -165,6 +189,49 @@ test("apply atomically preserves both task associations and exactly one provenan
   assert.deepEqual(associations.map((row) => row.fingerprint).sort(),
     [h.fingerprintA, h.fingerprintB].sort());
   assert.deepEqual(await applyGuardImport({ plan, store: h.store }), imported);
+});
+
+test("imported real Review-Run-IDs use live replay and collision identity without snapshot fiction", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  h.state.loops[h.fingerprintB].seen_review_run_ids = ["snapshot-only-review"];
+  await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  await applyGuardImport({ plan, store: h.store });
+  const shadow = await compareGuardShadow({ plan, store: h.store, comparisons: PASSING_COMPARISONS });
+  await cutoverGuard({
+    repoRoot: h.repoRoot, stateFile: h.stateFile, plan, store: h.store,
+    paritySetDigest: shadow.paritySetDigest, decisionRef: "review replay cutover", apply: true
+  });
+
+  const before = await runGuardCommand({
+    args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
+  });
+  const reviewCount = () => h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='review_recorded'"
+  ).get().count;
+  const baselineCount = reviewCount();
+  for (const event of [h.state.loops[h.fingerprintA].events[0], h.state.loops[h.fingerprintA].events[5]]) {
+    await runGuardCommand({ args: reviewArgs(event), repoRoot: h.repoRoot, store: h.store });
+    const after = await runGuardCommand({
+      args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
+    });
+    assert.deepEqual(after, before);
+    assert.equal(reviewCount(), baselineCount);
+  }
+  await assert.rejects(
+    runGuardCommand({
+      args: reviewArgs(h.state.loops[h.fingerprintA].events[5], { commit: "changed-commit" }),
+      repoRoot: h.repoRoot,
+      store: h.store
+    }),
+    (error) => error.code === "event_collision"
+  );
+  const taskB = await runGuardCommand({
+    args: ["status", "--task-id", "task-b"], repoRoot: h.repoRoot, store: h.store
+  });
+  assert.deepEqual(taskB.loops[0].seen_review_run_ids, []);
+  assert.equal(reviewCount(), baselineCount);
 });
 
 test("unsupported legacy actions are bounded warnings and never guessed into Kernel history", async (t) => {
@@ -413,6 +480,136 @@ test("rollback rejects snapshot drift and keeps AFL authoritative", async (t) =>
   }), (error) => error.code === "snapshot_digest_changed");
   assert.equal(h.store.getGuardAuthority({ authorityTaskUid: plan.authorityTaskUid }).authority,
     "afl_sqlite");
+});
+
+test("rollback atomically replaces a safe differing target from the exact snapshot", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  const original = await readFile(h.stateFile);
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  await applyGuardImport({ plan, store: h.store });
+  const shadow = await compareGuardShadow({ plan, store: h.store, comparisons: PASSING_COMPARISONS });
+  const cutover = await cutoverGuard({
+    repoRoot: h.repoRoot, stateFile: h.stateFile, plan, store: h.store,
+    paritySetDigest: shadow.paritySetDigest, decisionRef: "cutover before safe drift", apply: true
+  });
+  await writeFile(h.stateFile, `${JSON.stringify({ ...h.state,
+    updated_at: "2026-07-21T00:00:01Z" })}\n`, { mode: 0o600 });
+
+  const rollback = await rollbackGuardCutover({
+    repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store,
+    authorityTaskUid: plan.authorityTaskUid, cutoverEventUid: cutover.cutoverEventUid,
+    decisionRef: "restore exact snapshot", apply: true
+  });
+
+  assert.equal(rollback.authority, "legacy_guard");
+  assert.deepEqual(await readFile(h.stateFile), original);
+});
+
+test("rollback Store failure is retryable after restoration while AFL remains authoritative", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  const original = await readFile(h.stateFile);
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  await applyGuardImport({ plan, store: h.store });
+  const shadow = await compareGuardShadow({ plan, store: h.store, comparisons: PASSING_COMPARISONS });
+  const cutover = await cutoverGuard({
+    repoRoot: h.repoRoot, stateFile: h.stateFile, plan, store: h.store,
+    paritySetDigest: shadow.paritySetDigest, decisionRef: "cutover before retry", apply: true
+  });
+  await writeFile(h.stateFile, `${JSON.stringify({ ...h.state,
+    updated_at: "2026-07-21T00:00:02Z" })}\n`, { mode: 0o600 });
+  h.store.database.exec(`CREATE TEMP TRIGGER abort_guard_rollback
+    BEFORE INSERT ON convergence_events WHEN NEW.event_type='guard_rollback'
+    BEGIN SELECT RAISE(ABORT, 'forced rollback abort'); END`);
+  const rollbackInput = {
+    repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store,
+    authorityTaskUid: plan.authorityTaskUid, cutoverEventUid: cutover.cutoverEventUid,
+    decisionRef: "retry exact rollback", apply: true
+  };
+  await assert.rejects(rollbackGuardCutover(rollbackInput), /forced rollback abort/u);
+  assert.deepEqual(await readFile(h.stateFile), original);
+  assert.equal(h.store.getGuardAuthority({ authorityTaskUid: plan.authorityTaskUid }).authority,
+    "afl_sqlite");
+  h.store.database.exec("DROP TRIGGER abort_guard_rollback");
+  assert.equal((await rollbackGuardCutover(rollbackInput)).authority, "legacy_guard");
+});
+
+test("rollback rejects target safety violations and exact-snapshot inode replacement", async (t) => {
+  const unsafe = await migrationHarness();
+  t.after(() => unsafe.store.close());
+  const unsafePlan = await inspectGuardImport({
+    repoRoot: unsafe.repoRoot, stateFile: unsafe.stateFile, store: unsafe.store
+  });
+  await applyGuardImport({ plan: unsafePlan, store: unsafe.store });
+  const unsafeShadow = await compareGuardShadow({
+    plan: unsafePlan, store: unsafe.store, comparisons: PASSING_COMPARISONS
+  });
+  const unsafeCutover = await cutoverGuard({
+    repoRoot: unsafe.repoRoot, stateFile: unsafe.stateFile, plan: unsafePlan, store: unsafe.store,
+    paritySetDigest: unsafeShadow.paritySetDigest, decisionRef: "unsafe target cutover", apply: true
+  });
+  await chmod(unsafe.stateFile, 0o644);
+  await assert.rejects(rollbackGuardCutover({
+    repoRoot: unsafe.repoRoot, stateFile: unsafe.stateFile, store: unsafe.store,
+    authorityTaskUid: unsafePlan.authorityTaskUid, cutoverEventUid: unsafeCutover.cutoverEventUid,
+    decisionRef: "unsafe target rollback", apply: true
+  }), (error) => error.code === "source_unsafe_mode");
+  assert.equal(unsafe.store.getGuardAuthority({
+    authorityTaskUid: unsafePlan.authorityTaskUid
+  }).authority, "afl_sqlite");
+
+  const replaced = await migrationHarness();
+  t.after(() => replaced.store.close());
+  const replacedPlan = await inspectGuardImport({
+    repoRoot: replaced.repoRoot, stateFile: replaced.stateFile, store: replaced.store
+  });
+  await applyGuardImport({ plan: replacedPlan, store: replaced.store });
+  const replacedShadow = await compareGuardShadow({
+    plan: replacedPlan, store: replaced.store, comparisons: PASSING_COMPARISONS
+  });
+  const replacedCutover = await cutoverGuard({
+    repoRoot: replaced.repoRoot, stateFile: replaced.stateFile, plan: replacedPlan, store: replaced.store,
+    paritySetDigest: replacedShadow.paritySetDigest, decisionRef: "snapshot inode cutover", apply: true
+  });
+  const snapshot = path.join(path.dirname(replaced.stateFile), ".review-loop-state.afl-cutover.snapshot");
+  const snapshotBytes = await readFile(snapshot);
+  await unlink(snapshot);
+  await writeFile(snapshot, snapshotBytes, { mode: 0o400 });
+  await chmod(snapshot, 0o400);
+  await assert.rejects(rollbackGuardCutover({
+    repoRoot: replaced.repoRoot, stateFile: replaced.stateFile, store: replaced.store,
+    authorityTaskUid: replacedPlan.authorityTaskUid,
+    cutoverEventUid: replacedCutover.cutoverEventUid,
+    decisionRef: "snapshot inode rollback", apply: true
+  }), (error) => error.code === "snapshot_identity_changed");
+  assert.equal(replaced.store.getGuardAuthority({
+    authorityTaskUid: replacedPlan.authorityTaskUid
+  }).authority, "afl_sqlite");
+});
+
+test("shadow rejects unsupported decision and action values before authority can change", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  await applyGuardImport({ plan, store: h.store });
+
+  await assert.rejects(compareGuardShadow({
+    plan,
+    store: h.store,
+    comparisons: PASSING_COMPARISONS.map((item) => item.field === "decision"
+      ? { ...item, legacy: "not-a-guard-decision", kernel: "not-a-guard-decision" }
+      : item)
+  }), (error) => error.code === "shadow_input_invalid");
+  await assert.rejects(compareGuardShadow({
+    plan,
+    store: h.store,
+    comparisons: PASSING_COMPARISONS.map((item) => item.field === "next_required_action"
+      ? { ...item, legacy: "not-a-next-action", kernel: "not-a-next-action" }
+      : item)
+  }), (error) => error.code === "shadow_input_invalid");
+  assert.equal(h.store.getGuardAuthority({ authorityTaskUid: plan.authorityTaskUid }).authority,
+    "legacy_guard");
 });
 
 test("Guard migration CLI exposes strict dry-run, apply, shadow, cutover, and rollback commands", async (t) => {

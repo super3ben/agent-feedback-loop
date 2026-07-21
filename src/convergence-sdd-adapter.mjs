@@ -282,7 +282,7 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
   const fingerprint = prior?.fingerprint ?? fingerprintFor(task.taskUid, key);
   const reviewUid = reviewEventUid(task.taskUid, fingerprint, reviewRunId);
   const replayEvent = store.database.prepare(
-    "SELECT 1 FROM convergence_events WHERE event_uid=?"
+    "SELECT * FROM convergence_events WHERE event_uid=?"
   ).get(reviewUid);
   if (!prior && !replayEvent) {
     const candidates = store.database.prepare(`SELECT 1 FROM convergence_loops
@@ -327,6 +327,23 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
     evidenceDigest,
     generation: prior?.currentGeneration ?? 0
   });
+  if (replayEvent) {
+    let replayFacts;
+    try { replayFacts = JSON.parse(replayEvent.facts_json); } catch { throw coded("guard_state_invalid"); }
+    if (Number(replayFacts.legacyImported) === 1) {
+      const count = architectureFixCount(store, loop.fingerprint);
+      if (replayFacts.verdict === "approved") return summary(loop, "closed", 0, count);
+      if (replayFacts.verdict !== "changes_required"
+          || replayFacts.severity === "minor") return summary(loop, "review_recorded", 0, count);
+      if (replayEvent.decision === "human_decision") {
+        return summary(loop, "human_decision_required", 4, count);
+      }
+      if (replayEvent.decision === "checkpoint_required") {
+        return summary(loop, "direction_review_required", 3, count);
+      }
+      return summary(loop, "local_fix_allowed", 0, count);
+    }
+  }
   if (verdict === "approved") return summary(loop, "closed", 0, architectureFixCount(store, loop.fingerprint));
   if (!countedFailure) return summary(loop, "review_recorded", 0, architectureFixCount(store, loop.fingerprint));
 

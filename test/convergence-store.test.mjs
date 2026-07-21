@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
@@ -17,6 +18,10 @@ import {
 } from "../src/control-store.mjs";
 import { evaluateConvergence } from "../src/convergence-policy.mjs";
 import { projectContract } from "../src/convergence-identity.mjs";
+import {
+  canonicalGuardParityValue,
+  guardParitySetDigest
+} from "../src/convergence-store.mjs";
 
 const EXPECTED_V2_TABLES = [
   "continuation_grants",
@@ -74,6 +79,14 @@ const DIGEST = Object.freeze({
   evidence: "7".repeat(64),
   scope: "8".repeat(64)
 });
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
 function convergenceFixture(initialNow = "2026-07-21T00:00:00.000Z") {
   const home = mkdtempSync(path.join(tmpdir(), "afl-convergence-"));
@@ -1333,21 +1346,52 @@ test("failed Guard import rolls back its event task and loop projections togethe
   store.close();
 });
 
-function recordPassingGuardShadow(store, input, paritySetDigest = "c".repeat(64)) {
+const PASSING_GUARD_PARITY = Object.freeze([
+  Object.freeze({ field: "decision", legacy: "direction_review_required", kernel: "checkpoint_required" }),
+  Object.freeze({ field: "next_required_action", legacy: "direction_review", kernel: "checkpoint" }),
+  Object.freeze({ field: "failure_generation", legacy: 2, kernel: 2 }),
+  Object.freeze({ field: "authorization_eligibility", legacy: false, kernel: false })
+]);
+
+function guardShadowObservation(input, item, index, paritySetDigest, overrides = {}) {
+  const canonicalLegacy = canonicalGuardParityValue(item.field, "legacy", item.legacy);
+  const canonicalKernel = canonicalGuardParityValue(item.field, "kernel", item.kernel);
+  return {
+    eventUid: `guard-shadow-${index}`,
+    authorityTaskUid: input.authorityTask.taskUid,
+    sourceSha256: input.sourceSha256,
+    mappingRevision: input.mappingRevision,
+    paritySetDigest,
+    field: item.field,
+    legacyValue: item.legacy,
+    kernelValue: item.kernel,
+    inputDigest: sha256(canonicalJson({
+      field: item.field, legacy: item.legacy, kernel: item.kernel
+    })),
+    legacyResultDigest: sha256(canonicalJson(canonicalLegacy)),
+    kernelResultDigest: sha256(canonicalJson(canonicalKernel)),
+    matched: canonicalJson(canonicalLegacy) === canonicalJson(canonicalKernel),
+    ...overrides
+  };
+}
+
+function recordPassingGuardShadow(store, input, paritySetDigest = guardParitySetDigest({
+  sourceSha256: input.sourceSha256,
+  mappingRevision: input.mappingRevision,
+  comparisons: PASSING_GUARD_PARITY
+})) {
+  const values = {
+    decision: ["direction_review_required", "checkpoint_required"],
+    next_required_action: ["direction_review", "checkpoint"],
+    failure_generation: [2, 2],
+    authorization_eligibility: [false, false]
+  };
   for (const [index, field] of [
     "decision", "next_required_action", "failure_generation", "authorization_eligibility"
   ].entries()) {
-    store.recordGuardShadowComparison({
-      eventUid: `guard-shadow-${index}`,
-      authorityTaskUid: input.authorityTask.taskUid,
-      sourceSha256: input.sourceSha256,
-      mappingRevision: input.mappingRevision,
-      paritySetDigest,
-      inputDigest: `${index + 1}`.repeat(64),
-      legacyResultDigest: `${index + 5}`.repeat(64),
-      kernelResultDigest: `${index + 5}`.repeat(64),
-      matched: true
-    });
+    store.recordGuardShadowComparison(guardShadowObservation(input, {
+      field, legacy: values[field][0], kernel: values[field][1]
+    }, index, paritySetDigest));
   }
   return paritySetDigest;
 }
@@ -1363,6 +1407,11 @@ test("Store owns persisted Guard shadow, cutover, rollback, and authority replay
     mappingRevision: input.mappingRevision,
     paritySetDigest: null,
     snapshotDigest: null,
+    snapshotDev: null,
+    snapshotIno: null,
+    snapshotMode: null,
+    snapshotType: null,
+    snapshotUid: null,
     cutoverEventUid: null
   });
 
@@ -1374,6 +1423,11 @@ test("Store owns persisted Guard shadow, cutover, rollback, and authority replay
     mappingRevision: input.mappingRevision,
     paritySetDigest,
     snapshotDigest: input.sourceSha256,
+    snapshotDev: 1,
+    snapshotIno: 2,
+    snapshotMode: 0o400,
+    snapshotType: "regular",
+    snapshotUid: typeof process.getuid === "function" ? process.getuid() : 0,
     decisionRefDigest: "e".repeat(64)
   };
   const cutoverResult = store.recordGuardCutover(cutover);
@@ -1386,6 +1440,11 @@ test("Store owns persisted Guard shadow, cutover, rollback, and authority replay
     authorityTaskUid: input.authorityTask.taskUid,
     cutoverEventUid: cutover.eventUid,
     snapshotDigest: cutover.snapshotDigest,
+    snapshotDev: cutover.snapshotDev,
+    snapshotIno: cutover.snapshotIno,
+    snapshotMode: cutover.snapshotMode,
+    snapshotType: cutover.snapshotType,
+    snapshotUid: cutover.snapshotUid,
     decisionRefDigest: "f".repeat(64)
   };
   const rollbackResult = store.recordGuardRollback(rollback);
@@ -1402,24 +1461,30 @@ test("Store refuses Guard cutover on incomplete parity or live continuation auth
   const first = convergenceFixture();
   const input = importInput();
   first.store.transactionalGuardImport(input);
-  first.store.recordGuardShadowComparison({
-    eventUid: "guard-shadow-mismatch",
-    authorityTaskUid: input.authorityTask.taskUid,
+  const mismatchComparison = {
+    field: "decision", legacy: "direction_review_required", kernel: "finish"
+  };
+  const mismatchSet = guardParitySetDigest({
     sourceSha256: input.sourceSha256,
     mappingRevision: input.mappingRevision,
-    paritySetDigest: "c".repeat(64),
-    inputDigest: "1".repeat(64),
-    legacyResultDigest: "2".repeat(64),
-    kernelResultDigest: "3".repeat(64),
-    matched: false
+    comparisons: PASSING_GUARD_PARITY.map((item) => item.field === "decision"
+      ? mismatchComparison : item)
   });
+  first.store.recordGuardShadowComparison(guardShadowObservation(
+    input, mismatchComparison, 0, mismatchSet, { eventUid: "guard-shadow-mismatch" }
+  ));
   assert.throws(() => first.store.recordGuardCutover({
     eventUid: "guard-cutover-mismatch",
     authorityTaskUid: input.authorityTask.taskUid,
     sourceSha256: input.sourceSha256,
     mappingRevision: input.mappingRevision,
-    paritySetDigest: "c".repeat(64),
+    paritySetDigest: mismatchSet,
     snapshotDigest: input.sourceSha256,
+    snapshotDev: 1,
+    snapshotIno: 2,
+    snapshotMode: 0o400,
+    snapshotType: "regular",
+    snapshotUid: typeof process.getuid === "function" ? process.getuid() : 0,
     decisionRefDigest: "e".repeat(64)
   }), /shadow_parity_incomplete/u);
   first.store.close();
@@ -1455,7 +1520,98 @@ test("Store refuses Guard cutover on incomplete parity or live continuation auth
     mappingRevision: liveInput.mappingRevision,
     paritySetDigest,
     snapshotDigest: liveInput.sourceSha256,
+    snapshotDev: 1,
+    snapshotIno: 2,
+    snapshotMode: 0o400,
+    snapshotType: "regular",
+    snapshotUid: typeof process.getuid === "function" ? process.getuid() : 0,
     decisionRefDigest: "e".repeat(64)
   }), /guard_live_action/u);
   second.store.close();
+});
+
+test("Store cutover requires one typed observation for every field in one bound parity run", () => {
+  const duplicate = convergenceFixture();
+  const duplicateInput = importInput();
+  duplicate.store.transactionalGuardImport(duplicateInput);
+  const duplicateDigest = recordPassingGuardShadow(duplicate.store, duplicateInput);
+  duplicate.store.recordGuardShadowComparison(guardShadowObservation(
+    duplicateInput,
+    PASSING_GUARD_PARITY[0],
+    9,
+    duplicateDigest,
+    { eventUid: "guard-shadow-duplicate-decision" }
+  ));
+  assert.throws(() => duplicate.store.recordGuardCutover({
+    eventUid: "guard-cutover-duplicate",
+    authorityTaskUid: duplicateInput.authorityTask.taskUid,
+    sourceSha256: duplicateInput.sourceSha256,
+    mappingRevision: duplicateInput.mappingRevision,
+    paritySetDigest: duplicateDigest,
+    snapshotDigest: duplicateInput.sourceSha256,
+    snapshotDev: 1,
+    snapshotIno: 2,
+    snapshotMode: 0o400,
+    snapshotType: "regular",
+    snapshotUid: typeof process.getuid === "function" ? process.getuid() : 0,
+    decisionRefDigest: "e".repeat(64)
+  }), /shadow_parity_incomplete/u);
+  assert.equal(duplicate.store.getGuardAuthority({
+    authorityTaskUid: duplicateInput.authorityTask.taskUid
+  }).authority, "legacy_guard");
+  duplicate.store.close();
+
+  const missing = convergenceFixture();
+  const missingInput = importInput();
+  missing.store.transactionalGuardImport(missingInput);
+  const missingDigest = guardParitySetDigest({
+    sourceSha256: missingInput.sourceSha256,
+    mappingRevision: missingInput.mappingRevision,
+    comparisons: PASSING_GUARD_PARITY
+  });
+  PASSING_GUARD_PARITY.slice(0, 3).forEach((item, index) => {
+    missing.store.recordGuardShadowComparison(guardShadowObservation(
+      missingInput, item, index, missingDigest
+    ));
+  });
+  assert.throws(() => missing.store.recordGuardCutover({
+    eventUid: "guard-cutover-missing",
+    authorityTaskUid: missingInput.authorityTask.taskUid,
+    sourceSha256: missingInput.sourceSha256,
+    mappingRevision: missingInput.mappingRevision,
+    paritySetDigest: missingDigest,
+    snapshotDigest: missingInput.sourceSha256,
+    snapshotDev: 1,
+    snapshotIno: 2,
+    snapshotMode: 0o400,
+    snapshotType: "regular",
+    snapshotUid: typeof process.getuid === "function" ? process.getuid() : 0,
+    decisionRefDigest: "e".repeat(64)
+  }), /shadow_parity_incomplete/u);
+  missing.store.close();
+
+  const invalid = convergenceFixture();
+  const invalidInput = importInput();
+  invalid.store.transactionalGuardImport(invalidInput);
+  assert.throws(() => invalid.store.recordGuardShadowComparison({
+    ...guardShadowObservation(invalidInput, PASSING_GUARD_PARITY[0], 0, "c".repeat(64)),
+    legacyValue: "not-a-guard-decision",
+    kernelValue: "not-a-guard-decision"
+  }), /invalid_guard_parity_value/u);
+  assert.throws(() => invalid.store.recordGuardShadowComparison({
+    ...guardShadowObservation(invalidInput, PASSING_GUARD_PARITY[0], 0, "c".repeat(64)),
+    field: "unknown_parity_field"
+  }), /invalid_guard_parity_field/u);
+  assert.throws(() => invalid.store.recordGuardShadowComparison({
+    ...guardShadowObservation(invalidInput, PASSING_GUARD_PARITY[0], 0, "c".repeat(64)),
+    sourceSha256: "a".repeat(64)
+  }), /guard_import_not_found/u);
+  assert.throws(() => invalid.store.recordGuardShadowComparison({
+    ...guardShadowObservation(invalidInput, PASSING_GUARD_PARITY[0], 0, "c".repeat(64)),
+    mappingRevision: "guard-v1-different-run"
+  }), /guard_import_not_found/u);
+  assert.equal(invalid.store.getGuardAuthority({
+    authorityTaskUid: invalidInput.authorityTask.taskUid
+  }).authority, "legacy_guard");
+  invalid.store.close();
 });

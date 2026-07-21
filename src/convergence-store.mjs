@@ -50,7 +50,9 @@ const EVENT_FACT_FIELDS = new Map([
   ["contract_projected", new Set()],
   ["generation_opened", new Set(["generation", "purpose"])],
   ["evidence_recorded", new Set(["evidenceClass"])],
-  ["review_recorded", new Set(["directionSignal", "failureCount", "severity", "verdict"])],
+  ["review_recorded", new Set([
+    "directionSignal", "failureCount", "legacyImported", "severity", "verdict"
+  ])],
   ["alias_declared", new Set(["aliasId"])],
   ["distinct_declared", new Set(["reasonCode"])],
   ["breaker_triggered", new Set()],
@@ -67,9 +69,45 @@ const EVENT_FACT_FIELDS = new Map([
   ["legacy_imported", new Set([
     "consumedGrantCount", "eventCount", "grantCount", "loopCount", "mappingVersion", "taskCount"
   ])],
-  ["shadow_compared", new Set(["matched", "paritySetDigest"])],
-  ["guard_cutover", new Set(["mappingRevision", "paritySetDigest"])],
+  ["shadow_compared", new Set([
+    "field", "kernelValue", "legacyValue", "mappingRevision", "matched",
+    "paritySetDigest", "sourceSha256"
+  ])],
+  ["guard_cutover", new Set([
+    "mappingRevision", "paritySetDigest", "snapshotDev", "snapshotIno",
+    "snapshotMode", "snapshotType", "snapshotUid"
+  ])],
   ["guard_rollback", new Set(["cutoverEventUid"])]
+]);
+
+const GUARD_PARITY_FIELDS = Object.freeze([
+  "authorization_eligibility", "decision", "failure_generation", "next_required_action"
+]);
+const LEGACY_GUARD_DECISIONS = new Map([
+  ["open", "pass"],
+  ["closed", "finish"],
+  ["blocked_direction_review", "checkpoint_required"],
+  ["blocked_architecture_review", "checkpoint_required"],
+  ["architecture_fix_ready", "checkpoint_required"],
+  ["architecture_fix_in_progress", "pass"],
+  ["blocked_human_decision", "human_decision"],
+  ["review_recorded", "pass"],
+  ["local_fix_allowed", "pass"],
+  ["direction_review_required", "checkpoint_required"],
+  ["architecture_review_required", "checkpoint_required"],
+  ["human_decision_required", "human_decision"]
+]);
+const LEGACY_GUARD_ACTIONS = new Map([
+  ["local_fix", "local_fix"],
+  ["architecture_fix", "architecture_fix"],
+  ["direction_review", "checkpoint"],
+  ["architecture_review", "checkpoint"],
+  ["human_decision", "human_decision"],
+  ["finish", "finish"],
+  ["none", "none"]
+]);
+const KERNEL_GUARD_ACTIONS = new Set([
+  "local_fix", "architecture_fix", "checkpoint", "human_decision", "finish", "none"
 ]);
 
 function coded(code) {
@@ -123,6 +161,74 @@ function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+}
+
+export function canonicalGuardParityValue(field, side, value) {
+  if (!GUARD_PARITY_FIELDS.includes(field) || !new Set(["legacy", "kernel"]).has(side)) {
+    throw coded("invalid_guard_parity_field");
+  }
+  if (field === "failure_generation") return integer(value, "guard_parity_value", 0, 3);
+  if (field === "authorization_eligibility") return boolean(value, "guard_parity_value");
+  if (typeof value !== "string") throw coded("invalid_guard_parity_value");
+  if (field === "decision") {
+    if (side === "legacy") {
+      if (!LEGACY_GUARD_DECISIONS.has(value)) throw coded("invalid_guard_parity_value");
+      return LEGACY_GUARD_DECISIONS.get(value);
+    }
+    return enumValue(value, DECISION_SET, "guard_parity_value");
+  }
+  if (side === "legacy") {
+    if (!LEGACY_GUARD_ACTIONS.has(value)) throw coded("invalid_guard_parity_value");
+    return LEGACY_GUARD_ACTIONS.get(value);
+  }
+  return enumValue(value, KERNEL_GUARD_ACTIONS, "guard_parity_value");
+}
+
+function parityFactValue(field, value) {
+  if (field === "authorization_eligibility") return value ? "true" : "false";
+  return String(value);
+}
+
+function parityValueFromFact(field, value) {
+  if (field === "failure_generation") {
+    if (!/^[0-3]$/u.test(value)) throw coded("shadow_parity_invalid");
+    return Number(value);
+  }
+  if (field === "authorization_eligibility") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+    throw coded("shadow_parity_invalid");
+  }
+  return value;
+}
+
+function guardParityDigest({ sourceSha256, mappingRevision, comparisons }) {
+  return sha256(canonicalJson({
+    sourceSha256,
+    mappingRevision,
+    comparisons: [...comparisons]
+      .sort((left, right) => left.field.localeCompare(right.field))
+      .map(({ field, legacy, kernel }) => ({ field, legacy, kernel }))
+  }));
+}
+
+export function guardParitySetDigest({ sourceSha256, mappingRevision, comparisons }) {
+  digest(sourceSha256, "source_sha256");
+  identifier(mappingRevision, "mapping_revision");
+  if (!Array.isArray(comparisons) || comparisons.length !== GUARD_PARITY_FIELDS.length) {
+    throw coded("invalid_guard_parity_set");
+  }
+  const fields = new Set();
+  const validated = comparisons.map((item) => {
+    const value = exactObject(item, new Set(["field", "legacy", "kernel"]), "guard_parity_item");
+    if (fields.has(value.field)) throw coded("invalid_guard_parity_set");
+    fields.add(value.field);
+    canonicalGuardParityValue(value.field, "legacy", value.legacy);
+    canonicalGuardParityValue(value.field, "kernel", value.kernel);
+    return Object.freeze({ field: value.field, legacy: value.legacy, kernel: value.kernel });
+  });
+  if (GUARD_PARITY_FIELDS.some((field) => !fields.has(field))) throw coded("invalid_guard_parity_set");
+  return guardParityDigest({ sourceSha256, mappingRevision, comparisons: validated });
 }
 
 function timestamp(now) {
@@ -1426,17 +1532,31 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
     recordGuardShadowComparison(input) {
       const value = exactObject(input, new Set([
         "eventUid", "authorityTaskUid", "sourceSha256", "mappingRevision", "paritySetDigest",
-        "inputDigest", "legacyResultDigest", "kernelResultDigest", "matched"
+        "field", "legacyValue", "kernelValue", "inputDigest", "legacyResultDigest",
+        "kernelResultDigest", "matched"
       ]), "guard_shadow");
       const eventUid = identifier(value.eventUid, "event_uid");
       const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
       const sourceSha256 = digest(value.sourceSha256, "source_sha256");
       const mappingRevision = identifier(value.mappingRevision, "mapping_revision");
       const paritySetDigest = digest(value.paritySetDigest, "parity_set_digest");
+      const field = enumValue(value.field, new Set(GUARD_PARITY_FIELDS), "guard_parity_field");
+      const legacyValue = value.legacyValue;
+      const kernelValue = value.kernelValue;
+      const canonicalLegacy = canonicalGuardParityValue(field, "legacy", legacyValue);
+      const canonicalKernel = canonicalGuardParityValue(field, "kernel", kernelValue);
       const inputDigest = digest(value.inputDigest, "input_digest");
       const legacyResultDigest = digest(value.legacyResultDigest, "legacy_result_digest");
       const kernelResultDigest = digest(value.kernelResultDigest, "kernel_result_digest");
       const matched = boolean(value.matched, "matched");
+      const expectedInputDigest = sha256(canonicalJson({ field, legacy: legacyValue, kernel: kernelValue }));
+      const expectedLegacyDigest = sha256(canonicalJson(canonicalLegacy));
+      const expectedKernelDigest = sha256(canonicalJson(canonicalKernel));
+      const expectedMatched = canonicalJson(canonicalLegacy) === canonicalJson(canonicalKernel);
+      if (inputDigest !== expectedInputDigest || legacyResultDigest !== expectedLegacyDigest
+          || kernelResultDigest !== expectedKernelDigest || matched !== expectedMatched) {
+        throw coded("shadow_comparison_invalid");
+      }
       return transaction(() => {
         const authority = requireTask(database, authorityTaskUid);
         const imported = database.prepare(`SELECT facts_json FROM convergence_events
@@ -1449,7 +1569,15 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           eventUid, taskUid: authorityTaskUid, eventType: "shadow_compared",
           evidenceDigest: inputDigest, sourceDigest: legacyResultDigest,
           resultDigest: kernelResultDigest, action: matched ? "matched" : "mismatch",
-          facts: { matched: matched ? 1 : 0, paritySetDigest }
+          facts: {
+            field,
+            legacyValue: parityFactValue(field, legacyValue),
+            kernelValue: parityFactValue(field, kernelValue),
+            mappingRevision,
+            matched: matched ? 1 : 0,
+            paritySetDigest,
+            sourceSha256
+          }
         });
         const rows = database.prepare(`SELECT facts_json FROM convergence_events
           WHERE task_uid=? AND event_type='shadow_compared' ORDER BY id`).all(authorityTaskUid)
@@ -1468,7 +1596,8 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
     recordGuardCutover(input) {
       const value = exactObject(input, new Set([
         "eventUid", "authorityTaskUid", "sourceSha256", "mappingRevision", "paritySetDigest",
-        "snapshotDigest", "decisionRefDigest"
+        "snapshotDigest", "snapshotDev", "snapshotIno", "snapshotMode", "snapshotType",
+        "snapshotUid", "decisionRefDigest"
       ]), "guard_cutover");
       const eventUid = identifier(value.eventUid, "event_uid");
       const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
@@ -1476,14 +1605,23 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const mappingRevision = identifier(value.mappingRevision, "mapping_revision");
       const paritySetDigest = digest(value.paritySetDigest, "parity_set_digest");
       const snapshotDigest = digest(value.snapshotDigest, "snapshot_digest");
+      const snapshotDev = integer(value.snapshotDev, "snapshot_dev", 0, Number.MAX_SAFE_INTEGER);
+      const snapshotIno = integer(value.snapshotIno, "snapshot_ino", 1, Number.MAX_SAFE_INTEGER);
+      const snapshotMode = integer(value.snapshotMode, "snapshot_mode", 0, 0o777);
+      const snapshotType = enumValue(value.snapshotType, new Set(["regular"]), "snapshot_type");
+      const snapshotUid = integer(value.snapshotUid, "snapshot_uid", 0, Number.MAX_SAFE_INTEGER);
       const decisionRefDigest = digest(value.decisionRefDigest, "decision_ref_digest");
       if (snapshotDigest !== sourceSha256) throw coded("cutover_snapshot_mismatch");
+      if (snapshotMode !== 0o400) throw coded("cutover_snapshot_unsafe");
       return transaction(() => {
         const eventInput = {
           eventUid, taskUid: authorityTaskUid, eventType: "guard_cutover",
           action: "afl_sqlite", evidenceDigest: decisionRefDigest,
           sourceDigest: sourceSha256, resultDigest: snapshotDigest,
-          facts: { mappingRevision, paritySetDigest }
+          facts: {
+            mappingRevision, paritySetDigest, snapshotDev, snapshotIno, snapshotMode,
+            snapshotType, snapshotUid
+          }
         };
         const prior = database.prepare("SELECT 1 FROM convergence_events WHERE event_uid=?").get(eventUid);
         const authority = requireTask(database, authorityTaskUid);
@@ -1508,9 +1646,38 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           WHERE task_uid=? AND event_type='shadow_compared' ORDER BY id`).all(authorityTaskUid)
           .map((row) => JSON.parse(row.facts_json))
           .filter((facts) => facts.paritySetDigest === paritySetDigest);
-        if (comparisons.length < 4 || comparisons.some((facts) => Number(facts.matched) !== 1)) {
+        const fields = new Set(comparisons.map((facts) => facts.field));
+        if (comparisons.length !== GUARD_PARITY_FIELDS.length
+            || fields.size !== GUARD_PARITY_FIELDS.length
+            || GUARD_PARITY_FIELDS.some((field) => !fields.has(field))
+            || comparisons.some((facts) => Number(facts.matched) !== 1
+              || facts.sourceSha256 !== sourceSha256
+              || facts.mappingRevision !== mappingRevision)) {
           throw coded("shadow_parity_incomplete");
         }
+        let reconstructedDigest;
+        try {
+          reconstructedDigest = guardParityDigest({
+            sourceSha256,
+            mappingRevision,
+            comparisons: comparisons.map((facts) => ({
+              field: facts.field,
+              legacy: parityValueFromFact(facts.field, facts.legacyValue),
+              kernel: parityValueFromFact(facts.field, facts.kernelValue)
+            }))
+          });
+          for (const facts of comparisons) {
+            const legacy = parityValueFromFact(facts.field, facts.legacyValue);
+            const kernel = parityValueFromFact(facts.field, facts.kernelValue);
+            if (canonicalJson(canonicalGuardParityValue(facts.field, "legacy", legacy))
+                !== canonicalJson(canonicalGuardParityValue(facts.field, "kernel", kernel))) {
+              throw coded("shadow_parity_incomplete");
+            }
+          }
+        } catch {
+          throw coded("shadow_parity_incomplete");
+        }
+        if (reconstructedDigest !== paritySetDigest) throw coded("shadow_parity_incomplete");
         const liveGrant = database.prepare(`SELECT 1 FROM continuation_grants g
           JOIN convergence_tasks t ON t.task_uid=g.task_uid
           WHERE t.lineage_digest=? AND g.state='active' LIMIT 1`).get(authority.lineage_digest);
@@ -1526,12 +1693,18 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
 
     recordGuardRollback(input) {
       const value = exactObject(input, new Set([
-        "eventUid", "authorityTaskUid", "cutoverEventUid", "snapshotDigest", "decisionRefDigest"
+        "eventUid", "authorityTaskUid", "cutoverEventUid", "snapshotDigest", "snapshotDev",
+        "snapshotIno", "snapshotMode", "snapshotType", "snapshotUid", "decisionRefDigest"
       ]), "guard_rollback");
       const eventUid = identifier(value.eventUid, "event_uid");
       const authorityTaskUid = identifier(value.authorityTaskUid, "authority_task_uid");
       const cutoverEventUid = identifier(value.cutoverEventUid, "cutover_event_uid");
       const snapshotDigest = digest(value.snapshotDigest, "snapshot_digest");
+      const snapshotDev = integer(value.snapshotDev, "snapshot_dev", 0, Number.MAX_SAFE_INTEGER);
+      const snapshotIno = integer(value.snapshotIno, "snapshot_ino", 1, Number.MAX_SAFE_INTEGER);
+      const snapshotMode = integer(value.snapshotMode, "snapshot_mode", 0, 0o777);
+      const snapshotType = enumValue(value.snapshotType, new Set(["regular"]), "snapshot_type");
+      const snapshotUid = integer(value.snapshotUid, "snapshot_uid", 0, Number.MAX_SAFE_INTEGER);
       const decisionRefDigest = digest(value.decisionRefDigest, "decision_ref_digest");
       return transaction(() => {
         const eventInput = {
@@ -1545,7 +1718,16 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
           WHERE task_uid=? AND event_uid=? AND event_type='guard_cutover'`).get(
             authorityTaskUid, cutoverEventUid
           );
-        if (!cutover || cutover.result_digest !== snapshotDigest) throw coded("cutover_snapshot_mismatch");
+        let cutoverFacts;
+        try { cutoverFacts = JSON.parse(cutover?.facts_json ?? "null"); } catch {
+          throw coded("cutover_snapshot_mismatch");
+        }
+        if (!cutover || cutover.result_digest !== snapshotDigest
+            || cutoverFacts.snapshotDev !== snapshotDev
+            || cutoverFacts.snapshotIno !== snapshotIno
+            || cutoverFacts.snapshotMode !== snapshotMode
+            || cutoverFacts.snapshotType !== snapshotType
+            || cutoverFacts.snapshotUid !== snapshotUid) throw coded("cutover_snapshot_mismatch");
         const latest = database.prepare(`SELECT event_uid, event_type FROM convergence_events
           WHERE task_uid=? AND event_type IN ('guard_cutover','guard_rollback')
           ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
@@ -1570,7 +1752,9 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       const task = database.prepare("SELECT * FROM convergence_tasks WHERE task_uid=?").get(authorityTaskUid);
       if (!task) return Object.freeze({
         authority: "afl_sqlite", imported: false, sourceSha256: null,
-        mappingRevision: null, paritySetDigest: null, snapshotDigest: null, cutoverEventUid: null
+        mappingRevision: null, paritySetDigest: null, snapshotDigest: null,
+        snapshotDev: null, snapshotIno: null, snapshotMode: null, snapshotType: null,
+        snapshotUid: null, cutoverEventUid: null
       });
       const imported = database.prepare(`SELECT * FROM convergence_events
         WHERE task_uid=? AND event_type='legacy_imported' ORDER BY id DESC LIMIT 1`).get(authorityTaskUid);
@@ -1582,14 +1766,18 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       if (!latest) return Object.freeze({
         authority: "legacy_guard", imported: true, sourceSha256: imported.source_digest,
         mappingRevision: importFacts.mappingVersion, paritySetDigest: null,
-        snapshotDigest: null, cutoverEventUid: null
+        snapshotDigest: null, snapshotDev: null, snapshotIno: null, snapshotMode: null,
+        snapshotType: null, snapshotUid: null, cutoverEventUid: null
       });
       if (latest.event_type === "guard_cutover") {
         const facts = JSON.parse(latest.facts_json);
         return Object.freeze({
           authority: "afl_sqlite", imported: true, sourceSha256: latest.source_digest,
           mappingRevision: facts.mappingRevision, paritySetDigest: facts.paritySetDigest,
-          snapshotDigest: latest.result_digest, cutoverEventUid: latest.event_uid
+          snapshotDigest: latest.result_digest, snapshotDev: facts.snapshotDev,
+          snapshotIno: facts.snapshotIno, snapshotMode: facts.snapshotMode,
+          snapshotType: facts.snapshotType, snapshotUid: facts.snapshotUid,
+          cutoverEventUid: latest.event_uid
         });
       }
       const facts = JSON.parse(latest.facts_json);
@@ -1599,7 +1787,10 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
       return Object.freeze({
         authority: "legacy_guard", imported: true, sourceSha256: imported.source_digest,
         mappingRevision: importFacts.mappingVersion, paritySetDigest: cutoverFacts.paritySetDigest ?? null,
-        snapshotDigest: latest.result_digest, cutoverEventUid: facts.cutoverEventUid
+        snapshotDigest: latest.result_digest, snapshotDev: cutoverFacts.snapshotDev ?? null,
+        snapshotIno: cutoverFacts.snapshotIno ?? null, snapshotMode: cutoverFacts.snapshotMode ?? null,
+        snapshotType: cutoverFacts.snapshotType ?? null, snapshotUid: cutoverFacts.snapshotUid ?? null,
+        cutoverEventUid: facts.cutoverEventUid
       });
     },
 
