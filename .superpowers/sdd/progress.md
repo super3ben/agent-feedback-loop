@@ -97,3 +97,11 @@
 - On 2026-07-20 the user replied `继续`, authorizing one review-10 identity-coherence fix and one fresh independent re-review. The fix must use a shared conflict-validating reader for all existing canonical alias groups and a shared replay-compatible alias-target rule with completeness applied before candidate bounding; no schema, hook, scheduler, notification, RAG, Markdown-truth, or later-task expansion is authorized.
 - Review 11 confirms both review-10 blockers are closed but proves one remaining semantic split: SQLite `julianday()` accepts a timezone-less timestamp as a 60-second alias match while JavaScript `Date.parse()` sees a 28,740-second difference, so the same accepted alias immediately collides on replay. The authorized fix/re-review round is consumed; no timestamp-contract fix is dispatched without a new explicit user decision.
 - On 2026-07-20 the user replied `继续`, authorizing one root-cause timestamp-contract amendment, its TDD implementation, and one fresh independent review. The correction must normalize valid timezone-bearing RFC3339 input to fixed-width UTC before side effects and make SQL/replay consume one canonical inclusive window; it must not add schema, services, schedulers, hooks, notifications, RAG, or later-task behavior.
+
+## Convergence Kernel Guard Integration (2026-07-21)
+
+- Plan: `docs/superpowers/plans/2026-07-21-convergence-kernel-guard-integration.md`
+- Design: `docs/superpowers/specs/2026-07-21-convergence-kernel-guard-integration-design.md`
+- Task 1: in progress (repository lineage and contract projection; implementation base recorded after this ledger commit).
+- Tasks 2-9: pending.
+- Final whole-branch review: pending.
