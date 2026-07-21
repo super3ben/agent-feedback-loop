@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 
 import { evaluateConvergence } from "./convergence-policy.mjs";
-import { validateConvergenceProbeResult } from "./convergence-probe-result.mjs";
 
-const TRUSTED_EVIDENCE = new Set([
+const TRUSTED_EVIDENCE_CLASSES = new Set([
   "explicit_user", "approved_spec", "approved_plan", "verified_runtime"
+]);
+const EVIDENCE_CLASSES = new Set([
+  ...TRUSTED_EVIDENCE_CLASSES, "review_finding", "inferred_advisory"
 ]);
 const PROBE_GRANT_PURPOSE = new Map([
   ["continue_once", "local_fix"],
@@ -12,6 +14,9 @@ const PROBE_GRANT_PURPOSE = new Map([
   ["rollback_to_generation", "rollback"]
 ]);
 const DIGEST = /^[a-f0-9]{64}$/u;
+const POST_PROBE_FIELDS = new Set([
+  "store", "task", "loop", "request", "evidenceEventUid", "probeResultDigest", "now"
+]);
 
 function coded(code) {
   return Object.assign(new Error(code), { code });
@@ -41,6 +46,18 @@ function timestamp(now) {
 
 function controllerEvent(kind, value) {
   return `controller-${kind}:${sha256(value)}`;
+}
+
+function exactInput(input, fields) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)
+      || Object.getPrototypeOf(input) !== Object.prototype) throw coded("controller_invalid");
+  if (Object.hasOwn(input, "verifiedEvidence")) throw coded("evidence_provenance_required");
+  for (const field of Object.keys(input)) {
+    if (!fields.has(field)) {
+      throw coded("controller_invalid");
+    }
+  }
+  return input;
 }
 
 function assertAuthority({ store, task, loop }) {
@@ -88,7 +105,8 @@ function evaluatedRequest({
     lastGrantPurpose: history.lastGrantPurpose,
     explorationUsed: history.explorationUsed,
     evidenceQuality,
-    evidenceChanged: previousDecisionBasisDigest !== loop.decisionBasisDigest
+    evidenceChanged: previousDecisionBasisDigest !== loop.decisionBasisDigest,
+    probeAction: request.probeAction ?? null
   };
 }
 
@@ -99,6 +117,107 @@ function previousReviewBasis(store, loop) {
     fingerprint: loop.fingerprint,
     state: "before_first_review"
   });
+}
+
+function eventFacts(row) {
+  let facts;
+  try { facts = JSON.parse(row.facts_json); } catch { throw coded("evidence_provenance_invalid"); }
+  if (facts === null || typeof facts !== "object" || Array.isArray(facts)
+      || Object.getPrototypeOf(facts) !== Object.prototype) {
+    throw coded("evidence_provenance_invalid");
+  }
+  return facts;
+}
+
+function latestReview(store, fingerprint) {
+  const row = store.database.prepare(`SELECT * FROM convergence_events
+    WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`).get(fingerprint);
+  if (!row) return null;
+  return Object.freeze({ row, facts: Object.freeze(eventFacts(row)) });
+}
+
+function assertLocalReviewAuthorization(store, loop) {
+  const review = latestReview(store, loop.fingerprint);
+  if (!review) throw coded("continuation_not_authorized");
+  const counted = review.facts.verdict === "changes_required"
+    && (review.facts.severity === "important" || review.facts.severity === "critical");
+  const requiresDirection = counted
+    && (review.facts.directionSignal !== "none" || Number(review.facts.failureCount) >= 2);
+  if (requiresDirection || review.row.decision === "checkpoint_required") {
+    throw coded("direction_review_required");
+  }
+}
+
+function completionEvent(store, loop) {
+  const row = store.database.prepare(`SELECT * FROM convergence_events
+    WHERE task_uid=? AND fingerprint=? AND event_type='reflection_completed'
+    ORDER BY id DESC LIMIT 1`).get(loop.taskUid, loop.fingerprint);
+  if (!row || row.generation !== loop.currentGeneration
+      || row.result_digest !== loop.probeResultDigest
+      || (!PROBE_GRANT_PURPOSE.has(row.action)
+        && !["direction_checkpoint", "human_decision", "finish_now"].includes(row.action))) {
+    throw coded("probe_result_mismatch");
+  }
+  return row;
+}
+
+function provenanceEvent(store, loop, eventUid) {
+  if (eventUid === undefined || eventUid === null) return null;
+  if (typeof eventUid !== "string" || eventUid.length === 0) {
+    throw coded("evidence_provenance_invalid");
+  }
+  const row = store.database.prepare(
+    "SELECT * FROM convergence_events WHERE event_uid=?"
+  ).get(eventUid);
+  if (!row || row.task_uid !== loop.taskUid || row.fingerprint !== loop.fingerprint
+      || !["review_recorded", "evidence_recorded"].includes(row.event_type)) {
+    throw coded("evidence_provenance_invalid");
+  }
+  const latest = store.database.prepare(`SELECT event_uid FROM convergence_events
+    WHERE task_uid=? AND fingerprint=? AND event_type IN ('review_recorded', 'evidence_recorded')
+    ORDER BY id DESC LIMIT 1`).get(loop.taskUid, loop.fingerprint);
+  if (latest?.event_uid !== row.event_uid || row.result_digest !== loop.decisionBasisDigest) {
+    throw coded("evidence_provenance_stale");
+  }
+  const facts = eventFacts(row);
+  const evidenceClass = row.event_type === "review_recorded"
+    ? "review_finding"
+    : facts.evidenceClass;
+  if (!EVIDENCE_CLASSES.has(evidenceClass) || !DIGEST.test(row.evidence_digest ?? "")) {
+    throw coded("evidence_provenance_invalid");
+  }
+  const previous = store.database.prepare(`SELECT result_digest FROM convergence_events
+    WHERE task_uid=? AND fingerprint=? AND id<?
+      AND event_type IN ('review_recorded', 'evidence_recorded')
+    ORDER BY id DESC LIMIT 1`).get(loop.taskUid, loop.fingerprint, row.id);
+  return Object.freeze({
+    eventUid: row.event_uid,
+    evidenceClass,
+    evidenceDigest: row.evidence_digest,
+    decisionBasisDigest: row.result_digest,
+    previousDecisionBasisDigest: previous?.result_digest ?? sha256({
+      fingerprint: loop.fingerprint,
+      state: "before_first_evidence"
+    }),
+    trusted: TRUSTED_EVIDENCE_CLASSES.has(evidenceClass)
+  });
+}
+
+function postProbeScope(loop, action, purpose) {
+  const scope = {
+    action,
+    boundaryId: loop.boundaryId,
+    canonicalInvariantId: loop.canonicalInvariantId,
+    currentGeneration: loop.currentGeneration,
+    fingerprint: loop.fingerprint,
+    nextGeneration: loop.currentGeneration + 1,
+    purpose,
+    taskUid: loop.taskUid
+  };
+  if (purpose === "rollback") {
+    scope.rollbackTargetGeneration = Math.max(0, loop.currentGeneration - 1);
+  }
+  return sha256(scope);
 }
 
 function decisionTarget(decision) {
@@ -216,6 +335,7 @@ export function authorizeContinuation(input = {}) {
   if (input.purpose === "architecture_fix") return issueAuthorizedContinuation(input);
   const current = assertAuthority(input);
   if (!input.request || current.failureCount !== 1) throw coded("continuation_not_authorized");
+  assertLocalReviewAuthorization(input.store, current);
   const request = evaluatedRequest({
     store: input.store,
     task: input.task,
@@ -282,7 +402,6 @@ export function evaluateAndAdvance({
     const priorReservation = store.database.prepare(
       "SELECT created_at FROM convergence_events WHERE event_uid=?"
     ).get(probeEventUid);
-    const reservationExisted = priorReservation !== undefined;
     const dueAt = priorReservation?.created_at ?? timestamp(now).toISOString();
     const reservation = store.requestConvergenceProbe({
       eventUid: probeEventUid,
@@ -291,11 +410,19 @@ export function evaluateAndAdvance({
       probeKind: "convergence_reflection",
       dueAt
     });
-    const launched = reservationExisted
-      ? { attempted: false, reason: "reservation_replayed" }
-      : probeLaunch(launchProbe, reservation);
+    const currentTime = timestamp(now).getTime();
+    const due = ["pending", "retryable"].includes(reservation.probeState)
+      && reservation.probeNextAttemptAt !== null
+      && Date.parse(reservation.probeNextAttemptAt) <= currentTime;
+    const launched = due
+      ? probeLaunch(launchProbe, reservation)
+      : { attempted: false, reason: ["running", "completed"].includes(reservation.probeState)
+          ? `probe_${reservation.probeState}`
+          : "probe_not_due" };
     return Object.freeze({
-      action: launched.attempted ? "probe_started" : "reflection_required",
+      action: launched.attempted
+        ? "probe_started"
+        : reservation.probeState === "completed" ? "reflection_resolved" : "reflection_required",
       decision,
       loop: reservation,
       launch: Object.freeze(launched)
@@ -305,90 +432,66 @@ export function evaluateAndAdvance({
   return Object.freeze({ action, decision, loop: advanced });
 }
 
-function recordVerifiedEvidence({ store, task, loop, verifiedEvidence }) {
-  if (verifiedEvidence === null) return loop;
-  if (verifiedEvidence === undefined || verifiedEvidence === null
-      || typeof verifiedEvidence !== "object" || Array.isArray(verifiedEvidence)
-      || Object.getPrototypeOf(verifiedEvidence) !== Object.prototype
-      || Object.keys(verifiedEvidence).sort().join(",")
-        !== "decisionBasisDigest,evidenceClass,evidenceDigest"
-      || !TRUSTED_EVIDENCE.has(verifiedEvidence.evidenceClass)) {
-    throw coded("verified_evidence_invalid");
-  }
-  digest(verifiedEvidence.evidenceDigest, "invalid_evidence_digest");
-  digest(verifiedEvidence.decisionBasisDigest, "invalid_decision_basis_digest");
-  store.recordConvergenceEvidence({
-    eventUid: controllerEvent("evidence", {
-      taskUid: task.taskUid,
-      fingerprint: loop.fingerprint,
-      ...verifiedEvidence
-    }),
-    taskUid: task.taskUid,
-    fingerprint: loop.fingerprint,
-    ...verifiedEvidence
-  });
-  return store.getConvergenceStatus({ taskUid: task.taskUid, fingerprint: loop.fingerprint });
-}
-
-export function authorizeAfterProbe({
-  store,
-  task,
-  loop,
-  request,
-  probeResult,
-  verifiedEvidence = null,
-  scopeDigest,
-  now = () => new Date()
-} = {}) {
-  const beforeEvidence = assertAuthority({ store, task, loop });
-  if (beforeEvidence.status !== "reflection_resolved" || beforeEvidence.probeState !== "completed") {
-    throw coded("probe_not_resolved");
-  }
-  const validatedProbe = validateConvergenceProbeResult(probeResult);
-  if (sha256(validatedProbe) !== beforeEvidence.probeResultDigest) throw coded("probe_result_mismatch");
-  const current = recordVerifiedEvidence({
+export function authorizeAfterProbe(rawInput = {}) {
+  const input = exactInput(rawInput, POST_PROBE_FIELDS);
+  const {
     store,
     task,
-    loop: beforeEvidence,
-    verifiedEvidence
-  });
+    loop,
+    request,
+    evidenceEventUid,
+    probeResultDigest,
+    now = () => new Date()
+  } = input;
+  const current = assertAuthority({ store, task, loop });
+  if (!["reflection_resolved", "grant_ready", "checkpoint_required", "human_decision", "terminal"]
+    .includes(current.status) || current.probeState !== "completed") {
+    throw coded("probe_not_resolved");
+  }
+  const completed = completionEvent(store, current);
+  if (probeResultDigest !== undefined
+      && digest(probeResultDigest, "invalid_probe_result_digest") !== completed.result_digest) {
+    throw coded("probe_result_mismatch");
+  }
+  const provenance = provenanceEvent(store, current, evidenceEventUid);
   const evaluationRequest = evaluatedRequest({
     store,
     task,
     loop: current,
     request: {
       ...request,
-      previousDecisionBasisDigest: beforeEvidence.decisionBasisDigest
+      probeAction: completed.action,
+      previousDecisionBasisDigest: provenance?.previousDecisionBasisDigest
+        ?? current.decisionBasisDigest
     },
-    evidenceQuality: verifiedEvidence === null ? "none" : "verified"
+    evidenceQuality: provenance === null ? "none" : "verified",
+    previousBasis: provenance?.previousDecisionBasisDigest ?? current.decisionBasisDigest
   });
   const decision = evaluateConvergence(evaluationRequest);
 
-  if (validatedProbe.action === "finish_now") {
-    if (verifiedEvidence === null || evaluationRequest.acceptanceSatisfied !== true) {
+  if (completed.action === "finish_now") {
+    if (provenance?.trusted !== true || evaluationRequest.acceptanceSatisfied !== true) {
       throw coded("verified_acceptance_required");
     }
-    if (decision.decision !== "pass") throw coded("finish_not_authorized");
-    const resolved = store.resolveConvergenceLoop({
-      eventUid: controllerEvent("finish", {
-        taskUid: task.taskUid,
-        fingerprint: current.fingerprint,
-        evidenceDigest: verifiedEvidence.evidenceDigest
-      }),
-      taskUid: task.taskUid,
-      fingerprint: current.fingerprint,
-      resolution: "closed",
-      reasonCode: "verified_acceptance"
+    if (decision.decision !== "finish") throw coded("finish_not_authorized");
+    const resolved = recordHardDecision({
+      store,
+      task,
+      loop: current,
+      request: evaluationRequest,
+      decision
     });
     return Object.freeze({ action: "finish", decision, loop: resolved });
   }
   if (decision.decision === "checkpoint_required" || decision.decision === "hold") {
-    return Object.freeze({ action: "checkpoint_required", decision, loop: current });
+    const advanced = recordHardDecision({ store, task, loop: current, request: evaluationRequest, decision });
+    return Object.freeze({ action: "checkpoint_required", decision, loop: advanced });
   }
   if (decision.decision === "human_decision") {
-    return Object.freeze({ action: "human_decision", decision, loop: current });
+    const advanced = recordHardDecision({ store, task, loop: current, request: evaluationRequest, decision });
+    return Object.freeze({ action: "human_decision", decision, loop: advanced });
   }
-  const purpose = PROBE_GRANT_PURPOSE.get(validatedProbe.action);
+  const purpose = PROBE_GRANT_PURPOSE.get(completed.action);
   if (decision.decision !== "pass" || purpose === undefined) {
     throw coded("verified_basis_or_exploration_required");
   }
@@ -398,12 +501,13 @@ export function authorizeAfterProbe({
       task,
       loop: current,
       purpose,
-      scopeDigest,
-      evidenceDigest: verifiedEvidence?.evidenceDigest ?? current.decisionBasisDigest,
+      scopeDigest: postProbeScope(current, completed.action, purpose),
+      evidenceDigest: provenance?.evidenceDigest ?? current.decisionBasisDigest,
       policyDecision: decision,
-      probeAction: validatedProbe.action,
+      probeAction: completed.action,
       now
     }),
-    decision
+    decision,
+    purpose
   });
 }

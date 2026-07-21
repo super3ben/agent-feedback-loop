@@ -24,6 +24,9 @@ export const BREAKER_REASONS = Object.freeze([
   "exploration_budget_exhausted",
   "critical_evidence_required",
   "exploration_grant_available",
+  "probe_direction_checkpoint",
+  "probe_human_decision",
+  "verified_acceptance_complete",
   "basis_changed_or_scope_aligned"
 ]);
 
@@ -42,7 +45,7 @@ export const ADAPTER_CAPABILITIES = Object.freeze([
   "tool_gate"
 ]);
 
-const POLICY_REVISION = "convergence-policy-v1";
+const POLICY_REVISION = "convergence-policy-v2";
 const MAX_COLLECTION_LENGTH = 128;
 const MAX_TEXT_LENGTH = 2_048;
 const MAX_COUNTER = 1_000_000;
@@ -62,6 +65,10 @@ const HARD_AUTHORITIES = new Set(["explicit_user", "approved_spec", "approved_pl
 const EVIDENCE_QUALITIES = new Set(["none", "partial", "verified"]);
 const CAPABILITIES = new Set(ADAPTER_CAPABILITIES);
 const PURPOSES = new Set(GRANT_PURPOSES);
+const PROBE_ACTIONS = new Set([
+  "continue_once", "simplify_current_generation", "rollback_to_generation",
+  "direction_checkpoint", "human_decision", "finish_now"
+]);
 
 const REQUEST_FIELDS = new Set([
   "adapterCapability",
@@ -84,7 +91,8 @@ const REQUEST_FIELDS = new Set([
   "evidenceQuality",
   "evidenceChanged",
   "fileSaveCount",
-  "semanticRecommendation"
+  "semanticRecommendation",
+  "probeAction"
 ]);
 
 const CONTRACT_FIELDS = new Set([
@@ -319,7 +327,10 @@ function validateRequest(input) {
     evidenceQuality,
     evidenceChanged,
     fileSaveCount: boundedCounter(required(value, "fileSaveCount"), "invalid_file_save_count"),
-    semanticRecommendation: validateSemanticRecommendation(required(value, "semanticRecommendation"))
+    semanticRecommendation: validateSemanticRecommendation(required(value, "semanticRecommendation")),
+    probeAction: value.probeAction === undefined || value.probeAction === null
+      ? null
+      : enumValue(value.probeAction, PROBE_ACTIONS, "invalid_probe_action")
   });
 }
 
@@ -343,6 +354,20 @@ function repeatedReviewInvariant(value) {
   return value.failureCount >= 2
     ? trigger("checkpoint_required", "repeated_review_invariant")
     : null;
+}
+
+function resolvedProbeDirection(value) {
+  if (value.evidenceQuality !== "verified") return null;
+  if (value.probeAction === "direction_checkpoint") {
+    return trigger("checkpoint_required", "probe_direction_checkpoint");
+  }
+  if (value.probeAction === "human_decision") {
+    return trigger("human_decision", "probe_human_decision");
+  }
+  if (value.probeAction === "finish_now" && value.acceptanceSatisfied) {
+    return trigger("finish", "verified_acceptance_complete");
+  }
+  return null;
 }
 
 function acceptanceSatisfiedScopeExpansion(value) {
@@ -430,6 +455,7 @@ export function evaluateConvergence(request) {
     explicitExclusionTouched(value),
     architectureFixFailed(value),
     repeatedReviewInvariant(value),
+    resolvedProbeDirection(value),
     acceptanceSatisfiedScopeExpansion(value),
     unjustifiedArchitectureExpansion(value),
     oscillation(value),
@@ -478,6 +504,9 @@ const STATE_CHANGING_EDGES = Object.freeze([
     [from, "breaker_triggered", "checkpoint_required"],
     [from, "breaker_triggered", "human_decision"],
     [from, "breaker_triggered", "terminal"]
+  ]),
+  ...["checkpoint_required", "human_decision", "terminal"].map((to) => [
+    "reflection_resolved", "breaker_triggered", to
   ]),
   ["reflection_required", "reflection_requested", "probe_pending"],
   ["probe_pending", "reflection_claimed", "probe_running"],

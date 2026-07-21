@@ -16,7 +16,7 @@ import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
 import { pathsFor } from "../src/index.mjs";
 
-const POLICY_REVISION = createHash("sha256").update("convergence-policy-v1").digest("hex");
+const POLICY_REVISION = createHash("sha256").update("convergence-policy-v2").digest("hex");
 const BASIS_A = digestDecisionBasis({ basis: "a" });
 const BASIS_B = digestDecisionBasis({ basis: "b" });
 const BASIS_C = digestDecisionBasis({ basis: "c" });
@@ -154,11 +154,17 @@ function harness({
   }
 
   function verifiedEvidence(basis = BASIS_C) {
-    return {
+    const evidenceDigest = digestDecisionBasis({ verified: serial + 1 });
+    const evidenceEventUid = eventUid("verified-evidence");
+    store.recordConvergenceEvidence({
+      eventUid: evidenceEventUid,
+      taskUid: taskProjection.taskUid,
+      fingerprint: loop().fingerprint,
       evidenceClass: "verified_runtime",
-      evidenceDigest: digestDecisionBasis({ verified: serial + 1 }),
+      evidenceDigest,
       decisionBasisDigest: basis
-    };
+    });
+    return { eventUid: evidenceEventUid, evidenceDigest, decisionBasisDigest: basis };
   }
 
   function afterProbe(result, {
@@ -171,9 +177,8 @@ function harness({
       task: taskProjection,
       loop: loop(),
       request: request(requestOverrides),
-      probeResult: result,
-      verifiedEvidence: evidence,
-      scopeDigest: scope,
+      evidenceEventUid: evidence?.eventUid,
+      probeResultDigest: loop().probeResultDigest,
       now
     });
   }
@@ -229,8 +234,8 @@ test("routine evidence-free expansion pauses and starts one Probe without a gran
     },
     now: h.now
   });
-  assert.equal(replay.action, "reflection_required");
-  assert.equal(launches.length, 1);
+  assert.equal(replay.action, "probe_started");
+  assert.equal(launches.length, 2);
   assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
   assert.throws(() => h.store.requestConvergenceGeneration({
     eventUid: h.eventUid("open"),
@@ -391,6 +396,211 @@ test("Probe launch failure remains reflection-required and issues no grant", (t)
   assert.equal(result.action, "reflection_required");
   assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
 });
+
+test("fabricated evidence is rejected before any authoritative side effect", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  const result = probeResult();
+  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.completeProbe(result);
+  const before = h.loop();
+  const eventCount = h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count;
+
+  assert.throws(() => authorizeAfterProbe({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request(),
+    probeResult: result,
+    verifiedEvidence: {
+      evidenceClass: "verified_runtime",
+      evidenceDigest: "e".repeat(64),
+      decisionBasisDigest: "f".repeat(64)
+    },
+    scopeDigest: digestDecisionBasis({ scope: "fabricated" }),
+    now: h.now
+  }), (error) => error.code === "evidence_provenance_required");
+
+  assert.deepEqual(h.loop(), before);
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count, eventCount);
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+});
+
+test("completed Probe resumes from the real Store after restart and exact replay is stable", async (t) => {
+  const h = harness();
+  let reopened = null;
+  t.after(() => {
+    reopened?.close();
+    rmSync(h.home, { recursive: true, force: true });
+  });
+  const result = probeResult();
+  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.completeProbe(result);
+  const task = h.task();
+  const request = h.request();
+  const fingerprint = h.loop().fingerprint;
+  const evidenceEventUid = h.store.database.prepare(`SELECT event_uid FROM convergence_events
+    WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`
+  ).get(fingerprint).event_uid;
+  h.store.close();
+  reopened = initializeControlStore({ paths: pathsFor(h.home), now: h.now });
+
+  const first = authorizeAfterProbe({
+    store: reopened,
+    task,
+    loop: reopened.getConvergenceStatus({ taskUid: task.taskUid, fingerprint }),
+    request,
+    evidenceEventUid,
+    now: h.now
+  });
+  const replay = authorizeAfterProbe({
+    store: reopened,
+    task,
+    loop: reopened.getConvergenceStatus({ taskUid: task.taskUid, fingerprint }),
+    request,
+    evidenceEventUid,
+    now: h.now
+  });
+
+  assert.equal(first.action, "grant_issued");
+  assert.equal(first.grant.purpose, "local_fix");
+  assert.equal(replay.action, first.action);
+  assert.equal(replay.grant.grantId, first.grant.grantId);
+  assert.equal(reopened.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 1);
+});
+
+test("failed Probe launch is attempted once again by an explicit replay after restart", (t) => {
+  const h = harness();
+  let reopened = null;
+  t.after(() => {
+    reopened?.close();
+    rmSync(h.home, { recursive: true, force: true });
+  });
+  const overrides = { acceptanceSatisfied: true, addsArchitecture: true };
+  const first = h.evaluate(overrides, () => ({ attempted: false, reason: "spawn_failed" }));
+  assert.equal(first.action, "reflection_required");
+  const task = h.task();
+  const request = h.request(overrides);
+  const fingerprint = h.loop().fingerprint;
+  h.store.close();
+  reopened = initializeControlStore({ paths: pathsFor(h.home), now: h.now });
+  let launches = 0;
+
+  const replay = evaluateAndAdvance({
+    store: reopened,
+    task,
+    loop: reopened.getConvergenceStatus({ taskUid: task.taskUid, fingerprint }),
+    request,
+    launchProbe() {
+      launches += 1;
+      return { attempted: true, reason: "spawn_attempted" };
+    },
+    now: h.now
+  });
+
+  assert.equal(replay.action, "probe_started");
+  assert.equal(launches, 1);
+  assert.equal(reopened.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+});
+
+test("post-Probe cleanup scope rejects caller authority and binds rollback target", async (t) => {
+  const rejected = harness();
+  const canonical = harness();
+  t.after(() => rejected.close());
+  t.after(() => canonical.close());
+  const rollback = probeResult("rollback_to_generation", "wrong_direction");
+  for (const h of [rejected, canonical]) {
+    h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+    await h.completeProbe(rollback);
+  }
+  const evidenceEvent = (h) => h.store.database.prepare(`SELECT event_uid FROM convergence_events
+    WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`
+  ).get(h.loop().fingerprint).event_uid;
+
+  assert.throws(() => authorizeAfterProbe({
+    store: rejected.store,
+    task: rejected.task(),
+    loop: rejected.loop(),
+    request: rejected.request(),
+    probeResult: rollback,
+    evidenceEventUid: evidenceEvent(rejected),
+    scopeDigest: digestDecisionBasis({ scope: "entire-repository" }),
+    now: rejected.now
+  }), (error) => error.code === "controller_invalid");
+  assert.equal(rejected.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+
+  const before = canonical.loop();
+  const authorized = authorizeAfterProbe({
+    store: canonical.store,
+    task: canonical.task(),
+    loop: before,
+    request: canonical.request(),
+    evidenceEventUid: evidenceEvent(canonical),
+    now: canonical.now
+  });
+  assert.equal(authorized.grant.scopeDigest, digestDecisionBasis({
+    action: "rollback_to_generation",
+    boundaryId: before.boundaryId,
+    canonicalInvariantId: before.canonicalInvariantId,
+    currentGeneration: before.currentGeneration,
+    fingerprint: before.fingerprint,
+    nextGeneration: before.currentGeneration + 1,
+    purpose: "rollback",
+    rollbackTargetGeneration: Math.max(0, before.currentGeneration - 1),
+    taskUid: before.taskUid
+  }));
+});
+
+for (const [action, expectedAction, expectedStatus] of [
+  ["direction_checkpoint", "checkpoint_required", "checkpoint_required"],
+  ["human_decision", "human_decision", "human_decision"]
+]) {
+  test(`stored ${action} advice reaches ${expectedStatus} only through deterministic policy`, async (t) => {
+    const h = harness();
+    t.after(() => h.close());
+    const result = probeResult(action, action === "human_decision" ? "wrong_direction" : "scope_drift");
+    h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+    await h.completeProbe(result);
+    const evidenceEventUid = h.store.database.prepare(`SELECT event_uid FROM convergence_events
+      WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`
+    ).get(h.loop().fingerprint).event_uid;
+
+    const advanced = authorizeAfterProbe({
+      store: h.store,
+      task: h.task(),
+      loop: h.loop(),
+      request: h.request(),
+      evidenceEventUid,
+      now: h.now
+    });
+    const replay = authorizeAfterProbe({
+      store: h.store,
+      task: h.task(),
+      loop: h.loop(),
+      request: h.request(),
+      evidenceEventUid,
+      now: h.now
+    });
+
+    assert.equal(advanced.action, expectedAction);
+    assert.equal(h.loop().status, expectedStatus);
+    assert.equal(replay.action, expectedAction);
+    assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+      WHERE event_type='breaker_triggered' AND decision=?`).get(expectedAction).count, 1);
+  });
+}
 
 test("generic audit downgrades the hard request to warning authority", (t) => {
   const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });

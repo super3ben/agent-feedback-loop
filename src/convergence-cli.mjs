@@ -5,7 +5,7 @@ import { launchDetachedConvergenceProbe } from "./convergence-probe-launcher.mjs
 import { runGuardCommand } from "./convergence-sdd-adapter.mjs";
 import { pathsFor } from "./index.mjs";
 
-const CLI_FILE = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 
 const EXIT_BY_CODE = Object.freeze({
   guard_invalid_arguments: 2,

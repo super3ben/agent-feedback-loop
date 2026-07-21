@@ -98,7 +98,7 @@ function expectedDecision(input, decision, reasonCode, requestedDecision = decis
     reasonCode,
     enforcement: enforcementFor(decision, input.adapterCapability),
     probeRequired: requestedDecision === "reflection_required",
-    policyRevision: "convergence-policy-v1"
+    policyRevision: "convergence-policy-v2"
   };
 }
 
@@ -366,6 +366,9 @@ test("public enums are frozen and contain the complete approved vocabulary", () 
     "exploration_budget_exhausted",
     "critical_evidence_required",
     "exploration_grant_available",
+    "probe_direction_checkpoint",
+    "probe_human_decision",
+    "verified_acceptance_complete",
     "basis_changed_or_scope_aligned"
   ]);
   assert.deepEqual(GRANT_PURPOSES, ["local_fix", "exploration", "simplify", "rollback", "architecture_fix"]);
@@ -395,6 +398,9 @@ const stateChangingTransitions = [
   ["probe_running", "reflection_failed", "reflection_required"],
   ["probe_running", "reflection_failed", "checkpoint_required"],
   ["probe_running", "reflection_failed", "human_decision"],
+  ["reflection_resolved", "breaker_triggered", "checkpoint_required"],
+  ["reflection_resolved", "breaker_triggered", "human_decision"],
+  ["reflection_resolved", "breaker_triggered", "terminal"],
   ["checkpoint_required", "checkpoint_recorded", "direction_approved"],
   ["generation_closed", "grant_issued", "grant_ready"],
   ["reflection_resolved", "grant_issued", "grant_ready"],

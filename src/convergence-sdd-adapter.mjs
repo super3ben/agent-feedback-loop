@@ -10,11 +10,12 @@ import {
   projectContract
 } from "./convergence-identity.mjs";
 import {
+  authorizeAfterProbe,
   authorizeContinuation,
   evaluateAndAdvance
 } from "./convergence-controller.mjs";
 
-const POLICY_REVISION = "convergence-policy-v1";
+const POLICY_REVISION = "convergence-policy-v2";
 const POLICY_REVISION_DIGEST = sha256(POLICY_REVISION);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const REVIEW_SEVERITIES = new Set(["minor", "important", "critical"]);
@@ -182,7 +183,7 @@ async function ensureTask({ store, repoRoot, taskId }) {
   });
   const taskUid = deriveTaskUid({ lineageId: lineage.lineageId, adapterKind: "sdd", nativeTaskId: taskId });
   const task = store.upsertConvergenceTask({
-    eventUid: `contract:${taskUid}`,
+    eventUid: `contract:${taskUid}:${contract.revision.slice(0, 16)}:${POLICY_REVISION_DIGEST.slice(0, 16)}`,
     taskUid,
     lineageDigest: sha256(lineage.lineageId),
     adapterKind: "sdd",
@@ -328,6 +329,7 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
   if (verdict === "approved") return summary(loop, "closed", 0, architectureFixCount(store, loop.fingerprint));
   if (!countedFailure) return summary(loop, "review_recorded", 0, architectureFixCount(store, loop.fingerprint));
 
+  let workflowAction = null;
   if (loop.failureCount >= 2 || directionSignal !== "none") {
     const request = decisionRequest({
       contract,
@@ -343,6 +345,7 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
       launchProbe,
       now
     });
+    workflowAction = advanced.action;
     loop = advanced.loop ?? store.getConvergenceStatus({
       taskUid: task.taskUid,
       fingerprint: loop.fingerprint
@@ -351,6 +354,9 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
   const count = architectureFixCount(store, loop.fingerprint);
   if (loop.decision === "human_decision") return summary(loop, "human_decision_required", 4, count);
   if (loop.decision === "checkpoint_required") return summary(loop, "direction_review_required", 3, count);
+  if (workflowAction !== null) {
+    return summary(loop, workflowAction, workflowAction === "finish" ? 0 : 3, count);
+  }
   return summary(loop, "local_fix_allowed", 0, count);
 }
 
@@ -632,9 +638,16 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   const loop = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
   if (!loop) throw coded("loop_not_found");
   const fingerprint = loop.fingerprint;
-  if (mode === "local_fix" && (loop.failureCount !== 1 || loop.currentGeneration !== 0)) {
+  const postProbe = mode === "local_fix"
+    && ["reflection_resolved", "grant_ready", "checkpoint_required", "human_decision", "terminal"]
+      .includes(loop.status)
+    && loop.probeState === "completed";
+  if (mode === "local_fix" && !postProbe
+      && (loop.failureCount !== 1 || loop.currentGeneration !== 0)) {
     throw coded(loop.decision === "checkpoint_required" ? "direction_review_required" : "transition_invalid");
   }
+  if (mode === "local_fix" && ["probe_pending", "probe_running", "reflection_required"]
+    .includes(loop.status)) throw coded("direction_review_required");
   if (mode === "architecture_fix" && !["direction_approved", "grant_ready"].includes(loop.status)) {
     throw coded(loop.decision === "human_decision" ? "human_decision_required" : "direction_review_required");
   }
@@ -655,23 +668,60 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   } else if (Object.hasOwn(parsed.values, "--checkpoint-file")) {
     throw coded("guard_invalid_arguments");
   }
-  const scopeDigest = digestDecisionBasis({ taskUid: task.taskUid, fingerprint, mode, generation: loop.currentGeneration });
-  const evidenceDigest = checkpoint?.digest ?? loop.decisionBasisDigest;
-  const { grant: issued } = authorizeContinuation({
-    store,
-    task,
-    loop,
-    purpose: mode,
-    scopeDigest,
-    evidenceDigest,
-    request: mode === "local_fix" ? decisionRequest({
-      contract,
+  let issued;
+  let authorizedPurpose = mode;
+  if (postProbe) {
+    const evidence = store.database.prepare(`SELECT event_uid FROM convergence_events
+      WHERE task_uid=? AND fingerprint=?
+        AND event_type IN ('review_recorded', 'evidence_recorded')
+      ORDER BY id DESC LIMIT 1`).get(task.taskUid, fingerprint);
+    const resumed = authorizeAfterProbe({
+      store,
+      task,
       loop,
-      priorBasis: loop.decisionBasisDigest,
-      lastPurpose: lastGrantPurpose(store, loop.fingerprint)
-    }) : undefined,
-    now
-  });
+      request: decisionRequest({
+        contract,
+        loop,
+        priorBasis: loop.decisionBasisDigest,
+        lastPurpose: lastGrantPurpose(store, loop.fingerprint)
+      }),
+      evidenceEventUid: evidence?.event_uid,
+      probeResultDigest: loop.probeResultDigest,
+      now
+    });
+    if (resumed.action === "checkpoint_required") {
+      return summary(resumed.loop, "direction_review_required", 3, architectureFixCount(store, fingerprint));
+    }
+    if (resumed.action === "human_decision") {
+      return summary(resumed.loop, "human_decision_required", 4, architectureFixCount(store, fingerprint));
+    }
+    if (resumed.action === "finish") {
+      return summary(resumed.loop, "closed", 0, architectureFixCount(store, fingerprint));
+    }
+    if (resumed.action !== "grant_issued") throw coded("continuation_not_authorized");
+    issued = resumed.grant;
+    authorizedPurpose = resumed.purpose;
+  } else {
+    const scopeDigest = digestDecisionBasis({
+      taskUid: task.taskUid, fingerprint, mode, generation: loop.currentGeneration
+    });
+    const evidenceDigest = checkpoint?.digest ?? loop.decisionBasisDigest;
+    ({ grant: issued } = authorizeContinuation({
+      store,
+      task,
+      loop,
+      purpose: mode,
+      scopeDigest,
+      evidenceDigest,
+      request: mode === "local_fix" ? decisionRequest({
+        contract,
+        loop,
+        priorBasis: loop.decisionBasisDigest,
+        lastPurpose: lastGrantPurpose(store, loop.fingerprint)
+      }) : undefined,
+      now
+    }));
+  }
   if (issued.replayed === true) {
     const artifactFile = await readPrivateArtifact(repoRoot, artifactTarget.target);
     let existing;
@@ -681,12 +731,13 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
     const existingGrant = existing?.continuation_grant;
     if (existing?.version !== 1 || existingGrant?.grantId !== issued.grantId
         || existingGrant.taskUid !== task.taskUid || existingGrant.fingerprint !== fingerprint
-        || existingGrant.purpose !== mode || existingGrant.currentGeneration !== loop.currentGeneration
+        || existingGrant.purpose !== authorizedPurpose
+        || existingGrant.currentGeneration !== loop.currentGeneration
         || typeof existingGrant.token !== "string") {
       throw coded("grant_artifact_unrecoverable");
     }
     return Object.freeze({
-      action: `${mode}_authorized`,
+      action: `${authorizedPurpose}_authorized`,
       exitCode: 0,
       continuation_grant: Object.freeze({
         grant_id: existingGrant.grantId,
@@ -719,7 +770,7 @@ async function authorizeFix({ parsed, repoRoot, store, now, artifactHooks }) {
   };
   await writePrivateJson(repoRoot, artifactTarget.target, artifact, artifactHooks);
   return Object.freeze({
-    action: `${mode}_authorized`,
+    action: `${authorizedPurpose}_authorized`,
     exitCode: 0,
     continuation_grant: Object.freeze({
       grant_id: issued.grantId,

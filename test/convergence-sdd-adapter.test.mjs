@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile
 } from "node:fs/promises";
@@ -8,6 +9,10 @@ import path from "node:path";
 import { afterEach, test } from "node:test";
 
 import { runGuardCommand } from "../src/convergence-sdd-adapter.mjs";
+import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
+import {
+  deriveTaskUid, ensureRepositoryLineage, projectContract
+} from "../src/convergence-identity.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
 import { pathsFor } from "../src/index.mjs";
 
@@ -131,6 +136,151 @@ test("first failure authorizes one local fix and the second requires direction r
   assert.equal(second.action, secondFixture.expected.action);
   assert.equal(second.exitCode, secondFixture.expected.exit_code);
   assert.equal(second.failure_count, secondFixture.expected.failure_count);
+});
+
+test("a crash after structural review commit fails closed before local authorization", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const args = [
+    "record-review", ...h.key,
+    "--review-run-id", "review-crash",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "commit-review-crash",
+    "--review-ref", "reviews/review-crash.md",
+    "--hypothesis", "the review and decision commits can separate",
+    "--new-evidence", "structural crash-window evidence",
+    "--falsification-test", "authorize local fix after only the review commit",
+    "--failure-next-action", "direction_review",
+    "--direction-signal", "structural_blocked"
+  ];
+  const crashingStore = Object.freeze({
+    ...h.store,
+    recordConvergenceReview(input) {
+      h.store.recordConvergenceReview(input);
+      throw Object.assign(new Error("simulated_crash_after_review_commit"), {
+        code: "simulated_crash_after_review_commit"
+      });
+    }
+  });
+  await assert.rejects(
+    runGuardCommand({ args, repoRoot: h.repoRoot, store: crashingStore }),
+    (error) => error.code === "simulated_crash_after_review_commit"
+  );
+  const grantFile = path.join(h.repoRoot, ".superpowers", "sdd", "crash-local-grant.json");
+
+  await assert.rejects(
+    h.authorize("local_fix", grantFile),
+    (error) => error.code === "direction_review_required"
+  );
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+
+  let launches = 0;
+  const replay = await runGuardCommand({
+    args,
+    repoRoot: h.repoRoot,
+    store: h.store,
+    launchProbe() {
+      launches += 1;
+      return { attempted: true, reason: "spawn_attempted" };
+    }
+  });
+  assert.equal(replay.action, "probe_started");
+  assert.equal(launches, 1);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+    WHERE event_type='review_recorded'`).get().count, 1);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+    WHERE event_type='reflection_requested'`).get().count, 1);
+});
+
+test("authorize-fix resumes a completed Probe through the existing SDD boundary", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const reviewed = await h.command([
+    "record-review", ...h.key,
+    "--review-run-id", "review-post-probe",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "commit-post-probe",
+    "--review-ref", "reviews/post-probe.md",
+    "--hypothesis", "the current design needs reflection",
+    "--new-evidence", "post-probe restart evidence",
+    "--falsification-test", "restart then authorize through SDD",
+    "--failure-next-action", "direction_review",
+    "--direction-signal", "structural_blocked"
+  ]);
+  assert.equal(reviewed.action, "reflection_required");
+  const completed = await runConvergenceProbeJob({
+    store: h.store,
+    taskUid: reviewed.task_id,
+    fingerprint: reviewed.fingerprint,
+    ownerId: "sdd-post-probe-owner",
+    provider: async () => ({
+      assessment: "aligned_and_necessary",
+      action: "continue_once",
+      unmet_user_value: "The bounded local correction remains necessary",
+      wrong_assumption: "Probe output is direct authority",
+      unnecessary_scope: [],
+      minimal_next_step: "Issue one policy-bound local grant",
+      falsification_test: "Consume exactly one canonical grant"
+    }),
+    eventUid: (() => {
+      let serial = 0;
+      return () => `sdd-post-probe-event-${++serial}`;
+    })()
+  });
+  assert.equal(completed.action, "continue_once");
+  const grantFile = path.join(h.repoRoot, ".superpowers", "sdd", "post-probe-grant.json");
+
+  const authorized = await h.authorize("local_fix", grantFile);
+  assert.equal(authorized.action, "local_fix_authorized");
+  assert.equal(authorized.continuation_grant.purpose, "local_fix");
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 1);
+});
+
+test("existing v1 task projection upgrades through a revision-bound immutable event", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const lineage = await ensureRepositoryLineage({ repoRoot: h.repoRoot });
+  const contract = projectContract({
+    sourceKind: "approved_plan",
+    sourceRef: `sdd-task:${h.state.task_id}`,
+    sourceRevision: "sdd-task-v1",
+    requirements: [],
+    exclusions: [],
+    importance: "routine",
+    importanceAuthority: "approved_plan"
+  });
+  const taskUid = deriveTaskUid({
+    lineageId: lineage.lineageId,
+    adapterKind: "sdd",
+    nativeTaskId: h.state.task_id
+  });
+  h.store.upsertConvergenceTask({
+    eventUid: `contract:${taskUid}`,
+    taskUid,
+    lineageDigest: createHash("sha256").update(lineage.lineageId).digest("hex"),
+    adapterKind: "sdd",
+    adapterCapability: "workflow_gate",
+    nativeTaskDigest: createHash("sha256").update(h.state.task_id).digest("hex"),
+    contractSourceKind: contract.sourceKind,
+    contractSourceRefDigest: contract.sourceRefDigest,
+    contractRevision: contract.revision,
+    policyRevision: createHash("sha256").update("convergence-policy-v1").digest("hex"),
+    importance: contract.importance,
+    importanceAuthority: contract.importanceAuthority
+  });
+
+  await h.command(["status", "--task-id", h.state.task_id]);
+
+  assert.equal(h.store.database.prepare(
+    "SELECT policy_revision FROM convergence_tasks WHERE task_uid=?"
+  ).get(taskUid).policy_revision,
+  createHash("sha256").update("convergence-policy-v2").digest("hex"));
 });
 
 test("minor changes-required is audited without authorizing or consuming failure count", async (t) => {
@@ -651,4 +801,10 @@ test("SDD adapter delegates grant authority to the convergence controller", asyn
   const source = await readFile(new URL("../src/convergence-sdd-adapter.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /\.issueContinuationGrant\s*\(/u);
   assert.match(source, /authorizeContinuation\s*\(/u);
+});
+
+test("real Guard injection launches the executable package entrypoint", async () => {
+  const source = await readFile(new URL("../src/convergence-cli.mjs", import.meta.url), "utf8");
+  assert.match(source, /bin\/agent-feedback-loop\.mjs/u);
+  assert.doesNotMatch(source, /new URL\("\.\/cli\.mjs"/u);
 });

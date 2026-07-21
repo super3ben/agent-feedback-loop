@@ -158,7 +158,7 @@ const EVALUATION_REQUEST_FIELDS = new Set([
   "acceptanceSatisfied", "addsArchitecture", "touchesExplicitExclusion", "oscillationDetected",
   "sameInvariant", "explorationRequested", "explorationUsed", "riskHypothesis",
   "falsificationTest", "evidenceQuality", "evidenceChanged", "fileSaveCount",
-  "semanticRecommendation"
+  "semanticRecommendation", "probeAction"
 ]);
 const EVALUATION_CONTRACT_FIELDS = new Set([
   "sourceKind", "sourceRefDigest", "sourceRevision", "requirements", "exclusions",
@@ -172,7 +172,9 @@ function validateDecisionProjection(evaluationRequest, evaluation) {
     "decision_snapshot"
   );
   for (const field of EVALUATION_REQUEST_FIELDS) {
-    if (!Object.hasOwn(request, field)) throw coded("invalid_decision_snapshot");
+    if (field !== "probeAction" && !Object.hasOwn(request, field)) {
+      throw coded("invalid_decision_snapshot");
+    }
   }
   const contract = exactObject(
     request.contract,

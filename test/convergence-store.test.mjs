@@ -69,7 +69,7 @@ const DIGEST = Object.freeze({
   nativeTask: "2".repeat(64),
   contractRef: "3".repeat(64),
   contract: "f703e687ef7b42b75da2a39b6f8c1572eb7346cef40cf446f9de96cafb6570e7",
-  policy: "bf67e66d36cbf9b12f8164ce93d66811c67eaf7e1f26c1c1dd20af528a2a4dfc",
+  policy: "b81c94b8880ab8fd44714bb82d8c2a6479d512e506a50349ab1601194cadc58f",
   basis: "6".repeat(64),
   evidence: "7".repeat(64),
   scope: "8".repeat(64)
@@ -549,7 +549,7 @@ test("breaker projection binds the evaluated snapshot and matching target", () =
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     evaluationRequest: request,
-    evaluation: { ...evaluation, policyRevision: "convergence-policy-v2" },
+    evaluation: { ...evaluation, policyRevision: "convergence-policy-v3" },
     targetStatus: "checkpoint_required"
   }), /decision_snapshot_mismatch/u);
   store.close();
