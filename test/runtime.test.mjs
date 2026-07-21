@@ -11,6 +11,10 @@ import { RUNTIME_VERSION, install, pathsFor, uninstall } from "../src/index.mjs"
 import { listUserTables, openControlStore } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
+  "continuation_grants",
+  "convergence_events",
+  "convergence_loops",
+  "convergence_tasks",
   "event_observations",
   "reflection_emissions",
   "review_job_events",
@@ -103,7 +107,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
   assert.equal(current.runtimeVersion, RUNTIME_VERSION);
-  assert.equal(current.schemaVersion, 1);
+  assert.equal(current.schemaVersion, 2);
 });
 
 test("package excludes removed control plane files", async () => {

@@ -23,6 +23,10 @@ import {
 } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
+  "continuation_grants",
+  "convergence_events",
+  "convergence_loops",
+  "convergence_tasks",
   "event_observations",
   "reflection_emissions",
   "review_job_events",
@@ -398,7 +402,7 @@ test("runtime open rejects a same-version control schema missing identity metada
   assert.deepEqual(readFileSync(paths.controlDatabase), before);
 });
 
-test("runtime open rejects every malformed canonical v1 schema signature", () => {
+test("runtime open rejects every malformed canonical v2 schema signature", () => {
   const mutations = [
     [
       "required column",
@@ -437,7 +441,7 @@ test("runtime open rejects every malformed canonical v1 schema signature", () =>
     assert.notEqual(malformedSchema, SCHEMA_SQL, `${label} mutation must alter the schema fixture`);
     const database = new DatabaseSync(paths.controlDatabase);
     database.exec(malformedSchema);
-    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, "2026-07-17T00:00:00.000Z");
     database.close();
     chmodSync(paths.controlDatabase, 0o600);
     const before = readFileSync(paths.controlDatabase);
@@ -457,7 +461,7 @@ test("runtime open rejects undeclared generated columns", () => {
   const database = new DatabaseSync(paths.controlDatabase);
   database.exec(SCHEMA_SQL);
   database.exec("ALTER TABLE store_meta ADD COLUMN shadow TEXT GENERATED ALWAYS AS (value) VIRTUAL");
-  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, "2026-07-17T00:00:00.000Z");
   database.close();
   chmodSync(paths.controlDatabase, 0o600);
   const before = readFileSync(paths.controlDatabase);
@@ -480,7 +484,7 @@ test("runtime open rejects noncanonical unique index collation", () => {
   assert.notEqual(schema, SCHEMA_SQL, "collation mutation must alter the schema fixture");
   const database = new DatabaseSync(paths.controlDatabase);
   database.exec(schema);
-  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(1, "2026-07-17T00:00:00.000Z");
+  database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(2, "2026-07-17T00:00:00.000Z");
   database.close();
   chmodSync(paths.controlDatabase, 0o600);
   const before = readFileSync(paths.controlDatabase);

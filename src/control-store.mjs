@@ -3,9 +3,14 @@ import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
+import { createConvergenceStoreApi } from "./convergence-store.mjs";
+
 import {
+  CONVERGENCE_SCHEMA_SQL,
   CONTROL_SCHEMA_SIGNATURE,
   CONTROL_SCHEMA_SQL_SIGNATURE,
+  CONTROL_SCHEMA_V1_SIGNATURE,
+  CONTROL_SCHEMA_V1_SQL_SIGNATURE,
   SCHEMA_SQL,
   SCHEMA_VERSION
 } from "./control-schema.mjs";
@@ -642,7 +647,7 @@ function withCaptureAliases(resolution) {
 
 function createStore(database, now) {
   const transaction = (fn) => {
-    database.exec("BEGIN IMMEDIATE");
+    database.exec("BEGIN IMMEDIATE; PRAGMA defer_foreign_keys = ON;");
     try {
       const result = fn();
       database.exec("COMMIT");
@@ -780,6 +785,7 @@ function createStore(database, now) {
   };
 
   return {
+    ...createConvergenceStoreApi({ database, transaction, now }),
     database,
     getReflectionEmission(id) {
       const row = getReflectionEmission(id);
@@ -1309,7 +1315,12 @@ export function listUserTables(database) {
     WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all().map((row) => row.name);
 }
 
-function verifyControlSchema(database, requireSchemaVersion) {
+function verifyControlSchema(
+  database,
+  requireSchemaVersion,
+  expectedSignature = CONTROL_SCHEMA_SIGNATURE,
+  expectedSqlSignature = CONTROL_SCHEMA_SQL_SIGNATURE
+) {
   let versions;
   try {
     versions = database.prepare("SELECT version FROM schema_migrations ORDER BY version").all().map((row) => Number(row.version));
@@ -1319,13 +1330,13 @@ function verifyControlSchema(database, requireSchemaVersion) {
   if (versions.length !== 1 || versions[0] !== requireSchemaVersion) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
-  const expected = Object.keys(CONTROL_SCHEMA_SIGNATURE);
+  const expected = Object.keys(expectedSignature);
   if (JSON.stringify(listUserTables(database)) !== JSON.stringify(expected)) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
   const schemaObjects = database.prepare(`SELECT type, name, tbl_name, sql FROM sqlite_schema
     WHERE type IN ('table', 'trigger', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name`).all();
-  const expectedSchemaObjects = Object.entries(CONTROL_SCHEMA_SQL_SIGNATURE).map(([name, sql]) => ({
+  const expectedSchemaObjects = Object.entries(expectedSqlSignature).map(([name, sql]) => ({
     type: "table",
     name,
     tbl_name: name,
@@ -1334,7 +1345,7 @@ function verifyControlSchema(database, requireSchemaVersion) {
   if (JSON.stringify(schemaObjects) !== JSON.stringify(expectedSchemaObjects)) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
-  for (const [table, signature] of Object.entries(CONTROL_SCHEMA_SIGNATURE)) {
+  for (const [table, signature] of Object.entries(expectedSignature)) {
     const escapedTable = table.replaceAll("'", "''");
     const columns = database.prepare(`PRAGMA table_xinfo('${escapedTable}')`).all().map((row) => [
       row.name, row.type, Number(row.notnull), row.dflt_value, Number(row.pk), Number(row.hidden)
@@ -1368,6 +1379,53 @@ function configureConnection(database, busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS) {
   database.exec(`PRAGMA busy_timeout = ${timeoutMs}; PRAGMA foreign_keys = ON;`);
 }
 
+export function migrateControlSchemaV1ToV2(database, now = () => new Date()) {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    verifyControlSchema(database, 1, CONTROL_SCHEMA_V1_SIGNATURE, CONTROL_SCHEMA_V1_SQL_SIGNATURE);
+    database.exec(CONVERGENCE_SCHEMA_SQL);
+    database.prepare("DELETE FROM schema_migrations").run();
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(SCHEMA_VERSION, nowIso(now));
+    verifyControlSchema(database, SCHEMA_VERSION);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
+function initializeOrMigrateSchema(database, now) {
+  const hasMigrationTable = database.prepare(`SELECT 1 AS present FROM sqlite_schema
+    WHERE type='table' AND name='schema_migrations'`).get();
+  if (!hasMigrationTable) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(SCHEMA_SQL);
+      database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+        .run(SCHEMA_VERSION, nowIso(now));
+      verifyControlSchema(database, SCHEMA_VERSION);
+      database.exec("COMMIT");
+      return;
+    } catch (error) {
+      try { database.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  const versions = database.prepare("SELECT version FROM schema_migrations ORDER BY version")
+    .all().map((row) => Number(row.version));
+  if (versions.length === 1 && versions[0] === SCHEMA_VERSION) {
+    verifyControlSchema(database, SCHEMA_VERSION);
+    return;
+  }
+  if (versions.length !== 1 || versions[0] !== 1) {
+    throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
+  }
+
+  migrateControlSchemaV1ToV2(database, now);
+}
+
 export function initializeControlStore({ paths, now = () => new Date() }) {
   requireDatabase();
   if (!paths?.controlDatabase || !paths?.dataRoot) throw new TypeError("paths.controlDatabase and paths.dataRoot are required");
@@ -1378,9 +1436,7 @@ export function initializeControlStore({ paths, now = () => new Date() }) {
   try {
     chmodSync(paths.controlDatabase, 0o600);
     configureConnection(database);
-    database.exec(SCHEMA_SQL);
-    database.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, nowIso(now));
-    verifyControlSchema(database, SCHEMA_VERSION);
+    initializeOrMigrateSchema(database, now);
     return createStore(database, now);
   } catch (error) {
     database.close();
