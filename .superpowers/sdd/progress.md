@@ -102,6 +102,7 @@
 
 - Plan: `docs/superpowers/plans/2026-07-21-convergence-kernel-guard-integration.md`
 - Design: `docs/superpowers/specs/2026-07-21-convergence-kernel-guard-integration-design.md`
-- Task 1: in progress (repository lineage and contract projection; implementation base recorded after this ledger commit).
-- Tasks 2-9: pending.
+- Task 1: complete (commits `ba0e087`, `5279d98`, `0d625ef`; frozen human-resolution review clean with Critical 0 / Important 0 / Minor 1). Both Guard loops are closed while retaining failure counts 2 and 1 plus one architecture-fix generation; the binding decision is JSON value semantics, with property descriptor flags non-semantic. Minor retained for final triage: negative lineage safety and concurrent-creation coverage.
+- Task 2: in progress (deterministic convergence policy).
+- Tasks 3-9: pending.
 - Final whole-branch review: pending.
