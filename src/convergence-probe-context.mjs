@@ -67,6 +67,8 @@ const REVIEW_INPUT_FIELDS = [
   "severity", "verdict", "hypothesis", "newEvidence", "falsificationTest",
   "evidenceDigest", "decisionBasisDigest"
 ];
+const SEMANTIC_REVIEW_FIELDS = ["hypothesis", "newEvidence", "falsificationTest"];
+const SEMANTIC_ENVELOPE_FIELDS = new Set(["reviewEvidence", "probeContext"]);
 
 const FORBIDDEN_CONTENT = Object.freeze([
   /\bauthorization\s*:\s*bearer\s+\S+/iu,
@@ -124,6 +126,27 @@ function scannedText(value, maximum) {
   const length = Array.from(value).length;
   if (length < 1 || length > maximum || FORBIDDEN_CONTENT.some((pattern) => pattern.test(value))) invalid();
   return value;
+}
+
+function normalizedScannedText(value, maximum) {
+  if (!validUnicode(value)) invalid();
+  return scannedText(value.trim(), maximum);
+}
+
+function semanticEnvelopeValues(input) {
+  if (input === null || typeof input !== "object" || Array.isArray(input)
+      || types.isProxy(input) || Object.getPrototypeOf(input) !== Object.prototype) invalid();
+  const result = {};
+  const keys = Reflect.ownKeys(input);
+  if (keys.length < 1 || keys.length > 2) invalid();
+  for (const key of keys) {
+    if (typeof key !== "string" || !SEMANTIC_ENVELOPE_FIELDS.has(key)) invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value") || !descriptor.enumerable) invalid();
+    result[key] = descriptor.value;
+  }
+  if (!Object.hasOwn(result, "reviewEvidence")) invalid();
+  return result;
 }
 
 function identifier(value) {
@@ -331,6 +354,36 @@ export function validateConvergenceProbeProducerProjection(input) {
       arrayValues(value.generationObservations, 2).map(validateObservation)
     )
   });
+}
+
+export function validateConvergenceProbeSemanticEnvelope(input) {
+  const value = semanticEnvelopeValues(input);
+  const review = recordValues(value.reviewEvidence, SEMANTIC_REVIEW_FIELDS);
+  const reviewEvidence = Object.freeze({
+    hypothesis: normalizedScannedText(review.hypothesis, 1_024),
+    newEvidence: normalizedScannedText(review.newEvidence, 1_024),
+    falsificationTest: normalizedScannedText(review.falsificationTest, 1_024)
+  });
+  if (!Object.hasOwn(value, "probeContext")) {
+    return Object.freeze({
+      reviewEvidence,
+      probeContextState: Object.freeze({ status: "missing" })
+    });
+  }
+  try {
+    return Object.freeze({
+      reviewEvidence,
+      probeContextState: Object.freeze({
+        status: "valid",
+        value: validateConvergenceProbeProducerProjection(value.probeContext)
+      })
+    });
+  } catch {
+    return Object.freeze({
+      reviewEvidence,
+      probeContextState: Object.freeze({ status: "invalid" })
+    });
+  }
 }
 
 function validateControllerFacts(input) {

@@ -14,7 +14,7 @@ import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
 import { executeGuardCli } from "../src/convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
-import { ensureRepositoryLineage } from "../src/convergence-identity.mjs";
+import { ensureRepositoryLineage, projectContract } from "../src/convergence-identity.mjs";
 import { publishReflectionDocument } from "../src/reflection-document.mjs";
 import { recoverDueReviewers } from "../src/reviewer-launcher.mjs";
 import { loadReflectionDocuments } from "../src/selector.mjs";
@@ -22,6 +22,45 @@ import { loadReflectionDocuments } from "../src/selector.mjs";
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
 const BIN = path.join(ROOT, "bin", "agent-feedback-loop.mjs");
+
+function stdinReviewEvidence(overrides = {}) {
+  return {
+    hypothesis: "stdin-hypothesis-canary-6d91",
+    newEvidence: "stdin-evidence-canary-842f",
+    falsificationTest: "stdin-falsification-canary-a377",
+    ...overrides
+  };
+}
+
+function sddProbeContext(taskId = "task-5", overrides = {}) {
+  const contract = projectContract({
+    sourceKind: "approved_plan",
+    sourceRef: `sdd-task:${taskId}`,
+    sourceRevision: "sdd-task-v1",
+    requirements: [],
+    exclusions: [],
+    importance: "routine",
+    importanceAuthority: "approved_plan"
+  });
+  return {
+    producer: "sdd",
+    goalSummary: "Bound semantic context without exposing it",
+    acceptanceCriteria: ["Reject every byte outside the explicit envelope"],
+    exclusions: ["No semantic bytes in argv or output"],
+    importance: contract.importance,
+    importanceAuthority: contract.importanceAuthority,
+    contractRevision: contract.revision,
+    generationObservations: [],
+    ...overrides
+  };
+}
+
+function stdinEnvelope(options = {}) {
+  const reviewEvidence = options.reviewEvidence ?? stdinReviewEvidence();
+  const probeContext = Object.hasOwn(options, "probeContext")
+    ? options.probeContext : sddProbeContext();
+  return JSON.stringify({ reviewEvidence, ...(probeContext === undefined ? {} : { probeContext }) });
+}
 
 async function legacyCliFixture({ configuredLegacyPath = false } = {}) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-legacy-cli-")));
@@ -1462,9 +1501,8 @@ describe("agent-feedback-loop package", () => {
         "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
         "--review-run-id", "stdin-review", "--severity", "Important",
         "--verdict", "changes_required", "--commit", "deadbeef",
-        "--review-ref", "reviews/stdin.md", "--hypothesis", "opaque input is insufficient",
-        "--new-evidence", "provider lacks semantic facts", "--falsification-test", "observe exact evidence",
-        "--failure-next-action", "direction_review", "--probe-context-stdin"
+        "--review-ref", "reviews/stdin.md", "--failure-next-action", "direction_review",
+        "--probe-context-stdin"
       ], {
         readStdin: async ({ maxBytes }) => {
           reads += 1;
@@ -1475,6 +1513,42 @@ describe("agent-feedback-loop package", () => {
       assert.equal(reads, 1);
       assert.deepEqual(invalid.payload, { error: "probe_context_invalid" });
       await assert.rejects(stat(home));
+
+      for (const envelope of [
+        { probeContext: sddProbeContext() },
+        {
+          reviewEvidence: {
+            hypothesis: "bounded hypothesis",
+            newEvidence: "bounded evidence"
+          },
+          probeContext: sddProbeContext()
+        },
+        {
+          reviewEvidence: { ...stdinReviewEvidence(), unknown: true },
+          probeContext: sddProbeContext()
+        },
+        {
+          reviewEvidence: stdinReviewEvidence({ newEvidence: "token=super-secret-value" }),
+          probeContext: sddProbeContext()
+        },
+        {
+          reviewEvidence: stdinReviewEvidence(),
+          probeContext: sddProbeContext(),
+          unknown: true
+        }
+      ]) {
+        const rejected = await executeGuardCli([
+          "--repo-root", repoRoot, "--home", home,
+          "record-review",
+          "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+          "--review-run-id", "stdin-review-invalid", "--severity", "Important",
+          "--verdict", "changes_required", "--commit", "deadbeef",
+          "--review-ref", "reviews/stdin.md", "--failure-next-action", "direction_review",
+          "--probe-context-stdin"
+        ], { readStdin: async () => JSON.stringify(envelope) });
+        assert.deepEqual(rejected.payload, { error: "probe_context_invalid" });
+        await assert.rejects(stat(home));
+      }
 
       const noFlag = await executeGuardCli([
         "--repo-root", repoRoot, "--home", home,
@@ -1494,25 +1568,15 @@ describe("agent-feedback-loop package", () => {
     const home = path.join(root, "home");
     await mkdir(repoRoot, { mode: 0o700 });
     await execFileAsync("git", ["init", "-q", repoRoot]);
-    const context = JSON.stringify({
-      producer: "sdd",
-      goalSummary: "Bound semantic context without exposing it",
-      acceptanceCriteria: ["Reject every byte outside the explicit envelope"],
-      exclusions: ["No semantic bytes in argv or output"],
-      importance: "routine",
-      importanceAuthority: "approved_plan",
-      contractRevision: "a".repeat(64),
-      generationObservations: []
-    });
+    const context = stdinEnvelope();
     const args = [
       "--repo-root", repoRoot, "--home", home,
       "record-review",
       "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
       "--review-run-id", "stdin-bounds", "--severity", "Important",
       "--verdict", "changes_required", "--commit", "deadbeef",
-      "--review-ref", "reviews/stdin.md", "--hypothesis", "opaque input is insufficient",
-      "--new-evidence", "provider lacks semantic facts", "--falsification-test", "observe exact evidence",
-      "--failure-next-action", "direction_review", "--probe-context-stdin"
+      "--review-ref", "reviews/stdin.md", "--failure-next-action", "direction_review",
+      "--probe-context-stdin"
     ];
     try {
       const exact = Buffer.alloc(16 * 1_024, 0x20);
@@ -1533,6 +1597,147 @@ describe("agent-feedback-loop package", () => {
       await assert.rejects(stat(home));
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("Probe semantic stdin forbids legacy review evidence flags before reading or Store mutation", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-guard-stdin-argv-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    let reads = 0;
+    try {
+      for (const [flag, value] of [
+        ["--hypothesis", "argv-hypothesis-canary"],
+        ["--new-evidence", "argv-evidence-canary"],
+        ["--falsification-test", "argv-falsification-canary"]
+      ]) {
+        const result = await executeGuardCli([
+          "--repo-root", repoRoot, "--home", home,
+          "record-review",
+          "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+          "--review-run-id", `forbidden-${flag.slice(2)}`, "--severity", "Important",
+          "--verdict", "changes_required", "--commit", "deadbeef",
+          "--review-ref", "reviews/stdin.md", "--failure-next-action", "direction_review",
+          flag, value, "--probe-context-stdin"
+        ], {
+          readStdin: async () => { reads += 1; return stdinEnvelope(); }
+        });
+        assert.deepEqual(result.payload, { error: "guard_invalid_arguments" });
+      }
+      assert.equal(reads, 0);
+      await assert.rejects(stat(home));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("real Guard subprocess keeps review canaries out of OS argv and consumes one semantic envelope", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-guard-stdin-process-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    await ensureRepositoryLineage({ repoRoot });
+    const evidence = stdinReviewEvidence();
+    const args = [
+      BIN, "guard", "--repo-root", repoRoot, "--home", home,
+      "record-review",
+      "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+      "--review-run-id", "real-stdin-review", "--severity", "Important",
+      "--verdict", "changes_required", "--commit", "deadbeef",
+      "--review-ref", "reviews/stdin-process.md", "--failure-next-action", "direction_review",
+      "--direction-signal", "structural_blocked", "--probe-context-stdin"
+    ];
+    const child = spawn(process.execPath, args, { env: { ...process.env, HOME: root } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    try {
+      await new Promise((resolve, reject) => {
+        child.once("spawn", resolve);
+        child.once("error", reject);
+      });
+      const visible = await execFileAsync("ps", ["-p", String(child.pid), "-o", "command="]);
+      for (const canary of Object.values(evidence)) assert.doesNotMatch(visible.stdout, new RegExp(canary, "u"));
+      child.stdin.end(stdinEnvelope({
+        reviewEvidence: evidence,
+        probeContext: sddProbeContext("task-5", { contractRevision: "f".repeat(64) })
+      }));
+      const exitCode = await new Promise((resolve, reject) => {
+        child.once("close", resolve);
+        child.once("error", reject);
+      });
+      assert.equal(exitCode, 3);
+      const payload = JSON.parse(stdout);
+      assert.equal(payload.action, "checkpoint_required");
+      assert.equal(payload.reason_code, "probe_context_invalid");
+      assert.doesNotMatch(`${stdout}${stderr}`, /stdin-(?:hypothesis|evidence|falsification)-canary/u);
+
+      const database = new DatabaseSync(pathsFor(home).controlDatabase, { readOnly: true });
+      try {
+        const recorded = database.prepare(`SELECT evidence_digest FROM convergence_events
+          WHERE event_type='review_recorded'`).get();
+        assert.equal(recorded.evidence_digest, createHash("sha256").update(evidence.newEvidence).digest("hex"));
+        assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+          WHERE event_type='reflection_requested'`).get().count, 0);
+        assert.equal(database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
+      } finally {
+        database.close();
+      }
+    } finally {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("valid review evidence lets missing and invalid Probe context persist bounded fallback", async () => {
+    for (const scenario of [
+      { name: "missing", envelope: stdinEnvelope({ probeContext: undefined }), reason: "probe_context_required" },
+      {
+        name: "invalid",
+        envelope: stdinEnvelope({ probeContext: sddProbeContext("task-5", { acceptanceCriteria: [] }) }),
+        reason: "probe_context_invalid"
+      }
+    ]) {
+      const root = await realpath(await mkdtemp(path.join(tmpdir(), `afl-guard-stdin-${scenario.name}-`)));
+      const repoRoot = path.join(root, "repo");
+      const home = path.join(root, "home");
+      await mkdir(repoRoot, { mode: 0o700 });
+      await execFileAsync("git", ["init", "-q", repoRoot]);
+      await ensureRepositoryLineage({ repoRoot });
+      try {
+        const result = await executeGuardCli([
+          "--repo-root", repoRoot, "--home", home,
+          "record-review",
+          "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+          "--review-run-id", `stdin-${scenario.name}`, "--severity", "Important",
+          "--verdict", "changes_required", "--commit", "deadbeef",
+          "--review-ref", `reviews/${scenario.name}.md`, "--failure-next-action", "direction_review",
+          "--direction-signal", "structural_blocked", "--probe-context-stdin"
+        ], { readStdin: async () => scenario.envelope });
+        assert.equal(result.payload.action, "checkpoint_required");
+        assert.equal(result.payload.reason_code, scenario.reason);
+        assert.equal(result.payload.status, "checkpoint_required");
+
+        const database = new DatabaseSync(pathsFor(home).controlDatabase, { readOnly: true });
+        try {
+          assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+            WHERE event_type='review_recorded'`).get().count, 1);
+          assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM convergence_events
+            WHERE event_type='reflection_requested'`).get().count, 0);
+          assert.equal(database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
+        } finally {
+          database.close();
+        }
+        await assert.rejects(stat(pathsFor(home).probeContextRoot));
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 

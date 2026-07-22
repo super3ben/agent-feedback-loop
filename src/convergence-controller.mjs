@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { types } from "node:util";
 
 import { evaluateConvergence } from "./convergence-policy.mjs";
 import {
@@ -27,6 +28,35 @@ const CONTINUATION_FIELDS = new Set([
 
 function coded(code) {
   return Object.assign(new Error(code), { code });
+}
+
+function exactProbeContextState(probeContext, input) {
+  if (input === undefined) {
+    return probeContext === undefined
+      ? Object.freeze({ status: "missing" })
+      : Object.freeze({ status: "valid", value: probeContext });
+  }
+  if (input === null || typeof input !== "object" || Array.isArray(input)
+      || types.isProxy(input) || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw coded("controller_invalid");
+  }
+  const statusDescriptor = Object.getOwnPropertyDescriptor(input, "status");
+  if (statusDescriptor === undefined || !Object.hasOwn(statusDescriptor, "value")
+      || !statusDescriptor.enumerable || !["missing", "invalid", "valid"].includes(statusDescriptor.value)) {
+    throw coded("controller_invalid");
+  }
+  const status = statusDescriptor.value;
+  const expectedKeys = status === "valid" ? ["status", "value"] : ["status"];
+  const keys = Reflect.ownKeys(input);
+  if (keys.length !== expectedKeys.length
+      || keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) {
+    throw coded("controller_invalid");
+  }
+  if (status !== "valid") return Object.freeze({ status });
+  const valueDescriptor = Object.getOwnPropertyDescriptor(input, "value");
+  if (valueDescriptor === undefined || !Object.hasOwn(valueDescriptor, "value")
+      || !valueDescriptor.enumerable) throw coded("controller_invalid");
+  return Object.freeze({ status, value: valueDescriptor.value });
 }
 
 function canonicalJson(value) {
@@ -528,6 +558,7 @@ export async function evaluateAndAdvance({
   loop,
   request,
   probeContext,
+  probeContextState,
   contextStore,
   launchProbe,
   now = () => new Date()
@@ -535,6 +566,7 @@ export async function evaluateAndAdvance({
   const current = assertAuthority({ store, task, loop });
   const evaluationRequest = evaluatedRequest({ store, task, loop: current, request });
   const decision = evaluateConvergence(evaluationRequest);
+  const contextState = exactProbeContextState(probeContext, probeContextState);
 
   if (decision.decision === "pass" && decision.reasonCode === "exploration_grant_available") {
     return Object.freeze({
@@ -553,14 +585,15 @@ export async function evaluateAndAdvance({
   }
 
   if (decision.probeRequired === true && decision.decision === "warn") {
-    if (probeContext === undefined) {
+    if (contextState.status !== "valid") {
       return applyProbeContextFallback({
         store,
         task,
         loop: current,
         evaluationRequest,
         decision,
-        reasonCode: "probe_context_required"
+        reasonCode: contextState.status === "missing"
+          ? "probe_context_required" : "probe_context_invalid"
       });
     }
     try {
@@ -569,7 +602,7 @@ export async function evaluateAndAdvance({
         task,
         loop: current,
         decision,
-        probeContext
+        probeContext: contextState.value
       });
     } catch {
       return applyProbeContextFallback({
@@ -584,14 +617,15 @@ export async function evaluateAndAdvance({
     return Object.freeze({ action: "warn", decision, loop: current });
   }
   if (decision.decision === "reflection_required") {
-    if (probeContext === undefined) {
+    if (contextState.status !== "valid") {
       return applyProbeContextFallback({
         store,
         task,
         loop: current,
         evaluationRequest,
         decision,
-        reasonCode: "probe_context_required"
+        reasonCode: contextState.status === "missing"
+          ? "probe_context_required" : "probe_context_invalid"
       });
     }
     let evidence;
@@ -601,7 +635,7 @@ export async function evaluateAndAdvance({
         task,
         loop: current,
         decision,
-        probeContext
+        probeContext: contextState.value
       });
     } catch {
       return applyProbeContextFallback({

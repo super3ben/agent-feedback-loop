@@ -369,6 +369,33 @@ test("audit-only missing context warns without artifact, request, launch, or har
     FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
 });
 
+test("audit-only typed invalid context warns without Probe side effects", async (t) => {
+  const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });
+  t.after(() => h.close());
+  let artifactCalls = 0;
+  let launches = 0;
+
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true, evidenceQuality: "verified" }),
+    probeContextState: Object.freeze({ status: "invalid" }),
+    contextStore: { async put() { artifactCalls += 1; } },
+    launchProbe() { launches += 1; return { attempted: true }; },
+    now: h.now
+  });
+
+  assert.equal(result.action, "warn");
+  assert.equal(result.decision.reasonCode, "probe_context_invalid");
+  assert.equal(h.loop().status, "generation_closed");
+  assert.equal(artifactCalls, 0);
+  assert.equal(launches, 0);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
+  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM continuation_grants").get().count, 0);
+});
+
 test("audit-only stale context reports invalid without publishing or hard state", async (t) => {
   const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });
   t.after(() => h.close());

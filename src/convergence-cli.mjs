@@ -20,7 +20,7 @@ import {
 import { runGuardCommand } from "./convergence-sdd-adapter.mjs";
 import {
   ConvergenceProbeContextStore,
-  validateConvergenceProbeProducerProjection
+  validateConvergenceProbeSemanticEnvelope
 } from "./convergence-probe-context.mjs";
 import { BlobKeyProvider } from "./crypto-store.mjs";
 import { pathsFor } from "./index.mjs";
@@ -39,6 +39,9 @@ const EXIT_BY_CODE = Object.freeze({
 });
 const MIGRATION_COMMANDS = new Set(["import", "shadow", "cutover", "rollback"]);
 const MAX_PROBE_CONTEXT_BYTES = 16 * 1_024;
+const PROBE_STDIN_FORBIDDEN_FLAGS = new Set([
+  "--hypothesis", "--new-evidence", "--falsification-test"
+]);
 
 function boundedCode(error, fallback = "guard_transition_invalid") {
   const code = String(error?.code ?? "").toLowerCase();
@@ -83,6 +86,9 @@ function parseGuardCliArgs(args) {
   if (probeContextStdin && commandArgs[0] !== "record-review") {
     throw Object.assign(new Error("guard_invalid_arguments"), { code: "guard_invalid_arguments" });
   }
+  if (probeContextStdin && commandArgs.some((value) => PROBE_STDIN_FORBIDDEN_FLAGS.has(value))) {
+    throw Object.assign(new Error("guard_invalid_arguments"), { code: "guard_invalid_arguments" });
+  }
   if (!migration && home === null) {
     throw Object.assign(new Error("guard_invalid_arguments"), { code: "guard_invalid_arguments" });
   }
@@ -103,7 +109,7 @@ async function readProcessStdin({ maxBytes }) {
   return Buffer.concat(chunks, total);
 }
 
-async function readProbeContext(readStdin) {
+async function readProbeSemanticEnvelope(readStdin) {
   if (typeof readStdin !== "function") {
     throw Object.assign(new Error("probe_context_invalid"), { code: "probe_context_invalid" });
   }
@@ -114,7 +120,7 @@ async function readProbeContext(readStdin) {
       : Buffer.from(raw);
     if (bytes.length > MAX_PROBE_CONTEXT_BYTES) throw new Error("oversized");
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return validateConvergenceProbeProducerProjection(JSON.parse(text));
+    return validateConvergenceProbeSemanticEnvelope(JSON.parse(text));
   } catch {
     throw Object.assign(new Error("probe_context_invalid"), { code: "probe_context_invalid" });
   }
@@ -227,8 +233,8 @@ export async function executeGuardCli(args, { readStdin = readProcessStdin } = {
   let store = null;
   try {
     const parsed = parseGuardCliArgs(args);
-    const probeContext = parsed.probeContextStdin
-      ? await readProbeContext(readStdin)
+    const semanticInput = parsed.probeContextStdin
+      ? await readProbeSemanticEnvelope(readStdin)
       : undefined;
     const paths = pathsFor(parsed.home);
     if (parsed.migration) {
@@ -295,7 +301,8 @@ export async function executeGuardCli(args, { readStdin = readProcessStdin } = {
           args: parsed.commandArgs,
           repoRoot: parsed.repoRoot,
           preflight,
-          probeContext,
+          reviewEvidence: semanticInput?.reviewEvidence,
+          probeContextState: semanticInput?.probeContextState,
           contextStore
         });
       } catch (error) {
@@ -310,7 +317,8 @@ export async function executeGuardCli(args, { readStdin = readProcessStdin } = {
       repoRoot: parsed.repoRoot,
       store,
       preflight,
-      probeContext,
+      reviewEvidence: semanticInput?.reviewEvidence,
+      probeContextState: semanticInput?.probeContextState,
       contextStore,
       launchProbe: ({ taskUid, fingerprint }) => launchDetachedConvergenceProbe({
         platform: process.platform,

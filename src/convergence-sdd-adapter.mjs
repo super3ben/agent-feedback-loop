@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
+import { types } from "node:util";
 
 import {
   deriveTaskUid,
@@ -245,7 +246,58 @@ function decisionRequest({ contract, loop, priorBasis, lastPurpose }) {
   };
 }
 
-function reviewCommandInput(parsed) {
+function semanticReviewEvidence(input) {
+  if (input === undefined) return null;
+  if (input === null || typeof input !== "object" || Array.isArray(input)
+      || types.isProxy(input) || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw coded("guard_invalid_arguments");
+  }
+  const fields = ["hypothesis", "newEvidence", "falsificationTest"];
+  const keys = Reflect.ownKeys(input);
+  if (keys.length !== fields.length || keys.some((key) => typeof key !== "string" || !fields.includes(key))) {
+    throw coded("guard_invalid_arguments");
+  }
+  const result = {};
+  for (const field of fields) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, field);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value") || !descriptor.enumerable) {
+      throw coded("guard_invalid_arguments");
+    }
+    result[field] = descriptor.value;
+  }
+  return result;
+}
+
+function exactProbeContextState(probeContext, input) {
+  if (input === undefined) {
+    return probeContext === undefined
+      ? Object.freeze({ status: "missing" })
+      : Object.freeze({ status: "valid", value: probeContext });
+  }
+  if (input === null || typeof input !== "object" || Array.isArray(input)
+      || types.isProxy(input) || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw coded("guard_invalid_arguments");
+  }
+  const statusDescriptor = Object.getOwnPropertyDescriptor(input, "status");
+  if (statusDescriptor === undefined || !Object.hasOwn(statusDescriptor, "value")
+      || !statusDescriptor.enumerable || !["missing", "invalid", "valid"].includes(statusDescriptor.value)) {
+    throw coded("guard_invalid_arguments");
+  }
+  const status = statusDescriptor.value;
+  const expectedKeys = status === "valid" ? ["status", "value"] : ["status"];
+  const keys = Reflect.ownKeys(input);
+  if (keys.length !== expectedKeys.length
+      || keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) {
+    throw coded("guard_invalid_arguments");
+  }
+  if (status !== "valid") return Object.freeze({ status });
+  const valueDescriptor = Object.getOwnPropertyDescriptor(input, "value");
+  if (valueDescriptor === undefined || !Object.hasOwn(valueDescriptor, "value")
+      || !valueDescriptor.enumerable) throw coded("guard_invalid_arguments");
+  return Object.freeze({ status, value: valueDescriptor.value });
+}
+
+function reviewCommandInput(parsed, suppliedReviewEvidence) {
   const key = keyFrom(parsed.values);
   const severity = normalizeAuditText(parsed.values["--severity"]).toLowerCase();
   const verdict = normalizeAuditText(parsed.values["--verdict"]).toLowerCase();
@@ -258,16 +310,30 @@ function reviewCommandInput(parsed) {
       || !DIRECTION_SIGNALS.has(directionSignal)) throw coded("guard_invalid_arguments");
   const countedFailure = verdict === "changes_required" && severity !== "minor";
   const evidenceFlags = ["--hypothesis", "--new-evidence", "--falsification-test"];
-  if (countedFailure) {
-    for (const flag of [...evidenceFlags, "--failure-next-action"]) {
-      if (!Object.hasOwn(parsed.values, flag)) throw coded("review_evidence_required");
-    }
+  const semanticEvidence = semanticReviewEvidence(suppliedReviewEvidence);
+  if (semanticEvidence !== null
+      && evidenceFlags.some((flag) => Object.hasOwn(parsed.values, flag))) {
+    throw coded("guard_invalid_arguments");
   }
-  const auditEvidence = Object.fromEntries(evidenceFlags.map((flag) => [flag,
-    Object.hasOwn(parsed.values, flag)
-      ? normalizeAuditText(parsed.values[flag], countedFailure ? "review_evidence_required" : "guard_invalid_arguments")
-      : null
-  ]));
+  if (countedFailure) {
+    if (semanticEvidence === null
+        && evidenceFlags.some((flag) => !Object.hasOwn(parsed.values, flag))) {
+      throw coded("review_evidence_required");
+    }
+    if (!Object.hasOwn(parsed.values, "--failure-next-action")) throw coded("review_evidence_required");
+  }
+  const auditEvidence = Object.fromEntries(evidenceFlags.map((flag) => {
+    const field = {
+      "--hypothesis": "hypothesis",
+      "--new-evidence": "newEvidence",
+      "--falsification-test": "falsificationTest"
+    }[flag];
+    const supplied = semanticEvidence === null ? undefined : semanticEvidence[field];
+    const raw = supplied ?? parsed.values[flag];
+    return [flag, raw === undefined
+      ? null
+      : normalizeAuditText(raw, countedFailure ? "review_evidence_required" : "guard_invalid_arguments")];
+  }));
   const failureNextAction = Object.hasOwn(parsed.values, "--failure-next-action")
     ? normalizeAuditText(
       parsed.values["--failure-next-action"],
@@ -309,9 +375,12 @@ async function recordReview({
   now,
   launchProbe,
   probeContext,
+  probeContextState,
+  reviewEvidence,
   contextStore
 }) {
-  const request = reviewCommandInput(parsed);
+  const request = reviewCommandInput(parsed, reviewEvidence);
+  const sourceContextState = exactProbeContextState(probeContext, probeContextState);
   const { key, severity, verdict, directionSignal, countedFailure, reviewRunId,
     auditEnvelope, evidenceDigest, basis } = request;
   const { contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
@@ -373,24 +442,29 @@ async function recordReview({
       priorBasis: prior?.decisionBasisDigest ?? loop.decisionBasisDigest,
       lastPurpose: lastGrantPurpose(store, loop.fingerprint)
     });
-    const controllerProbeContext = probeContext === undefined ? undefined : {
-      ...probeContext,
-      reviewEvidence: {
-        severity,
-        verdict,
-        hypothesis: auditEnvelope.hypothesis,
-        newEvidence: auditEnvelope.newEvidence,
-        falsificationTest: auditEnvelope.falsificationTest,
-        evidenceDigest,
-        decisionBasisDigest: basis
-      }
-    };
+    const controllerProbeContextState = sourceContextState.status === "valid"
+      ? Object.freeze({
+          status: "valid",
+          value: Object.freeze({
+            ...sourceContextState.value,
+            reviewEvidence: Object.freeze({
+              severity,
+              verdict,
+              hypothesis: auditEnvelope.hypothesis,
+              newEvidence: auditEnvelope.newEvidence,
+              falsificationTest: auditEnvelope.falsificationTest,
+              evidenceDigest,
+              decisionBasisDigest: basis
+            })
+          })
+        })
+      : Object.freeze({ status: sourceContextState.status });
     const advanced = await evaluateAndAdvance({
       store,
       task,
       loop,
       request,
-      probeContext: controllerProbeContext,
+      probeContextState: controllerProbeContextState,
       contextStore,
       launchProbe,
       now
@@ -910,6 +984,8 @@ export async function runGuardCommand({
   now = () => new Date(),
   launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
   probeContext,
+  probeContextState,
+  reviewEvidence,
   contextStore,
   artifactHooks: rawArtifactHooks
 }) {
@@ -937,7 +1013,7 @@ export async function runGuardCommand({
   if (repository.repositoryState === "legacy_guard") throw coded("legacy_guard_authoritative");
   if (repository.repositoryState === "fresh_afl_eligible") {
     if (parsed.command !== "record-review") throw coded("guard_state_uninitialized");
-    reviewCommandInput(parsed);
+    reviewCommandInput(parsed, reviewEvidence);
   }
   if (!store) throw coded("control_store_required");
   if (parsed.command === "record-review") {
@@ -948,6 +1024,8 @@ export async function runGuardCommand({
       now,
       launchProbe,
       probeContext,
+      probeContextState,
+      reviewEvidence,
       contextStore
     });
   }

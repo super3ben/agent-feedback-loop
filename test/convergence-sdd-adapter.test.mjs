@@ -114,6 +114,7 @@ async function harness(name) {
     repoRoot,
     home,
     store,
+    now,
     probeContext,
     contextStore,
     key,
@@ -340,6 +341,160 @@ test("missing Probe context returns and persists one bounded checkpoint reason",
   assert.equal(launches, 0);
   assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
     FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
+});
+
+test("typed semantic stdin binds normalized review evidence through the exact provider contract", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const args = [
+    "record-review", ...h.key,
+    "--review-run-id", "semantic-stdin-provider",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "semantic-stdin-commit",
+    "--review-ref", "reviews/semantic-stdin.md",
+    "--failure-next-action", "direction_review",
+    "--direction-signal", "structural_blocked"
+  ];
+  const reviewEvidence = Object.freeze({
+    hypothesis: "  stdin-provider-hypothesis-canary  ",
+    newEvidence: "  stdin-provider-evidence-canary  ",
+    falsificationTest: "  stdin-provider-falsification-canary  "
+  });
+  const preflight = await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) });
+  const reviewed = await runGuardCommand({
+    args,
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight,
+    now: h.now,
+    reviewEvidence,
+    probeContextState: Object.freeze({ status: "valid", value: h.probeContext }),
+    contextStore: h.contextStore
+  });
+  assert.equal(reviewed.action, "reflection_required");
+  assert.doesNotMatch(JSON.stringify(reviewed), /stdin-provider-(?:hypothesis|evidence|falsification)-canary/u);
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+
+  await assert.rejects(runGuardCommand({
+    args,
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight,
+    now: h.now,
+    reviewEvidence: Object.freeze({
+      ...reviewEvidence,
+      newEvidence: "stdin-provider-changed-evidence-canary"
+    }),
+    probeContextState: Object.freeze({ status: "valid", value: h.probeContext }),
+    contextStore: h.contextStore
+  }), (error) => error.code === "event_collision");
+
+  let providerInput;
+  await runConvergenceProbeJob({
+    store: h.store,
+    contextStore: h.contextStore,
+    taskUid: reviewed.task_id,
+    fingerprint: reviewed.fingerprint,
+    ownerId: "semantic-stdin-provider-owner",
+    provider: async (input) => {
+      providerInput = input;
+      return {
+        assessment: "aligned_and_necessary",
+        action: "direction_checkpoint",
+        unmet_user_value: "The bounded semantic evidence remains required",
+        wrong_assumption: "Review bodies can safely travel in argv",
+        unnecessary_scope: [],
+        minimal_next_step: "Keep one semantic stdin envelope",
+        falsification_test: "Inspect OS argv and provider evidence"
+      };
+    },
+    eventUid: (() => {
+      let serial = 0;
+      return () => `semantic-stdin-provider-event-${++serial}`;
+    })()
+  });
+
+  assert.deepEqual(Reflect.ownKeys(providerInput), ["status", "evidence"]);
+  assert.deepEqual(providerInput.evidence.reviewEvidence, {
+    severity: "important",
+    verdict: "changes_required",
+    hypothesis: "stdin-provider-hypothesis-canary",
+    newEvidence: "stdin-provider-evidence-canary",
+    falsificationTest: "stdin-provider-falsification-canary"
+  });
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM continuation_grants"
+  ).get().count, 0);
+});
+
+test("semantic stdin adapter rejects forged evidence and context states before mutation", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  const args = [
+    "record-review", ...h.key,
+    "--review-run-id", "semantic-stdin-forged",
+    "--severity", "Important",
+    "--verdict", "changes_required",
+    "--commit", "semantic-stdin-forged-commit",
+    "--review-ref", "reviews/semantic-stdin-forged.md",
+    "--failure-next-action", "direction_review",
+    "--direction-signal", "structural_blocked"
+  ];
+  const evidence = Object.freeze({
+    hypothesis: "stdin forged hypothesis",
+    newEvidence: "stdin forged evidence",
+    falsificationTest: "stdin forged falsification"
+  });
+  const preflight = await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) });
+  const eventCount = () => h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count;
+  const before = eventCount();
+  let getterCalls = 0;
+  const accessorEvidence = { ...evidence };
+  Object.defineProperty(accessorEvidence, "newEvidence", {
+    enumerable: true,
+    get() { getterCalls += 1; return "must not run"; }
+  });
+  const invalidEvidence = [
+    Object.freeze({ ...evidence, unknown: true }),
+    new Proxy({ ...evidence }, {}),
+    accessorEvidence
+  ];
+  for (const reviewEvidence of invalidEvidence) {
+    await assert.rejects(runGuardCommand({
+      args,
+      repoRoot: h.repoRoot,
+      store: h.store,
+      preflight,
+      now: h.now,
+      reviewEvidence,
+      probeContextState: Object.freeze({ status: "valid", value: h.probeContext }),
+      contextStore: h.contextStore
+    }), (error) => error.code === "guard_invalid_arguments");
+  }
+  assert.equal(getterCalls, 0);
+
+  for (const probeContextState of [
+    Object.freeze({ status: "missing", value: h.probeContext }),
+    Object.freeze({ status: "valid", value: h.probeContext, unknown: true }),
+    new Proxy({ status: "valid", value: h.probeContext }, {})
+  ]) {
+    await assert.rejects(runGuardCommand({
+      args,
+      repoRoot: h.repoRoot,
+      store: h.store,
+      preflight,
+      now: h.now,
+      reviewEvidence: evidence,
+      probeContextState,
+      contextStore: h.contextStore
+    }), (error) => error.code === "guard_invalid_arguments");
+  }
+  assert.equal(eventCount(), before);
 });
 
 test("status leaves an existing v1 task projection unchanged", async (t) => {

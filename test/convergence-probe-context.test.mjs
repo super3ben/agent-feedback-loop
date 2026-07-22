@@ -8,7 +8,8 @@ import {
   buildConvergenceProbeEvidence,
   canonicalProbeEvidence,
   ConvergenceProbeContextStore,
-  validateConvergenceProbeEvidence
+  validateConvergenceProbeEvidence,
+  validateConvergenceProbeSemanticEnvelope
 } from "../src/convergence-probe-context.mjs";
 import { BlobKeyProvider } from "../src/crypto-store.mjs";
 
@@ -119,6 +120,27 @@ function assertInvalid(value) {
   assert.throws(() => validateConvergenceProbeEvidence(value), TypeError);
 }
 
+function semanticEnvelope(probeContext = {}) {
+  return {
+    reviewEvidence: {
+      hypothesis: "  One bounded stdin record should carry all semantic evidence  ",
+      newEvidence: "  Review bodies still appear in the supported argv contract  ",
+      falsificationTest: "  Inspect a blocked real process and then run its Probe path  "
+    },
+    probeContext: {
+      producer: "sdd",
+      goalSummary: "Keep semantic decision evidence out of argv",
+      acceptanceCriteria: ["One exact envelope reaches the existing Probe path"],
+      exclusions: ["No second input channel"],
+      importance: "important",
+      importanceAuthority: "explicit_user",
+      contractRevision: A,
+      generationObservations: [],
+      ...probeContext
+    }
+  };
+}
+
 async function storeFixture({ keyRootName = "keys" } = {}) {
   const home = await mkdtemp(path.join(tmpdir(), "afl-probe-context-"));
   const root = path.join(home, "probe-context");
@@ -149,6 +171,74 @@ test("validator accepts the exact envelope and returns a detached deeply frozen 
   assert.equal(Object.isFrozen(validated.recentGenerations[0].pathCategories), true);
   input.contract.goalSummary = "mutated after validation";
   assert.notEqual(validated.contract.goalSummary, input.contract.goalSummary);
+});
+
+test("semantic stdin validator detaches review evidence and returns explicit frozen context states", () => {
+  const input = semanticEnvelope();
+  const valid = validateConvergenceProbeSemanticEnvelope(input);
+  assert.deepEqual(valid.reviewEvidence, {
+    hypothesis: "One bounded stdin record should carry all semantic evidence",
+    newEvidence: "Review bodies still appear in the supported argv contract",
+    falsificationTest: "Inspect a blocked real process and then run its Probe path"
+  });
+  assert.equal(valid.probeContextState.status, "valid");
+  assert.notEqual(valid.probeContextState.value, input.probeContext);
+  assert.equal(Object.isFrozen(valid), true);
+  assert.equal(Object.isFrozen(valid.reviewEvidence), true);
+  assert.equal(Object.isFrozen(valid.probeContextState), true);
+  assert.equal(Object.isFrozen(valid.probeContextState.value.acceptanceCriteria), true);
+
+  const missing = semanticEnvelope();
+  delete missing.probeContext;
+  assert.deepEqual(validateConvergenceProbeSemanticEnvelope(missing).probeContextState, {
+    status: "missing"
+  });
+
+  const invalidContext = semanticEnvelope({ acceptanceCriteria: [] });
+  assert.deepEqual(validateConvergenceProbeSemanticEnvelope(invalidContext).probeContextState, {
+    status: "invalid"
+  });
+});
+
+test("semantic stdin rejects untrusted outer or review evidence without invoking accessors", () => {
+  for (const mutate of [
+    (value) => { value.unknown = true; },
+    (value) => { delete value.reviewEvidence.hypothesis; },
+    (value) => { value.reviewEvidence.unknown = true; },
+    (value) => { value.reviewEvidence.newEvidence = "token=super-secret-value"; }
+  ]) {
+    const value = semanticEnvelope();
+    mutate(value);
+    assert.throws(() => validateConvergenceProbeSemanticEnvelope(value), TypeError);
+  }
+
+  const accessor = semanticEnvelope();
+  let calls = 0;
+  Object.defineProperty(accessor.reviewEvidence, "newEvidence", {
+    enumerable: true,
+    get() { calls += 1; return "must not run"; }
+  });
+  assert.throws(() => validateConvergenceProbeSemanticEnvelope(accessor), TypeError);
+  assert.equal(calls, 0);
+  assert.throws(
+    () => validateConvergenceProbeSemanticEnvelope(new Proxy(semanticEnvelope(), {})),
+    TypeError
+  );
+});
+
+test("semantic stdin converts malformed producer projections into typed invalid context", () => {
+  for (const mutate of [
+    (value) => { value.probeContext.unknown = true; },
+    (value) => { value.probeContext.acceptanceCriteria = new Array(1); },
+    (value) => { value.probeContext.exclusions.semanticTag = "hidden"; },
+    (value) => { value.probeContext = new Proxy(value.probeContext, {}); }
+  ]) {
+    const value = semanticEnvelope();
+    mutate(value);
+    assert.deepEqual(validateConvergenceProbeSemanticEnvelope(value).probeContextState, {
+      status: "invalid"
+    });
+  }
 });
 
 test("validator enforces exact keys at every record boundary", () => {
