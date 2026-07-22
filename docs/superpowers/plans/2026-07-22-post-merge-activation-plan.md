@@ -50,23 +50,23 @@
 - [x] 残留的 `hooks.Stop` 属于用户自己的 `context_compact_guard.py`,与 AFL 无关,保留不动
 - [x] hook 真实执行验证:管道注入一次 prompt,返回静默 `{"continue":true}`,无 Guard/Probe/receipt 文本;`doctor --live` 确认 controlStore healthy、encryption healthy、runtime 0.9.0 selected
 
-### Step D:真实 provider / Codex Desktop canary — 待做(需真实交互会话)
+### Step D:真实 provider / Codex Desktop canary — ⚠ 部分完成(2026-07-22),发现一个真实缺陷
 
-- [ ] 以真实 Codex/Claude/Gemini CLI 作为 reviewer 跑一次完整后台反思链路
-- [ ] Desktop 会话启用 AFL 做可见 canary,确认延迟与静默性
-- [ ] 记录不满识别、reviewer job、lesson 发布、后续投递各环节证据
+- [x] 真实不满 canary 走通前半链路:hook 静默 `{"continue":true}` → 原子创建 durable reviewer job → detached one-shot reviewer 启动 → 尝试真实 claude provider
+- [ ] **发现缺陷**:claude reviewer provider 用 `--json-schema` 传 draft 2020-12 schema 被真实 claude CLI 拒绝(`no schema with key or ref "https://json-schema.org/draft/2020-12/schema"`),job 停在 `retryable`/`provider_unavailable`。需要单独修复(调整 schema dialect 或 provider 调用方式)后重跑 canary
+- [ ] 修复后:完整后台反思链路(lesson 发布 + 后续投递)与 Desktop 可见 canary
 
-### Step E:发布与生产有效性观察
+### Step E:发布与生产有效性观察 — ✅ 发布完成(2026-07-22)
 
-- [ ] push `main` 到 origin(当前本地领先 origin/main 232+ 提交,推送前需用户确认)
-- [ ] 创建 0.9.0 tag/release
-- [ ] 生产指标观察:不满识别准确率、后台反思成功率、Markdown 经验复用率、误触发率、主会话延迟
+- [x] push `main` 到 origin(SSH 被网络重置,origin 已切 HTTPS)
+- [x] tag `v0.9.0` + GitHub Release:https://github.com/super3ben/agent-feedback-loop/releases/tag/v0.9.0
+- [ ] 生产指标观察(hook 已在真实 HOME 启用,随日常使用积累)
 
-### Step F:流程与工作区收尾
+### Step F:流程与工作区收尾 — ✅ 完成(2026-07-22)
 
-- [ ] Comet change `isolate-feedback-control-plane` 仍处 `phase: build`、`verify_result: pending`:走 `/comet-verify` → `/comet-archive` 正式闭环(或由用户决定直接归档处理)
-- [ ] 用户裁决 4 个保留工作树中的未提交报告(task-1/2/3 report 修改、task5/task7 未跟踪报告):提交、复制或丢弃;处理完后再删工作树
-- [ ] 清理已吸收的本地分支(`codex/task5-*`、`codex/task7-*`、`codex/isolate-feedback-control-plane`、`codex/background-review-observability`、`codex/convergence-kernel`、`codex/backlog-closeout`)
+- [x] Comet change `isolate-feedback-control-plane`:build guard → verify(full 模式,报告 `docs/superpowers/reports/2026-07-22-isolate-feedback-control-plane-verify.md`,PASS)→ 用户确认归档 → delta spec 合并入 `openspec/specs/`(5 capabilities / 23 requirements)→ archive guard 全 PASS
+- [x] 全部 12 份未提交工作树报告归档到 `docs/superpowers/reports-archive/2026-07-22-worktree-reports/`,随后清理 6 个 worktree
+- [x] 删除 8 个已吸收本地分支与远端 stale 分支
 
 ## 3. 红线(继承交接文档 §7)
 
