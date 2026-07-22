@@ -3,7 +3,7 @@ design-docs:
   - docs/superpowers/specs/2026-07-22-repository-guard-authority-lifecycle-recovery-design.md
   - docs/superpowers/specs/2026-07-22-convergence-probe-evidence-envelope-recovery-design.md
 base-ref: 97a175d
-status: awaiting-user-approval
+status: approved-for-implementation
 ---
 
 # Convergence Authority and Probe Recovery Implementation Plan
@@ -40,8 +40,8 @@ lineage, SHA-256, AES-256-GCM through AFL's existing key infrastructure, macOS a
   historical fingerprint. Its human-decision resolution points to the Task 7 root cause;
   it is never renamed or reopened.
 - Execute two guarded change sets, not a chain of per-test fixers:
-  1. one Task 7 `architecture_fix` receipt covers Workstream A in full;
-  2. one Task 5 `architecture_fix` receipt covers Workstream B in full.
+  1. one Guard Task 7 `architecture_fix` receipt covers implementation-plan Task 2;
+  2. one Guard Task 5 `architecture_fix` receipt covers implementation-plan Task 5.
 - Each receipt is persisted by the real Guard, consumed once by the generated task brief,
   and handed to one implementer. Do not hand-write a fix brief or split one invariant
   across fresh receipts.
@@ -104,10 +104,10 @@ or overwrite events from this table.
 
 ## Workstream A: Repository authority lifecycle
 
-One Task 7 receipt and one implementer own Tasks A1-A2 together. Task A3 is performed by
-an independent frozen-scope reviewer.
+One Guard Task 7 receipt and one implementer own implementation-plan Task 2. Task 3 is
+performed by an independent frozen-scope reviewer.
 
-### Task A0: Resolve and authorize the real Guard boundary
+### Task 1: Resolve and authorize the real Guard boundary
 
 **Files:**
 - Create: `.superpowers/sdd/task-7-authority-lifecycle-checkpoint.md`
@@ -148,7 +148,9 @@ the success exit code. Record the artifact path in the Task 7 report.
 Expected: Task 7 becomes an authorized architecture generation without altering its
 fingerprint or failure count.
 
-### Task A1: Prove and add side-effect-free repository preflight
+### Task 2: Implement the repository authority lifecycle
+
+#### Phase 1: Prove and add side-effect-free repository preflight
 
 **Files:**
 - Modify: `test/convergence-identity.test.mjs`
@@ -231,7 +233,7 @@ parser.
 
 Run the command from Step 2. Confirm the filesystem snapshots are byte-for-byte stable.
 
-### Task A2: Route every Guard command through preflight before Store creation
+#### Phase 2: Route every Guard command through preflight before Store creation
 
 **Files:**
 - Modify: `test/convergence-sdd-adapter.test.mjs`
@@ -319,7 +321,7 @@ receipt artifacts. Verify the three pre-existing task reports are unstaged.
 git commit -m "fix: enforce explicit repository guard authority"
 ```
 
-### Task A3: Frozen Task 7 review and stop decision
+### Task 3: Frozen Guard Task 7 review and stop decision
 
 - [ ] Run the macOS focused process tests above in real temporary Git repositories.
 - [ ] Run the existing migration/cutover/rollback and linked-worktree identity tests.
@@ -337,10 +339,10 @@ git commit -m "fix: enforce explicit repository guard authority"
 
 ## Workstream B: Bounded semantic Probe evidence
 
-Start only after Workstream A reaches its stop condition. One Task 5 receipt and one
-implementer own Tasks B1-B3 together.
+Start only after Workstream A reaches its stop condition. One Guard Task 5 receipt and one
+implementer own implementation-plan Task 5.
 
-### Task B0: Authorize the Task 5 architecture generation
+### Task 4: Authorize the Guard Task 5 architecture generation
 
 **Files:**
 - Create: `.superpowers/sdd/task-5-probe-evidence-checkpoint.md`
@@ -355,7 +357,9 @@ implementer own Tasks B1-B3 together.
 - [ ] Persist and consume the generated receipt through the generated fix brief before
   dispatching the implementer.
 
-### Task B1: Validate and protect the semantic evidence artifact
+### Task 5: Implement bounded semantic Probe evidence
+
+#### Phase 1: Validate and protect the semantic evidence artifact
 
 **Files:**
 - Create: `src/convergence-probe-context.mjs`
@@ -415,7 +419,7 @@ node --test test/convergence-probe-context.test.mjs test/control-store.test.mjs 
 
 Run the command from Step 3.
 
-### Task B2: Bind reflection request, CLI stdin, Store digest, and detached runner
+#### Phase 2: Bind reflection request, CLI stdin, Store digest, and detached runner
 
 **Files:**
 - Modify: `test/convergence-controller.test.mjs`
@@ -514,7 +518,7 @@ node --test test/convergence-probe-context.test.mjs test/convergence-store.test.
   test/reviewer-provider.test.mjs test/reviewer-result-file.test.mjs test/cli.test.mjs
 ```
 
-### Task B3: Truthful packaging, platform smoke, and commit
+#### Phase 3: Truthful packaging, platform smoke, and commit
 
 **Files:**
 - Modify: `README.md`
@@ -557,7 +561,7 @@ git diff --check
 git commit -m "fix: bind probes to bounded semantic evidence"
 ```
 
-### Task B4: Frozen Task 5 review and final stop decision
+### Task 6: Frozen Guard Task 5 review and final stop decision
 
 - [ ] Dispatch one reviewer with stable Review-Run-ID
   `task-5-probe-evidence-architecture-review-1` and only the Probe design's frozen
