@@ -1,7 +1,7 @@
 # Repository Guard Authority Lifecycle Recovery Design
 
-**Date:** 2026-07-22  
-**Status:** approved design, implementation not authorized  
+**Date:** 2026-07-22
+**Status:** approved design, implementation not authorized
 **Owns:** Task 7 `guard-unimported-legacy-remains-authoritative` and the human resolution of Task 9 `legacy-import-dry-run-has-supported-lineage-bootstrap`
 
 ## 1. Goal
@@ -210,4 +210,3 @@ Stop and return to human decision if the repair requires a new authority table, 
 activation service, implicit repository scans, writing during status, treating corrupt
 legacy state as absent, weakening exact cutover/rollback history, modifying the global
 Skill, or executing a real repository migration.
-

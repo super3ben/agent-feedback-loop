@@ -1,7 +1,7 @@
 # Convergence Probe Evidence Envelope Recovery Design
 
-**Date:** 2026-07-22  
-**Status:** approved design, implementation not authorized  
+**Date:** 2026-07-22
+**Status:** approved design, implementation not authorized
 **Owns:** Task 5 `probe-bounded-input-carries-semantic-decision-evidence`
 
 ## 1. Goal
