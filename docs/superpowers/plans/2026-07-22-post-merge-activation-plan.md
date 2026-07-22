@@ -50,11 +50,14 @@
 - [x] 残留的 `hooks.Stop` 属于用户自己的 `context_compact_guard.py`,与 AFL 无关,保留不动
 - [x] hook 真实执行验证:管道注入一次 prompt,返回静默 `{"continue":true}`,无 Guard/Probe/receipt 文本;`doctor --live` 确认 controlStore healthy、encryption healthy、runtime 0.9.0 selected
 
-### Step D:真实 provider / Codex Desktop canary — ⚠ 部分完成(2026-07-22),发现一个真实缺陷
+### Step D:真实 provider / Codex Desktop canary — 进行中(2026-07-22),已修 1 缺陷、确认 2 项环境要求
 
-- [x] 真实不满 canary 走通前半链路:hook 静默 `{"continue":true}` → 原子创建 durable reviewer job → detached one-shot reviewer 启动 → 尝试真实 claude provider
-- [ ] **发现缺陷**:claude reviewer provider 用 `--json-schema` 传 draft 2020-12 schema 被真实 claude CLI 拒绝(`no schema with key or ref "https://json-schema.org/draft/2020-12/schema"`),job 停在 `retryable`/`provider_unavailable`。需要单独修复(调整 schema dialect 或 provider 调用方式)后重跑 canary
-- [ ] 修复后:完整后台反思链路(lesson 发布 + 后续投递)与 Desktop 可见 canary
+- [x] 真实不满 canary 走通前半链路:hook 静默 `{"continue":true}` → 原子创建 durable reviewer job → detached one-shot reviewer 启动 → 真实 provider 调用
+- [x] **缺陷已修**(`ec340e9`):claude provider 以 `--json-schema` 传 draft 2020-12 `$schema` pin 被真实 claude CLI 拒绝;claude 传输层现在剥离该 pin(schema 只用跨 draft 关键字,语义不变),坏 JSON fail-closed。手动真实 claude 调用 4.4s 返回合法 `structured_output`
+- [x] **lesson 投递路径已在真实会话验证**:多次 hook 调用按相关性注入历史 lesson(additionalContext),`reflection_emissions` 正确记录每次投递审计
+- [x] **候选检测语义确认**:`negative_evaluation` 为必中证据 + ≥1 辅助证据才建 job;同族复发按设计不再建重复 job
+- [x] **环境要求确认(生产启用前提)**:reviewer 子进程被双层环境白名单剥离;第三方 `ANTHROPIC_BASE_URL` 中转与超时配置须通过 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` 显式放行(值中必须包含它自身与 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS`);真实 codex reviewer 单次审查 >180s 默认超时,建议 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS=480000`
+- [ ] 完整链路终点(reviewer 终审 → lesson 发布/no_lesson)在 480s 预算下的 canary 终态确认;Desktop 会话可见 canary
 
 ### Step E:发布与生产有效性观察 — ✅ 发布完成(2026-07-22)
 
