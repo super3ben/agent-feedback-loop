@@ -203,6 +203,21 @@ function unwrapResult(value, discriminator) {
   return null;
 }
 
+function claudeTransportSchema(schemaText) {
+  let logicalSchema;
+  try {
+    logicalSchema = JSON.parse(schemaText);
+  } catch (error) {
+    throw providerError("provider_invalid", error);
+  }
+  if (!isPlainObject(logicalSchema)) throw providerError("provider_invalid");
+  // The real claude CLI validator rejects a draft 2020-12 "$schema" dialect
+  // pin ("no schema with key or ref ..."). The packaged schemas only use
+  // cross-draft keywords, so dropping the pin preserves validation semantics.
+  const { $schema: _dialect, ...transported } = logicalSchema;
+  return JSON.stringify(transported);
+}
+
 export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null }) {
   if (cli === "codex") {
     return {
@@ -231,7 +246,7 @@ export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, 
         "--no-session-persistence",
         "--tools", "",
         "--output-format", "json",
-        "--json-schema", schemaText
+        "--json-schema", claudeTransportSchema(schemaText)
       ]
     };
   }

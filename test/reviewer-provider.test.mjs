@@ -217,6 +217,43 @@ test("Claude reviewer disables customizations and tools and unwraps structured o
   assert.doesNotMatch(observed.args.join(" "), /ignore prior instructions/);
 });
 
+test("Claude reviewer strips the $schema dialect pin the real CLI validator rejects", async () => {
+  const files = await inputFiles();
+  await writeFile(files.schemaFile, JSON.stringify({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    oneOf: [{ type: "object", required: ["outcome"], additionalProperties: false,
+      properties: { outcome: { const: "no_lesson" } } }]
+  }), { mode: 0o600 });
+  let observed;
+  await runReviewerProvider({
+    cli: "claude",
+    executable: "/opt/claude",
+    ...files,
+    context: {},
+    runProcess: async (input) => {
+      observed = input;
+      return { stdout: JSON.stringify({ type: "result", structured_output: RESULT }), stderr: "" };
+    }
+  });
+
+  const transported = JSON.parse(observed.args[observed.args.indexOf("--json-schema") + 1]);
+  assert.equal(Object.hasOwn(transported, "$schema"), false);
+  assert.deepEqual(transported.oneOf, [{ type: "object", required: ["outcome"], additionalProperties: false,
+    properties: { outcome: { const: "no_lesson" } } }]);
+});
+
+test("Claude reviewer fails closed on unparseable schema assets", async () => {
+  const files = await inputFiles();
+  await writeFile(files.schemaFile, "{ not json", { mode: 0o600 });
+  await assert.rejects(
+    runReviewerProvider({
+      cli: "claude", executable: "/opt/claude", ...files, context: {},
+      runProcess: async () => ({ stdout: JSON.stringify({ type: "result", structured_output: RESULT }), stderr: "" })
+    }),
+    (error) => error.code === "provider_invalid"
+  );
+});
+
 test("unsupported reviewer providers fail closed instead of falling back to the main conversation", async () => {
   const files = await inputFiles();
   await assert.rejects(
