@@ -18,6 +18,7 @@ import {
 } from "./convergence-store.mjs";
 
 const PLAN_PRIVATE = new WeakMap();
+const VERIFIED_REPOSITORY_PREFLIGHTS = new WeakSet();
 const MAPPING_REVISION = "guard-v1-repository-v1";
 const POLICY_REVISION_DIGEST = sha256("convergence-policy-v2");
 const AUTHORITY_NATIVE_ID = "guard-authority";
@@ -274,10 +275,20 @@ function repositoryProjection({
   imported = false,
   cutOver = false
 }) {
-  return Object.freeze({
+  const projection = Object.freeze({
     repositoryState, lineageId, legacyState, storeState,
     imported: Boolean(imported), cutOver: Boolean(cutOver)
   });
+  VERIFIED_REPOSITORY_PREFLIGHTS.add(projection);
+  return projection;
+}
+
+export function assertVerifiedGuardRepositoryPreflight(preflight) {
+  if (!preflight || typeof preflight !== "object"
+      || !VERIFIED_REPOSITORY_PREFLIGHTS.has(preflight)) {
+    throw coded("guard_preflight_required");
+  }
+  return preflight;
 }
 
 export async function inspectGuardRepository({ repoRoot, paths, logger = () => {} } = {}) {

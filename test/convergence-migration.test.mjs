@@ -324,6 +324,36 @@ test("lineage-initialized read commands remain Store-free or read-only under con
   await assert.rejects(stat(`${paths.controlDatabase}-shm`));
 });
 
+test("CLI status and lock-status leave an active WAL source set byte-for-byte unchanged", async (t) => {
+  const h = await migrationHarness({ initializeStore: false });
+  t.after(() => h.store?.close());
+  await unlink(h.stateFile);
+  const paths = pathsFor(h.home);
+  const writer = initializeControlStore({ paths });
+  t.after(() => writer.close());
+  assert.equal(String(writer.database.prepare(
+    "PRAGMA journal_mode = WAL"
+  ).get().journal_mode).toLowerCase(), "wal");
+  writer.database.prepare("INSERT INTO store_meta(key, value) VALUES (?, ?)")
+    .run("active-wal-cli-proof", "uncheckpointed");
+  const common = ["--repo-root", h.repoRoot, "--home", h.home];
+
+  for (const command of [
+    ["status", "--task-id", "task-a"],
+    ["lock-status"]
+  ]) {
+    const before = await snapshotTree(path.dirname(paths.controlDatabase));
+    const result = await executeGuardCli([...common, ...command]);
+    assert.equal(result.exitCode, 0, command[0]);
+    assert.equal(result.payload.authority, "afl_sqlite", command[0]);
+    assert.deepEqual(
+      await snapshotTree(path.dirname(paths.controlDatabase)),
+      before,
+      command[0]
+    );
+  }
+});
+
 test("CLI keeps unimported and imported legacy authoritative until exact cutover and after rollback", async () => {
   const h = await migrationHarness({ initializeStore: false });
   const common = ["--repo-root", h.repoRoot, "--home", h.home];
@@ -698,6 +728,12 @@ test("apply atomically preserves both task associations and exactly one provenan
 test("imported real Review-Run-IDs use live replay and collision identity without snapshot fiction", async (t) => {
   const h = await migrationHarness();
   t.after(() => h.store.close());
+  const command = async (args) => runGuardCommand({
+    args,
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) })
+  });
   h.state.loops[h.fingerprintB].seen_review_run_ids = ["snapshot-only-review"];
   await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
   const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
@@ -708,32 +744,22 @@ test("imported real Review-Run-IDs use live replay and collision identity withou
     paritySetDigest: shadow.paritySetDigest, decisionRef: "review replay cutover", apply: true
   });
 
-  const before = await runGuardCommand({
-    args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
-  });
+  const before = await command(["status", "--task-id", "task-a"]);
   const reviewCount = () => h.store.database.prepare(
     "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='review_recorded'"
   ).get().count;
   const baselineCount = reviewCount();
   for (const event of [h.state.loops[h.fingerprintA].events[0], h.state.loops[h.fingerprintA].events[5]]) {
-    await runGuardCommand({ args: reviewArgs(event), repoRoot: h.repoRoot, store: h.store });
-    const after = await runGuardCommand({
-      args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
-    });
+    await command(reviewArgs(event));
+    const after = await command(["status", "--task-id", "task-a"]);
     assert.deepEqual(after, before);
     assert.equal(reviewCount(), baselineCount);
   }
   await assert.rejects(
-    runGuardCommand({
-      args: reviewArgs(h.state.loops[h.fingerprintA].events[5], { commit: "changed-commit" }),
-      repoRoot: h.repoRoot,
-      store: h.store
-    }),
+    command(reviewArgs(h.state.loops[h.fingerprintA].events[5], { commit: "changed-commit" })),
     (error) => error.code === "event_collision"
   );
-  const taskB = await runGuardCommand({
-    args: ["status", "--task-id", "task-b"], repoRoot: h.repoRoot, store: h.store
-  });
+  const taskB = await command(["status", "--task-id", "task-b"]);
   assert.deepEqual(taskB.loops[0].seen_review_run_ids, []);
   assert.equal(reviewCount(), baselineCount);
 });
@@ -789,12 +815,16 @@ test("import rejects corrupt, permissive, and symlinked legacy state without Sto
 test("matching shadow parity cuts over once and rollback restores the exact immutable snapshot", async (t) => {
   const h = await migrationHarness();
   t.after(() => h.store.close());
+  const command = async (args) => runGuardCommand({
+    args,
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) })
+  });
   const original = await readFile(h.stateFile);
   const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
   await applyGuardImport({ plan, store: h.store });
-  const beforeCutover = await runGuardCommand({
-    args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
-  });
+  const beforeCutover = await command(["status", "--task-id", "task-a"]);
   assert.equal(beforeCutover.authority, "legacy_guard");
   const shadow = await compareGuardShadow({ plan, store: h.store, comparisons: PASSING_COMPARISONS });
   assert.deepEqual({ matched: shadow.matched, comparisonCount: shadow.comparisonCount,
@@ -815,9 +845,7 @@ test("matching shadow parity cuts over once and rollback restores the exact immu
   assert.equal((await stat(snapshot)).mode & 0o777, 0o400);
   assert.equal(h.store.getGuardAuthority({ authorityTaskUid: plan.authorityTaskUid }).authority,
     "afl_sqlite");
-  const afterCutover = await runGuardCommand({
-    args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
-  });
+  const afterCutover = await command(["status", "--task-id", "task-a"]);
   assert.equal(afterCutover.authority, "afl_sqlite");
 
   const rollback = await rollbackGuardCutover({
@@ -829,9 +857,7 @@ test("matching shadow parity cuts over once and rollback restores the exact immu
   assert.deepEqual(await readFile(h.stateFile), original);
   assert.equal(h.store.getGuardAuthority({ authorityTaskUid: plan.authorityTaskUid }).authority,
     "legacy_guard");
-  const afterRollback = await runGuardCommand({
-    args: ["status", "--task-id", "task-a"], repoRoot: h.repoRoot, store: h.store
-  });
+  const afterRollback = await command(["status", "--task-id", "task-a"]);
   assert.equal(afterRollback.authority, "legacy_guard");
 });
 

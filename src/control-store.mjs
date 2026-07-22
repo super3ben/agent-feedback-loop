@@ -1,6 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  rmSync,
+  writeSync
+} from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createConvergenceStoreApi } from "./convergence-store.mjs";
@@ -44,6 +59,9 @@ const REVIEW_FAILURE_CODES = new Set([
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
+const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
+const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
+const READ_ONLY_COPY_CHUNK_BYTES = 64 * 1024;
 const CAPTURE_IDENTITY_FIELDS = Object.freeze([
   "event_uid",
   "source_provider",
@@ -156,6 +174,212 @@ function assertControlDatabasePath(paths) {
   assertExistingPrivateDirectory(dataRoot, "data root");
   assertExistingPrivateDirectory(storeRoot, "control store directory");
   assertExistingPrivateDatabase(expected);
+}
+
+function readOnlySourceIdentity(info) {
+  return Object.freeze({
+    dev: String(info.dev),
+    ino: String(info.ino),
+    size: String(info.size),
+    mode: String(info.mode),
+    uid: String(info.uid),
+    mtimeNs: String(info.mtimeNs),
+    ctimeNs: String(info.ctimeNs)
+  });
+}
+
+function sameReadOnlyIdentity(left, right) {
+  return Object.keys(left).every((key) => left[key] === right[key]);
+}
+
+function readOnlySnapshotFailure() {
+  throw unavailable();
+}
+
+function openReadOnlySourceMember(databaseFile, suffix, required) {
+  const source = `${databaseFile}${suffix}`;
+  let fd;
+  try {
+    fd = openSync(source, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (error?.code === "ENOENT" && !required) return null;
+    readOnlySnapshotFailure();
+  }
+  try {
+    const info = fstatSync(fd, { bigint: true });
+    if (!info.isFile() || (info.mode & 0o077n) !== 0n) readOnlySnapshotFailure();
+    if (typeof process.getuid === "function" && info.uid !== BigInt(process.getuid())) {
+      readOnlySnapshotFailure();
+    }
+    if (info.size < 0n || info.size > BigInt(MAX_READ_ONLY_SNAPSHOT_BYTES)) {
+      readOnlySnapshotFailure();
+    }
+    return Object.freeze({ suffix, source, fd, identity: readOnlySourceIdentity(info) });
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function openReadOnlySourceSet(databaseFile) {
+  const members = [];
+  try {
+    for (const suffix of READ_ONLY_SOURCE_SUFFIXES) {
+      const member = openReadOnlySourceMember(databaseFile, suffix, suffix === "");
+      if (member) members.push(member);
+    }
+    const totalBytes = members.reduce((sum, member) => {
+      const size = BigInt(member.identity.size);
+      return sum + size;
+    }, 0n);
+    if (totalBytes > BigInt(MAX_READ_ONLY_SNAPSHOT_BYTES)) readOnlySnapshotFailure();
+    return members;
+  } catch (error) {
+    for (const member of members) closeSync(member.fd);
+    throw error;
+  }
+}
+
+function closeReadOnlySourceSet(members) {
+  for (const member of members) {
+    try { closeSync(member.fd); } catch {}
+  }
+}
+
+function hashReadOnlyHandle(fd) {
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(READ_ONLY_COPY_CHUNK_BYTES);
+  let position = 0;
+  while (true) {
+    const bytesRead = readSync(fd, buffer, 0, buffer.byteLength, position);
+    if (bytesRead === 0) break;
+    digest.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+    if (!Number.isSafeInteger(position) || position > MAX_READ_ONLY_SNAPSHOT_BYTES) {
+      readOnlySnapshotFailure();
+    }
+  }
+  return digest.digest("hex");
+}
+
+function fingerprintReadOnlySourceSet(members) {
+  return Object.freeze(members.map((member) => {
+    const before = readOnlySourceIdentity(fstatSync(member.fd, { bigint: true }));
+    if (!sameReadOnlyIdentity(member.identity, before)) readOnlySnapshotFailure();
+    const digest = hashReadOnlyHandle(member.fd);
+    const after = readOnlySourceIdentity(fstatSync(member.fd, { bigint: true }));
+    if (!sameReadOnlyIdentity(before, after)) readOnlySnapshotFailure();
+    const current = lstatSync(member.source, { bigint: true });
+    if (!current.isFile() || current.isSymbolicLink()
+        || !sameReadOnlyIdentity(after, readOnlySourceIdentity(current))) {
+      readOnlySnapshotFailure();
+    }
+    return Object.freeze({ suffix: member.suffix, identity: after, digest });
+  }));
+}
+
+function sameReadOnlyFingerprint(left, right) {
+  return left.length === right.length && left.every((member, index) => {
+    const other = right[index];
+    return member.suffix === other?.suffix
+      && member.digest === other.digest
+      && sameReadOnlyIdentity(member.identity, other.identity);
+  });
+}
+
+function currentReadOnlySourceFingerprint(databaseFile) {
+  const members = openReadOnlySourceSet(databaseFile);
+  try {
+    return fingerprintReadOnlySourceSet(members);
+  } finally {
+    closeReadOnlySourceSet(members);
+  }
+}
+
+function copyReadOnlySourceMember(member, destination) {
+  let destinationFd;
+  try {
+    destinationFd = openSync(
+      destination,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600
+    );
+    const destinationInfo = fstatSync(destinationFd, { bigint: true });
+    if (!destinationInfo.isFile() || (destinationInfo.mode & 0o077n) !== 0n) {
+      readOnlySnapshotFailure();
+    }
+    const sourceBefore = readOnlySourceIdentity(fstatSync(member.fd, { bigint: true }));
+    if (!sameReadOnlyIdentity(member.identity, sourceBefore)) readOnlySnapshotFailure();
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(READ_ONLY_COPY_CHUNK_BYTES);
+    let position = 0;
+    while (true) {
+      const bytesRead = readSync(member.fd, buffer, 0, buffer.byteLength, position);
+      if (bytesRead === 0) break;
+      digest.update(buffer.subarray(0, bytesRead));
+      let written = 0;
+      while (written < bytesRead) {
+        const bytesWritten = writeSync(
+          destinationFd, buffer, written, bytesRead - written, position + written
+        );
+        if (bytesWritten <= 0) readOnlySnapshotFailure();
+        written += bytesWritten;
+      }
+      position += bytesRead;
+      if (!Number.isSafeInteger(position) || position > MAX_READ_ONLY_SNAPSHOT_BYTES) {
+        readOnlySnapshotFailure();
+      }
+    }
+    fsyncSync(destinationFd);
+    const sourceAfter = readOnlySourceIdentity(fstatSync(member.fd, { bigint: true }));
+    if (!sameReadOnlyIdentity(sourceBefore, sourceAfter)) readOnlySnapshotFailure();
+    return digest.digest("hex");
+  } finally {
+    if (destinationFd !== undefined) closeSync(destinationFd);
+  }
+}
+
+function createReadOnlyControlSnapshot(databaseFile, logger) {
+  const snapshotRoot = mkdtempSync(path.join(tmpdir(), "afl-control-read-"));
+  const snapshotId = path.basename(snapshotRoot);
+  const snapshotDatabase = path.join(snapshotRoot, "control.sqlite3");
+  let members = [];
+  try {
+    chmodSync(snapshotRoot, 0o700);
+    const rootInfo = lstatSync(snapshotRoot, { bigint: true });
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || (rootInfo.mode & 0o077n) !== 0n
+        || (typeof process.getuid === "function" && rootInfo.uid !== BigInt(process.getuid()))) {
+      readOnlySnapshotFailure();
+    }
+    logger(Object.freeze({
+      action: "read_only_snapshot_started", state: "copying", snapshotId
+    }));
+    members = openReadOnlySourceSet(databaseFile);
+    const before = fingerprintReadOnlySourceSet(members);
+    for (const [index, member] of members.entries()) {
+      const copiedDigest = copyReadOnlySourceMember(
+        member, `${snapshotDatabase}${member.suffix}`
+      );
+      if (copiedDigest !== before[index].digest) readOnlySnapshotFailure();
+    }
+    logger(Object.freeze({
+      action: "read_only_snapshot_copied", state: "verifying", snapshotId
+    }));
+    const after = fingerprintReadOnlySourceSet(members);
+    if (!sameReadOnlyFingerprint(before, after)) readOnlySnapshotFailure();
+    const current = currentReadOnlySourceFingerprint(databaseFile);
+    if (!sameReadOnlyFingerprint(before, current)) readOnlySnapshotFailure();
+    logger(Object.freeze({
+      action: "read_only_snapshot_verified", state: "ready", snapshotId
+    }));
+    return Object.freeze({ snapshotRoot, snapshotDatabase, snapshotId });
+  } catch (error) {
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    if (error instanceof ControlStoreError) throw error;
+    throw unavailable();
+  } finally {
+    closeReadOnlySourceSet(members);
+  }
 }
 
 function assertString(value, field, maxLength = 4096) {
@@ -1467,18 +1691,44 @@ export function openControlStore({
 export function openControlStoreReadOnly({
   paths,
   now = () => new Date(),
-  busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS
+  busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS,
+  logger = () => {}
 }) {
   requireDatabase();
+  if (typeof logger !== "function") throw new TypeError("logger must be a function");
   assertControlDatabasePath(paths);
   const timeoutMs = boundedBusyTimeoutMs(busyTimeoutMs);
-  const database = new DatabaseSync(paths.controlDatabase, { readOnly: true });
+  const snapshot = createReadOnlyControlSnapshot(paths.controlDatabase, logger);
+  let database;
   try {
+    database = new DatabaseSync(snapshot.snapshotDatabase, { readOnly: true });
     configureConnection(database, timeoutMs);
     verifyControlSchema(database, SCHEMA_VERSION);
-    return createStore(database, now);
+    logger(Object.freeze({
+      action: "read_only_snapshot_opened", state: "active", snapshotId: snapshot.snapshotId
+    }));
+    const store = createStore(database, now);
+    let closed = false;
+    store.close = () => {
+      if (closed) return;
+      closed = true;
+      let closeError = null;
+      try {
+        database.close();
+      } catch (error) {
+        closeError = error;
+      } finally {
+        rmSync(snapshot.snapshotRoot, { recursive: true, force: true });
+      }
+      logger(Object.freeze({
+        action: "read_only_snapshot_cleaned", state: "closed", snapshotId: snapshot.snapshotId
+      }));
+      if (closeError) throw closeError;
+    };
+    return store;
   } catch (error) {
-    database.close();
-    throw error;
+    try { database?.close(); } catch {}
+    rmSync(snapshot.snapshotRoot, { recursive: true, force: true });
+    throw error instanceof ControlStoreError ? error : unavailable();
   }
 }

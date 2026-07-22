@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import {
   deriveTaskUid, ensureRepositoryLineage, projectContract
 } from "../src/convergence-identity.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { inspectGuardRepository } from "../src/convergence-migration.mjs";
 import { pathsFor } from "../src/index.mjs";
 
 const FIXTURES = path.join(import.meta.dirname, "fixtures", "guard");
@@ -46,7 +47,14 @@ async function harness(name) {
     "--invariant-id", state.invariant_id,
     "--boundary", state.boundary
   ];
-  const command = (args, artifactHooks) => runGuardCommand({ args, repoRoot, store, now, artifactHooks });
+  const command = async (args, artifactHooks) => runGuardCommand({
+    args,
+    repoRoot,
+    store,
+    now,
+    artifactHooks,
+    preflight: await inspectGuardRepository({ repoRoot, paths: pathsFor(home) })
+  });
   const review = ({
     run,
     verdict = "changes_required",
@@ -77,6 +85,7 @@ async function harness(name) {
   return {
     state,
     repoRoot,
+    home,
     store,
     key,
     command,
@@ -115,6 +124,20 @@ async function checkpointFile(repoRoot, key) {
   ].join("\n"), { mode: 0o600 });
   await chmod(file, 0o600);
   return file;
+}
+
+async function writeEmptyCanonicalLegacyState(repoRoot) {
+  const legacy = {
+    version: 1,
+    repository_id: createHash("sha256").update(await realpath(repoRoot)).digest("hex"),
+    updated_at: "2026-07-22T00:00:00.000Z",
+    aliases: {},
+    distinct_declarations: [],
+    loops: {}
+  };
+  const stateFile = path.join(repoRoot, ".superpowers", "sdd", "review-loop-state.json");
+  await writeFile(stateFile, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+  await chmod(stateFile, 0o600);
 }
 
 test("first failure authorizes one local fix and the second requires direction review", async (t) => {
@@ -165,7 +188,12 @@ test("a crash after structural review commit fails closed before local authoriza
     }
   });
   await assert.rejects(
-    runGuardCommand({ args, repoRoot: h.repoRoot, store: crashingStore }),
+    runGuardCommand({
+      args,
+      repoRoot: h.repoRoot,
+      store: crashingStore,
+      preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) })
+    }),
     (error) => error.code === "simulated_crash_after_review_commit"
   );
   const grantFile = path.join(h.repoRoot, ".superpowers", "sdd", "crash-local-grant.json");
@@ -183,6 +211,7 @@ test("a crash after structural review commit fails closed before local authoriza
     args,
     repoRoot: h.repoRoot,
     store: h.store,
+    preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) }),
     launchProbe() {
       launches += 1;
       return { attempted: true, reason: "spawn_attempted" };
@@ -450,15 +479,22 @@ test("the same SDD loop coordinates remain isolated across repository lineages",
     "--failure-next-action", "direction_review"
   ];
 
-  const first = await runGuardCommand({ args, repoRoot: repos[0], store });
-  const second = await runGuardCommand({ args, repoRoot: repos[1], store });
+  const first = await runGuardCommand({
+    args, repoRoot: repos[0], store,
+    preflight: await inspectGuardRepository({ repoRoot: repos[0], paths: pathsFor(home) })
+  });
+  const second = await runGuardCommand({
+    args, repoRoot: repos[1], store,
+    preflight: await inspectGuardRepository({ repoRoot: repos[1], paths: pathsFor(home) })
+  });
   assert.notEqual(first.task_id, second.task_id);
   assert.notEqual(first.fingerprint, second.fingerprint);
   for (const [index, result] of [first, second].entries()) {
     const projection = await runGuardCommand({
       args: ["status", "--task-id", state.task_id],
       repoRoot: repos[index],
-      store
+      store,
+      preflight: await inspectGuardRepository({ repoRoot: repos[index], paths: pathsFor(home) })
     });
     assert.deepEqual(projection.loops.map((loop) => loop.fingerprint), [result.fingerprint]);
     assert.equal(projection.loops[0].failure_count, 1);
@@ -805,73 +841,87 @@ test("status and lock-status are bounded Store projections and strict parsing re
   }
 });
 
-test("status and lock-status accept an uninitialized preflight without a Store", async () => {
-  const preflight = Object.freeze({
-    repositoryState: "uninitialized", lineageId: null,
-    legacyState: "absent", storeState: "absent", imported: false, cutOver: false
+test("status and lock-status accept a verified uninitialized preflight without a Store", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "afl-sdd-uninitialized-"));
+  cleanups.push(root);
+  const repoRoot = path.join(root, "repo");
+  await mkdir(repoRoot, { mode: 0o700 });
+  execFileSync("git", ["init", "-q", repoRoot]);
+  const preflight = await inspectGuardRepository({
+    repoRoot,
+    paths: pathsFor(path.join(root, "unread-home"))
   });
   const statusResult = await runGuardCommand({
-    args: ["status", "--task-id", "task-a"], repoRoot: "/not-read", preflight
+    args: ["status", "--task-id", "task-a"], repoRoot, preflight
   });
   assert.deepEqual(statusResult, {
     authority: "uninitialized", task_id: null, loops: [], exitCode: 0
   });
   const lockResult = await runGuardCommand({
-    args: ["lock-status"], repoRoot: "/not-read", preflight
+    args: ["lock-status"], repoRoot, preflight
   });
   assert.deepEqual(lockResult, {
     authority: "uninitialized", locked: false, journal_mode: "unknown", exitCode: 0
   });
 });
 
-test("SDD adapter routes every official read and write through persisted Guard authority", async (t) => {
+test("exported adapter fails closed without a verified repository preflight", async (t) => {
   const h = await harness("open-first-failure");
   t.after(() => h.store.close());
-  const authorityResolver = (authority) => async () => Object.freeze({ authority });
+  await writeEmptyCanonicalLegacyState(h.repoRoot);
 
-  const legacyStatus = await runGuardCommand({
+  await assert.rejects(runGuardCommand({
+    args: ["status", "--task-id", h.state.task_id],
+    repoRoot: h.repoRoot,
+    store: h.store
+  }), (error) => error.code === "guard_preflight_required");
+});
+
+test("exported adapter cannot bypass real unimported legacy authority", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  await writeEmptyCanonicalLegacyState(h.repoRoot);
+  const preflight = await inspectGuardRepository({
+    repoRoot: h.repoRoot,
+    paths: pathsFor(h.home)
+  });
+  assert.equal(preflight.repositoryState, "legacy_guard");
+
+  await assert.rejects(runGuardCommand({
+    args: ["record-review", ...h.key,
+      "--review-run-id", "verified-legacy-authority",
+      "--severity", "Important",
+      "--verdict", "approved",
+      "--commit", "verified-legacy-authority-commit",
+      "--review-ref", "reviews/verified-legacy-authority.md"],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight
+  }), (error) => error.code === "legacy_guard_authoritative");
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_tasks"
+  ).get().count, 0);
+});
+
+test("SDD adapter rejects forged authority and uses verified persisted Guard authority", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  await assert.rejects(runGuardCommand({
     args: ["status", "--task-id", h.state.task_id],
     repoRoot: h.repoRoot,
     store: h.store,
-    authorityResolver: authorityResolver("legacy_guard")
-  });
-  assert.equal(legacyStatus.authority, "legacy_guard");
-  assert.deepEqual(legacyStatus.loops, []);
-  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 0);
-  await assert.rejects(runGuardCommand({
-    args: [
-      "record-review", ...h.key,
-      "--review-run-id", "legacy-authority-review",
-      "--severity", "Important",
-      "--verdict", "approved",
-      "--commit", "legacy-authority-commit",
-      "--review-ref", "reviews/legacy-authority.md"
-    ],
-    repoRoot: h.repoRoot,
-    store: h.store,
-    authorityResolver: authorityResolver("legacy_guard")
-  }), (error) => error.code === "legacy_guard_authoritative");
+    preflight: Object.freeze({
+      repositoryState: "legacy_guard", lineageId: "forged",
+      legacyState: "valid", storeState: "valid", imported: false, cutOver: false
+    })
+  }), (error) => error.code === "guard_preflight_required");
 
-  const locked = await runGuardCommand({
-    args: ["lock-status"],
-    repoRoot: h.repoRoot,
-    store: h.store,
-    authorityResolver: authorityResolver("transition_locked")
-  });
-  assert.equal(locked.authority, "transition_locked");
-  assert.equal(locked.locked, true);
-  await assert.rejects(runGuardCommand({
-    args: ["add-alias", "--alias", "legacy-name", "--canonical", "canonical-name"],
-    repoRoot: h.repoRoot,
-    store: h.store,
-    authorityResolver: authorityResolver("transition_locked")
-  }), (error) => error.code === "guard_authority_locked");
-
+  const preflight = await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) });
   const aflStatus = await runGuardCommand({
     args: ["status", "--task-id", h.state.task_id],
     repoRoot: h.repoRoot,
     store: h.store,
-    authorityResolver: authorityResolver("afl_sqlite")
+    preflight
   });
   assert.equal(aflStatus.authority, "afl_sqlite");
   assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 0);

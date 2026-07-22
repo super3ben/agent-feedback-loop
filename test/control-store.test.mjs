@@ -392,6 +392,86 @@ test("read-only Store inspection creates no database journal or schema bytes", (
   assert.equal(existsSync(shm), false);
 });
 
+function snapshotSqliteSource(databaseFile) {
+  return Object.fromEntries(["", "-wal", "-shm", "-journal"].flatMap((suffix) => {
+    const file = `${databaseFile}${suffix}`;
+    if (!existsSync(file)) return [];
+    const info = lstatSync(file);
+    return [[suffix || "main", {
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      bytes: readFileSync(file)
+    }]];
+  }));
+}
+
+test("read-only Store inspection leaves a closed WAL database without sidecars", () => {
+  const { paths } = fixture();
+  const initialized = initializeControlStore({ paths });
+  assert.equal(String(initialized.database.prepare(
+    "PRAGMA journal_mode = WAL"
+  ).get().journal_mode).toLowerCase(), "wal");
+  initialized.close();
+  assert.deepEqual(Object.keys(snapshotSqliteSource(paths.controlDatabase)), ["main"]);
+  const before = snapshotSqliteSource(paths.controlDatabase);
+
+  const inspected = openControlStoreReadOnly({ paths });
+  assert.deepEqual(listUserTables(inspected.database), ALLOWED_CONTROL_TABLES);
+  inspected.close();
+
+  assert.deepEqual(snapshotSqliteSource(paths.controlDatabase), before);
+});
+
+test("read-only Store inspection reads active WAL state from a cleaned temporary snapshot", () => {
+  const { paths } = fixture();
+  const writer = initializeControlStore({ paths });
+  assert.equal(String(writer.database.prepare(
+    "PRAGMA journal_mode = WAL"
+  ).get().journal_mode).toLowerCase(), "wal");
+  writer.database.prepare("INSERT INTO store_meta(key, value) VALUES (?, ?)")
+    .run("active-wal-proof", "visible-only-through-wal");
+  const before = snapshotSqliteSource(paths.controlDatabase);
+  assert.deepEqual(Object.keys(before), ["main", "-wal", "-shm"]);
+
+  const inspected = openControlStoreReadOnly({ paths });
+  const snapshotFile = inspected.database.location();
+  const snapshotRoot = path.dirname(snapshotFile);
+  assert.notEqual(snapshotFile, paths.controlDatabase);
+  assert.equal(lstatSync(snapshotRoot).mode & 0o777, 0o700);
+  assert.equal(inspected.database.prepare(
+    "SELECT value FROM store_meta WHERE key=?"
+  ).get("active-wal-proof").value, "visible-only-through-wal");
+  assert.deepEqual(snapshotSqliteSource(paths.controlDatabase), before);
+
+  inspected.close();
+  assert.equal(existsSync(snapshotRoot), false);
+  assert.deepEqual(snapshotSqliteSource(paths.controlDatabase), before);
+  writer.close();
+});
+
+test("read-only Store inspection rejects source drift and cleans its snapshot", () => {
+  const { paths } = fixture();
+  const writer = initializeControlStore({ paths });
+  writer.database.prepare("PRAGMA journal_mode = WAL").get();
+  writer.database.prepare("INSERT INTO store_meta(key, value) VALUES (?, ?)")
+    .run("drift-proof", "before");
+  let createdSnapshot = null;
+
+  assert.throws(() => openControlStoreReadOnly({
+    paths,
+    logger(event) {
+      if (event.action !== "read_only_snapshot_copied") return;
+      createdSnapshot = path.join(tmpdir(), event.snapshotId);
+      writer.database.prepare("UPDATE store_meta SET value=? WHERE key=?")
+        .run("after", "drift-proof");
+    }
+  }), (error) => error?.code === CONTROL_STORE_UNAVAILABLE);
+  assert.notEqual(createdSnapshot, null);
+  assert.equal(existsSync(createdSnapshot), false);
+  writer.close();
+});
+
 test("read-only Store inspection rejects missing and invalid stores without creating bytes", () => {
   const { paths } = fixture();
   assert.throws(

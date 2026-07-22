@@ -14,7 +14,7 @@ import {
   authorizeContinuation,
   evaluateAndAdvance
 } from "./convergence-controller.mjs";
-import { readGuardAdapterAuthority } from "./convergence-migration.mjs";
+import { assertVerifiedGuardRepositoryPreflight } from "./convergence-migration.mjs";
 
 const POLICY_REVISION = "convergence-policy-v2";
 const POLICY_REVISION_DIGEST = sha256(POLICY_REVISION);
@@ -876,29 +876,15 @@ export async function runGuardCommand({
   preflight,
   now = () => new Date(),
   launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
-  artifactHooks: rawArtifactHooks,
-  authorityResolver = readGuardAdapterAuthority
+  artifactHooks: rawArtifactHooks
 }) {
   if (typeof repoRoot !== "string" || typeof now !== "function"
-      || typeof launchProbe !== "function" || typeof authorityResolver !== "function") {
+      || typeof launchProbe !== "function") {
     throw coded("guard_invalid_arguments");
   }
   const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
-  let repository = preflight;
-  if (repository === undefined) {
-    if (!store) throw coded("guard_invalid_arguments");
-    const lineage = await readRepositoryLineage({ repoRoot });
-    const authority = await authorityResolver({ repoRoot, store, lineageId: lineage.lineageId });
-    repository = Object.freeze({
-      repositoryState: authority?.authority,
-      lineageId: lineage.lineageId,
-      legacyState: authority?.authority === "legacy_guard" ? "valid" : "absent",
-      storeState: "valid",
-      imported: Boolean(authority?.imported),
-      cutOver: authority?.authority === "afl_sqlite" && Boolean(authority?.imported)
-    });
-  }
+  const repository = assertVerifiedGuardRepositoryPreflight(preflight);
   if (!repository || ![
     "uninitialized", "transition_locked", "legacy_guard", "fresh_afl_eligible", "afl_sqlite"
   ].includes(repository.repositoryState)) {
