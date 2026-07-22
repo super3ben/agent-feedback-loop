@@ -25,35 +25,32 @@
 
 现状(已核实):真实仓库无 `.agent-feedback-loop/` authority;`convergence-cli` 在未初始化时安全返回 `lineage_not_initialized`,不写库。
 
-- [ ] 在 `main` 工作树执行 `lineage-init`
-- [ ] Guard import dry-run,确认只读、无副作用
-- [ ] 记录 dry-run 输出作为 Step B 的输入证据
+### Step A:真实仓库 lineage 初始化与 import dry-run — ✅ 完成(2026-07-22)
 
-### Step B:Guard import → shadow parity → cutover canary → rollback proof
+- [x] 在 `main` 工作树执行 `lineage-init`:`created:true`,lineageDigest `8911415e…`(lineage 存 git common dir,所有 worktree 共享)
+- [x] Guard import dry-run:首次 dry-run 对两份真实 state 均 fail-closed(`legacy_state_invalid`),确认只读、无副作用
+- [x] dry-run 暴露真实缺陷:0.9.0 迁移校验器无法导入真实 SDD 历史(见下方「导入兼容修复」),修复后两份 state 均产出导入计划
 
-现状(已核实):`review-loop-state.json` 仅存在于 `convergence-kernel` 和 `background-review-observability` 两个工作树(未提交),主工作树没有。
+**导入兼容修复(commit `cc98cfe`,经用户逐项确认)**:真实 legacy state 与校验器有 5 处格式差异——boundary 含 `/`、task_id 纯数字/含 `.`、旧 schema 缺 `direction_signal`/`last_evidence_sha256`、部分 `changes_required` review 无 hypothesis/evidence(用户选择接受空依据导入)、`failure_next_action` 为 null。全部按「接受真实数据、不改写指纹身份」原则放宽,回归 515/515。
 
-- [ ] 确定权威 legacy state 来源(两个工作树中哪份是真),快照留存
-- [ ] 真实 import,前后对比
-- [ ] shadow parity:legacy 与 AFL authority 并行观察,输出一致才继续
-- [ ] 单仓库 cutover canary,保留切换前快照
-- [ ] 演练 rollback 并留证
-- 禁止:跳过 shadow parity 直接 cutover
+### Step B:Guard import → shadow parity → cutover canary → rollback proof — ✅ 完成(2026-07-22)
 
-### Step C:真实 HOME 安装与 prompt hook 重启
+- [x] 权威 legacy state 判定:两份 state **不是副本而是互不相交的两段历史**(convergence-kernel 29 loops / background-review-observability 22 loops,fingerprint 零重叠),各自绑定所在 worktree 的 repository_id,须分别导入
+- [x] 快照留存:`.cutover-snapshot-2026-07-22/`(两份 state + 三份 CLI 配置 + cutover refs)
+- [x] 真实 import:convergence-kernel(9 tasks/29 loops/158 events/33 grants)、background-review-observability(10 tasks/22 loops/99 events/24 grants),写入真实 HOME control store
+- [x] shadow parity:51 个 loop 逐一自动比对 `failure_count` 与 `status→(kernel status, decision)` 映射,0 不匹配;4 个 repo 级 parity 字段(decision=closed→finish、action=none、generation=2、eligibility=false)经 `compareGuardShadow` 记录,0 mismatch
+- [x] cutover canary:先对 convergence-kernel 单仓库 cutover(authority `legacy_guard`→`afl_sqlite`,生成 0400 快照)
+- [x] rollback proof:真实执行 rollback,authority 回到 `legacy_guard`,state 文件 sha256 与切换前完全一致
+- [x] 最终 cutover:两个 repo authority 均为 `afl_sqlite`,refs 记录于 `.cutover-snapshot-2026-07-22/cutover-refs.json`
 
-现状(已核实,注意有两处遗留):
+### Step C:真实 HOME 安装与 prompt hook 重启 — ✅ 完成(2026-07-22)
 
-1. `~/.agent-feedback-loop/` 是旧版布局(`events.jsonl`、`global-trigger-archive.md` 等);
-2. `~/.agent/feedback-loop/hooks/` 下仍有旧版 `core-hook.sh`;
-3. `~/.codex/config.toml` 中 `# agent-feedback-loop:start/end` 标记块仍指向旧路径,且包含 0.9.0 已删除的 **Stop hook** 和 `statusMessage`(0.9.0 明确禁止 Stop/AfterAgent 控制 hook 与状态输出)。
+- [x] 隔离 canary(临时 HOME):install/doctor/uninstall 往返干净,hook 块无 Stop hook、无 statusMessage
+- [x] 真实 HOME 安装 0.9.0:installer 自动清除旧 `stop-hook.sh`/`trigger-rules.sh`,重写 Codex/Claude/Gemini 三个 hook 块;安装前三份配置已备份到 `.cutover-snapshot-2026-07-22/`
+- [x] 残留的 `hooks.Stop` 属于用户自己的 `context_compact_guard.py`,与 AFL 无关,保留不动
+- [x] hook 真实执行验证:管道注入一次 prompt,返回静默 `{"continue":true}`,无 Guard/Probe/receipt 文本;`doctor --live` 确认 controlStore healthy、encryption healthy、runtime 0.9.0 selected
 
-- [ ] 先做隔离 canary(临时 HOME)验证 0.9.0 安装/卸载往返
-- [ ] 用 0.9.0 `install` 重写真实 HOME:清掉旧 Stop hook 块、旧路径指向,必要时走 `legacy-export` 迁移旧数据
-- [ ] 重启 prompt hook 后在真实会话观察:主会话不得出现 Guard/Probe/receipt 文本
-- 禁止:自动启用 Stop/AfterAgent hook
-
-### Step D:真实 provider / Codex Desktop canary
+### Step D:真实 provider / Codex Desktop canary — 待做(需真实交互会话)
 
 - [ ] 以真实 Codex/Claude/Gemini CLI 作为 reviewer 跑一次完整后台反思链路
 - [ ] Desktop 会话启用 AFL 做可见 canary,确认延迟与静默性
