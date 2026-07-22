@@ -1463,3 +1463,22 @@ export function openControlStore({
     throw error;
   }
 }
+
+export function openControlStoreReadOnly({
+  paths,
+  now = () => new Date(),
+  busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS
+}) {
+  requireDatabase();
+  assertControlDatabasePath(paths);
+  const timeoutMs = boundedBusyTimeoutMs(busyTimeoutMs);
+  const database = new DatabaseSync(paths.controlDatabase, { readOnly: true });
+  try {
+    configureConnection(database, timeoutMs);
+    verifyControlSchema(database, SCHEMA_VERSION);
+    return createStore(database, now);
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}

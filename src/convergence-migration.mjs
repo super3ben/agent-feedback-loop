@@ -11,6 +11,7 @@ import {
   projectContract,
   readRepositoryLineage
 } from "./convergence-identity.mjs";
+import { openControlStoreReadOnly } from "./control-store.mjs";
 import {
   canonicalGuardParityValue,
   guardParitySetDigest
@@ -231,6 +232,108 @@ function validateLegacyState(value, repositoryId) {
     return Object.freeze({ fingerprint, taskId, invariantId, boundary, ...loop });
   });
   return Object.freeze({ aliases, distinct, loops });
+}
+
+async function inspectCanonicalLegacyState(root) {
+  const stateFile = path.join(root, ".superpowers", "sdd", "review-loop-state.json");
+  let source;
+  try {
+    source = await readOwnedGuardState({ repoRoot: root, stateFile });
+  } catch (error) {
+    if (new Set(["legacy_state_missing", "ENOENT"]).has(error?.code)) return "absent";
+    throw error;
+  }
+  let json;
+  try { json = JSON.parse(source.bytes.toString("utf8")); } catch { throw coded("legacy_state_invalid"); }
+  validateLegacyState(json, sha256(source.root));
+  return "valid";
+}
+
+async function inspectTransitionLock(root) {
+  const lock = transitionPaths(
+    path.join(root, ".superpowers", "sdd", "review-loop-state.json")
+  ).authorityLock;
+  try {
+    const info = await lstat(lock);
+    if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) {
+      throw coded("guard_authority_lock_invalid");
+    }
+    own(info, "guard_authority_lock_invalid");
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function repositoryProjection({
+  repositoryState,
+  lineageId,
+  legacyState,
+  storeState,
+  imported = false,
+  cutOver = false
+}) {
+  return Object.freeze({
+    repositoryState, lineageId, legacyState, storeState,
+    imported: Boolean(imported), cutOver: Boolean(cutOver)
+  });
+}
+
+export async function inspectGuardRepository({ repoRoot, paths, logger = () => {} } = {}) {
+  if (typeof logger !== "function") throw coded("guard_preflight_invalid_arguments");
+  let lineage;
+  try {
+    lineage = await readRepositoryLineage({ repoRoot });
+  } catch (error) {
+    if (error?.code !== "lineage_not_initialized") throw error;
+    const result = repositoryProjection({
+      repositoryState: "uninitialized", lineageId: null,
+      legacyState: "absent", storeState: "absent"
+    });
+    logger(Object.freeze({
+      action: "repository_preflight", effectiveState: result.repositoryState,
+      reasonCode: "lineage_not_initialized"
+    }));
+    return result;
+  }
+
+  const root = await secureRepoRoot(repoRoot);
+  const transitionLocked = await inspectTransitionLock(root);
+  const legacyState = await inspectCanonicalLegacyState(root);
+  let storeState = "absent";
+  let authority = null;
+  try {
+    await lstat(paths?.controlDatabase);
+    const store = openControlStoreReadOnly({ paths });
+    try {
+      authority = store.getGuardAuthority({
+        authorityTaskUid: guardAuthorityTaskUid(lineage.lineageId)
+      });
+      storeState = "valid";
+    } finally {
+      store.close();
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw coded("control_store_invalid");
+  }
+
+  const imported = Boolean(authority?.imported);
+  const cutOver = authority?.authority === "afl_sqlite" && imported;
+  let repositoryState;
+  if (transitionLocked) repositoryState = "transition_locked";
+  else if (legacyState === "valid") repositoryState = cutOver ? "afl_sqlite" : "legacy_guard";
+  else repositoryState = storeState === "valid" ? "afl_sqlite" : "fresh_afl_eligible";
+  const result = repositoryProjection({
+    repositoryState, lineageId: lineage.lineageId, legacyState, storeState, imported, cutOver
+  });
+  logger(Object.freeze({
+    action: "repository_preflight", effectiveState: result.repositoryState,
+    reasonCode: transitionLocked ? "transition_lock_present"
+      : legacyState === "valid" && !cutOver ? "legacy_authoritative"
+        : storeState === "valid" ? "store_valid" : "store_absent"
+  }));
+  return result;
 }
 
 function taskProjection({ lineageId, taskId, authority = false }) {

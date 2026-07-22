@@ -1375,6 +1375,36 @@ describe("agent-feedback-loop package", () => {
     await mkdir(repoRoot, { mode: 0o700 });
     await execFileAsync("git", ["init", "-q", repoRoot]);
     try {
+      await assert.rejects(
+        execFileAsync(BIN, [
+          "guard", "--repo-root", repoRoot, "--home", home,
+          "record-review",
+          "--task-id", "task-4", "--invariant-id", "cli-writer", "--boundary", "cli-boundary",
+          "--review-run-id", "cli-review-1", "--severity", "Important",
+          "--verdict", "approved", "--commit", "deadbeef", "--review-ref", "reviews/cli-1.md"
+        ], { env: { ...process.env, HOME: root } }),
+        (error) => {
+          assert.equal(error.code, 6);
+          assert.deepEqual(JSON.parse(String(error.stdout)), { error: "lineage_not_initialized" });
+          return true;
+        }
+      );
+      await assert.rejects(stat(home));
+      await execFileAsync(BIN, ["lineage-init", "--repo-root", repoRoot, "--apply"], {
+        env: { ...process.env, HOME: root }
+      });
+      await assert.rejects(
+        execFileAsync(BIN, [
+          "guard", "--repo-root", repoRoot, "--home", home,
+          "record-review", "--unknown", "private-value"
+        ], { env: { ...process.env, HOME: root } }),
+        (error) => {
+          assert.equal(error.code, 2);
+          assert.deepEqual(JSON.parse(String(error.stdout)), { error: "guard_invalid_arguments" });
+          return true;
+        }
+      );
+      await assert.rejects(stat(home));
       const valid = await execFileAsync(BIN, [
         "guard", "--repo-root", repoRoot, "--home", home,
         "record-review",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { lstat, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +10,8 @@ import {
   deriveTaskUid,
   digestDecisionBasis,
   ensureRepositoryLineage,
-  projectContract
+  projectContract,
+  readRepositoryLineage
 } from "../src/convergence-identity.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -56,6 +57,20 @@ test("linked worktrees share one private lineage while separate clones do not", 
   assert.notEqual(a.lineageId, c.lineageId);
   assert.match(a.lineageId, /^[a-f0-9]{64}$/u);
   assert.equal((await lstat(path.join(a.commonDir, "afl-lineage-id"))).mode & 0o777, 0o600);
+});
+
+test("readRepositoryLineage reports missing identity without changing the Git common directory", async (t) => {
+  const fixture = await gitFixture();
+  t.after(() => removeFixture(fixture.root));
+  const commonDir = path.join(fixture.root, ".git");
+  const before = (await readdir(commonDir)).sort();
+
+  await assert.rejects(
+    readRepositoryLineage({ repoRoot: fixture.root }),
+    (error) => error?.code === "lineage_not_initialized"
+  );
+
+  assert.deepEqual((await readdir(commonDir)).sort(), before);
 });
 
 test("inferred requirements remain advisory and cannot raise importance", () => {

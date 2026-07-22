@@ -36,6 +36,7 @@ async function harness(name) {
   await mkdir(repoRoot, { mode: 0o700 });
   await mkdir(path.join(repoRoot, ".superpowers", "sdd"), { recursive: true, mode: 0o700 });
   execFileSync("git", ["init", "-q", repoRoot]);
+  await ensureRepositoryLineage({ repoRoot });
   let currentTime = new Date("2026-07-21T00:00:00.000Z");
   const now = () => new Date(currentTime);
   const store = initializeControlStore({ paths: pathsFor(home), now });
@@ -242,7 +243,7 @@ test("authorize-fix resumes a completed Probe through the existing SDD boundary"
   ).get().count, 1);
 });
 
-test("existing v1 task projection upgrades through a revision-bound immutable event", async (t) => {
+test("status leaves an existing v1 task projection unchanged", async (t) => {
   const h = await harness("open-first-failure");
   t.after(() => h.store.close());
   const lineage = await ensureRepositoryLineage({ repoRoot: h.repoRoot });
@@ -275,12 +276,18 @@ test("existing v1 task projection upgrades through a revision-bound immutable ev
     importanceAuthority: contract.importanceAuthority
   });
 
+  const eventsBefore = h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count;
   await h.command(["status", "--task-id", h.state.task_id]);
 
   assert.equal(h.store.database.prepare(
     "SELECT policy_revision FROM convergence_tasks WHERE task_uid=?"
   ).get(taskUid).policy_revision,
-  createHash("sha256").update("convergence-policy-v2").digest("hex"));
+  createHash("sha256").update("convergence-policy-v1").digest("hex"));
+  assert.equal(h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events"
+  ).get().count, eventsBefore);
 });
 
 test("minor changes-required is audited without authorizing or consuming failure count", async (t) => {
@@ -425,6 +432,7 @@ test("the same SDD loop coordinates remain isolated across repository lineages",
   for (const repoRoot of repos) {
     await mkdir(repoRoot, { mode: 0o700 });
     execFileSync("git", ["init", "-q", repoRoot]);
+    await ensureRepositoryLineage({ repoRoot });
   }
   const args = [
     "record-review",
@@ -797,6 +805,25 @@ test("status and lock-status are bounded Store projections and strict parsing re
   }
 });
 
+test("status and lock-status accept an uninitialized preflight without a Store", async () => {
+  const preflight = Object.freeze({
+    repositoryState: "uninitialized", lineageId: null,
+    legacyState: "absent", storeState: "absent", imported: false, cutOver: false
+  });
+  const statusResult = await runGuardCommand({
+    args: ["status", "--task-id", "task-a"], repoRoot: "/not-read", preflight
+  });
+  assert.deepEqual(statusResult, {
+    authority: "uninitialized", task_id: null, loops: [], exitCode: 0
+  });
+  const lockResult = await runGuardCommand({
+    args: ["lock-status"], repoRoot: "/not-read", preflight
+  });
+  assert.deepEqual(lockResult, {
+    authority: "uninitialized", locked: false, journal_mode: "unknown", exitCode: 0
+  });
+});
+
 test("SDD adapter routes every official read and write through persisted Guard authority", async (t) => {
   const h = await harness("open-first-failure");
   t.after(() => h.store.close());
@@ -847,7 +874,7 @@ test("SDD adapter routes every official read and write through persisted Guard a
     authorityResolver: authorityResolver("afl_sqlite")
   });
   assert.equal(aflStatus.authority, "afl_sqlite");
-  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 1);
+  assert.equal(h.store.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 0);
 });
 
 test("SDD adapter delegates grant authority to the convergence controller", async () => {

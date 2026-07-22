@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,7 +19,8 @@ import {
   CONTROL_STORE_UNAVAILABLE,
   initializeControlStore,
   listUserTables,
-  openControlStore
+  openControlStore,
+  openControlStoreReadOnly
 } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
@@ -370,6 +371,42 @@ test("runtime open does not create a missing control database", () => {
     (error) => error?.code === CONTROL_STORE_UNAVAILABLE
   );
   assert.throws(() => statSync(paths.controlDatabase), /ENOENT/);
+});
+
+test("read-only Store inspection creates no database journal or schema bytes", () => {
+  const { paths } = fixture();
+  const initialized = initializeControlStore({ paths });
+  initialized.close();
+  const before = readFileSync(paths.controlDatabase);
+  const wal = `${paths.controlDatabase}-wal`;
+  const shm = `${paths.controlDatabase}-shm`;
+  assert.equal(existsSync(wal), false);
+  assert.equal(existsSync(shm), false);
+
+  const store = openControlStoreReadOnly({ paths });
+  assert.deepEqual(listUserTables(store.database), ALLOWED_CONTROL_TABLES);
+  store.close();
+
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+  assert.equal(existsSync(wal), false);
+  assert.equal(existsSync(shm), false);
+});
+
+test("read-only Store inspection rejects missing and invalid stores without creating bytes", () => {
+  const { paths } = fixture();
+  assert.throws(
+    () => openControlStoreReadOnly({ paths }),
+    (error) => error?.code === CONTROL_STORE_UNAVAILABLE
+  );
+  assert.equal(existsSync(paths.controlDatabase), false);
+
+  mkdirSync(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  writeFileSync(paths.controlDatabase, "not-sqlite", { mode: 0o600 });
+  const before = readFileSync(paths.controlDatabase);
+  assert.throws(() => openControlStoreReadOnly({ paths }));
+  assert.deepEqual(readFileSync(paths.controlDatabase), before);
+  assert.equal(existsSync(`${paths.controlDatabase}-wal`), false);
+  assert.equal(existsSync(`${paths.controlDatabase}-shm`), false);
 });
 
 test("runtime open rejects a mismatched schema without changing the database", () => {

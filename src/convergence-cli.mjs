@@ -1,12 +1,18 @@
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
-import { initializeControlStore } from "./control-store.mjs";
+import {
+  initializeControlStore,
+  openControlStore,
+  openControlStoreReadOnly
+} from "./control-store.mjs";
+import { readRepositoryLineage } from "./convergence-identity.mjs";
 import { launchDetachedConvergenceProbe } from "./convergence-probe-launcher.mjs";
 import {
   applyGuardImport,
   compareGuardShadow,
   cutoverGuard,
+  inspectGuardRepository,
   inspectGuardImport,
   rollbackGuardCutover
 } from "./convergence-migration.mjs";
@@ -172,9 +178,11 @@ export async function executeGuardCli(args) {
   let store = null;
   try {
     const parsed = parseGuardCliArgs(args);
+    const paths = pathsFor(parsed.home);
     if (parsed.migration) {
       const migration = parseMigrationArgs(parsed.commandArgs);
       if (migration.command === "import" && migration.values["--dry-run"] === true) {
+        await readRepositoryLineage({ repoRoot: parsed.repoRoot });
         const inertStore = Object.freeze({ transactionalGuardImport() {
           throw Object.assign(new Error("guard_dry_run_store_write"), { code: "guard_dry_run_store_write" });
         } });
@@ -183,17 +191,67 @@ export async function executeGuardCli(args) {
         });
         return Object.freeze({ payload, exitCode: 0, stderrCode: null });
       }
-      store = initializeControlStore({ paths: pathsFor(parsed.home) });
+      if (migration.command === "import") {
+        await readRepositoryLineage({ repoRoot: parsed.repoRoot });
+        const inertStore = Object.freeze({ transactionalGuardImport() {
+          throw Object.assign(new Error("guard_import_store_write"), { code: "guard_import_store_write" });
+        } });
+        const plan = await inspectGuardImport({
+          repoRoot: parsed.repoRoot,
+          stateFile: migration.values["--state-file"],
+          store: inertStore
+        });
+        const preflight = await inspectGuardRepository({ repoRoot: parsed.repoRoot, paths });
+        if (preflight.repositoryState === "transition_locked") {
+          throw Object.assign(new Error("guard_authority_locked"), { code: "guard_authority_locked" });
+        }
+        store = preflight.storeState === "valid"
+          ? openControlStore({ paths }) : initializeControlStore({ paths });
+        const payload = Object.freeze({
+          status: "applied", ...(await applyGuardImport({ plan, store }))
+        });
+        return Object.freeze({ payload, exitCode: 0, stderrCode: null });
+      }
+      const preflight = await inspectGuardRepository({ repoRoot: parsed.repoRoot, paths });
+      if (preflight.repositoryState === "uninitialized") {
+        throw Object.assign(new Error("lineage_not_initialized"), { code: "lineage_not_initialized" });
+      }
+      if (preflight.repositoryState === "transition_locked") {
+        throw Object.assign(new Error("guard_authority_locked"), { code: "guard_authority_locked" });
+      }
+      if (preflight.storeState !== "valid") {
+        throw Object.assign(new Error("control_store_unavailable"), { code: "control_store_unavailable" });
+      }
+      store = openControlStore({ paths });
       const payload = await executeMigrationCommand({
         parsed: migration, repoRoot: parsed.repoRoot, store
       });
       return Object.freeze({ payload, exitCode: 0, stderrCode: null });
     }
-    store = initializeControlStore({ paths: pathsFor(parsed.home) });
+    const preflight = await inspectGuardRepository({ repoRoot: parsed.repoRoot, paths });
+    const command = parsed.commandArgs[0];
+    const readOnly = command === "status" || command === "lock-status";
+    if (readOnly && preflight.storeState === "valid") {
+      store = openControlStoreReadOnly({ paths });
+    } else if (!readOnly && preflight.repositoryState === "fresh_afl_eligible") {
+      try {
+        await runGuardCommand({
+          args: parsed.commandArgs,
+          repoRoot: parsed.repoRoot,
+          preflight
+        });
+      } catch (error) {
+        if (error?.code !== "control_store_required") throw error;
+      }
+      store = initializeControlStore({ paths });
+    } else if (!readOnly && preflight.repositoryState === "afl_sqlite") {
+      store = openControlStore({ paths });
+    }
     const result = await runGuardCommand({
       args: parsed.commandArgs,
       repoRoot: parsed.repoRoot,
       store,
+      preflight,
       launchProbe: ({ taskUid, fingerprint }) => launchDetachedConvergenceProbe({
         platform: process.platform,
         nodeExecutable: process.execPath,

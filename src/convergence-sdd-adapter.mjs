@@ -6,8 +6,8 @@ import path from "node:path";
 import {
   deriveTaskUid,
   digestDecisionBasis,
-  ensureRepositoryLineage,
-  projectContract
+  projectContract,
+  readRepositoryLineage
 } from "./convergence-identity.mjs";
 import {
   authorizeAfterProbe,
@@ -172,7 +172,7 @@ function summary(loop, action, exitCode, architectureFixCount = 0) {
 }
 
 async function ensureTask({ store, repoRoot, taskId }) {
-  const lineage = await ensureRepositoryLineage({ repoRoot });
+  const lineage = await readRepositoryLineage({ repoRoot });
   const contract = projectContract({
     sourceKind: "approved_plan",
     sourceRef: `sdd-task:${taskId}`,
@@ -244,9 +244,8 @@ function decisionRequest({ contract, loop, priorBasis, lastPurpose }) {
   };
 }
 
-async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
+function reviewCommandInput(parsed) {
   const key = keyFrom(parsed.values);
-  const { contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
   const severity = normalizeAuditText(parsed.values["--severity"]).toLowerCase();
   const verdict = normalizeAuditText(parsed.values["--verdict"]).toLowerCase();
   const directionSignal = Object.hasOwn(parsed.values, "--direction-signal")
@@ -278,17 +277,6 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
     throw coded("guard_invalid_arguments");
   }
   const reviewRunId = normalizeId(parsed.values["--review-run-id"]);
-  const prior = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
-  const fingerprint = prior?.fingerprint ?? fingerprintFor(task.taskUid, key);
-  const reviewUid = reviewEventUid(task.taskUid, fingerprint, reviewRunId);
-  const replayEvent = store.database.prepare(
-    "SELECT * FROM convergence_events WHERE event_uid=?"
-  ).get(reviewUid);
-  if (!prior && !replayEvent) {
-    const candidates = store.database.prepare(`SELECT 1 FROM convergence_loops
-      WHERE task_uid=? AND boundary_id=? LIMIT 1`).get(task.taskUid, key.boundary);
-    if (candidates) throw coded("invariant_classification_required");
-  }
   const auditEnvelope = Object.freeze({
     reviewRunId,
     taskId: key.taskId,
@@ -307,13 +295,34 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
   const evidenceDigest = countedFailure
     ? sha256(auditEnvelope.newEvidence)
     : sha256(`${verdict}:${reviewRunId}`);
+  return Object.freeze({
+    key, severity, verdict, directionSignal, countedFailure, reviewRunId,
+    auditEnvelope, evidenceDigest, basis: digestDecisionBasis(auditEnvelope)
+  });
+}
+
+async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
+  const request = reviewCommandInput(parsed);
+  const { key, severity, verdict, directionSignal, countedFailure, reviewRunId,
+    auditEnvelope, evidenceDigest, basis } = request;
+  const { contract, task } = await ensureTask({ store, repoRoot, taskId: key.taskId });
+  const prior = loopByIdentity(store, task.taskUid, key.boundary, key.invariantId);
+  const fingerprint = prior?.fingerprint ?? fingerprintFor(task.taskUid, key);
+  const reviewUid = reviewEventUid(task.taskUid, fingerprint, reviewRunId);
+  const replayEvent = store.database.prepare(
+    "SELECT * FROM convergence_events WHERE event_uid=?"
+  ).get(reviewUid);
+  if (!prior && !replayEvent) {
+    const candidates = store.database.prepare(`SELECT 1 FROM convergence_loops
+      WHERE task_uid=? AND boundary_id=? LIMIT 1`).get(task.taskUid, key.boundary);
+    if (candidates) throw coded("invariant_classification_required");
+  }
   if (countedFailure && prior && !replayEvent) {
     const historical = store.database.prepare(`SELECT 1 FROM convergence_events
       WHERE task_uid=? AND fingerprint=? AND event_type='review_recorded'
         AND evidence_digest=? LIMIT 1`).get(task.taskUid, prior.fingerprint, evidenceDigest);
     if (historical) throw coded("evidence_not_new");
   }
-  const basis = digestDecisionBasis(auditEnvelope);
   let loop = store.recordConvergenceReview({
     eventUid: reviewUid,
     taskUid: task.taskUid,
@@ -400,26 +409,24 @@ function loopStatus(store, loop) {
 
 async function status({ parsed, repoRoot, store, lineage, authority }) {
   const taskId = normalizeId(parsed.values["--task-id"]);
-  const task = authority.authority === "afl_sqlite"
-    ? (await ensureTask({ store, repoRoot, taskId })).task
-    : Object.freeze({ taskUid: deriveTaskUid({
-      lineageId: lineage.lineageId, adapterKind: "sdd", nativeTaskId: taskId
-    }) });
-  const rows = store.database.prepare(`SELECT fingerprint FROM convergence_loops
-    WHERE task_uid=? ORDER BY created_at, fingerprint`).all(task.taskUid);
+  const taskUid = lineage?.lineageId ? deriveTaskUid({
+    lineageId: lineage.lineageId, adapterKind: "sdd", nativeTaskId: taskId
+  }) : null;
+  const rows = store && taskUid ? store.database.prepare(`SELECT fingerprint FROM convergence_loops
+    WHERE task_uid=? ORDER BY created_at, fingerprint`).all(taskUid) : [];
   return Object.freeze({
     authority: authority.authority,
-    task_id: task.taskUid,
+    task_id: taskUid,
     loops: Object.freeze(rows.map((row) => loopStatus(
       store,
-      store.getConvergenceStatus({ taskUid: task.taskUid, fingerprint: row.fingerprint })
+      store.getConvergenceStatus({ taskUid, fingerprint: row.fingerprint })
     ))),
     exitCode: 0
   });
 }
 
 function lockStatus(store, authority) {
-  const row = store.database.prepare("PRAGMA journal_mode").get();
+  const row = store?.database.prepare("PRAGMA journal_mode").get();
   return Object.freeze({
     authority: authority.authority,
     locked: authority.authority === "transition_locked",
@@ -806,7 +813,7 @@ async function consumeGrant({ parsed, repoRoot, store, artifactHooks }) {
     }
     const grant = artifact?.continuation_grant;
     if (artifact?.version !== 1 || !grant || typeof grant !== "object") throw coded("grant_artifact_invalid");
-    const lineage = await ensureRepositoryLineage({ repoRoot });
+    const lineage = await readRepositoryLineage({ repoRoot });
     if (grant.lineageDigest !== sha256(lineage.lineageId)) throw coded("grant_repository_mismatch");
     if (grant.purpose === "architecture_fix") {
       if (typeof grant.checkpointFile !== "string" || typeof grant.checkpointDigest !== "string") {
@@ -866,28 +873,52 @@ export async function runGuardCommand({
   args,
   repoRoot,
   store,
+  preflight,
   now = () => new Date(),
   launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
   artifactHooks: rawArtifactHooks,
   authorityResolver = readGuardAdapterAuthority
 }) {
-  if (typeof repoRoot !== "string" || !store || typeof now !== "function"
+  if (typeof repoRoot !== "string" || typeof now !== "function"
       || typeof launchProbe !== "function" || typeof authorityResolver !== "function") {
     throw coded("guard_invalid_arguments");
   }
   const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
-  const lineage = await ensureRepositoryLineage({ repoRoot });
-  const authority = await authorityResolver({ repoRoot, store, lineageId: lineage.lineageId });
-  if (!authority || !["afl_sqlite", "legacy_guard", "transition_locked"].includes(authority.authority)) {
+  let repository = preflight;
+  if (repository === undefined) {
+    if (!store) throw coded("guard_invalid_arguments");
+    const lineage = await readRepositoryLineage({ repoRoot });
+    const authority = await authorityResolver({ repoRoot, store, lineageId: lineage.lineageId });
+    repository = Object.freeze({
+      repositoryState: authority?.authority,
+      lineageId: lineage.lineageId,
+      legacyState: authority?.authority === "legacy_guard" ? "valid" : "absent",
+      storeState: "valid",
+      imported: Boolean(authority?.imported),
+      cutOver: authority?.authority === "afl_sqlite" && Boolean(authority?.imported)
+    });
+  }
+  if (!repository || ![
+    "uninitialized", "transition_locked", "legacy_guard", "fresh_afl_eligible", "afl_sqlite"
+  ].includes(repository.repositoryState)) {
     throw coded("guard_authority_invalid");
   }
+  const lineage = repository.lineageId === null
+    ? null : Object.freeze({ lineageId: repository.lineageId });
+  const authority = Object.freeze({ authority: repository.repositoryState });
   if (parsed.command === "status") {
     return status({ parsed, repoRoot, store, lineage, authority });
   }
   if (parsed.command === "lock-status") return lockStatus(store, authority);
-  if (authority.authority === "transition_locked") throw coded("guard_authority_locked");
-  if (authority.authority !== "afl_sqlite") throw coded("legacy_guard_authoritative");
+  if (repository.repositoryState === "uninitialized") throw coded("lineage_not_initialized");
+  if (repository.repositoryState === "transition_locked") throw coded("guard_authority_locked");
+  if (repository.repositoryState === "legacy_guard") throw coded("legacy_guard_authoritative");
+  if (repository.repositoryState === "fresh_afl_eligible") {
+    if (parsed.command !== "record-review") throw coded("guard_state_uninitialized");
+    reviewCommandInput(parsed);
+  }
+  if (!store) throw coded("control_store_required");
   if (parsed.command === "record-review") {
     return recordReview({ parsed, repoRoot, store, now, launchProbe });
   }

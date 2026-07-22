@@ -2,19 +2,21 @@ import assert from "node:assert/strict";
 import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile
+  chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat,
+  symlink, unlink, writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
-import { initializeControlStore } from "../src/control-store.mjs";
+import { initializeControlStore, openControlStoreReadOnly } from "../src/control-store.mjs";
 import { ensureRepositoryLineage } from "../src/convergence-identity.mjs";
 import {
   applyGuardImport,
   compareGuardShadow,
   cutoverGuard,
+  inspectGuardRepository,
   inspectGuardImport,
   rollbackGuardCutover
 } from "../src/convergence-migration.mjs";
@@ -141,6 +143,347 @@ const PASSING_COMPARISONS = Object.freeze([
   Object.freeze({ field: "failure_generation", legacy: 2, kernel: 2 }),
   Object.freeze({ field: "authorization_eligibility", legacy: false, kernel: false })
 ]);
+
+function repositoryProjection(overrides = {}) {
+  return {
+    repositoryState: "legacy_guard",
+    lineageId: overrides.lineageId,
+    legacyState: "valid",
+    storeState: "absent",
+    imported: false,
+    cutOver: false,
+    ...overrides
+  };
+}
+
+async function snapshotTree(target) {
+  let info;
+  try { info = await lstat(target); } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  const mode = info.mode & 0o777;
+  if (info.isSymbolicLink()) return { type: "symlink", mode, target: await readlink(target) };
+  if (info.isFile()) return { type: "file", mode, digest: sha256(await readFile(target)) };
+  if (!info.isDirectory()) return { type: "other", mode };
+  const entries = {};
+  for (const name of (await readdir(target)).sort()) {
+    entries[name] = await snapshotTree(path.join(target, name));
+  }
+  return { type: "directory", mode, entries };
+}
+
+function allGuardInvocations(h) {
+  const key = ["--task-id", "task-a", "--invariant-id", "single-writer", "--boundary", "state-store"];
+  const artifact = path.join(h.repoRoot, ".superpowers", "sdd", "artifact.json");
+  const global = ["--repo-root", h.repoRoot, "--home", h.home];
+  return [
+    { command: "status", args: [...global, "status", "--task-id", "task-a"] },
+    { command: "lock-status", args: [...global, "lock-status"] },
+    { command: "record-review", args: [...global, "record-review", ...key,
+      "--review-run-id", "review-a", "--severity", "Important", "--verdict", "approved",
+      "--commit", "commit-a", "--review-ref", "reviews/a.md"] },
+    { command: "add-alias", args: [...global, "add-alias", "--alias", "alias-a", "--canonical", "single-writer"] },
+    { command: "declare-distinct", args: [...global, "declare-distinct", ...key,
+      "--reason", "separate cause", "--evidence", "verified evidence"] },
+    { command: "checkpoint", args: [...global, "checkpoint", ...key, "--file", artifact] },
+    { command: "authorize-fix", args: [...global, "authorize-fix", ...key,
+      "--mode", "local_fix", "--grant-file", artifact] },
+    { command: "consume-grant", args: [...global, "consume-grant",
+      "--grant-file", artifact, "--brief-ref", "brief.md"] },
+    { command: "consume-receipt", args: [...global, "consume-receipt",
+      "--receipt-file", artifact, "--brief-ref", "brief.md"] },
+    { command: "resolve", args: [...global, "resolve", ...key,
+      "--action", "close", "--decision-ref", "approved-design"] },
+    { command: "import", args: [...global, "import", "--state-file", h.stateFile, "--dry-run"] },
+    { command: "import", args: [...global, "import", "--state-file", h.stateFile, "--apply"] },
+    { command: "shadow", args: [...global, "shadow", "--state-file", h.stateFile,
+      "--legacy-decision", "direction_review_required", "--kernel-decision", "checkpoint_required",
+      "--legacy-action", "direction_review", "--kernel-action", "checkpoint",
+      "--legacy-generation", "2", "--kernel-generation", "2",
+      "--legacy-eligible", "false", "--kernel-eligible", "false"] },
+    { command: "cutover", args: [...global, "cutover", "--state-file", h.stateFile,
+      "--parity-set-digest", "a".repeat(64), "--decision-ref", "approved", "--apply"] },
+    { command: "rollback", args: [...global, "rollback", "--state-file", h.stateFile,
+      "--authority-task-uid", "a".repeat(64), "--cutover-event-uid", "cutover-event",
+      "--decision-ref", "approved", "--apply"] }
+  ];
+}
+
+test("lineage-free preflight returns uninitialized before inspecting HOME", async () => {
+  const h = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const commonBefore = (await readdir(path.join(h.repoRoot, ".git"))).sort();
+  const repoBefore = (await readdir(h.repoRoot)).sort();
+  const poisonedPaths = new Proxy({}, {
+    get() { throw new Error("HOME inspected before lineage"); }
+  });
+
+  const result = await inspectGuardRepository({ repoRoot: h.repoRoot, paths: poisonedPaths });
+
+  assert.deepEqual(result, {
+    repositoryState: "uninitialized",
+    lineageId: null,
+    legacyState: "absent",
+    storeState: "absent",
+    imported: false,
+    cutOver: false
+  });
+  assert.deepEqual((await readdir(path.join(h.repoRoot, ".git"))).sort(), commonBefore);
+  assert.deepEqual((await readdir(h.repoRoot)).sort(), repoBefore);
+  await assert.rejects(stat(h.home));
+});
+
+test("no Guard command implicitly initializes lineage or control state", async () => {
+  const template = await migrationHarness({ initializeLineage: false, initializeStore: false });
+  const invocationCount = allGuardInvocations(template).length;
+  for (let index = 0; index < invocationCount; index += 1) {
+    const h = await migrationHarness({ initializeLineage: false, initializeStore: false });
+    const invocation = allGuardInvocations(h)[index];
+    const before = {
+      git: await snapshotTree(path.join(h.repoRoot, ".git")),
+      repo: await snapshotTree(h.repoRoot),
+      home: await snapshotTree(h.home)
+    };
+
+    const result = await executeGuardCli(invocation.args);
+
+    if (invocation.command === "status" || invocation.command === "lock-status") {
+      assert.equal(result.payload.authority, "uninitialized", invocation.command);
+    } else {
+      assert.equal(result.payload.error, "lineage_not_initialized", invocation.command);
+    }
+    assert.deepEqual({
+      git: await snapshotTree(path.join(h.repoRoot, ".git")),
+      repo: await snapshotTree(h.repoRoot),
+      home: await snapshotTree(h.home)
+    }, before, invocation.command);
+  }
+});
+
+test("fresh repositories retain no Store after impossible or semantically invalid mutations", async () => {
+  for (const commandArgs of [
+    ["add-alias", "--alias", "alias-a", "--canonical", "missing-loop"],
+    [
+      "record-review",
+      "--task-id", "task-a", "--invariant-id", "single-writer", "--boundary", "state-store",
+      "--review-run-id", "review-invalid", "--severity", "not-a-severity",
+      "--verdict", "approved", "--commit", "commit-a", "--review-ref", "reviews/a.md"
+    ]
+  ]) {
+    const h = await migrationHarness({ initializeStore: false });
+    await unlink(h.stateFile);
+    const before = {
+      git: await snapshotTree(path.join(h.repoRoot, ".git")),
+      repo: await snapshotTree(h.repoRoot),
+      home: await snapshotTree(h.home)
+    };
+
+    const result = await executeGuardCli([
+      "--repo-root", h.repoRoot, "--home", h.home, ...commandArgs
+    ]);
+
+    assert.ok(result.payload.error, commandArgs[0]);
+    assert.deepEqual({
+      git: await snapshotTree(path.join(h.repoRoot, ".git")),
+      repo: await snapshotTree(h.repoRoot),
+      home: await snapshotTree(h.home)
+    }, before, commandArgs[0]);
+  }
+});
+
+test("lineage-initialized read commands remain Store-free or read-only under concurrency", async () => {
+  const h = await migrationHarness({ initializeStore: false });
+  await unlink(h.stateFile);
+  const common = ["--repo-root", h.repoRoot, "--home", h.home];
+  const reads = await Promise.all(Array.from({ length: 8 }, (_, index) => index % 2 === 0
+    ? executeGuardCli([...common, "status", "--task-id", "task-a"])
+    : executeGuardCli([...common, "lock-status"])));
+  for (const result of reads) {
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.payload.authority, "fresh_afl_eligible");
+    if (Object.hasOwn(result.payload, "loops")) assert.deepEqual(result.payload.loops, []);
+    else assert.equal(result.payload.journal_mode, "unknown");
+  }
+  await assert.rejects(stat(h.home));
+
+  const paths = pathsFor(h.home);
+  const initialized = initializeControlStore({ paths });
+  initialized.close();
+  const before = await readFile(paths.controlDatabase);
+  const storedReads = await Promise.all(Array.from({ length: 8 }, () => executeGuardCli([
+    ...common, "status", "--task-id", "task-a"
+  ])));
+  assert.ok(storedReads.every((result) => result.payload.authority === "afl_sqlite"
+    && result.payload.loops.length === 0));
+  const inspected = openControlStoreReadOnly({ paths });
+  assert.equal(inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count, 0);
+  assert.equal(inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count, 0);
+  inspected.close();
+  assert.deepEqual(await readFile(paths.controlDatabase), before);
+  await assert.rejects(stat(`${paths.controlDatabase}-wal`));
+  await assert.rejects(stat(`${paths.controlDatabase}-shm`));
+});
+
+test("CLI keeps unimported and imported legacy authoritative until exact cutover and after rollback", async () => {
+  const h = await migrationHarness({ initializeStore: false });
+  const common = ["--repo-root", h.repoRoot, "--home", h.home];
+  const review = [
+    "record-review", "--task-id", "task-new", "--invariant-id", "new-invariant",
+    "--boundary", "new-boundary", "--review-run-id", "new-review", "--severity", "Important",
+    "--verdict", "approved", "--commit", "new-commit", "--review-ref", "reviews/new.md"
+  ];
+  const unimported = await executeGuardCli([...common, ...review]);
+  assert.equal(unimported.payload.error, "legacy_guard_authoritative");
+  await assert.rejects(stat(h.home));
+
+  const imported = await executeGuardCli([
+    ...common, "import", "--state-file", h.stateFile, "--apply"
+  ]);
+  assert.equal(imported.payload.status, "applied");
+  const paths = pathsFor(h.home);
+  let inspected = openControlStoreReadOnly({ paths });
+  const importedCounts = {
+    tasks: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count,
+    events: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count
+  };
+  inspected.close();
+  const blockedAfterImport = await executeGuardCli([...common, ...review]);
+  assert.equal(blockedAfterImport.payload.error, "legacy_guard_authoritative");
+  inspected = openControlStoreReadOnly({ paths });
+  assert.deepEqual({
+    tasks: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count,
+    events: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count
+  }, importedCounts);
+  inspected.close();
+
+  const shadow = await executeGuardCli([
+    ...common, "shadow", "--state-file", h.stateFile,
+    "--legacy-decision", "direction_review_required", "--kernel-decision", "checkpoint_required",
+    "--legacy-action", "direction_review", "--kernel-action", "checkpoint",
+    "--legacy-generation", "2", "--kernel-generation", "2",
+    "--legacy-eligible", "false", "--kernel-eligible", "false"
+  ]);
+  const cutover = await executeGuardCli([
+    ...common, "cutover", "--state-file", h.stateFile,
+    "--parity-set-digest", shadow.payload.paritySetDigest,
+    "--decision-ref", "approved cutover", "--apply"
+  ]);
+  assert.equal(cutover.payload.authority, "afl_sqlite");
+  assert.equal((await executeGuardCli([...common, ...review])).payload.action, "closed");
+
+  const rollback = await executeGuardCli([
+    ...common, "rollback", "--state-file", h.stateFile,
+    "--authority-task-uid", imported.payload.authorityTaskUid,
+    "--cutover-event-uid", cutover.payload.cutoverEventUid,
+    "--decision-ref", "approved rollback", "--apply"
+  ]);
+  assert.equal(rollback.payload.authority, "legacy_guard");
+  inspected = openControlStoreReadOnly({ paths });
+  const rollbackCounts = {
+    tasks: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count,
+    events: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count
+  };
+  inspected.close();
+  assert.equal((await executeGuardCli([...common, ...review])).payload.error, "legacy_guard_authoritative");
+  inspected = openControlStoreReadOnly({ paths });
+  assert.deepEqual({
+    tasks: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_tasks").get().count,
+    events: inspected.database.prepare("SELECT COUNT(*) AS count FROM convergence_events").get().count
+  }, rollbackCounts);
+  inspected.close();
+});
+
+test("preflight distinguishes fresh, legacy, Store, and transition authority without writes", async () => {
+  const legacy = await migrationHarness({ initializeStore: false });
+  const lineageId = (await ensureRepositoryLineage({ repoRoot: legacy.repoRoot })).lineageId;
+  assert.deepEqual(
+    await inspectGuardRepository({ repoRoot: legacy.repoRoot, paths: pathsFor(legacy.home) }),
+    repositoryProjection({ lineageId })
+  );
+
+  await unlink(legacy.stateFile);
+  assert.deepEqual(
+    await inspectGuardRepository({ repoRoot: legacy.repoRoot, paths: pathsFor(legacy.home) }),
+    repositoryProjection({
+      repositoryState: "fresh_afl_eligible", lineageId,
+      legacyState: "absent"
+    })
+  );
+
+  const initialized = initializeControlStore({ paths: pathsFor(legacy.home) });
+  initialized.close();
+  const databaseBefore = await readFile(pathsFor(legacy.home).controlDatabase);
+  assert.deepEqual(
+    await inspectGuardRepository({ repoRoot: legacy.repoRoot, paths: pathsFor(legacy.home) }),
+    repositoryProjection({
+      repositoryState: "afl_sqlite", lineageId,
+      legacyState: "absent", storeState: "valid"
+    })
+  );
+  assert.deepEqual(await readFile(pathsFor(legacy.home).controlDatabase), databaseBefore);
+  await assert.rejects(stat(`${pathsFor(legacy.home).controlDatabase}-wal`));
+  await assert.rejects(stat(`${pathsFor(legacy.home).controlDatabase}-shm`));
+
+  const locked = await migrationHarness({ initializeStore: false });
+  await mkdir(path.join(locked.repoRoot, ".superpowers", "sdd", "review-loop-authority.lock"), {
+    mode: 0o700
+  });
+  const lockedLineage = (await ensureRepositoryLineage({ repoRoot: locked.repoRoot })).lineageId;
+  assert.deepEqual(
+    await inspectGuardRepository({ repoRoot: locked.repoRoot, paths: pathsFor(locked.home) }),
+    repositoryProjection({ repositoryState: "transition_locked", lineageId: lockedLineage })
+  );
+});
+
+test("preflight fails closed for corrupt, copied, unsafe, symlinked legacy and invalid Store state", async (t) => {
+  for (const mutation of ["corrupt", "copied", "mode", "symlink"]) {
+    await t.test(mutation, async () => {
+      const h = await migrationHarness({ initializeStore: false });
+      if (mutation === "corrupt") await writeFile(h.stateFile, "{", { mode: 0o600 });
+      if (mutation === "copied") {
+        h.state.repository_id = "0".repeat(64);
+        await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
+      }
+      if (mutation === "mode") await chmod(h.stateFile, 0o644);
+      if (mutation === "symlink") {
+        const target = `${h.stateFile}.target`;
+        await rename(h.stateFile, target);
+        await symlink(target, h.stateFile);
+      }
+      await assert.rejects(
+        inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) }),
+        (error) => error?.code?.startsWith("legacy_state_") || error?.code?.startsWith("source_")
+      );
+      await assert.rejects(stat(pathsFor(h.home).controlDatabase));
+    });
+  }
+
+  const invalidStore = await migrationHarness({ initializeStore: false });
+  await unlink(invalidStore.stateFile);
+  const paths = pathsFor(invalidStore.home);
+  await mkdir(path.dirname(paths.controlDatabase), { recursive: true, mode: 0o700 });
+  await writeFile(paths.controlDatabase, "not-sqlite", { mode: 0o600 });
+  const before = await readFile(paths.controlDatabase);
+  await assert.rejects(
+    inspectGuardRepository({ repoRoot: invalidStore.repoRoot, paths }),
+    (error) => error?.code === "control_store_invalid"
+  );
+  assert.deepEqual(await readFile(paths.controlDatabase), before);
+  await assert.rejects(stat(`${paths.controlDatabase}-wal`));
+  await assert.rejects(stat(`${paths.controlDatabase}-shm`));
+
+  const invalidLock = await migrationHarness({ initializeStore: false });
+  const lock = path.join(
+    invalidLock.repoRoot, ".superpowers", "sdd", "review-loop-authority.lock"
+  );
+  await mkdir(lock, { mode: 0o700 });
+  await chmod(lock, 0o755);
+  await assert.rejects(
+    inspectGuardRepository({ repoRoot: invalidLock.repoRoot, paths: pathsFor(invalidLock.home) }),
+    (error) => error?.code === "guard_authority_lock_invalid"
+  );
+  await assert.rejects(stat(pathsFor(invalidLock.home).controlDatabase));
+});
 
 function reviewArgs(event, { commit = event.commit } = {}) {
   const args = [
