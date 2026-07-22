@@ -33,6 +33,7 @@ const CONVERGENCE_MODULES = Object.freeze([
   "convergence-identity.mjs",
   "convergence-migration.mjs",
   "convergence-policy.mjs",
+  "convergence-probe-context.mjs",
   "convergence-probe-launcher.mjs",
   "convergence-probe-result.mjs",
   "convergence-probe-runner.mjs",

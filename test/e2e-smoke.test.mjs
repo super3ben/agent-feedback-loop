@@ -383,7 +383,7 @@ statusMessage = "Injecting feedback reflection prompt"
   assert.doesNotMatch(config, /Injecting feedback reflection prompt/u);
 });
 
-test("installed explicit-feedback hook fails open within two seconds while a real control writer is held", async (t) => {
+test("installed explicit-feedback hook fails open without waiting for a held control writer", async (t) => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-busy-prompt-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
@@ -424,7 +424,10 @@ test("installed explicit-feedback hook fails open within two seconds while a rea
   assert.equal(result.stdout, '{"continue":true}\n');
   assert.equal(result.stderr, "");
   assert.doesNotMatch(`${result.stdout}${result.stderr}`, /\[AFL\]|afl-receipt|Output this receipt|reviewer.*queued|hookPrompt|runner_transition/iu);
-  assert.ok(elapsedMs < 2_000, `expected fail-open in <2s, received ${elapsedMs}ms`);
+  // Must finish well below the 5s default SQLite busy timeout and the 6.5s writer
+  // hold: that proves the hook took the short-timeout fail-open path instead of
+  // blocking on the lock. 4s keeps that distinction with headroom for loaded hosts.
+  assert.ok(elapsedMs < 4_000, `expected fail-open below busy-timeout, received ${elapsedMs}ms`);
   t.diagnostic(`held-writer hook response elapsed ${elapsedMs}ms; writer cleanup is awaited separately`);
 
   const [exitCode] = await holderExit;

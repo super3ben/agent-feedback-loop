@@ -146,6 +146,7 @@ test("0.9.0 package includes every convergence module and exact Probe asset", as
     "src/convergence-identity.mjs",
     "src/convergence-migration.mjs",
     "src/convergence-policy.mjs",
+    "src/convergence-probe-context.mjs",
     "src/convergence-probe-launcher.mjs",
     "src/convergence-probe-result.mjs",
     "src/convergence-probe-runner.mjs",
