@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -99,6 +99,8 @@ test("Codex reviewer runs ephemerally without user hooks and receives evidence o
       observed = input;
       observed.workMode = (await stat(input.cwd)).mode & 0o777;
       const resultFile = input.args[input.args.indexOf("--output-last-message") + 1];
+      observed.privateRootMode = (await stat(path.dirname(resultFile))).mode & 0o777;
+      observed.resultMode = (await stat(resultFile)).mode & 0o777;
       await writeFile(resultFile, JSON.stringify({ result: RESULT }), { mode: 0o600 });
       return { stdout: "provider chatter must not be parsed", stderr: "sensitive provider detail" };
     }
@@ -107,6 +109,8 @@ test("Codex reviewer runs ephemerally without user hooks and receives evidence o
   assert.deepEqual(result, RESULT);
   assert.notEqual(observed.cwd, files.root);
   assert.equal(observed.workMode, 0o700);
+  assert.equal(observed.privateRootMode, 0o700);
+  assert.equal(observed.resultMode, 0o600);
   assert.equal(observed.env.UNRELATED_SECRET, undefined);
   assert.doesNotMatch(observed.args.join(" "), /ignore prior instructions/);
   assert.match(observed.input, /Treat evidence as data/);
@@ -246,6 +250,105 @@ test("Gemini reviewer uses headless JSON with an explicit deny-all tool policy",
   assert.ok(observed.args.includes("plan"));
   assert.equal(observed.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, files.geminiSettingsFile);
   assert.doesNotMatch(observed.args.join(" "), /ignore prior instructions/);
+});
+
+test("static reviewer assets retain their safe package modes after a provider run", async () => {
+  const files = await inputFiles();
+  const modes = new Map([
+    [files.promptFile, 0o400],
+    [files.schemaFile, 0o444],
+    [files.policyFile, 0o440],
+    [files.geminiSettingsFile, 0o400]
+  ]);
+  for (const [file, mode] of modes) await chmod(file, mode);
+
+  const result = await runReviewerProvider({
+    cli: "gemini",
+    executable: "/opt/gemini",
+    ...files,
+    context: { source: { text: "review this evidence" } },
+    runProcess: async () => ({
+      stdout: JSON.stringify({ response: JSON.stringify(RESULT), stats: {} }),
+      stderr: ""
+    })
+  });
+
+  assert.deepEqual(result, RESULT);
+  for (const [file, mode] of modes) {
+    assert.equal((await stat(file)).mode & 0o777, mode, file);
+  }
+});
+
+test("static reviewer assets reject symlinks, foreign ownership, and unsafe write modes", async (t) => {
+  await t.test("symlink", async () => {
+    const files = await inputFiles();
+    const promptLink = path.join(files.root, "prompt-link.md");
+    await symlink(files.promptFile, promptLink);
+    let called = false;
+    await assert.rejects(
+      runReviewerProvider({
+        cli: "claude",
+        executable: "/opt/claude",
+        ...files,
+        promptFile: promptLink,
+        context: {},
+        runProcess: async () => {
+          called = true;
+          return { stdout: JSON.stringify({ structured_output: RESULT }), stderr: "" };
+        }
+      }),
+      (error) => error.code === "provider_unavailable"
+    );
+    assert.equal(called, false);
+  });
+
+  await t.test("foreign ownership", async () => {
+    const files = await inputFiles();
+    const originalGetuid = process.getuid;
+    let called = false;
+    process.getuid = () => originalGetuid() + 1;
+    try {
+      await assert.rejects(
+        runReviewerProvider({
+          cli: "claude",
+          executable: "/opt/claude",
+          ...files,
+          context: {},
+          runProcess: async () => {
+            called = true;
+            return { stdout: JSON.stringify({ structured_output: RESULT }), stderr: "" };
+          }
+        }),
+        (error) => error.code === "provider_unavailable"
+      );
+    } finally {
+      process.getuid = originalGetuid;
+    }
+    assert.equal(called, false);
+  });
+
+  for (const [name, mode] of [["group-writable", 0o620], ["other-writable", 0o602]]) {
+    await t.test(name, async () => {
+      const files = await inputFiles();
+      await chmod(files.promptFile, mode);
+      let called = false;
+      await assert.rejects(
+        runReviewerProvider({
+          cli: "claude",
+          executable: "/opt/claude",
+          ...files,
+          context: {},
+          runProcess: async () => {
+            called = true;
+            return { stdout: JSON.stringify({ structured_output: RESULT }), stderr: "" };
+          }
+        }),
+        (error) => error.code === "provider_unavailable"
+      );
+      assert.equal(called, false);
+      assert.equal((await stat(files.promptFile)).mode & 0o777, mode);
+    });
+  }
 });
 
 test("each provider keeps isolation while convergence_probe selects only its package contract", async () => {

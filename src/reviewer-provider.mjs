@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -79,18 +79,22 @@ export async function resolveReviewerExecutable({ cli, env = process.env } = {})
   return null;
 }
 
-async function readPrivateFile(file, label) {
+async function readStaticAsset(file) {
+  let handle;
   try {
-    const info = await lstat(file);
-    if (!info.isFile() || info.isSymbolicLink()) throw providerError("provider_unavailable");
+    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = await handle.stat();
+    if (!info.isFile()) throw providerError("provider_unavailable");
     if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
       throw providerError("provider_unavailable");
     }
-    await chmod(file, 0o600);
-    return await readFile(file, "utf8");
+    if ((info.mode & 0o022) !== 0) throw providerError("provider_unavailable");
+    return await handle.readFile({ encoding: "utf8" });
   } catch (error) {
     if (error?.code === "provider_unavailable") throw error;
     throw providerError("provider_unavailable", error);
+  } finally {
+    await handle?.close().catch(() => {});
   }
 }
 
@@ -350,8 +354,8 @@ export async function runReviewerProvider({
     discriminator = owned.discriminator;
   }
   const [contract, schemaText] = await Promise.all([
-    readPrivateFile(promptFile, "reviewer prompt"),
-    readPrivateFile(schemaFile, "reviewer schema")
+    readStaticAsset(promptFile),
+    readStaticAsset(schemaFile)
   ]);
   const serializedContext = JSON.stringify(context);
   const input = [
@@ -371,8 +375,8 @@ export async function runReviewerProvider({
   if (cli === "gemini") {
     if (!policyFile || !geminiSettingsFile) throw providerError("provider_unavailable");
     await Promise.all([
-      readPrivateFile(policyFile, "Gemini reviewer policy"),
-      readPrivateFile(geminiSettingsFile, "Gemini reviewer settings")
+      readStaticAsset(policyFile),
+      readStaticAsset(geminiSettingsFile)
     ]);
   }
 
