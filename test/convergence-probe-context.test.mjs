@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
+import { rename, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import {
   buildConvergenceProbeEvidence,
   canonicalProbeEvidence,
+  ConvergenceProbeContextStore,
   validateConvergenceProbeEvidence
 } from "../src/convergence-probe-context.mjs";
+import { BlobKeyProvider } from "../src/crypto-store.mjs";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -112,6 +117,21 @@ function buildInput(overrides = {}) {
 
 function assertInvalid(value) {
   assert.throws(() => validateConvergenceProbeEvidence(value), TypeError);
+}
+
+async function storeFixture({ keyRootName = "keys" } = {}) {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-probe-context-"));
+  const root = path.join(home, "probe-context");
+  const keyRoot = path.join(home, keyRootName);
+  const store = new ConvergenceProbeContextStore({
+    root,
+    keyProvider: new BlobKeyProvider({ keyRoot })
+  });
+  return { home, root, keyRoot, store };
+}
+
+function artifactPath(root, digest) {
+  return path.join(root, `${digest}.enc`);
 }
 
 test("validator accepts the exact envelope and returns a detached deeply frozen value", () => {
@@ -375,4 +395,179 @@ test("builder validates the named producer and does not publish it in the exact 
   assert.deepEqual(Object.keys(built), [
     "version", "identity", "contract", "trigger", "recentGenerations", "reviewEvidence"
   ]);
+});
+
+test("context store publishes one private digest artifact and reuses identical canonical evidence", async (t) => {
+  const fixture = await storeFixture();
+  const concurrent = await storeFixture();
+  t.after(() => rm(fixture.home, { recursive: true, force: true }));
+  t.after(() => rm(concurrent.home, { recursive: true, force: true }));
+
+  const first = await fixture.store.put(envelope());
+  const replay = await fixture.store.put(structuredClone(envelope()));
+  const file = artifactPath(fixture.root, first.digest);
+
+  assert.deepEqual(first, { digest: first.digest, created: true });
+  assert.deepEqual(replay, { digest: first.digest, created: false });
+  assert.match(first.digest, /^[a-f0-9]{64}$/u);
+  assert.equal((await lstat(fixture.root)).mode & 0o777, 0o700);
+  assert.equal((await lstat(file)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(fixture.root), [`${first.digest}.enc`]);
+
+  const restored = await fixture.store.read(first.digest);
+  assert.deepEqual(restored, envelope());
+  assert.equal(Object.isFrozen(restored), true);
+  assert.equal(Object.isFrozen(restored.contract.acceptanceCriteria), true);
+
+  const contenders = await Promise.all(
+    Array.from({ length: 8 }, () => concurrent.store.put(structuredClone(envelope())))
+  );
+  assert.equal(contenders.filter(({ created }) => created).length, 1);
+  assert.equal(new Set(contenders.map(({ digest }) => digest)).size, 1);
+  assert.equal((await readdir(concurrent.root)).length, 1);
+});
+
+test("context store rejects permissive roots and artifacts without repairing their modes", async (t) => {
+  const permissiveRoot = await storeFixture();
+  t.after(() => rm(permissiveRoot.home, { recursive: true, force: true }));
+  await mkdir(permissiveRoot.root, { recursive: true, mode: 0o755 });
+  await chmod(permissiveRoot.root, 0o755);
+  await assert.rejects(() => permissiveRoot.store.put(envelope()), /probe_context_root_invalid/u);
+  assert.equal((await lstat(permissiveRoot.root)).mode & 0o777, 0o755);
+
+  const permissiveFile = await storeFixture();
+  t.after(() => rm(permissiveFile.home, { recursive: true, force: true }));
+  const publication = await permissiveFile.store.put(envelope());
+  const file = artifactPath(permissiveFile.root, publication.digest);
+  await chmod(file, 0o644);
+  await assert.rejects(() => permissiveFile.store.read(publication.digest), /probe_context_artifact_invalid/u);
+  assert.equal((await lstat(file)).mode & 0o777, 0o644);
+});
+
+test("context store rejects symlink and simulated unowned roots or artifacts", async (t) => {
+  const rootSymlink = await storeFixture();
+  const outside = await mkdtemp(path.join(tmpdir(), "afl-probe-outside-"));
+  t.after(() => rm(rootSymlink.home, { recursive: true, force: true }));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await symlink(outside, rootSymlink.root);
+  await assert.rejects(() => rootSymlink.store.put(envelope()), /probe_context_root_invalid/u);
+
+  const artifactSymlink = await storeFixture();
+  t.after(() => rm(artifactSymlink.home, { recursive: true, force: true }));
+  const target = path.join(artifactSymlink.home, "outside.enc");
+  await writeFile(target, "outside", { mode: 0o600 });
+  await mkdir(artifactSymlink.root, { recursive: true, mode: 0o700 });
+  const digest = "d".repeat(64);
+  await symlink(target, artifactPath(artifactSymlink.root, digest));
+  await assert.rejects(() => artifactSymlink.store.read(digest), /probe_context_artifact_invalid/u);
+  assert.equal(await readFile(target, "utf8"), "outside");
+
+  if (typeof process.getuid === "function") {
+    const unowned = await storeFixture();
+    t.after(() => rm(unowned.home, { recursive: true, force: true }));
+    const publication = await unowned.store.put(envelope());
+    const originalGetuid = process.getuid;
+    process.getuid = () => originalGetuid() + 1;
+    try {
+      await assert.rejects(() => unowned.store.read(publication.digest), /probe_context_root_invalid/u);
+    } finally {
+      process.getuid = originalGetuid;
+    }
+  }
+});
+
+test("context store rejects truncated, corrupt, wrong-key, replaced, and digest-mismatched artifacts", async (t) => {
+  const fixture = await storeFixture();
+  t.after(() => rm(fixture.home, { recursive: true, force: true }));
+  const publication = await fixture.store.put(envelope());
+  const file = artifactPath(fixture.root, publication.digest);
+  const original = await readFile(file);
+
+  for (const damaged of [original.subarray(0, 20), Buffer.from(original).fill(0, 40, 41)]) {
+    await writeFile(file, damaged, { mode: 0o600 });
+    await assert.rejects(() => fixture.store.read(publication.digest), /probe_context_artifact_invalid/u);
+    await writeFile(file, original, { mode: 0o600 });
+  }
+
+  const wrongKeyStore = new ConvergenceProbeContextStore({
+    root: fixture.root,
+    keyProvider: new BlobKeyProvider({ keyRoot: path.join(fixture.home, "wrong-key") })
+  });
+  await assert.rejects(() => wrongKeyStore.read(publication.digest), /probe_context_artifact_invalid/u);
+
+  const different = envelope();
+  different.contract.goalSummary = "A different approved goal";
+  const other = await fixture.store.put(different);
+  await rename(artifactPath(fixture.root, other.digest), file);
+  await assert.rejects(() => fixture.store.read(publication.digest), /probe_context_artifact_invalid/u);
+
+  const mismatchedName = "e".repeat(64);
+  await rename(file, artifactPath(fixture.root, mismatchedName));
+  await assert.rejects(() => fixture.store.read(mismatchedName), /probe_context_artifact_invalid/u);
+});
+
+test("context store removes only a verified artifact and never follows unsafe replacements", async (t) => {
+  const fixture = await storeFixture();
+  t.after(() => rm(fixture.home, { recursive: true, force: true }));
+  const publication = await fixture.store.put(envelope());
+  const file = artifactPath(fixture.root, publication.digest);
+
+  assert.equal(await fixture.store.remove(publication.digest), true);
+  assert.equal(await fixture.store.remove(publication.digest), false);
+
+  const target = path.join(fixture.home, "outside.enc");
+  await writeFile(target, "outside", { mode: 0o600 });
+  await symlink(target, file);
+  await assert.rejects(() => fixture.store.remove(publication.digest), /probe_context_artifact_invalid/u);
+  assert.equal(await readFile(target, "utf8"), "outside");
+  assert.equal((await lstat(file)).isSymbolicLink(), true);
+
+  await assert.rejects(() => fixture.store.remove("../outside"), /probe_context_digest_invalid/u);
+});
+
+test("orphan pruning inspects at most 32 entries and retains live or younger-than-24h contexts", async (t) => {
+  const fixture = await storeFixture();
+  t.after(() => rm(fixture.home, { recursive: true, force: true }));
+  const publications = [];
+  for (let index = 0; index < 35; index += 1) {
+    const value = envelope();
+    value.contract.goalSummary = `Bounded semantic evidence goal ${index}`;
+    publications.push(await fixture.store.put(value));
+  }
+
+  const now = Date.now();
+  for (const publication of publications) {
+    const old = new Date(now - 25 * 60 * 60 * 1_000);
+    await utimes(artifactPath(fixture.root, publication.digest), old, old);
+  }
+  const live = publications[0].digest;
+  const fresh = publications[1].digest;
+  const young = new Date(now - 23 * 60 * 60 * 1_000);
+  await utimes(artifactPath(fixture.root, fresh), young, young);
+
+  const result = await fixture.store.pruneOrphans(new Set([live]));
+  assert.equal(result.inspected, 32);
+  assert.equal(result.removed.length <= 32, true);
+  assert.equal((await lstat(artifactPath(fixture.root, live))).isFile(), true);
+  assert.equal((await lstat(artifactPath(fixture.root, fresh))).isFile(), true);
+  assert.equal((await readdir(fixture.root)).length >= 3, true);
+  assert.equal(result.removed.every((digest) => /^[a-f0-9]{64}$/u.test(digest)), true);
+  assert.equal(JSON.stringify(result).includes(fixture.root), false);
+});
+
+test("orphan pruning rejects unsafe candidate artifacts without deleting them or crossing the root", async (t) => {
+  const fixture = await storeFixture();
+  t.after(() => rm(fixture.home, { recursive: true, force: true }));
+  const outside = path.join(fixture.home, "outside.enc");
+  await writeFile(outside, "outside", { mode: 0o600 });
+  await mkdir(fixture.root, { recursive: true, mode: 0o700 });
+  const digest = "0".repeat(64);
+  const file = artifactPath(fixture.root, digest);
+  await symlink(outside, file);
+  const old = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+  await utimes(file, old, old);
+
+  await assert.rejects(() => fixture.store.pruneOrphans(new Set()), /probe_context_artifact_invalid/u);
+  assert.equal(await readFile(outside, "utf8"), "outside");
+  assert.equal((await lstat(file)).isSymbolicLink(), true);
 });

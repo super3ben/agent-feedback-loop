@@ -1,9 +1,17 @@
-import { types } from "node:util";
+import { createHash, randomBytes } from "node:crypto";
+import { constants } from "node:fs";
+import { link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
+import path from "node:path";
+import { TextDecoder, types } from "node:util";
 
 import { BREAKER_REASONS, GRANT_PURPOSES } from "./convergence-policy.mjs";
+import { decryptAesGcmBuffer, encryptAesGcmBuffer } from "./crypto-store.mjs";
 
 const MAX_CANONICAL_BYTES = 16 * 1_024;
+const MAX_ENCRYPTED_BYTES = MAX_CANONICAL_BYTES + 32;
 const MAX_COUNT = 10_000_000;
+const ORPHAN_AGE_MS = 24 * 60 * 60 * 1_000;
+const MAX_ORPHAN_INSPECTIONS = 32;
 const DIGEST = /^[a-f0-9]{64}$/u;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
 const CATEGORY_ID = /^[a-z][a-z0-9_-]{0,127}$/u;
@@ -376,4 +384,269 @@ export function buildConvergenceProbeEvidence(input) {
       falsificationTest: host.reviewEvidence.falsificationTest
     }
   });
+}
+
+function contextError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function artifactDigest(value) {
+  if (typeof value !== "string" || !DIGEST.test(value)) {
+    throw contextError("probe_context_digest_invalid");
+  }
+  return value;
+}
+
+function modeOf(info) {
+  return Number(info.mode & 0o777n);
+}
+
+function ownedByCurrentUser(info) {
+  return typeof process.getuid !== "function" || info.uid === BigInt(process.getuid());
+}
+
+function sameInode(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameSnapshot(left, right) {
+  return sameInode(left, right)
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.size === right.size
+    && left.nlink === right.nlink
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function assertPrivateRootInfo(info) {
+  if (info.isSymbolicLink() || !info.isDirectory() || !ownedByCurrentUser(info) || modeOf(info) !== 0o700) {
+    throw contextError("probe_context_root_invalid");
+  }
+}
+
+function assertPrivateArtifactInfo(info, { allowEmpty = false } = {}) {
+  if (info.isSymbolicLink() || !info.isFile() || !ownedByCurrentUser(info)
+      || modeOf(info) !== 0o600 || info.nlink !== 1n
+      || (!allowEmpty && info.size < 33n) || info.size > BigInt(MAX_ENCRYPTED_BYTES)) {
+    throw contextError("probe_context_artifact_invalid");
+  }
+}
+
+function sameSafeArtifact(left, right) {
+  return sameInode(left, right)
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.size === right.size
+    && left.nlink === right.nlink;
+}
+
+async function privateRootInfo(root, { create = false, missing = false } = {}) {
+  try {
+    if (create) await mkdir(root, { recursive: true, mode: 0o700 });
+    const info = await lstat(root, { bigint: true });
+    assertPrivateRootInfo(info);
+    return info;
+  } catch (error) {
+    if (missing && error?.code === "ENOENT") return null;
+    if (error?.code === "probe_context_root_invalid") throw error;
+    throw contextError("probe_context_root_invalid");
+  }
+}
+
+async function assertStableRoot(root, expected) {
+  const current = await privateRootInfo(root);
+  if (!sameInode(expected, current)) throw contextError("probe_context_root_invalid");
+}
+
+async function privateArtifactInfo(file, { missing = false } = {}) {
+  try {
+    const info = await lstat(file, { bigint: true });
+    assertPrivateArtifactInfo(info);
+    return info;
+  } catch (error) {
+    if (missing && error?.code === "ENOENT") return null;
+    if (error?.code === "probe_context_artifact_invalid") throw error;
+    throw contextError("probe_context_artifact_invalid");
+  }
+}
+
+async function readStableArtifact(root, file) {
+  const rootInfo = await privateRootInfo(root);
+  const before = await privateArtifactInfo(file);
+  let handle;
+  try {
+    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = await handle.stat({ bigint: true });
+    assertPrivateArtifactInfo(opened);
+    if (!sameSnapshot(before, opened)) throw contextError("probe_context_artifact_invalid");
+    const content = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const linked = await privateArtifactInfo(file);
+    if (!sameSnapshot(opened, after) || !sameSnapshot(after, linked)) {
+      throw contextError("probe_context_artifact_invalid");
+    }
+    await assertStableRoot(root, rootInfo);
+    return content;
+  } catch (error) {
+    if (error?.code === "probe_context_artifact_invalid"
+        || error?.code === "probe_context_root_invalid") throw error;
+    throw contextError("probe_context_artifact_invalid");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function liveDigestSet(value) {
+  if (!(value instanceof Set) || types.isProxy(value)
+      || Object.getPrototypeOf(value) !== Set.prototype || Reflect.ownKeys(value).length !== 0) {
+    throw contextError("probe_context_live_digests_invalid");
+  }
+  const result = new Set();
+  for (const item of value) result.add(artifactDigest(item));
+  return result;
+}
+
+export class ConvergenceProbeContextStore {
+  constructor({ root, keyProvider }) {
+    if (typeof root !== "string" || !path.isAbsolute(root)
+        || keyProvider === null || typeof keyProvider?.getKey !== "function") {
+      throw new TypeError("probe context store configuration is invalid");
+    }
+    this.root = path.resolve(root);
+    this.keyProvider = keyProvider;
+  }
+
+  artifactFile(digestValue) {
+    return path.join(this.root, `${artifactDigest(digestValue)}.enc`);
+  }
+
+  async key() {
+    try {
+      return await this.keyProvider.getKey();
+    } catch {
+      throw contextError("probe_context_artifact_invalid");
+    }
+  }
+
+  async put(evidence) {
+    const canonical = Buffer.from(canonicalProbeEvidence(evidence), "utf8");
+    const digestValue = sha256(canonical);
+    const file = this.artifactFile(digestValue);
+    const rootInfo = await privateRootInfo(this.root, { create: true });
+    if (await privateArtifactInfo(file, { missing: true })) {
+      await this.read(digestValue);
+      return Object.freeze({ digest: digestValue, created: false });
+    }
+
+    const encrypted = encryptAesGcmBuffer(await this.key(), canonical);
+    const temporary = path.join(
+      this.root,
+      `.${digestValue}.${process.pid}.${randomBytes(12).toString("hex")}.tmp`
+    );
+    let handle;
+    let created = false;
+    try {
+      handle = await open(
+        temporary,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600
+      );
+      const createdInfo = await handle.stat({ bigint: true });
+      assertPrivateArtifactInfo(createdInfo, { allowEmpty: true });
+      await handle.writeFile(encrypted);
+      await handle.sync();
+      const written = await handle.stat({ bigint: true });
+      assertPrivateArtifactInfo(written);
+      await assertStableRoot(this.root, rootInfo);
+      try {
+        await link(temporary, file);
+        created = true;
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+    } catch (error) {
+      if (error?.code?.startsWith?.("probe_context_")) throw error;
+      throw contextError("probe_context_artifact_invalid");
+    } finally {
+      await handle?.close().catch(() => {});
+      await rm(temporary, { force: true }).catch(() => {});
+    }
+
+    await this.read(digestValue);
+    return Object.freeze({ digest: digestValue, created });
+  }
+
+  async read(digestValue) {
+    const expectedDigest = artifactDigest(digestValue);
+    const encrypted = await readStableArtifact(this.root, this.artifactFile(expectedDigest));
+    let plaintext;
+    try {
+      plaintext = decryptAesGcmBuffer(await this.key(), encrypted);
+      if (sha256(plaintext) !== expectedDigest) throw contextError("probe_context_artifact_invalid");
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+      const evidence = validateConvergenceProbeEvidence(JSON.parse(text));
+      if (!Buffer.from(canonicalProbeEvidence(evidence), "utf8").equals(plaintext)) {
+        throw contextError("probe_context_artifact_invalid");
+      }
+      return evidence;
+    } catch (error) {
+      if (error?.code === "probe_context_artifact_invalid") throw error;
+      throw contextError("probe_context_artifact_invalid");
+    }
+  }
+
+  async remove(digestValue) {
+    const expectedDigest = artifactDigest(digestValue);
+    const rootInfo = await privateRootInfo(this.root, { missing: true });
+    if (rootInfo === null) return false;
+    const file = this.artifactFile(expectedDigest);
+    const before = await privateArtifactInfo(file, { missing: true });
+    if (before === null) return false;
+    await this.read(expectedDigest);
+
+    const quarantine = path.join(this.root, `.${expectedDigest}.${randomBytes(12).toString("hex")}.remove`);
+    try {
+      await rename(file, quarantine);
+      const moved = await privateArtifactInfo(quarantine);
+      if (!sameSafeArtifact(before, moved)) throw contextError("probe_context_artifact_invalid");
+      await assertStableRoot(this.root, rootInfo);
+      await rm(quarantine);
+      return true;
+    } catch (error) {
+      if (error?.code?.startsWith?.("probe_context_")) throw error;
+      throw contextError("probe_context_artifact_invalid");
+    }
+  }
+
+  async pruneOrphans(liveDigests) {
+    const live = liveDigestSet(liveDigests);
+    const rootInfo = await privateRootInfo(this.root, { missing: true });
+    if (rootInfo === null) return Object.freeze({ inspected: 0, removed: Object.freeze([]) });
+    let names;
+    try {
+      names = (await readdir(this.root)).sort().slice(0, MAX_ORPHAN_INSPECTIONS);
+    } catch {
+      throw contextError("probe_context_root_invalid");
+    }
+
+    const removed = [];
+    const cutoff = Date.now() - ORPHAN_AGE_MS;
+    for (const name of names) {
+      const match = /^([a-f0-9]{64})\.enc$/u.exec(name);
+      if (!match || live.has(match[1])) continue;
+      const info = await privateArtifactInfo(path.join(this.root, name));
+      if (Number(info.mtimeMs) >= cutoff) continue;
+      await this.read(match[1]);
+      if (await this.remove(match[1])) removed.push(match[1]);
+    }
+    await assertStableRoot(this.root, rootInfo);
+    return Object.freeze({ inspected: names.length, removed: Object.freeze(removed) });
+  }
 }

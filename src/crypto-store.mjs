@@ -2,6 +2,33 @@ import { chmod, link, lstat, mkdir, readFile, readdir, rm, stat, writeFile } fro
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import path from "node:path";
 
+const ENCRYPTED_BLOB_MAGIC = Buffer.from("AFL1");
+
+function aesKey(value) {
+  if (!Buffer.isBuffer(value) || value.length !== 32) {
+    throw new Error("data key must be exactly 32 bytes");
+  }
+  return value;
+}
+
+export function encryptAesGcmBuffer(key, plaintext) {
+  if (!Buffer.isBuffer(plaintext)) throw new TypeError("plaintext must be a Buffer");
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", aesKey(key), iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([ENCRYPTED_BLOB_MAGIC, iv, cipher.getAuthTag(), ciphertext]);
+}
+
+export function decryptAesGcmBuffer(key, envelope) {
+  if (!Buffer.isBuffer(envelope) || envelope.length < 32
+      || !envelope.subarray(0, 4).equals(ENCRYPTED_BLOB_MAGIC)) {
+    throw new Error("invalid encrypted blob envelope");
+  }
+  const decipher = createDecipheriv("aes-256-gcm", aesKey(key), envelope.subarray(4, 16));
+  decipher.setAuthTag(envelope.subarray(16, 32));
+  return Buffer.concat([decipher.update(envelope.subarray(32)), decipher.final()]);
+}
+
 function assertOwned(info, label) {
   if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} must be owned by the current user`);
 }
@@ -70,11 +97,7 @@ export class EncryptedBlobStore {
       if (error.code !== "ENOENT") throw error;
     }
     const key = await this.keyProvider.getKey();
-    const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", key, iv);
-    const ciphertext = Buffer.concat([cipher.update(String(rawText), "utf8"), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    const envelope = Buffer.concat([Buffer.from("AFL1"), iv, tag, ciphertext]);
+    const envelope = encryptAesGcmBuffer(key, Buffer.from(String(rawText), "utf8"));
     const temporary = path.join(this.root, `.${contentHash}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
     await writeFile(temporary, envelope, { mode: 0o600, flag: "wx" });
     try {
@@ -96,11 +119,8 @@ export class EncryptedBlobStore {
     const resolved = path.resolve(file);
     if (path.dirname(resolved) !== path.resolve(this.root) || !/^[a-f0-9]{64}\.enc$/i.test(path.basename(resolved))) throw new Error("encrypted blob path is outside the blob root");
     const envelope = await readPrivateRegularFile(resolved, "encrypted blob");
-    if (envelope.subarray(0, 4).toString() !== "AFL1") throw new Error("invalid encrypted blob envelope");
     const key = await this.keyProvider.getKey();
-    const decipher = createDecipheriv("aes-256-gcm", key, envelope.subarray(4, 16));
-    decipher.setAuthTag(envelope.subarray(16, 32));
-    return Buffer.concat([decipher.update(envelope.subarray(32)), decipher.final()]).toString("utf8");
+    return decryptAesGcmBuffer(key, envelope).toString("utf8");
   }
 
   async remove(contentHash) {
