@@ -23,6 +23,16 @@ const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
 const BIN = path.join(ROOT, "bin", "agent-feedback-loop.mjs");
 
+async function readLiveProcessArgv(pid) {
+  if (process.platform === "linux") {
+    return readFile(`/proc/${pid}/cmdline`, "utf8");
+  }
+  if (process.platform === "darwin") {
+    return (await execFileAsync("ps", ["-p", String(pid), "-o", "command="])).stdout;
+  }
+  throw new Error(`unsupported process argv inspection platform: ${process.platform}`);
+}
+
 function stdinReviewEvidence(overrides = {}) {
   return {
     hypothesis: "stdin-hypothesis-canary-6d91",
@@ -1662,8 +1672,8 @@ describe("agent-feedback-loop package", () => {
         child.once("spawn", resolve);
         child.once("error", reject);
       });
-      const visible = await execFileAsync("ps", ["-p", String(child.pid), "-o", "command="]);
-      for (const canary of Object.values(evidence)) assert.doesNotMatch(visible.stdout, new RegExp(canary, "u"));
+      const visibleArgv = await readLiveProcessArgv(child.pid);
+      for (const canary of Object.values(evidence)) assert.doesNotMatch(visibleArgv, new RegExp(canary, "u"));
       child.stdin.end(stdinEnvelope({
         reviewEvidence: evidence,
         probeContext: sddProbeContext("task-5", { contractRevision: "f".repeat(64) })
