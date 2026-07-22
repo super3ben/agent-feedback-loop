@@ -193,10 +193,18 @@ function unwrapResult(value, discriminator) {
   for (const key of ["structured_output", "result", "response", "output", "content"]) {
     const candidate = value[key];
     if (logicalResult(candidate, discriminator)) return candidate;
+    // Transport-wrapped shape ({ result: <logical> }) from the claude schema
+    // wrapper below, which exists because the API rejects top-level oneOf.
+    if (isPlainObject(candidate) && logicalResult(candidate.result, discriminator)) {
+      return candidate.result;
+    }
     if (typeof candidate === "string") {
       try {
         const parsed = parseJsonText(candidate);
         if (logicalResult(parsed, discriminator)) return parsed;
+        if (isPlainObject(parsed) && logicalResult(parsed.result, discriminator)) {
+          return parsed.result;
+        }
       } catch {}
     }
   }
@@ -211,11 +219,22 @@ function claudeTransportSchema(schemaText) {
     throw providerError("provider_invalid", error);
   }
   if (!isPlainObject(logicalSchema)) throw providerError("provider_invalid");
-  // The real claude CLI validator rejects a draft 2020-12 "$schema" dialect
-  // pin ("no schema with key or ref ..."). The packaged schemas only use
-  // cross-draft keywords, so dropping the pin preserves validation semantics.
-  const { $schema: _dialect, ...transported } = logicalSchema;
-  return JSON.stringify(transported);
+  // The real claude CLI forwards --json-schema as a structured-output tool
+  // input_schema. The API rejects both a draft 2020-12 "$schema" dialect pin
+  // and top-level oneOf/anyOf/allOf, so wrap the logical branches under one
+  // required "result" property (branches keep full fidelity) and unwrap the
+  // extra level in unwrapResult.
+  const { $schema: _dialect, ...logical } = logicalSchema;
+  const branches = Array.isArray(logical.oneOf) ? logical.oneOf : [logical];
+  if (branches.length < 1 || branches.some((branch) => !isPlainObject(branch))) {
+    throw providerError("provider_invalid");
+  }
+  return JSON.stringify({
+    type: "object",
+    properties: { result: branches.length === 1 ? branches[0] : { anyOf: branches } },
+    required: ["result"],
+    additionalProperties: false
+  });
 }
 
 export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null }) {
