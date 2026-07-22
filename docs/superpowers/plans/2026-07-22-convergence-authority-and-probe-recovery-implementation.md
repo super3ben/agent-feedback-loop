@@ -48,6 +48,18 @@ lineage, SHA-256, AES-256-GCM through AFL's existing key infrastructure, macOS a
 - Each workstream receives one frozen-scope review. A failed architecture generation
   returns to `human_decision`; no local-fix retry, invariant rename, counter reset, or
   adjacent full-scope review is allowed.
+- On 2026-07-22 the user selected human-decision option `A` for the two frozen Task 7
+  review findings. This authorizes exactly one combined, TDD correction without
+  fabricating or reusing a Guard receipt; the original fingerprint, failure count,
+  architecture generation, consumed receipt, and review history remain intact. The
+  correction makes repository preflight mandatory and reads live WAL state only through
+  a bounded private snapshot. One frozen re-review follows; another Critical/Important
+  failure returns to human decision.
+- To shorten elapsed time, Task 5 exact-envelope and package-path work may run in
+  parallel with that Task 7 correction only in disjoint files. Store, controller,
+  adapter, runner, and CLI integration stays serialized until Task 7 is merged and its
+  frozen review passes. This is execution parallelism, not a second Task 5 receipt or a
+  split invariant.
 - Only main-conversation interference, data corruption/unrecoverability,
   security/privacy failure, or a frozen acceptance failure blocks completion. Other
   adjacent findings go to backlog.
@@ -339,8 +351,10 @@ git commit -m "fix: enforce explicit repository guard authority"
 
 ## Workstream B: Bounded semantic Probe evidence
 
-Start only after Workstream A reaches its stop condition. One Guard Task 5 receipt and one
-implementer own implementation-plan Task 5.
+Disjoint pure-envelope and package-path preparation may start after the user-authorized
+Task 7 human decision, but shared integration starts only after Workstream A reaches its
+stop condition. One Guard Task 5 receipt and one frozen invariant still own the whole
+implementation-plan Task 5.
 
 ### Task 4: Authorize the Guard Task 5 architecture generation
 
