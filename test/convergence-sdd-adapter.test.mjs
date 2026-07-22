@@ -903,6 +903,40 @@ test("exported adapter cannot bypass real unimported legacy authority", async (t
   ).get().count, 0);
 });
 
+test("verified repository preflight cannot authorize a different repository", async (t) => {
+  const source = await harness("open-first-failure");
+  const target = await harness("open-first-failure");
+  t.after(() => source.store.close());
+  t.after(() => target.store.close());
+  await writeEmptyCanonicalLegacyState(target.repoRoot);
+
+  const sourcePreflight = await inspectGuardRepository({
+    repoRoot: source.repoRoot,
+    paths: pathsFor(source.home)
+  });
+  const targetPreflight = await inspectGuardRepository({
+    repoRoot: target.repoRoot,
+    paths: pathsFor(target.home)
+  });
+  assert.equal(sourcePreflight.repositoryState, "afl_sqlite");
+  assert.equal(targetPreflight.repositoryState, "legacy_guard");
+
+  await assert.rejects(runGuardCommand({
+    args: ["record-review", ...target.key,
+      "--review-run-id", "cross-repository-preflight",
+      "--severity", "Important",
+      "--verdict", "approved",
+      "--commit", "cross-repository-preflight-commit",
+      "--review-ref", "reviews/cross-repository-preflight.md"],
+    repoRoot: target.repoRoot,
+    store: target.store,
+    preflight: sourcePreflight
+  }), (error) => error.code === "guard_preflight_required");
+  assert.equal(target.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_tasks"
+  ).get().count, 0);
+});
+
 test("SDD adapter rejects forged authority and uses verified persisted Guard authority", async (t) => {
   const h = await harness("open-first-failure");
   t.after(() => h.store.close());

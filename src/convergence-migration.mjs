@@ -18,7 +18,7 @@ import {
 } from "./convergence-store.mjs";
 
 const PLAN_PRIVATE = new WeakMap();
-const VERIFIED_REPOSITORY_PREFLIGHTS = new WeakSet();
+const VERIFIED_REPOSITORY_PREFLIGHTS = new WeakMap();
 const MAPPING_REVISION = "guard-v1-repository-v1";
 const POLICY_REVISION_DIGEST = sha256("convergence-policy-v2");
 const AUTHORITY_NATIVE_ID = "guard-authority";
@@ -268,6 +268,7 @@ async function inspectTransitionLock(root) {
 }
 
 function repositoryProjection({
+  repositoryRoot,
   repositoryState,
   lineageId,
   legacyState,
@@ -279,13 +280,22 @@ function repositoryProjection({
     repositoryState, lineageId, legacyState, storeState,
     imported: Boolean(imported), cutOver: Boolean(cutOver)
   });
-  VERIFIED_REPOSITORY_PREFLIGHTS.add(projection);
+  VERIFIED_REPOSITORY_PREFLIGHTS.set(projection, repositoryRoot);
   return projection;
 }
 
-export function assertVerifiedGuardRepositoryPreflight(preflight) {
+export async function assertVerifiedGuardRepositoryPreflight(preflight, repoRoot) {
   if (!preflight || typeof preflight !== "object"
       || !VERIFIED_REPOSITORY_PREFLIGHTS.has(preflight)) {
+    throw coded("guard_preflight_required");
+  }
+  let currentRoot;
+  try {
+    currentRoot = await secureRepoRoot(repoRoot);
+  } catch {
+    throw coded("guard_preflight_required");
+  }
+  if (VERIFIED_REPOSITORY_PREFLIGHTS.get(preflight) !== currentRoot) {
     throw coded("guard_preflight_required");
   }
   return preflight;
@@ -293,12 +303,14 @@ export function assertVerifiedGuardRepositoryPreflight(preflight) {
 
 export async function inspectGuardRepository({ repoRoot, paths, logger = () => {} } = {}) {
   if (typeof logger !== "function") throw coded("guard_preflight_invalid_arguments");
+  const root = await secureRepoRoot(repoRoot);
   let lineage;
   try {
     lineage = await readRepositoryLineage({ repoRoot });
   } catch (error) {
     if (error?.code !== "lineage_not_initialized") throw error;
     const result = repositoryProjection({
+      repositoryRoot: root,
       repositoryState: "uninitialized", lineageId: null,
       legacyState: "absent", storeState: "absent"
     });
@@ -309,7 +321,6 @@ export async function inspectGuardRepository({ repoRoot, paths, logger = () => {
     return result;
   }
 
-  const root = await secureRepoRoot(repoRoot);
   const transitionLocked = await inspectTransitionLock(root);
   const legacyState = await inspectCanonicalLegacyState(root);
   let storeState = "absent";
@@ -336,6 +347,7 @@ export async function inspectGuardRepository({ repoRoot, paths, logger = () => {
   else if (legacyState === "valid") repositoryState = cutOver ? "afl_sqlite" : "legacy_guard";
   else repositoryState = storeState === "valid" ? "afl_sqlite" : "fresh_afl_eligible";
   const result = repositoryProjection({
+    repositoryRoot: root,
     repositoryState, lineageId: lineage.lineageId, legacyState, storeState, imported, cutOver
   });
   logger(Object.freeze({

@@ -884,7 +884,7 @@ export async function runGuardCommand({
   }
   const artifactHooks = validatedArtifactHooks(rawArtifactHooks);
   const parsed = parseArgs(args);
-  const repository = assertVerifiedGuardRepositoryPreflight(preflight);
+  const repository = await assertVerifiedGuardRepositoryPreflight(preflight, repoRoot);
   if (!repository || ![
     "uninitialized", "transition_locked", "legacy_guard", "fresh_afl_eligible", "afl_sqlite"
   ].includes(repository.repositoryState)) {
