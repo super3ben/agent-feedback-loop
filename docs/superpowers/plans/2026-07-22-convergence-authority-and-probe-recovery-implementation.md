@@ -127,13 +127,13 @@ performed by an independent frozen-scope reviewer.
   Guard
 - Modify: `.superpowers/sdd/review-loop-state.json` only through the real Guard commands
 
-- [ ] **Step 1: Re-read real state and script help**
+- [x] **Step 1: Re-read real state and script help**
 
 Load the current `subagent-driven-development` Review Loop Guard instructions and CLI
 help from disk. Confirm Task 9/7/5 match the real state; do not rely on this plan's
 snapshot if they differ.
 
-- [ ] **Step 2: Close only the Task 9 human-decision loop**
+- [x] **Step 2: Close only the Task 9 human-decision loop**
 
 Use the Guard's human-decision/resolve operation with a decision reference naming:
 
@@ -145,13 +145,13 @@ root-invariant:guard-unimported-legacy-remains-authoritative
 Verify the original Task 9 fingerprint, failure count, and architecture-fix count remain
 in history. Do not create a new review event.
 
-- [ ] **Step 3: Record the Task 7 direction checkpoint**
+- [x] **Step 3: Record the Task 7 direction checkpoint**
 
 The checkpoint must quote the approved spec's business value, authority lattice, bounded
 file scope, exclusions, falsifiable tests, and human-decision stop condition. Run the
 real Guard checkpoint command; do not edit state manually.
 
-- [ ] **Step 4: Authorize and consume exactly one architecture fix**
+- [x] **Step 4: Authorize and consume exactly one architecture fix**
 
 Run the real `authorize-fix --mode architecture_fix`, persist its JSON artifact in the
 repository, then generate/consume the fix brief with the Guard receipt. Proceed only on
@@ -179,7 +179,7 @@ fingerprint or failure count.
 - New: `inspectGuardRepository({ repoRoot, paths })` returns the frozen internal
   preflight projection from the approved design.
 
-- [ ] **Step 1: Write failing no-side-effect tests**
+- [x] **Step 1: Write failing no-side-effect tests**
 
 Create disposable Git repositories and snapshot the Git common directory, repository,
 temporary HOME, database/WAL/SHM paths, task count, and event count before/after:
@@ -210,7 +210,7 @@ Add matrix cases for missing Store, valid Store, invalid Store, absent legacy st
 valid repository-bound legacy state, corrupt JSON, copied repository ID, unsafe owner or
 mode, symlink, and transition lock. Assert invalid state is never projected as absent.
 
-- [ ] **Step 2: Run focused tests and observe RED**
+- [x] **Step 2: Run focused tests and observe RED**
 
 Run:
 
@@ -220,7 +220,7 @@ node --test test/convergence-identity.test.mjs test/control-store.test.mjs test/
 
 Expected: fail because read-only Store open and repository preflight do not exist.
 
-- [ ] **Step 3: Implement the smallest read-only primitives**
+- [x] **Step 3: Implement the smallest read-only primitives**
 
 - Reuse secure Git common-directory discovery; do not call
   `ensureRepositoryLineage` from preflight.
@@ -241,7 +241,7 @@ Expected: fail because read-only Store open and repository preflight do not exis
 Do not create a registry, activation event, table, schema version, or alternate legacy
 parser.
 
-- [ ] **Step 4: Run focused tests to GREEN**
+- [x] **Step 4: Run focused tests to GREEN**
 
 Run the command from Step 2. Confirm the filesystem snapshots are byte-for-byte stable.
 
@@ -259,7 +259,7 @@ Run the command from Step 2. Confirm the filesystem snapshots are byte-for-byte 
   bounded read results.
 - `executeGuardCli(args)` parses the command before selecting a Store mode.
 
-- [ ] **Step 1: Write failing command-matrix tests**
+- [x] **Step 1: Write failing command-matrix tests**
 
 Cover every official Guard verb with valid required arguments:
 
@@ -291,13 +291,13 @@ Add assertions that:
 - `status --task-id` derives a task UID in memory but performs no task upsert;
 - concurrent read commands do not create tasks/events/journal files.
 
-- [ ] **Step 2: Run focused tests and observe RED**
+- [x] **Step 2: Run focused tests and observe RED**
 
 ```bash
 node --test test/convergence-sdd-adapter.test.mjs test/convergence-migration.test.mjs test/cli.test.mjs
 ```
 
-- [ ] **Step 3: Implement parse → preflight → Store-mode selection**
+- [x] **Step 3: Implement parse → preflight → Store-mode selection**
 
 Use this fixed routing table:
 
@@ -317,14 +317,14 @@ Move task creation behind the successful mutating branch. Read commands must nev
 event append. Migration dry-run remains Store-free; explicit import apply may initialize
 the Store only after lineage and legacy validation succeed.
 
-- [ ] **Step 4: Run focused and migration regressions**
+- [x] **Step 4: Run focused and migration regressions**
 
 ```bash
 node --test test/convergence-identity.test.mjs test/control-store.test.mjs \
   test/convergence-migration.test.mjs test/convergence-sdd-adapter.test.mjs test/cli.test.mjs
 ```
 
-- [ ] **Step 5: Commit Workstream A implementation**
+- [x] **Step 5: Commit Workstream A implementation**
 
 Stage only the Workstream A source/tests plus the Guard-generated Task 7 checkpoint and
 receipt artifacts. Verify the three pre-existing task reports are unstaged.
@@ -335,17 +335,17 @@ git commit -m "fix: enforce explicit repository guard authority"
 
 ### Task 3: Frozen Guard Task 7 review and stop decision
 
-- [ ] Run the macOS focused process tests above in real temporary Git repositories.
-- [ ] Run the existing migration/cutover/rollback and linked-worktree identity tests.
-- [ ] Run `npm test` once for regression evidence.
-- [ ] Dispatch one reviewer with stable Review-Run-ID
+- [x] Run the macOS focused process tests above in real temporary Git repositories.
+- [x] Run the existing migration/cutover/rollback and linked-worktree identity tests.
+- [x] Run `npm test` once for regression evidence.
+- [x] Dispatch one reviewer with stable Review-Run-ID
   `task-7-authority-lifecycle-architecture-review-1` and the frozen acceptance list from
   the authority design.
-- [ ] If approved, record the approved review in the real Guard and stop Workstream A.
-- [ ] If Critical/Important within the frozen invariant, record it under the existing
+- [x] If approved, record the approved review in the real Guard and stop Workstream A.
+- [x] If Critical/Important within the frozen invariant, record it under the existing
   Task 7 invariant. Because this was its architecture generation, return to human
   decision; do not dispatch another fixer.
-- [ ] Put non-blocking adjacent findings in a backlog document without reopening review.
+- [x] Put non-blocking adjacent findings in a backlog document without reopening review.
 
 ---
 
@@ -363,12 +363,12 @@ implementation-plan Task 5.
 - Create: Guard-generated Task 5 receipt/grant artifact
 - Modify: `.superpowers/sdd/review-loop-state.json` only through real Guard commands
 
-- [ ] Re-read actual Task 5 state.
-- [ ] Write the direction checkpoint from the approved Probe design, including the exact
+- [x] Re-read actual Task 5 state.
+- [x] Write the direction checkpoint from the approved Probe design, including the exact
   16 KiB envelope, named producer, digest-only DB, no-context fallback, encrypted
   lifecycle, and stop conditions.
-- [ ] Run the real checkpoint and one `authorize-fix --mode architecture_fix`.
-- [ ] Persist and consume the generated receipt through the generated fix brief before
+- [x] Run the real checkpoint and one `authorize-fix --mode architecture_fix`.
+- [x] Persist and consume the generated receipt through the generated fix brief before
   dispatching the implementer.
 
 ### Task 5: Implement bounded semantic Probe evidence
@@ -392,7 +392,7 @@ implementation-plan Task 5.
 - `ConvergenceProbeContextStore` exposes digest-addressed `put`, `read`, `remove`, and
   bounded `pruneOrphans` operations under `paths.probeContextRoot`.
 
-- [ ] **Step 1: Write failing exact-envelope tests**
+- [x] **Step 1: Write failing exact-envelope tests**
 
 Test every required key, enum, count, identifier, digest, and text bound from the design.
 Reject unknown keys, accessors, proxies, sparse/decorated arrays, unsupported prototypes,
@@ -404,20 +404,20 @@ the latest decision/evidence digests, contract fields bind to the current contra
 revision, and host-supplied attempts to override identity, importance, generation,
 decision, or authority fail.
 
-- [ ] **Step 2: Write failing encrypted-lifecycle tests**
+- [x] **Step 2: Write failing encrypted-lifecycle tests**
 
 Test private root/file modes, atomic publication, idempotent same-digest write,
 wrong-key/corrupt/truncated/replaced/symlink/unowned/permissive rejection, and exact
 digest verification before plaintext is returned. Test at most 32 cleanup inspections,
 24-hour cutoff, and no deletion outside the private root.
 
-- [ ] **Step 3: Run tests and observe RED**
+- [x] **Step 3: Run tests and observe RED**
 
 ```bash
 node --test test/convergence-probe-context.test.mjs test/control-store.test.mjs test/runtime.test.mjs
 ```
 
-- [ ] **Step 4: Implement one bounded context module**
+- [x] **Step 4: Implement one bounded context module**
 
 - Add `paths.probeContextRoot =
   ~/.agent/feedback-loop-data/convergence/probe-context`.
@@ -429,7 +429,7 @@ node --test test/convergence-probe-context.test.mjs test/control-store.test.mjs 
   failed request can safely roll back only its own orphan.
 - Keep plaintext, ciphertext paths, and bodies out of logs and returned machine output.
 
-- [ ] **Step 5: Run focused tests to GREEN**
+- [x] **Step 5: Run focused tests to GREEN**
 
 Run the command from Step 3.
 
@@ -458,7 +458,7 @@ Run the command from Step 3.
   digests without returning bodies.
 - Provider input becomes exactly `{ status, evidence }`.
 
-- [ ] **Step 1: Write failing producer and fallback tests**
+- [x] **Step 1: Write failing producer and fallback tests**
 
 Use two approved host projections with different goals/exclusions/evidence and prove the
 provider observes those exact bounded differences. Add tests that missing, truncated,
@@ -476,7 +476,7 @@ generation observations. Review hypothesis/new evidence/falsification test come 
 same `record-review` invocation; identity, counters, trigger, and digests are derived by
 the controller.
 
-- [ ] **Step 2: Write failing transaction and privacy tests**
+- [x] **Step 2: Write failing transaction and privacy tests**
 
 Assert:
 
@@ -489,7 +489,7 @@ Assert:
 - provider is never called before lease, context decrypt, digest verification, current
   generation, contract, and decision-basis checks all pass.
 
-- [ ] **Step 3: Run focused tests and observe RED**
+- [x] **Step 3: Run focused tests and observe RED**
 
 ```bash
 node --test test/convergence-probe-context.test.mjs test/convergence-store.test.mjs \
@@ -497,7 +497,7 @@ node --test test/convergence-probe-context.test.mjs test/convergence-store.test.
   test/convergence-probe.test.mjs test/cli.test.mjs
 ```
 
-- [ ] **Step 4: Implement the minimal vertical path**
+- [x] **Step 4: Implement the minimal vertical path**
 
 1. Parse/validate bounded stdin before any Store/artifact/provider side effect.
 2. Build the canonical envelope only after pure policy returns
@@ -523,7 +523,7 @@ token.
 Do not add a Store column/table, semantic body query, provider authority, or alternate
 lesson path.
 
-- [ ] **Step 5: Run focused and provider regressions**
+- [x] **Step 5: Run focused and provider regressions**
 
 ```bash
 node --test test/convergence-probe-context.test.mjs test/convergence-store.test.mjs \
@@ -543,21 +543,21 @@ node --test test/convergence-probe-context.test.mjs test/convergence-store.test.
 - Modify: `package.json` only if the package inventory requires the new module (do not
   bump the schema or add a dependency)
 
-- [ ] Document that semantic Probe capability is available only when a named host sends
+- [x] Document that semantic Probe capability is available only when a named host sends
   valid bounded context; otherwise the adapter checkpoints/warns and does not launch.
-- [ ] Document encrypted context as short-lived operational data and Markdown as the
+- [x] Document encrypted context as short-lived operational data and Markdown as the
   only long-term lesson source.
-- [ ] Add a macOS real-process smoke using temporary HOME/Git repositories that proves:
+- [x] Add a macOS real-process smoke using temporary HOME/Git repositories that proves:
   explicit review → detached Probe → bounded provider context → terminal cleanup, while
   prompt handling emits no Guard/receipt/probe status.
-- [ ] Run the same process test on Linux when a real Linux runner/container with Node
+- [x] Run the same process test on Linux when a real Linux runner/container with Node
   24.15+ and Git is available. If unavailable, report Linux as unverified rather than
   inferring it from platform branches.
-- [ ] Verify unsupported platforms return before artifact/Store/spawn side effects.
-- [ ] Use Computer Use for a final non-destructive Codex Desktop check only after the
+- [x] Verify unsupported platforms return before artifact/Store/spawn side effects.
+- [x] Use Computer Use for a final non-destructive Codex Desktop check only after the
   user separately authorizes an installed-canary test; without that authority, report
   local process evidence and do not touch real hooks/HOME.
-- [ ] Run:
+- [x] Run:
 
 ```bash
 node --test test/runtime.test.mjs test/e2e-smoke.test.mjs test/platform-smoke.test.mjs test/cli.test.mjs
@@ -566,9 +566,9 @@ npm pack --dry-run --json
 git diff --check
 ```
 
-- [ ] Inspect package inventory: new Probe context module is present; Guard state,
+- [x] Inspect package inventory: new Probe context module is present; Guard state,
   receipts, checkpoints, temporary context, tests, and real user data are absent.
-- [ ] Commit Workstream B source/tests/docs and its Guard-generated checkpoint/receipt
+- [x] Commit Workstream B source/tests/docs and its Guard-generated checkpoint/receipt
   artifacts, leaving Task 1-3 reports unstaged.
 
 ```bash
@@ -577,24 +577,24 @@ git commit -m "fix: bind probes to bounded semantic evidence"
 
 ### Task 6: Frozen Guard Task 5 review and final stop decision
 
-- [ ] Dispatch one reviewer with stable Review-Run-ID
+- [x] Dispatch one reviewer with stable Review-Run-ID
   `task-5-probe-evidence-architecture-review-1` and only the Probe design's frozen
   acceptance list.
-- [ ] If approved, record the approved review in the real Guard and stop Workstream B.
-- [ ] If Critical/Important within the frozen invariant, record it under the original
+- [x] If approved, record the approved review in the real Guard and stop Workstream B.
+- [x] If Critical/Important within the frozen invariant, record it under the original
   Task 5 invariant and return to human decision. Do not generate a second receipt.
-- [ ] Record non-blocking adjacent observations in backlog without widening this change.
+- [x] Record non-blocking adjacent observations in backlog without widening this change.
 
 ---
 
 ## Final evidence and handoff
 
-- [ ] Confirm the original user-value path is still intact and independently tested:
+- [x] Confirm the original user-value path is still intact and independently tested:
   explicit dissatisfaction → detached reviewer → Markdown lesson → later prompt
   selection/emission.
-- [ ] Confirm Guard/Probe paths never run from Stop and never print receipts or machine
+- [x] Confirm Guard/Probe paths never run from Stop and never print receipts or machine
   instructions into the main conversation.
-- [ ] Report evidence by layer:
+- [x] Report evidence by layer:
   1. focused unit/transaction tests;
   2. full regression count;
   3. macOS real-process smoke;
@@ -602,8 +602,8 @@ git commit -m "fix: bind probes to bounded semantic evidence"
   5. package inventory;
   6. installed Codex/Desktop canary only if separately authorized;
   7. real repository import/cutover remains not performed.
-- [ ] Do not claim production acceptance from tests, packaging, or a temporary-HOME
+- [x] Do not claim production acceptance from tests, packaging, or a temporary-HOME
   process run.
-- [ ] Offer the completed branch for final review/merge; real Guard import, cutover,
+- [x] Offer the completed branch for final review/merge; real Guard import, cutover,
   global Skill modification, hook enablement, or release publication still require
   separate user authorization.

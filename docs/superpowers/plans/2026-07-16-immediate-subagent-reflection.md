@@ -149,7 +149,7 @@ base-ref: cc14224444ef26894e407218235c37297714605c
 - Raw text and encrypted body bytes never enter the identity/signature. `encrypted_raw_ref` remains a separate immutable storage invariant and must not be used to make two different normalized capture identities equal.
 - Canonical `identity.content_hash` identifies the normalized/redacted event content. `blobContentHash` identifies the raw evidence bytes used by content-addressed encrypted blob storage. They may legitimately differ; neither raw body, `blobContentHash` nor `encrypted_raw_ref` enters `signature`.
 
-- [ ] **Step 1: Write the fresh-schema RED tests**
+- [x] **Step 1: Write the fresh-schema RED tests**
 
 Before editing runtime code, record `git diff --name-status 7d6b1e3^..9c89e00` and inspect the changed schema/CLI/installer/reviewer files. Write an audit table with columns `symbol/path`, `keep primitive`, `delete old architecture`, and `replacement task`. It must explicitly classify notification delivery, receipt/Stop/hookPrompt, episodes, maintenance, resident scheduler, fenced lease, encrypted blobs, provider process isolation and Markdown rendering; no unclassified changed runtime path may survive Task 13.
 
@@ -175,13 +175,13 @@ assert.equal(readFileSync(paths.legacyDatabase, "utf8"), "legacy-sentinel");
 
 Add a hook-mode fixture with a missing DB and another with schema version 0; `openControlStore` must return/throw a fixed `control_store_unavailable`/`control_schema_mismatch` error without creating or changing a file. Only `initializeControlStore` may create v1 during install or an explicit test setup.
 
-- [ ] **Step 2: Run the tests and observe the old schema fail**
+- [x] **Step 2: Run the tests and observe the old schema fail**
 
 Run: `node --test --test-name-pattern='separates the lean control database|fresh control schema contains only transient tables' test/runtime.test.mjs test/control-store.test.mjs`
 
 Expected: FAIL because `paths.controlDatabase`, `initializeControlStore()`, non-migrating `openControlStore()` and the new schema do not exist.
 
-- [ ] **Step 3: Replace the schema with the minimal control contract**
+- [x] **Step 3: Replace the schema with the minimal control contract**
 
 Define the complete table set with foreign keys and no body-bearing lesson/report/card columns. Use these canonical state checks:
 
@@ -205,20 +205,20 @@ CREATE TABLE IF NOT EXISTS reflection_emissions(id INTEGER PRIMARY KEY AUTOINCRE
 
 `initializeControlStore()` opens only `paths.controlDatabase`, creates v1 in an install/upgrade command and never imports or touches the legacy schema/file. Runtime `openControlStore()` requires an existing private regular DB with exactly the supported schema version and performs no DDL. `listUserTables()` must exclude SQLite internal names beginning with `sqlite_`. Implement the four capture-compatible methods against `sessions`, `session_events` and `event_observations`; preserve existing duplicate-observation semantics and persist only encrypted blob references plus bounded metadata, never raw text.
 
-- [ ] **Step 4: Run focused and existing storage safety tests**
+- [x] **Step 4: Run focused and existing storage safety tests**
 
 Run: `node --test test/runtime.test.mjs test/control-store.test.mjs test/store.test.mjs test/capture.test.mjs`
 
 Expected: PASS; the new control store safety tests pass and all unchanged legacy store/capture tests remain green during migration.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/index.mjs src/control-schema.mjs src/control-store.mjs docs/verification/2026-07-16-legacy-control-plane-audit.md test/runtime.test.mjs test/control-store.test.mjs
 git commit -m "refactor: separate the lean reflection control store"
 ```
 
-- [ ] **Step 6: Write the prepared-capture RED test and strengthen zero-side-effect invalid cases**
+- [x] **Step 6: Write the prepared-capture RED test and strengthen zero-side-effect invalid cases**
 
 Add `createHash` plus `import * as controlStoreModule from "../src/control-store.mjs"` to `test/control-store.test.mjs`; keep the existing named imports for other store APIs. Then add this exact contract test so the missing export fails only this selected RED test and does not mask the later behavioral RED probes:
 
@@ -298,7 +298,7 @@ test("invalid canonical capture identity is rejected before blob or database sid
 });
 ```
 
-- [ ] **Step 7: Run the prepared-capture RED**
+- [x] **Step 7: Run the prepared-capture RED**
 
 Run:
 
@@ -308,7 +308,7 @@ node --test --test-name-pattern='prepared capture freezes the body-free identity
 
 Expected: FAIL with `controlStoreModule.prepareCapture is not a function`; the separately selected invalid cases still prove zero side effects and must not regress while the missing interface is RED.
 
-- [ ] **Step 8: Write the supplied-ref and public/direct consistency RED tests**
+- [x] **Step 8: Write the supplied-ref and public/direct consistency RED tests**
 
 Add a public supplied-reference mismatch test that permits the required first blob write but proves no SQLite write:
 
@@ -393,7 +393,7 @@ test("public and direct exact replay return one persisted event and blob ref", a
 });
 ```
 
-- [ ] **Step 9: Run the reference-consistency RED**
+- [x] **Step 9: Run the reference-consistency RED**
 
 Run:
 
@@ -403,7 +403,7 @@ node --test --test-name-pattern='public capture rejects a supplied encrypted ref
 
 Expected: FAIL because the current public replay accepts a changed supplied ref and returns caller-owned `event` plus persisted `blobPath`; current direct/public returns also lack the unified `kind`, `eventUid`, `eventView`, and `blobPath` contract.
 
-- [ ] **Step 10: Write the caller-mutation barrier RED test**
+- [x] **Step 10: Write the caller-mutation barrier RED test**
 
 ```js
 test("public capture uses one frozen snapshot across the blob await", async () => {
@@ -472,7 +472,7 @@ test("public capture uses one frozen snapshot across the blob await", async () =
 });
 ```
 
-- [ ] **Step 11: Run the mutation-barrier RED**
+- [x] **Step 11: Run the mutation-barrier RED**
 
 Run:
 
@@ -482,7 +482,7 @@ node --test --test-name-pattern='public capture uses one frozen snapshot across 
 
 Expected: FAIL on current code after the first blob write because it re-reads the now-invalid `capture_source`; the corrected path must instead succeed from the frozen values and perform the post-commit second write.
 
-- [ ] **Step 12: Write the different-alias concurrency and incompatible-storage RED tests**
+- [x] **Step 12: Write the different-alias concurrency and incompatible-storage RED tests**
 
 Add a helper inside each test that constructs two valid aliases with different event/source identities but the same provider, session, context, role, canonical content hash, native turn and timestamp. Then add these assertions:
 
@@ -594,7 +594,7 @@ test("public capture inserts a new event for an alias with incompatible encrypte
 });
 ```
 
-- [ ] **Step 13: Run the alias transaction RED**
+- [x] **Step 13: Run the alias transaction RED**
 
 Run:
 
@@ -604,7 +604,7 @@ node --test --test-name-pattern='concurrent different first aliases resolve to o
 
 Expected: FAIL because current public resolution occurs before the blob await and event insert transaction: concurrent aliases produce two `new` events, while the sequential incompatible-ref alias can attach to the old event without enforcing the separate storage invariant.
 
-- [ ] **Step 14: Implement the minimal synchronous prepared-capture value**
+- [x] **Step 14: Implement the minimal synchronous prepared-capture value**
 
 In `src/control-store.mjs`, reuse `eventFields()`, `captureIdentitySignature()`, `observationKey()` and `observationUid()`; do not add a second normalizer. Implement the exported public preflight with this exact data flow:
 
@@ -627,7 +627,7 @@ export function prepareCapture({ event, rawText }) {
 
 The function must execute before any `await`, blob call, SQLite statement or log call. It creates no reference back to `event`; it freezes both object levels. Keep `identity.content_hash` and `blobContentHash` independent, and never add raw/body/ref fields to `CAPTURE_IDENTITY_FIELDS` or `captureIdentitySignature()`.
 
-- [ ] **Step 15: Implement exact replay and UID/source conflict phases in one write transaction**
+- [x] **Step 15: Implement exact replay and UID/source conflict phases in one write transaction**
 
 Add `store.resolveOrInsertCapture({ preparedCapture, authoritativeEncryptedRef })` and one result projector. Validate the bounded authoritative ref before opening the transaction, then execute this exact prefix inside one existing `transaction()`/`BEGIN IMMEDIATE`:
 
@@ -652,7 +652,7 @@ IF the persisted cli/provider differs: throw control_observation_collision
 
 Do not return an observation merely because its key exists. The result projector always derives `eventUid`, `blobPath`, `eventView`, and `observation` from the same persisted/just-inserted rows; it never receives the caller event.
 
-- [ ] **Step 16: Implement the complete alias recheck and new insert phases in that same transaction**
+- [x] **Step 16: Implement the complete alias recheck and new insert phases in that same transaction**
 
 Continue inside the same transaction and preserve the current provider/session/context/role/content/native-turn/timestamp semantics with the full five-minute window. Re-run the candidate SQL only while holding the write transaction; do not accept a pre-transaction candidate or truncate before all predicates:
 
@@ -690,7 +690,7 @@ COMMIT
 
 Zero candidates, more than one candidate, or one ref-incompatible candidate all take the `new` branch. Do not overwrite an existing event/ref, change schema/version, put blob I/O inside the transaction, or add a mutex/service/scheduler.
 
-- [ ] **Step 17: Route the public adapter and direct compatibility APIs through the single decision point**
+- [x] **Step 17: Route the public adapter and direct compatibility APIs through the single decision point**
 
 Replace the control-store branch of both public capture exports with this exact order; retain a bounded legacy-store compatibility branch only until Task 13, and never select it when `store.resolveOrInsertCapture` exists:
 
@@ -717,7 +717,7 @@ Delete the control-store public path's initial `resolveEventObservation()`, cons
 
 Implement `captureSessionEvent(event)` as a synchronous wrapper around the same internal prepared fields and `resolveOrInsertCapture()`, using supplied `encrypted_raw_ref` as authoritative and returning the same compatibility aliases. Keep `resolveEventObservation(input)` direct-only: add snake/camel encrypted-ref normalization, compare a supplied non-null ref with the persisted target, use the target persisted ref when the input ref is null, and preserve current exact/explicit-target/unique-alias/null/ambiguous return behavior. Do not call it from either control public capture export.
 
-- [ ] **Step 18: Run the amendment GREEN tests**
+- [x] **Step 18: Run the amendment GREEN tests**
 
 Run:
 
@@ -727,7 +727,7 @@ node --test --test-name-pattern='prepared capture freezes the body-free identity
 
 Expected: PASS; invalid input performs 0 blob/DB writes, supplied-ref mismatch performs 1 blob write and 0 DB writes, successful public captures perform 2 blob writes, and all result pointers agree with one committed event.
 
-- [ ] **Step 19: Run exact/provider/session/context/schema concurrency regressions**
+- [x] **Step 19: Run exact/provider/session/context/schema concurrency regressions**
 
 Run:
 
@@ -737,7 +737,7 @@ node --test --test-name-pattern='control observation replay preserves an omitted
 
 Expected: PASS; provider/session/context/window behavior, non-migrating schema fingerprint checks, and exact same-key concurrency remain unchanged.
 
-- [ ] **Step 20: Run the focused Task 1 and transitional legacy regression**
+- [x] **Step 20: Run the focused Task 1 and transitional legacy regression**
 
 Run:
 
@@ -747,7 +747,7 @@ node --test test/control-store.test.mjs test/runtime.test.mjs test/capture.test.
 
 Expected: PASS. The control public path is atomic; the still-transitional legacy store/capture suite remains green without changing `src/store.mjs`, and no Task 2-15 interface is changed.
 
-- [ ] **Step 21: Run one temporary-HOME full suite and static checks**
+- [x] **Step 21: Run one temporary-HOME full suite and static checks**
 
 Run the full package exactly once with a disposable HOME:
 
@@ -777,7 +777,7 @@ git diff --check
 
 Expected: all three commands exit 0 with no output. Confirm `git diff --name-only` contains only `src/capture.mjs`, `src/control-store.mjs`, and `test/control-store.test.mjs`; confirm `git diff -- src/control-schema.mjs src/crypto-store.mjs src/index.mjs src/cli.mjs` is empty.
 
-- [ ] **Step 22: Commit only the transaction-boundary amendment**
+- [x] **Step 22: Commit only the transaction-boundary amendment**
 
 ```bash
 git add src/capture.mjs src/control-store.mjs test/control-store.test.mjs
@@ -1899,7 +1899,7 @@ git commit -m "docs: describe the immediate reflection pipeline"
 - Task 15 may add tests and the verification report and may make only a minimal integration correction if a previously approved interface is not wired. It must not add a scheduler, RAG/index, service, schema, Stop/receipt/notification path, database lesson body, real-HOME installation, Windows support, or desktop visibility claim.
 - Real-provider compatibility amendment: keep `templates/schemas/reviewer-result.schema.json` as the unchanged authoritative logical contract. For Codex only, derive one per-invocation `0600` transport schema inside the existing private provider directory: the root is an object with one required `result` property, `result` uses nested `anyOf` for the two logical outcomes, `const` becomes a single-value `enum`, and unsupported composition/validation keywords are omitted only from the transport projection. Securely read the result file first, unwrap exactly that transport envelope, and then pass the logical result through the existing semantic validator. Claude and Gemini behavior stays unchanged. Prove this with RED tests before production code; do not add a second installed schema, schema migration, service, retry framework, or broader provider refactor.
 
-- [ ] **Step 1: Write the end-to-end RED scenarios before final integration fixes**
+- [x] **Step 1: Write the end-to-end RED scenarios before final integration fixes**
 
 Add subprocess tests using a temporary HOME and project:
 
@@ -1924,19 +1924,19 @@ The required completed-turn dissatisfaction sentence must drive this scenario. A
 
 Complete the effectiveness chain in the same disposable project: first feedback publishes family A; the next matching prompt emits its method; a later distinct feedback is reviewer-confirmed as family A and publishes a new immutable document with `recurrence_after_emission`; the following matching prompt selects only the newest family method. Also prove a document published during a hook is excluded by that hook's cutoff and appears only on the next prompt.
 
-- [ ] **Step 2: Run RED and diagnose only integration gaps**
+- [x] **Step 2: Run RED and diagnose only integration gaps**
 
 Run: `node --test test/e2e-smoke.test.mjs test/platform-smoke.test.mjs`
 
 Expected: FAIL only where completed modules are not yet wired; if a previously approved task behavior is broken, return to that task's implementer and review rather than patching it silently here.
 
-- [ ] **Step 3: Complete minimal integration and run the full Node suite**
+- [x] **Step 3: Complete minimal integration and run the full Node suite**
 
 Run: `npm test`
 
 Expected: all tests pass with zero failures; report the exact test count and duration. No test name should claim Stop, receipt, notification delivery, three-turn feedback, scheduler, database lesson or memory hold behavior.
 
-- [ ] **Step 4: Run fresh temporary-HOME and package verification on the real macOS host**
+- [x] **Step 4: Run fresh temporary-HOME and package verification on the real macOS host**
 
 Run:
 
@@ -1950,7 +1950,7 @@ rm -rf "$TMP_HOME"
 
 Expected: prompt-only install, the locally installed real isolated reviewer provider is invoked outside the parent turn, Markdown is atomically published, next prompt emits guidance, doctor ready, and no AFL Stop/scheduler configuration exists. The test passes the disposable controller home explicitly through `AFL_SMOKE_HOME` while leaving the provider's normal authentication environment intact; Codex still runs `--ephemeral --ignore-user-config`, and guarded real config/runtime/database hashes must not change. If the provider executable/authentication is unavailable, the test must report `real_provider_unavailable` and Task 15 remains incomplete; a fake provider cannot satisfy this macOS evidence. Record command output and filesystem assertions in the verification report; do not treat protocol success as Codex desktop UI proof.
 
-- [ ] **Step 5: Run the same smoke contract in a real Linux environment**
+- [x] **Step 5: Run the same smoke contract in a real Linux environment**
 
 Use the available Linux CI/container/VM with Node `>=24.15.0`; mount only the repository and a disposable HOME. Run:
 
@@ -1964,11 +1964,11 @@ rm -rf "$TMP_HOME"
 
 Expected: exit 0 for every command; detached/unref, lease recovery, permissions and atomic rename behave identically. If no real Linux executor is available, leave OpenSpec 7.3 unchecked and record the exact infrastructure blocker; do not substitute a mocked `process.platform` assertion for Linux proof.
 
-- [ ] **Step 6: Verify the real user environment was not touched**
+- [x] **Step 6: Verify the real user environment was not touched**
 
 Repeat the Step 1 read-only loop into `/tmp/afl-real-home-after.txt`, then run `diff -u /tmp/afl-real-home-before.txt /tmp/afl-real-home-after.txt`. Expected: no diff; global AFL hooks remain disabled. If another user process legitimately changes a guarded file during the window, stop and report the external-state conflict instead of overwriting or normalizing it.
 
-- [ ] **Step 7: Update task evidence and commit**
+- [x] **Step 7: Update task evidence and commit**
 
 Check each OpenSpec item only when its cited command/output exists. Keep real Codex desktop installation/visibility acceptance explicitly pending for the later user-authorized verify stage.
 

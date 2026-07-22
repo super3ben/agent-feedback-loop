@@ -82,7 +82,7 @@
 - Produces: `digestDecisionBasis(input): string`
 - Consumes: no new project modules.
 
-- [ ] **Step 1: Write failing lineage and projection tests**
+- [x] **Step 1: Write failing lineage and projection tests**
 
 ```js
 test("linked worktrees share one private lineage while separate clones do not", async () => {
@@ -113,13 +113,13 @@ test("inferred requirements remain advisory and cannot raise importance", () => 
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `node --test test/convergence-identity.test.mjs`
 
 Expected: FAIL with `ERR_MODULE_NOT_FOUND` for `src/convergence-identity.mjs`.
 
-- [ ] **Step 3: Implement secure lineage and canonical projection**
+- [x] **Step 3: Implement secure lineage and canonical projection**
 
 ```js
 export const CONTRACT_AUTHORITIES = Object.freeze(new Set([
@@ -167,13 +167,13 @@ export function projectContract(input) {
 
 The file must also implement the referenced bounded validators, length-prefixed digest, stable JSON serializer, owner/mode/symlink checks, and coded errors directly in this module. Each helper receives only strings or plain records and rejects NUL, non-canonical IDs, values over its fixed bound, and unsupported platforms before filesystem writes.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run: `node --test test/convergence-identity.test.mjs`
 
 Expected: PASS, including real linked-worktree and mode assertions on macOS.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add src/convergence-identity.mjs test/convergence-identity.test.mjs
@@ -194,7 +194,7 @@ git commit -m "feat: add convergence lineage and contract projection"
 - Produces: `validateTransition({ from, eventType, to }): true`
 - Produces: frozen enums `DECISIONS`, `BREAKER_REASONS`, `GRANT_PURPOSES`, `ADAPTER_CAPABILITIES`.
 
-- [ ] **Step 1: Write the full policy matrix as failing table tests**
+- [x] **Step 1: Write the full policy matrix as failing table tests**
 
 ```js
 const cases = [
@@ -224,13 +224,13 @@ for (const [name, input, decision, reasonCode] of cases) {
 
 Add explicit negative fixtures proving file saves do not open generations, new verified evidence changes the basis, a reviewer wording change does not, and semantic recommendations cannot raise importance or clear failure history.
 
-- [ ] **Step 2: Run the policy test and verify RED**
+- [x] **Step 2: Run the policy test and verify RED**
 
 Run: `node --test test/convergence-policy.test.mjs`
 
 Expected: FAIL with `ERR_MODULE_NOT_FOUND` for `src/convergence-policy.mjs`.
 
-- [ ] **Step 3: Implement the pure decision lattice**
+- [x] **Step 3: Implement the pure decision lattice**
 
 ```js
 const CAPABILITY_RANK = Object.freeze({ audit_only: 0, checkpoint_gate: 1, workflow_gate: 2, tool_gate: 3 });
@@ -266,13 +266,13 @@ function decision(requested, reasonCode, value, probeRequired) {
 
 Implement each predicate as a side-effect-free function with one reason code and explicit required inputs. `validateTransition` must encode only the state graph from the approved design and reject unknown event/state combinations.
 
-- [ ] **Step 4: Run policy and identity tests**
+- [x] **Step 4: Run policy and identity tests**
 
 Run: `node --test test/convergence-policy.test.mjs test/convergence-identity.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add src/convergence-policy.mjs test/convergence-policy.test.mjs
@@ -312,7 +312,7 @@ git commit -m "feat: add deterministic convergence breaker"
   - `getConvergenceStatus(input)`
   - `transactionalGuardImport(input)`
 
-- [ ] **Step 1: Write failing schema migration and transaction tests**
+- [x] **Step 1: Write failing schema migration and transaction tests**
 
 ```js
 test("v1 upgrades transactionally to the exact canonical v2 schema", () => {
@@ -346,13 +346,13 @@ test("closed regression retains fingerprint failure count and generations", () =
 
 Also test event replay idempotence, same event ID with changed digest rejection, alias collision, distinct declaration evidence, Probe lease fencing, policy/contract invalidation, concurrent grant consumers, and rollback of projection when event insertion fails.
 
-- [ ] **Step 2: Run store tests and verify RED**
+- [x] **Step 2: Run store tests and verify RED**
 
 Run: `node --test test/convergence-store.test.mjs test/control-store.test.mjs`
 
 Expected: FAIL because schema version 2 and convergence APIs do not exist.
 
-- [ ] **Step 3: Add the exact four-table schema and v1→v2 migration**
+- [x] **Step 3: Add the exact four-table schema and v1→v2 migration**
 
 ```sql
 CREATE TABLE convergence_tasks(
@@ -398,7 +398,7 @@ CREATE TABLE continuation_grants(
 
 Set `SCHEMA_VERSION = 2`, add exact `CONTROL_SCHEMA_SQL_SIGNATURE` and `CONTROL_SCHEMA_SIGNATURE` entries, and migrate inside `BEGIN IMMEDIATE`: verify exact v1 first, create the four tables, replace the single `schema_migrations` row with version 2, verify exact v2, then commit. A failure must roll back both schema and version.
 
-- [ ] **Step 4: Implement the convergence store API**
+- [x] **Step 4: Implement the convergence store API**
 
 ```js
 export function createConvergenceStoreApi({ database, transaction, now, randomBytesImpl = randomBytes }) {
@@ -461,13 +461,13 @@ Use this exact transaction contract for the remaining methods:
 
 `facts_json` schemas are event-specific: review stores severity/verdict/direction signal and bounded counters; alias stores alias ID; distinct stores reason code; checkpoint stores kind and file digest; Probe stores kind/attempt; grant stores purpose/generation. Unknown fields are rejected rather than silently persisted.
 
-- [ ] **Step 5: Run schema/store regression tests**
+- [x] **Step 5: Run schema/store regression tests**
 
 Run: `node --test test/convergence-store.test.mjs test/control-store.test.mjs test/runtime.test.mjs`
 
 Expected: PASS; fresh installs expose exactly twelve user tables, existing v1 evidence survives migration, and prompt-only runtime assertions remain green.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add src/convergence-store.mjs src/control-schema.mjs src/control-store.mjs test/convergence-store.test.mjs test/control-store.test.mjs test/runtime.test.mjs
@@ -495,7 +495,7 @@ git commit -m "feat: persist convergence state and one-shot grants"
 - Produces stable command verbs: `record-review`, `status`, `lock-status`, `add-alias`, `declare-distinct`, `checkpoint`, `authorize-fix`, `consume-grant`, `resolve`.
 - Preserves a compatibility parser for old `consume-receipt` and `--receipt-file`, while all new machine output names the artifact `continuation_grant`.
 
-- [ ] **Step 1: Write failing parity tests from real supported Guard states**
+- [x] **Step 1: Write failing parity tests from real supported Guard states**
 
 ```js
 test("first failure authorizes one local fix and the second requires direction review", async () => {
@@ -524,13 +524,13 @@ test("closed regression keeps identity and architecture failure goes human", asy
 
 Add tests for exact replay, review-run collision, alias rewrite, distinct declaration reason/evidence, changed checkpoint digest, expired/changed grant, status JSON, and nonzero machine exit classification.
 
-- [ ] **Step 2: Run adapter/CLI tests and verify RED**
+- [x] **Step 2: Run adapter/CLI tests and verify RED**
 
 Run: `node --test test/convergence-sdd-adapter.test.mjs test/cli.test.mjs`
 
 Expected: FAIL because `guard` dispatch and the SDD adapter are absent.
 
-- [ ] **Step 3: Implement strict parsing and adapter mapping**
+- [x] **Step 3: Implement strict parsing and adapter mapping**
 
 ```js
 export async function runGuardCommand({ args, repoRoot, store, now = () => new Date() }) {
@@ -555,7 +555,7 @@ export async function runGuardCommand({ args, repoRoot, store, now = () => new D
 
 Use an exact allowlist for flags and enums. `checkpoint` and grant artifact paths must be owned regular files inside `repoRoot`; artifacts are `0600`, created atomically, contain the token only in their private JSON body, and are deleted after successful consumption. CLI stdout is exactly one JSON object; stderr contains only bounded reason codes. No `guard` branch may be reachable from prompt-hook output.
 
-- [ ] **Step 4: Wire explicit CLI dispatch**
+- [x] **Step 4: Wire explicit CLI dispatch**
 
 ```js
 export async function main(args) {
@@ -570,13 +570,13 @@ export async function main(args) {
 
 Keep the comment as ordinary source prose only if it still describes the adjacent unchanged branches accurately; do not route `guard` through the generic prompt option parser.
 
-- [ ] **Step 5: Run adapter, CLI, and existing Guard oracle tests**
+- [x] **Step 5: Run adapter, CLI, and existing Guard oracle tests**
 
 Run: `node --test test/convergence-sdd-adapter.test.mjs test/cli.test.mjs && python3 /Users/sunxingda/.codex/skills/subagent-driven-development/tests/test_review_loop_guard.py`
 
 Expected: both suites PASS. The Python suite is an external oracle only; production AFL code must not import it or depend on its filesystem location.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```bash
 git add src/convergence-sdd-adapter.mjs src/convergence-cli.mjs src/cli.mjs test/convergence-sdd-adapter.test.mjs test/cli.test.mjs test/fixtures/guard
@@ -605,7 +605,7 @@ git commit -m "feat: add SDD convergence workflow gate"
 - Produces: `runConvergenceProbeJob(input): Promise<{ outcome, action, resultDigest }>`.
 - Extends: `runReviewerProvider({ resultKind: "lesson" | "convergence_probe", ... })`.
 
-- [ ] **Step 1: Write failing exact-schema and authority tests**
+- [x] **Step 1: Write failing exact-schema and authority tests**
 
 ```js
 test("validates one bounded structured conclusion without chain-of-thought", () => {
@@ -631,13 +631,13 @@ test("rejects extra keys secrets control receipts and oversized fields", () => {
 
 Add tests proving provider output cannot set importance, policy, grant, invariant identity, failure count, or hard decision.
 
-- [ ] **Step 2: Run Probe tests and verify RED**
+- [x] **Step 2: Run Probe tests and verify RED**
 
 Run: `node --test test/convergence-probe-result.test.mjs test/convergence-probe.test.mjs`
 
 Expected: FAIL with missing Probe modules/templates.
 
-- [ ] **Step 3: Implement validator and exact JSON Schema**
+- [x] **Step 3: Implement validator and exact JSON Schema**
 
 ```js
 const KEYS = new Set(["assessment", "action", "unmet_user_value", "wrong_assumption",
@@ -663,7 +663,7 @@ export function validateConvergenceProbeResult(value) {
 
 The JSON Schema must require exactly the seven fields, use the same enums, set `additionalProperties: false`, and mirror all array and string bounds supported by provider transports.
 
-- [ ] **Step 4: Implement detached launch and lease-fenced runner**
+- [x] **Step 4: Implement detached launch and lease-fenced runner**
 
 ```js
 export async function runConvergenceProbeJob({ store, taskUid, fingerprint, ownerId, provider }) {
@@ -707,17 +707,17 @@ export function launchDetachedConvergenceProbe({ platform, nodeExecutable, cliFi
 }
 ```
 
-- [ ] **Step 5: Extend provider result-kind handling without weakening isolation**
+- [x] **Step 5: Extend provider result-kind handling without weakening isolation**
 
 Run the same Codex/Claude/Gemini invocation tests for both schemas. `resultKind` selects a package-owned prompt/schema pair; arbitrary schema paths are rejected. Preserve ephemeral/no-user-config/no-tools/read-only flags and process-group timeout behavior.
 
-- [ ] **Step 6: Run Probe and provider regression tests**
+- [x] **Step 6: Run Probe and provider regression tests**
 
 Run: `node --test test/convergence-probe-result.test.mjs test/convergence-probe.test.mjs test/reviewer-provider.test.mjs test/reviewer-result-file.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 5**
+- [x] **Step 7: Commit Task 5**
 
 ```bash
 git add src/convergence-probe-result.mjs src/convergence-probe-runner.mjs src/convergence-probe-launcher.mjs src/reviewer-provider.mjs src/cli.mjs templates/prompts/convergence-probe.md templates/schemas/convergence-probe-result.schema.json test/convergence-probe-result.test.mjs test/convergence-probe.test.mjs test/reviewer-provider.test.mjs
@@ -740,7 +740,7 @@ git commit -m "feat: add isolated convergence reflection probe"
 - Produces: `evaluateAndAdvance({ store, task, loop, request, launchProbe }): ControllerResult`.
 - Produces: authorization actions `pass`, `probe_started`, `checkpoint_required`, `human_decision`, `grant_issued`, `finish`.
 
-- [ ] **Step 1: Write failing end-to-end controller tests**
+- [x] **Step 1: Write failing end-to-end controller tests**
 
 ```js
 test("routine evidence-free expansion pauses before the next generation and starts one Probe", async () => {
@@ -770,13 +770,13 @@ test("important task receives exactly one falsifiable exploration grant", async 
 
 Add tests for simplify/rollback constrained grants, verified new evidence, grant invalidation, finish-now, Probe failure, generic audit downgrade, second invariant failure, and architecture-fix failure.
 
-- [ ] **Step 2: Run controller tests and verify RED**
+- [x] **Step 2: Run controller tests and verify RED**
 
 Run: `node --test test/convergence-controller.test.mjs test/convergence-sdd-adapter.test.mjs`
 
 Expected: FAIL because orchestration is absent.
 
-- [ ] **Step 3: Implement deterministic orchestration**
+- [x] **Step 3: Implement deterministic orchestration**
 
 ```js
 export function evaluateAndAdvance({ store, task, loop, request, launchProbe }) {
@@ -799,13 +799,13 @@ export function evaluateAndAdvance({ store, task, loop, request, launchProbe }) 
 
 Add `authorizeAfterProbe()` that accepts the validated Probe outcome plus controller-verified evidence. It may issue only the purpose/scope allowed by deterministic policy. Wire SDD `record-review` and `authorize-fix` through this controller; no adapter may call `issueContinuationGrant` directly.
 
-- [ ] **Step 4: Run the vertical workflow tests**
+- [x] **Step 4: Run the vertical workflow tests**
 
 Run: `node --test test/convergence-controller.test.mjs test/convergence-sdd-adapter.test.mjs test/convergence-store.test.mjs test/convergence-probe.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add src/convergence-controller.mjs src/convergence-sdd-adapter.mjs src/convergence-cli.mjs test/convergence-controller.test.mjs test/convergence-sdd-adapter.test.mjs
@@ -831,7 +831,7 @@ git commit -m "feat: close the convergence breaker and grant loop"
 - Extends the Store with one lineage-aggregate `transactionalGuardImport({ authorityTask, sourceSha256, mappingRevision, tasks })` and bounded `recordGuardShadowComparison`, `recordGuardCutover`, `recordGuardRollback`, and `getGuardAuthority` transitions.
 - Produces explicit commands: `guard import --dry-run|--apply`, `guard shadow`, `guard cutover --apply`, `guard rollback --apply`.
 
-- [ ] **Step 1: Write failing migration safety tests**
+- [x] **Step 1: Write failing migration safety tests**
 
 ```js
 test("dry-run reports an exact bounded plan and performs no writes", async () => {
@@ -865,13 +865,13 @@ test("cutover requires matching shadow parity and blocks long-term dual write", 
 
 Add corrupt schema, symlink, owner/mode, source digest change, mismatch, idempotent multi-task import, already-consumed architecture grant, complete rollback snapshot, failure injection, adapter authority routing, and unchanged-real-state tests.
 
-- [ ] **Step 2: Run migration tests and verify RED**
+- [x] **Step 2: Run migration tests and verify RED**
 
 Run: `node --test test/convergence-migration.test.mjs`
 
 Expected: FAIL with missing migration module and missing repository-aggregate Store transitions.
 
-- [ ] **Step 3: Implement bounded import and provenance**
+- [x] **Step 3: Implement bounded import and provenance**
 
 ```js
 export async function inspectGuardImport({ repoRoot, stateFile, store }) {
@@ -893,13 +893,13 @@ The Store validates one lineage/source SHA/mapping revision aggregate and commit
 
 Use the existing four tables: a deterministic lineage-level authority task owns `legacy_imported`, `shadow_compared`, `guard_cutover`, and `guard_rollback` events. `compareGuardShadow` computes only the declared decision/action/generation/eligibility parity set and records bounded digests through the Store. `cutoverGuard` holds a narrow authority-transition lock, verifies source digest, complete matching parity, no live legacy receipt or AFL grant/Probe, creates and fsyncs an owner-only complete snapshot, rechecks the source, and appends `guard_cutover` last as the commit point. Rollback validates and atomically restores that exact snapshot before appending `guard_rollback` last. The SDD adapter derives authority from the Store and never dual-writes.
 
-- [ ] **Step 4: Run migration and SDD parity tests**
+- [x] **Step 4: Run migration and SDD parity tests**
 
 Run: `node --test test/convergence-store.test.mjs test/convergence-migration.test.mjs test/convergence-sdd-adapter.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit Task 7**
+- [x] **Step 5: Commit Task 7**
 
 ```bash
 git add src/convergence-migration.mjs src/convergence-store.mjs src/convergence-cli.mjs src/convergence-sdd-adapter.mjs test/convergence-migration.test.mjs test/convergence-store.test.mjs test/convergence-sdd-adapter.test.mjs
@@ -918,7 +918,7 @@ git commit -m "feat: migrate Guard authority without dual writes"
 - Produces: `projectOpenSpecCheckpoint(input)`, `projectCometCheckpoint(input)`, `projectGenericAudit(input)`.
 - Pure projections only: no Store write, source-spec write, CLI side effect, background job, policy mutation, or grant surface.
 
-- [ ] **Step 1: Write failing capability-boundary tests**
+- [x] **Step 1: Write failing capability-boundary tests**
 
 ```js
 test("OpenSpec may hold the next task but generic audit cannot claim a mutation block", () => {
@@ -932,13 +932,13 @@ test("OpenSpec may hold the next task but generic audit cannot claim a mutation 
 
 Add exact-key fixtures proving inferred contract fields remain advisory; unapproved, stale, or mismatched OpenSpec/Comet revisions cannot gate; approved native task/revision identity is preserved; and generic prompt/tool observations remain `audit_only` with maximum `warn` enforcement.
 
-- [ ] **Step 2: Run adapter tests and verify RED**
+- [x] **Step 2: Run adapter tests and verify RED**
 
 Run: `node --test test/convergence-adapters.test.mjs`
 
 Expected: FAIL with the missing adapter module.
 
-- [ ] **Step 3: Implement capability-bounded projections**
+- [x] **Step 3: Implement capability-bounded projections**
 
 ```js
 export function projectOpenSpecCheckpoint(input) {
@@ -956,17 +956,17 @@ export function projectGenericAudit(input) {
 
 Comet uses the same checkpoint capability but its native task ID and revision come from the active change/task artifact. No adapter writes source specifications.
 
-- [ ] **Step 4: Run adapter and affected convergence regressions**
+- [x] **Step 4: Run adapter and affected convergence regressions**
 
 Run: `node --test test/convergence-adapters.test.mjs test/convergence-identity.test.mjs test/convergence-policy.test.mjs test/convergence-controller.test.mjs`
 
 Expected: PASS.
 
-- [ ] **Step 5: Verify the deferred-learning exclusion**
+- [x] **Step 5: Verify the deferred-learning exclusion**
 
 Assert this task adds no production reference to `resolve-effectiveness`, `recordConvergenceEffectiveness`, or a `learning` Probe kind. The existing dissatisfaction reviewer remains the only automatic Markdown producer. Independent Guard-outcome learning is backlog until a named producer supplies a bounded evidence envelope and a separately approved learning-job authority/result contract.
 
-- [ ] **Step 6: Commit Task 8**
+- [x] **Step 6: Commit Task 8**
 
 ```bash
 git add src/convergence-adapters.mjs test/convergence-adapters.test.mjs
@@ -992,7 +992,7 @@ git commit -m "feat: add capability-bounded convergence adapters"
 - Consumes: all previous tasks.
 - Produces: packaged 0.9.0 runtime, convergence capability diagnostics, macOS/Linux acceptance evidence, and activation instructions.
 
-- [ ] **Step 1: Write failing packaging and prompt-isolation acceptance tests**
+- [x] **Step 1: Write failing packaging and prompt-isolation acceptance tests**
 
 ```js
 test("0.9.0 packages convergence assets without adding a Stop hook", async () => {
@@ -1017,13 +1017,13 @@ test("every convergence failure preserves the native prompt response exactly", a
 
 Add doctor output assertions for schema version 2, provider/Probe availability, platform support, and adapter capability without claiming cutover or real-time generic blocking.
 
-- [ ] **Step 2: Run runtime/e2e/platform tests and verify RED**
+- [x] **Step 2: Run runtime/e2e/platform tests and verify RED**
 
 Run: `node --test test/runtime.test.mjs test/e2e-smoke.test.mjs test/platform-smoke.test.mjs test/cli.test.mjs`
 
 Expected: FAIL on old version, missing templates, and missing capability output.
 
-- [ ] **Step 3: Update versioned packaging and doctor**
+- [x] **Step 3: Update versioned packaging and doctor**
 
 ```js
 export const RUNTIME_VERSION = "0.9.0";
@@ -1031,7 +1031,7 @@ export const RUNTIME_VERSION = "0.9.0";
 
 Add `convergenceProbePrompt`, `convergenceProbeSchema`, and private grant artifact root to `pathsFor()`. Install only package assets and schema migration; do not register a new hook or activate Guard authority. Doctor reports `audit_only`, `checkpoint_gate`, and `workflow_gate` availability separately from installation/cutover state.
 
-- [ ] **Step 4: Write truthful English and Chinese documentation**
+- [x] **Step 4: Write truthful English and Chinese documentation**
 
 Document:
 
@@ -1042,7 +1042,7 @@ Document:
 - no Stop hook, no user-visible receipt, no resident service, no database lesson body;
 - code verification, installed runtime, cutover canary, and production effectiveness as separate states.
 
-- [ ] **Step 5: Run focused and full regressions**
+- [x] **Step 5: Run focused and full regressions**
 
 Run: `node --test test/runtime.test.mjs test/e2e-smoke.test.mjs test/platform-smoke.test.mjs test/cli.test.mjs`
 
@@ -1052,7 +1052,7 @@ Run: `npm test`
 
 Expected: all existing 272 tests plus all new convergence tests PASS on macOS.
 
-- [ ] **Step 6: Attempt real macOS and Linux acceptance**
+- [x] **Step 6: Attempt real macOS and Linux acceptance**
 
 On the macOS development machine:
 
@@ -1074,7 +1074,7 @@ Expected: full PASS; doctor reports Linux process/database support and does not 
 
 If a Linux environment is unavailable, record the exact unavailable boundary and do not label Linux runtime verified.
 
-- [ ] **Step 7: Commit Task 9**
+- [x] **Step 7: Commit Task 9**
 
 ```bash
 git add src/index.mjs package.json README.md README-zh.md templates/rules/feedback-loop.md test/runtime.test.mjs test/e2e-smoke.test.mjs test/platform-smoke.test.mjs test/cli.test.mjs
@@ -1085,12 +1085,12 @@ git commit -m "docs: package and verify convergence guard integration"
 
 ## Final Verification and Activation Boundary
 
-- [ ] Run `git diff --check` and confirm no whitespace errors.
-- [ ] Run `npm test` and record the exact test/pass/fail counts.
-- [ ] Run `npm pack --dry-run --json` and confirm only intended runtime/template files are packaged.
-- [ ] Run the old Python Guard test suite as a semantic oracle; do not treat it as AFL runtime dependency.
-- [ ] Inspect installed temp-HOME hooks and prove no Stop/AfterAgent AFL control hook exists.
-- [ ] Inspect structured logs and prove no prompt, diff, Probe body, token, absolute path, or grant artifact content appears.
-- [ ] Confirm `.superpowers/sdd/review-loop-state.json` in the real development worktree has not been modified by tests.
-- [ ] Confirm the real global SDD Skill and real AFL installation remain unchanged.
-- [ ] Obtain separate user authorization before changing the global SDD Skill, importing real Guard state, switching a real repository to AFL authority, or enabling a canary runtime.
+- [x] Run `git diff --check` and confirm no whitespace errors.
+- [x] Run `npm test` and record the exact test/pass/fail counts.
+- [x] Run `npm pack --dry-run --json` and confirm only intended runtime/template files are packaged.
+- [x] Run the old Python Guard test suite as a semantic oracle; do not treat it as AFL runtime dependency.
+- [x] Inspect installed temp-HOME hooks and prove no Stop/AfterAgent AFL control hook exists.
+- [x] Inspect structured logs and prove no prompt, diff, Probe body, token, absolute path, or grant artifact content appears.
+- [x] Confirm `.superpowers/sdd/review-loop-state.json` in the real development worktree has not been modified by tests.
+- [x] Confirm the real global SDD Skill and real AFL installation remain unchanged.
+- [x] Obtain separate user authorization before changing the global SDD Skill, importing real Guard state, switching a real repository to AFL authority, or enabling a canary runtime.
