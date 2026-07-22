@@ -50,6 +50,10 @@ const HOST_FIELDS = [
   "producer", "goalSummary", "acceptanceCriteria", "exclusions", "importance",
   "importanceAuthority", "contractRevision", "generationObservations", "reviewEvidence"
 ];
+const PRODUCER_FIELDS = [
+  "producer", "goalSummary", "acceptanceCriteria", "exclusions", "importance",
+  "importanceAuthority", "contractRevision", "generationObservations"
+];
 const CONTROLLER_FIELDS = [
   "taskUid", "fingerprint", "boundaryId", "canonicalInvariantId", "importance",
   "importanceAuthority", "contractRevision", "decision", "breakerReason", "failureCount",
@@ -304,6 +308,28 @@ function validateHostProjection(input) {
     contractRevision: digest(value.contractRevision),
     generationObservations: Object.freeze(arrayValues(value.generationObservations, 2).map(validateObservation)),
     reviewEvidence: validateReviewInput(value.reviewEvidence)
+  });
+}
+
+export function validateConvergenceProbeHostProjection(input) {
+  return validateHostProjection(input);
+}
+
+export function validateConvergenceProbeProducerProjection(input) {
+  const value = recordValues(input, PRODUCER_FIELDS);
+  return Object.freeze({
+    producer: identifier(value.producer),
+    goalSummary: scannedText(value.goalSummary, 512),
+    acceptanceCriteria: textArray(value.acceptanceCriteria, {
+      minimum: 1, maximum: 8, itemMaximum: 256
+    }),
+    exclusions: textArray(value.exclusions, { minimum: 0, maximum: 8, itemMaximum: 256 }),
+    importance: enumValue(value.importance, IMPORTANCE),
+    importanceAuthority: enumValue(value.importanceAuthority, AUTHORITIES),
+    contractRevision: digest(value.contractRevision),
+    generationObservations: Object.freeze(
+      arrayValues(value.generationObservations, 2).map(validateObservation)
+    )
   });
 }
 

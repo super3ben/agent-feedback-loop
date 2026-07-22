@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -12,6 +12,9 @@ import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
 import * as cliModule from "../src/cli.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { executeGuardCli } from "../src/convergence-cli.mjs";
+import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
+import { ensureRepositoryLineage } from "../src/convergence-identity.mjs";
 import { publishReflectionDocument } from "../src/reflection-document.mjs";
 import { recoverDueReviewers } from "../src/reviewer-launcher.mjs";
 import { loadReflectionDocuments } from "../src/selector.mjs";
@@ -1440,6 +1443,166 @@ describe("agent-feedback-loop package", () => {
       assert.ok(mainBody.indexOf('args[0] === "guard"') < mainBody.indexOf("parseArgs(args)"));
       const hookBody = source.slice(source.indexOf("export async function handlePromptHook"), source.indexOf("export function reviewerTerminalLog"));
       assert.doesNotMatch(hookBody, /executeGuardCli|runGuardCommand/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("guard reads bounded semantic stdin only for the explicit Probe context flag", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-guard-stdin-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    let reads = 0;
+    try {
+      const invalid = await executeGuardCli([
+        "--repo-root", repoRoot, "--home", home,
+        "record-review",
+        "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+        "--review-run-id", "stdin-review", "--severity", "Important",
+        "--verdict", "changes_required", "--commit", "deadbeef",
+        "--review-ref", "reviews/stdin.md", "--hypothesis", "opaque input is insufficient",
+        "--new-evidence", "provider lacks semantic facts", "--falsification-test", "observe exact evidence",
+        "--failure-next-action", "direction_review", "--probe-context-stdin"
+      ], {
+        readStdin: async ({ maxBytes }) => {
+          reads += 1;
+          assert.equal(maxBytes, 16 * 1_024);
+          return "{";
+        }
+      });
+      assert.equal(reads, 1);
+      assert.deepEqual(invalid.payload, { error: "probe_context_invalid" });
+      await assert.rejects(stat(home));
+
+      const noFlag = await executeGuardCli([
+        "--repo-root", repoRoot, "--home", home,
+        "record-review", "--unknown", "private-value"
+      ], {
+        readStdin: async () => { throw new Error("stdin must remain unread"); }
+      });
+      assert.equal(noFlag.payload.error, "guard_invalid_arguments");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("Probe context stdin accepts 16 KiB and rejects overflow, truncation, UTF-8 errors, and trailing JSON", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-guard-stdin-bounds-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    const context = JSON.stringify({
+      producer: "sdd",
+      goalSummary: "Bound semantic context without exposing it",
+      acceptanceCriteria: ["Reject every byte outside the explicit envelope"],
+      exclusions: ["No semantic bytes in argv or output"],
+      importance: "routine",
+      importanceAuthority: "approved_plan",
+      contractRevision: "a".repeat(64),
+      generationObservations: []
+    });
+    const args = [
+      "--repo-root", repoRoot, "--home", home,
+      "record-review",
+      "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+      "--review-run-id", "stdin-bounds", "--severity", "Important",
+      "--verdict", "changes_required", "--commit", "deadbeef",
+      "--review-ref", "reviews/stdin.md", "--hypothesis", "opaque input is insufficient",
+      "--new-evidence", "provider lacks semantic facts", "--falsification-test", "observe exact evidence",
+      "--failure-next-action", "direction_review", "--probe-context-stdin"
+    ];
+    try {
+      const exact = Buffer.alloc(16 * 1_024, 0x20);
+      exact.write(context, 0, "utf8");
+      const accepted = await executeGuardCli(args, { readStdin: async () => exact });
+      assert.equal(accepted.payload.error, "lineage_not_initialized");
+
+      for (const raw of [
+        Buffer.concat([exact, Buffer.from(" ")]),
+        Buffer.from(context.slice(0, -1), "utf8"),
+        Buffer.from([0xc3, 0x28]),
+        Buffer.from(`${context}{}`, "utf8")
+      ]) {
+        const rejected = await executeGuardCli(args, { readStdin: async () => raw });
+        assert.deepEqual(rejected.payload, { error: "probe_context_invalid" });
+        assert.doesNotMatch(JSON.stringify(rejected), /Bound semantic|provider lacks/u);
+      }
+      await assert.rejects(stat(home));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("orphan cleanup runs only after an explicit mutation and never from status", async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "afl-probe-orphan-cli-")));
+    const repoRoot = path.join(root, "repo");
+    const home = path.join(root, "home");
+    await mkdir(repoRoot, { mode: 0o700 });
+    await execFileAsync("git", ["init", "-q", repoRoot]);
+    await ensureRepositoryLineage({ repoRoot });
+    const paths = pathsFor(home);
+    const contextStore = new ConvergenceProbeContextStore({
+      root: paths.probeContextRoot,
+      keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+    });
+    try {
+      const published = await contextStore.put({
+        version: 1,
+        identity: {
+          taskUid: "orphan-task",
+          fingerprint: "orphan-fingerprint",
+          boundaryId: "task-5",
+          canonicalInvariantId: "probe-context"
+        },
+        contract: {
+          goalSummary: "Remove only an old unreferenced Probe artifact",
+          acceptanceCriteria: ["Read commands never trigger cleanup"],
+          exclusions: ["No scheduler or prompt cleanup"],
+          importance: "routine",
+          importanceAuthority: "approved_plan",
+          contractRevision: "a".repeat(64)
+        },
+        trigger: {
+          decision: "reflection_required",
+          breakerReason: "unjustified_architecture_expansion",
+          failureCount: 1,
+          currentGeneration: 0,
+          decisionBasisDigest: "b".repeat(64)
+        },
+        recentGenerations: [],
+        reviewEvidence: {
+          severity: "important",
+          verdict: "changes_required",
+          hypothesis: "Read paths may mutate cleanup state",
+          newEvidence: "An old orphan remains available before status",
+          falsificationTest: "Compare status and explicit mutation"
+        }
+      });
+      const artifact = contextStore.artifactFile(published.digest);
+      const old = new Date(Date.now() - 25 * 60 * 60 * 1_000);
+      await utimes(artifact, old, old);
+
+      const statusResult = await executeGuardCli([
+        "--repo-root", repoRoot, "--home", home, "status", "--task-id", "task-5"
+      ]);
+      assert.equal(statusResult.exitCode, 0);
+      await stat(artifact);
+
+      const mutation = await executeGuardCli([
+        "--repo-root", repoRoot, "--home", home,
+        "record-review",
+        "--task-id", "task-5", "--invariant-id", "probe-evidence", "--boundary", "probe-boundary",
+        "--review-run-id", "orphan-cleanup", "--severity", "Important",
+        "--verdict", "changes_required", "--commit", "deadbeef",
+        "--review-ref", "reviews/orphan.md", "--hypothesis", "an orphan can survive a crash",
+        "--new-evidence", "an old digest is not live", "--falsification-test", "run one explicit mutation",
+        "--failure-next-action", "direction_review"
+      ]);
+      assert.equal(mutation.payload.action, "local_fix_allowed");
+      await assert.rejects(stat(artifact));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

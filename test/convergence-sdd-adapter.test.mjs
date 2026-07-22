@@ -10,10 +10,12 @@ import { afterEach, test } from "node:test";
 
 import { runGuardCommand } from "../src/convergence-sdd-adapter.mjs";
 import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
+import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
 import {
   deriveTaskUid, ensureRepositoryLineage, projectContract
 } from "../src/convergence-identity.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { BlobKeyProvider } from "../src/crypto-store.mjs";
 import { inspectGuardRepository } from "../src/convergence-migration.mjs";
 import { pathsFor } from "../src/index.mjs";
 
@@ -41,6 +43,29 @@ async function harness(name) {
   let currentTime = new Date("2026-07-21T00:00:00.000Z");
   const now = () => new Date(currentTime);
   const store = initializeControlStore({ paths: pathsFor(home), now });
+  const contextStore = new ConvergenceProbeContextStore({
+    root: pathsFor(home).probeContextRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: pathsFor(home).keyRoot })
+  });
+  const contract = projectContract({
+    sourceKind: "approved_plan",
+    sourceRef: `sdd-task:${state.task_id}`,
+    sourceRevision: "sdd-task-v1",
+    requirements: [],
+    exclusions: [],
+    importance: "routine",
+    importanceAuthority: "approved_plan"
+  });
+  const probeContext = Object.freeze({
+    producer: "sdd",
+    goalSummary: "Preserve one deterministic review authority",
+    acceptanceCriteria: ["The detached Probe receives bounded semantic evidence"],
+    exclusions: ["No semantic evidence enters SQLite"],
+    importance: contract.importance,
+    importanceAuthority: contract.importanceAuthority,
+    contractRevision: contract.revision,
+    generationObservations: []
+  });
 
   const key = [
     "--task-id", state.task_id,
@@ -53,6 +78,8 @@ async function harness(name) {
     store,
     now,
     artifactHooks,
+    probeContext,
+    contextStore,
     preflight: await inspectGuardRepository({ repoRoot, paths: pathsFor(home) })
   });
   const review = ({
@@ -87,6 +114,8 @@ async function harness(name) {
     repoRoot,
     home,
     store,
+    probeContext,
+    contextStore,
     key,
     command,
     review,
@@ -192,6 +221,8 @@ test("a crash after structural review commit fails closed before local authoriza
       args,
       repoRoot: h.repoRoot,
       store: crashingStore,
+      probeContext: h.probeContext,
+      contextStore: h.contextStore,
       preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) })
     }),
     (error) => error.code === "simulated_crash_after_review_commit"
@@ -211,6 +242,8 @@ test("a crash after structural review commit fails closed before local authoriza
     args,
     repoRoot: h.repoRoot,
     store: h.store,
+    probeContext: h.probeContext,
+    contextStore: h.contextStore,
     preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) }),
     launchProbe() {
       launches += 1;
@@ -244,6 +277,7 @@ test("authorize-fix resumes a completed Probe through the existing SDD boundary"
   assert.equal(reviewed.action, "reflection_required");
   const completed = await runConvergenceProbeJob({
     store: h.store,
+    contextStore: h.contextStore,
     taskUid: reviewed.task_id,
     fingerprint: reviewed.fingerprint,
     ownerId: "sdd-post-probe-owner",
@@ -270,6 +304,42 @@ test("authorize-fix resumes a completed Probe through the existing SDD boundary"
   assert.equal(h.store.database.prepare(
     "SELECT COUNT(*) AS count FROM continuation_grants"
   ).get().count, 1);
+});
+
+test("missing Probe context returns and persists one bounded checkpoint reason", async (t) => {
+  const h = await harness("open-first-failure");
+  t.after(() => h.store.close());
+  let launches = 0;
+  const result = await runGuardCommand({
+    args: [
+      "record-review", ...h.key,
+      "--review-run-id", "missing-probe-context",
+      "--severity", "Important",
+      "--verdict", "changes_required",
+      "--commit", "missing-context-commit",
+      "--review-ref", "reviews/missing-context.md",
+      "--hypothesis", "the provider lacks semantic evidence",
+      "--new-evidence", "no named producer context was supplied",
+      "--falsification-test", "supply one bounded producer projection",
+      "--failure-next-action", "direction_review",
+      "--direction-signal", "structural_blocked"
+    ],
+    repoRoot: h.repoRoot,
+    store: h.store,
+    preflight: await inspectGuardRepository({ repoRoot: h.repoRoot, paths: pathsFor(h.home) }),
+    launchProbe() { launches += 1; return { attempted: true }; }
+  });
+
+  assert.equal(result.action, "checkpoint_required");
+  assert.equal(result.reason_code, "probe_context_required");
+  assert.equal(result.status, "checkpoint_required");
+  assert.equal(h.store.getConvergenceStatus({
+    taskUid: result.task_id,
+    fingerprint: result.fingerprint
+  }).status, "checkpoint_required");
+  assert.equal(launches, 0);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
 });
 
 test("status leaves an existing v1 task projection unchanged", async (t) => {

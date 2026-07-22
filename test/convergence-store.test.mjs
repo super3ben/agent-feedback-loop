@@ -673,7 +673,8 @@ test("state-changing checkpoint generation and Probe writes replay before curren
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   };
   assert.deepEqual(
     probeFixture.store.requestConvergenceProbe(probeRequest),
@@ -717,7 +718,8 @@ test("Probe failure replay is idempotent after the lease state changes", () => {
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   });
   fixture.store.claimConvergenceProbe({
     eventUid: "probe-claim-failure-replay",
@@ -740,6 +742,43 @@ test("Probe failure replay is idempotent after the lease state changes", () => {
     fixture.store.failConvergenceProbe(failure),
     fixture.store.failConvergenceProbe(failure)
   );
+  fixture.store.close();
+});
+
+test("Probe requests bind one live context digest and expose no semantic body", () => {
+  const fixture = convergenceFixture();
+  requireReflection(fixture.store);
+  const contextDigest = "b".repeat(64);
+
+  fixture.store.requestConvergenceProbe({
+    eventUid: "probe-request-context-binding",
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    probeKind: "convergence_reflection",
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest
+  });
+
+  assert.deepEqual(
+    fixture.store.getConvergenceProbeContextBinding({
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1"
+    }),
+    {
+      contextDigest,
+      contractRevision: DIGEST.contract,
+      currentGeneration: 1,
+      decisionBasisDigest: DIGEST.basis
+    }
+  );
+  assert.deepEqual(
+    [...fixture.store.getLiveConvergenceProbeContextDigests()],
+    [contextDigest]
+  );
+  const event = fixture.store.database.prepare(`SELECT source_digest, facts_json
+    FROM convergence_events WHERE event_uid='probe-request-context-binding'`).get();
+  assert.equal(event.source_digest, contextDigest);
+  assert.deepEqual(JSON.parse(event.facts_json), { kind: "convergence_reflection" });
   fixture.store.close();
 });
 
@@ -773,7 +812,8 @@ test("Probe claims are lease-epoch fenced and completion clears the live owner",
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   });
   const claimed = store.claimConvergenceProbe({
     eventUid: "probe-claim-1",
@@ -818,7 +858,8 @@ test("hard-looking Probe advice stays neutral and immutable at the Store authori
       taskUid: "task-1",
       fingerprint: "fingerprint-1",
       probeKind: "convergence_reflection",
-      dueAt: "2026-07-21T00:00:00.000Z"
+      dueAt: "2026-07-21T00:00:00.000Z",
+      contextDigest: "b".repeat(64)
     });
     store.claimConvergenceProbe({
       eventUid: `probe-claim-neutral-${action}`,
@@ -865,7 +906,8 @@ test("Probe failure schedules bounded retry and a new claim fences the old epoch
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   });
   store.claimConvergenceProbe({
     eventUid: "probe-claim-retry-1",
@@ -907,7 +949,8 @@ test("expired running Probe leases are reclaimed and exhausted attempts become t
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   });
   const first = store.claimConvergenceProbe({
     eventUid: "probe-claim-expired-1",
@@ -1155,7 +1198,8 @@ test("resolve retains loop history and refuses a live grant or Probe", () => {
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     probeKind: "convergence_reflection",
-    dueAt: "2026-07-21T00:00:00.000Z"
+    dueAt: "2026-07-21T00:00:00.000Z",
+    contextDigest: "b".repeat(64)
   });
   assert.throws(() => second.store.resolveConvergenceLoop({
     eventUid: "resolve-live-probe",

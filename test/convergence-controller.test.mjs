@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,7 +13,9 @@ import {
 } from "../src/convergence-controller.mjs";
 import { digestDecisionBasis, projectContract } from "../src/convergence-identity.mjs";
 import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
+import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
 import { initializeControlStore } from "../src/control-store.mjs";
+import { BlobKeyProvider } from "../src/crypto-store.mjs";
 import { pathsFor } from "../src/index.mjs";
 
 const POLICY_REVISION = createHash("sha256").update("convergence-policy-v2").digest("hex");
@@ -48,7 +50,12 @@ function harness({
   let currentTime = new Date("2026-07-21T00:00:00.000Z");
   let serial = 0;
   const now = () => new Date(currentTime);
-  const store = initializeControlStore({ paths: pathsFor(home), now });
+  const paths = pathsFor(home);
+  const store = initializeControlStore({ paths, now });
+  const contextStore = new ConvergenceProbeContextStore({
+    root: paths.probeContextRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+  });
   const contract = projectContract({
     sourceKind: "approved_task",
     sourceRef: "controller-task-6",
@@ -132,12 +139,42 @@ function harness({
     };
   }
 
+  function probeContext(overrides = {}) {
+    const row = store.database.prepare(`SELECT evidence_digest, result_digest, facts_json
+      FROM convergence_events WHERE task_uid=? AND fingerprint=?
+        AND event_type IN ('review_recorded', 'evidence_recorded')
+      ORDER BY id DESC LIMIT 1`).get(taskProjection.taskUid, loop().fingerprint);
+    const facts = JSON.parse(row.facts_json);
+    return {
+      producer: "sdd",
+      goalSummary: "Keep the approved convergence boundary authoritative",
+      acceptanceCriteria: ["A detached Probe receives the exact bounded evidence"],
+      exclusions: ["No semantic body enters SQLite"],
+      importance: taskProjection.importance,
+      importanceAuthority: taskProjection.importanceAuthority,
+      contractRevision: taskProjection.contractRevision,
+      generationObservations: [],
+      reviewEvidence: {
+        severity: facts.severity ?? "important",
+        verdict: facts.verdict ?? "changes_required",
+        hypothesis: "The opaque status cannot support a semantic judgment",
+        newEvidence: "The provider needs the approved goal and current review evidence",
+        falsificationTest: "Observe the exact bounded differences at the provider",
+        evidenceDigest: row.evidence_digest,
+        decisionBasisDigest: row.result_digest
+      },
+      ...overrides
+    };
+  }
+
   function evaluate(overrides = {}, launchProbe = () => ({ attempted: true, reason: "test" })) {
     return evaluateAndAdvance({
       store,
       task: taskProjection,
       loop: loop(),
       request: request(overrides),
+      probeContext: probeContext(),
+      contextStore,
       launchProbe,
       now
     });
@@ -147,6 +184,7 @@ function harness({
     let probeSerial = 0;
     const completed = await runConvergenceProbeJob({
       store,
+      contextStore,
       taskUid: taskProjection.taskUid,
       fingerprint: loop().fingerprint,
       ownerId: eventUid("probe-owner"),
@@ -201,6 +239,8 @@ function harness({
     review,
     loop,
     request,
+    probeContext,
+    contextStore,
     evaluate,
     completeProbe,
     verifiedEvidence,
@@ -213,12 +253,319 @@ function harness({
   };
 }
 
-test("routine evidence-free expansion pauses and starts one Probe without a grant", (t) => {
+test("reflection publishes context before its digest-only request and launches after commit", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  const timeline = [];
+  const contextDigest = "b".repeat(64);
+  const contextStore = {
+    async put() {
+      timeline.push("artifact");
+      return { digest: contextDigest, created: true };
+    },
+    async remove() {
+      timeline.push("cleanup");
+      return true;
+    }
+  };
+
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+    probeContext: h.probeContext(),
+    contextStore,
+    launchProbe() {
+      const request = h.store.database.prepare(`SELECT source_digest FROM convergence_events
+        WHERE event_type='reflection_requested' ORDER BY id DESC LIMIT 1`).get();
+      assert.equal(request.source_digest, contextDigest);
+      timeline.push("launch");
+      return { attempted: true, reason: "spawn_attempted" };
+    },
+    now: h.now
+  });
+
+  assert.equal(result.action, "probe_started");
+  assert.deepEqual(timeline, ["artifact", "launch"]);
+});
+
+test("missing semantic context checkpoints hard adapters without Probe side effects", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  let artifactCalls = 0;
+  let launches = 0;
+  const beforeRequests = h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count;
+
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+    contextStore: { async put() { artifactCalls += 1; } },
+    launchProbe() { launches += 1; return { attempted: true }; },
+    now: h.now
+  });
+
+  assert.equal(result.action, "checkpoint_required");
+  assert.equal(result.decision.reasonCode, "probe_context_required");
+  assert.equal(h.loop().status, "checkpoint_required");
+  assert.equal(h.loop().decision, "checkpoint_required");
+  assert.equal(artifactCalls, 0);
+  assert.equal(launches, 0);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count, beforeRequests);
+});
+
+test("stale semantic context checkpoints before artifact publication", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  let artifactCalls = 0;
+  let launches = 0;
+
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+    probeContext: h.probeContext({ contractRevision: "f".repeat(64) }),
+    contextStore: { async put() { artifactCalls += 1; } },
+    launchProbe() { launches += 1; return { attempted: true }; },
+    now: h.now
+  });
+
+  assert.equal(result.action, "checkpoint_required");
+  assert.equal(result.decision.reasonCode, "probe_context_invalid");
+  assert.equal(h.loop().status, "checkpoint_required");
+  assert.equal(artifactCalls, 0);
+  assert.equal(launches, 0);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
+});
+
+test("audit-only missing context warns without artifact, request, launch, or hard state", async (t) => {
+  const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });
+  t.after(() => h.close());
+  let artifactCalls = 0;
+  let launches = 0;
+
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true, evidenceQuality: "verified" }),
+    contextStore: { async put() { artifactCalls += 1; } },
+    launchProbe() { launches += 1; return { attempted: true }; },
+    now: h.now
+  });
+
+  assert.equal(result.action, "warn");
+  assert.equal(result.decision.reasonCode, "probe_context_required");
+  assert.equal(h.loop().status, "generation_closed");
+  assert.equal(artifactCalls, 0);
+  assert.equal(launches, 0);
+  assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+    FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
+});
+
+test("audit-only stale context reports invalid without publishing or hard state", async (t) => {
+  const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });
+  t.after(() => h.close());
+  let artifactCalls = 0;
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true, evidenceQuality: "verified" }),
+    probeContext: h.probeContext({ contractRevision: "f".repeat(64) }),
+    contextStore: { async put() { artifactCalls += 1; } },
+    now: h.now
+  });
+
+  assert.equal(result.action, "warn");
+  assert.equal(result.decision.reasonCode, "probe_context_invalid");
+  assert.equal(h.loop().status, "generation_closed");
+  assert.equal(artifactCalls, 0);
+});
+
+test("request failure cleans only a newly published unreferenced context", async (t) => {
+  const fixtures = [harness(), harness()];
+  t.after(() => fixtures.forEach((h) => h.close()));
+  for (const [index, h] of fixtures.entries()) {
+    const created = index === 0;
+    const digest = (created ? "b" : "c").repeat(64);
+    let removals = 0;
+    const contextStore = {
+      async put() { return { digest, created }; },
+      async remove(value) {
+        assert.equal(value, digest);
+        removals += 1;
+      }
+    };
+    const failingStore = {
+      ...h.store,
+      requestConvergenceProbe() {
+        throw Object.assign(new Error("request_failed"), { code: "request_failed" });
+      }
+    };
+
+    await assert.rejects(evaluateAndAdvance({
+      store: failingStore,
+      task: h.task(),
+      loop: h.loop(),
+      request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+      probeContext: h.probeContext(),
+      contextStore,
+      launchProbe() { throw new Error("must not launch"); },
+      now: h.now
+    }), (error) => error.code === "request_failed");
+
+    assert.equal(removals, created ? 1 : 0);
+    assert.equal(h.store.database.prepare(`SELECT COUNT(*) AS count
+      FROM convergence_events WHERE event_type='reflection_requested'`).get().count, 0);
+  }
+});
+
+test("real Store third retryable provider failure becomes terminal before context cleanup", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  const contextDigest = h.store.getConvergenceProbeContextBinding({
+    taskUid: h.task().taskUid,
+    fingerprint: h.loop().fingerprint
+  }).contextDigest;
+  const providerError = Object.assign(new Error("bounded timeout"), { code: "provider_timeout" });
+  let eventSerial = 0;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await assert.rejects(runConvergenceProbeJob({
+      store: h.store,
+      contextStore: h.contextStore,
+      taskUid: h.task().taskUid,
+      fingerprint: h.loop().fingerprint,
+      ownerId: `retry-owner-${attempt}`,
+      provider: async () => { throw providerError; },
+      eventUid: () => `retry-event-${++eventSerial}`
+    }), (error) => error === providerError);
+    if (attempt < 3) {
+      assert.equal(h.loop().probeState, "retryable");
+      await h.contextStore.read(contextDigest);
+      h.advance(30_001);
+    }
+  }
+
+  assert.equal(h.loop().probeState, "failed");
+  assert.equal(h.loop().status, "checkpoint_required");
+  await assert.rejects(h.contextStore.read(contextDigest));
+});
+
+test("semantic Probe canaries stay out of request output, launch input, SQLite, journals, and Markdown", async (t) => {
+  const h = harness();
+  t.after(() => h.close());
+  const goalCanary = "semantic-goal-canary-6f1a";
+  const evidenceCanary = "semantic-evidence-canary-8c2b";
+  const launchInputs = [];
+  const baseProjection = h.probeContext();
+  const result = await evaluateAndAdvance({
+    store: h.store,
+    task: h.task(),
+    loop: h.loop(),
+    request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+    probeContext: {
+      ...baseProjection,
+      goalSummary: goalCanary,
+      reviewEvidence: {
+        ...baseProjection.reviewEvidence,
+        newEvidence: evidenceCanary
+      }
+    },
+    contextStore: h.contextStore,
+    launchProbe(input) {
+      launchInputs.push(input);
+      return { attempted: true, reason: "spawn_attempted" };
+    },
+    now: h.now
+  });
+  const serialized = JSON.stringify({ result, launchInputs });
+  assert.doesNotMatch(serialized, /semantic-(?:goal|evidence)-canary/u);
+
+  const paths = pathsFor(h.home);
+  for (const file of [paths.controlDatabase, `${paths.controlDatabase}-wal`, `${paths.controlDatabase}-shm`]) {
+    if (existsSync(file)) {
+      const bytes = readFileSync(file);
+      assert.equal(bytes.includes(goalCanary), false, file);
+      assert.equal(bytes.includes(evidenceCanary), false, file);
+    }
+  }
+  const artifact = h.contextStore.artifactFile(
+    h.store.getConvergenceProbeContextBinding({
+      taskUid: h.task().taskUid,
+      fingerprint: h.loop().fingerprint
+    }).contextDigest
+  );
+  const encrypted = readFileSync(artifact);
+  assert.equal(encrypted.includes(goalCanary), false);
+  assert.equal(encrypted.includes(evidenceCanary), false);
+  const markdown = readdirSync(h.home, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md"));
+  assert.equal(markdown.length, 0);
+});
+
+test("different approved goals and exclusions reach providers as exact bounded evidence", async (t) => {
+  const fixtures = [harness(), harness()];
+  t.after(() => fixtures.forEach((h) => h.close()));
+  const expected = [
+    { goal: "Preserve the smallest safe repair", exclusion: "No scheduler" },
+    { goal: "Restore restart-safe semantic review", exclusion: "No SQLite body" }
+  ];
+  const observed = [];
+
+  for (const [index, h] of fixtures.entries()) {
+    const base = h.probeContext();
+    await evaluateAndAdvance({
+      store: h.store,
+      task: h.task(),
+      loop: h.loop(),
+      request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+      probeContext: {
+        ...base,
+        goalSummary: expected[index].goal,
+        exclusions: [expected[index].exclusion]
+      },
+      contextStore: h.contextStore,
+      launchProbe: () => ({ attempted: false, reason: "test_deferred" }),
+      now: h.now
+    });
+    await runConvergenceProbeJob({
+      store: h.store,
+      contextStore: h.contextStore,
+      taskUid: h.task().taskUid,
+      fingerprint: h.loop().fingerprint,
+      ownerId: `exact-evidence-owner-${index}`,
+      provider: async ({ evidence }) => {
+        observed.push({
+          goal: evidence.contract.goalSummary,
+          exclusion: evidence.contract.exclusions[0]
+        });
+        return probeResult();
+      },
+      eventUid: (() => {
+        let serial = 0;
+        return () => `exact-evidence-${index}-${++serial}`;
+      })()
+    });
+  }
+
+  assert.deepEqual(observed, expected);
+});
+
+test("routine evidence-free expansion pauses and starts one Probe without a grant", async (t) => {
   const h = harness();
   t.after(() => h.close());
   const launches = [];
 
-  const result = h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true }, (reservation) => {
+  const result = await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true }, (reservation) => {
     launches.push(reservation);
     return { attempted: true, reason: "spawn_attempted" };
   });
@@ -227,11 +574,13 @@ test("routine evidence-free expansion pauses and starts one Probe without a gran
   assert.equal(launches.length, 1);
   assert.equal(h.loop().status, "probe_pending");
   h.advance(1_000);
-  const replay = evaluateAndAdvance({
+  const replay = await evaluateAndAdvance({
     store: h.store,
     task: h.task(),
     loop: h.loop(),
     request: h.request({ acceptanceSatisfied: true, addsArchitecture: true }),
+    probeContext: h.probeContext(),
+    contextStore: h.contextStore,
     launchProbe(reservation) {
       launches.push(reservation);
       return { attempted: true, reason: "must-not-relaunch" };
@@ -254,7 +603,7 @@ test("Probe continue advice alone cannot create a grant", async (t) => {
   const h = harness();
   t.after(() => h.close());
   const result = probeResult("continue_once");
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
 
   assert.throws(
@@ -353,7 +702,7 @@ test("canonical local scope changes with every frozen loop identity field", (t) 
   assert.equal(new Set(scopes).size, variants.length);
 });
 
-test("important task receives exactly one falsifiable exploration grant", (t) => {
+test("important task receives exactly one falsifiable exploration grant", async (t) => {
   const h = harness({ importance: "important", importanceAuthority: "approved_spec" });
   t.after(() => h.close());
   assert.throws(() => authorizeContinuation({
@@ -366,7 +715,7 @@ test("important task receives exactly one falsifiable exploration grant", (t) =>
     policyDecision: { decision: "pass", reasonCode: "exploration_grant_available" },
     now: h.now
   }), (error) => error.code === "controller_invalid");
-  const first = h.evaluate({
+  const first = await h.evaluate({
     previousDecisionBasisDigest: BASIS_A,
     evidenceQuality: "verified",
     explorationRequested: true,
@@ -393,7 +742,7 @@ test("important task receives exactly one falsifiable exploration grant", (t) =>
   h.consume(first.grant);
   h.review({ basis: BASIS_C });
 
-  const second = h.evaluate({
+  const second = await h.evaluate({
     previousDecisionBasisDigest: BASIS_B,
     evidenceQuality: "verified",
     explorationRequested: true,
@@ -414,7 +763,7 @@ for (const [advice, purpose, assessment] of [
     const h = harness();
     t.after(() => h.close());
     const result = probeResult(advice, assessment);
-    h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+    await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
     await h.completeProbe(result);
 
     const evidence = h.verifiedEvidence();
@@ -444,7 +793,7 @@ test("verified new evidence changes the authoritative basis before grant issuanc
   const h = harness();
   t.after(() => h.close());
   const result = probeResult();
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
   const evidence = h.verifiedEvidence(BASIS_D);
 
@@ -459,7 +808,7 @@ test("contract revision invalidates an unconsumed controller grant", async (t) =
   const h = harness();
   t.after(() => h.close());
   const result = probeResult();
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
   const issued = h.afterProbe(result, { evidence: h.verifiedEvidence() });
   const revised = projectContract({
@@ -493,7 +842,7 @@ test("finish-now requires deterministic verified acceptance evidence", async (t)
   const h = harness();
   t.after(() => h.close());
   const result = probeResult("finish_now", "acceptance_already_satisfied");
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
   assert.throws(
     () => h.afterProbe(result, { requestOverrides: { acceptanceSatisfied: true } }),
@@ -508,11 +857,11 @@ test("finish-now requires deterministic verified acceptance evidence", async (t)
   assert.equal(h.loop().status, "terminal");
 });
 
-test("Probe launch failure remains reflection-required and issues no grant", (t) => {
+test("Probe launch failure remains reflection-required and issues no grant", async (t) => {
   const h = harness();
   t.after(() => h.close());
 
-  const result = h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true }, () => {
+  const result = await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true }, () => {
     throw new Error("spawn exploded");
   });
 
@@ -524,7 +873,7 @@ test("fabricated evidence is rejected before any authoritative side effect", asy
   const h = harness();
   t.after(() => h.close());
   const result = probeResult();
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
   const before = h.loop();
   const eventCount = h.store.database.prepare(
@@ -563,7 +912,7 @@ test("completed Probe resumes from the real Store after restart and exact replay
     rmSync(h.home, { recursive: true, force: true });
   });
   const result = probeResult();
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(result);
   const task = h.task();
   const request = h.request();
@@ -614,7 +963,7 @@ test("completed Probe resumes from the real Store after restart and exact replay
   ).get().count, 1);
 });
 
-test("failed Probe launch is attempted once again by an explicit replay after restart", (t) => {
+test("failed Probe launch is attempted once again by an explicit replay after restart", async (t) => {
   const h = harness();
   let reopened = null;
   t.after(() => {
@@ -622,20 +971,23 @@ test("failed Probe launch is attempted once again by an explicit replay after re
     rmSync(h.home, { recursive: true, force: true });
   });
   const overrides = { acceptanceSatisfied: true, addsArchitecture: true };
-  const first = h.evaluate(overrides, () => ({ attempted: false, reason: "spawn_failed" }));
+  const first = await h.evaluate(overrides, () => ({ attempted: false, reason: "spawn_failed" }));
   assert.equal(first.action, "reflection_required");
   const task = h.task();
   const request = h.request(overrides);
+  const probeContext = h.probeContext();
   const fingerprint = h.loop().fingerprint;
   h.store.close();
   reopened = initializeControlStore({ paths: pathsFor(h.home), now: h.now });
   let launches = 0;
 
-  const replay = evaluateAndAdvance({
+  const replay = await evaluateAndAdvance({
     store: reopened,
     task,
     loop: reopened.getConvergenceStatus({ taskUid: task.taskUid, fingerprint }),
     request,
+    probeContext,
+    contextStore: h.contextStore,
     launchProbe() {
       launches += 1;
       return { attempted: true, reason: "spawn_attempted" };
@@ -657,7 +1009,7 @@ test("post-Probe cleanup scope rejects caller authority and binds rollback targe
   t.after(() => canonical.close());
   const rollback = probeResult("rollback_to_generation", "wrong_direction");
   for (const h of [rejected, canonical]) {
-    h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+    await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
     await h.completeProbe(rollback);
   }
   const evidenceEvent = (h) => h.store.database.prepare(`SELECT event_uid FROM convergence_events
@@ -708,7 +1060,7 @@ for (const [action, expectedAction, expectedStatus] of [
     const h = harness();
     t.after(() => h.close());
     const result = probeResult(action, action === "human_decision" ? "wrong_direction" : "scope_drift");
-    h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+    await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
     await h.completeProbe(result);
     const evidenceEventUid = h.store.database.prepare(`SELECT event_uid FROM convergence_events
       WHERE fingerprint=? AND event_type='review_recorded' ORDER BY id DESC LIMIT 1`
@@ -739,12 +1091,12 @@ for (const [action, expectedAction, expectedStatus] of [
   });
 }
 
-test("generic audit downgrades the hard request to warning authority", (t) => {
+test("generic audit downgrades the hard request to warning authority", async (t) => {
   const h = harness({ adapterCapability: "audit_only", adapterKind: "generic" });
   t.after(() => h.close());
   let launches = 0;
 
-  const result = h.evaluate({
+  const result = await h.evaluate({
     acceptanceSatisfied: true,
     addsArchitecture: true,
     evidenceQuality: "verified"
@@ -759,20 +1111,20 @@ test("generic audit downgrades the hard request to warning authority", (t) => {
   assert.equal(launches, 0);
 });
 
-test("second invariant failure requires checkpoint through the deterministic policy", (t) => {
+test("second invariant failure requires checkpoint through the deterministic policy", async (t) => {
   const h = harness();
   t.after(() => h.close());
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_D });
 
-  const result = h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
+  const result = await h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
 
   assert.equal(result.action, "checkpoint_required");
   assert.equal(result.decision.reasonCode, "repeated_review_invariant");
   assert.equal(h.loop().status, "checkpoint_required");
 });
 
-test("exploration and architecture bindings change their canonical scopes", (t) => {
+test("exploration and architecture bindings change their canonical scopes", async (t) => {
   const explorationA = harness({ importance: "important", importanceAuthority: "approved_spec" });
   const explorationB = harness({ importance: "important", importanceAuthority: "approved_spec" });
   const architectureA = harness();
@@ -780,19 +1132,19 @@ test("exploration and architecture bindings change their canonical scopes", (t) 
   const all = [explorationA, explorationB, architectureA, architectureB];
   t.after(() => all.forEach((h) => h.close()));
 
-  const explore = (h, suffix) => h.evaluate({
+  const explore = async (h, suffix) => (await h.evaluate({
     previousDecisionBasisDigest: BASIS_A,
     evidenceQuality: "verified",
     explorationRequested: true,
     riskHypothesis: `grant race ${suffix}`,
     falsificationTest: `concurrent consumers ${suffix}`
-  }).grant.scopeDigest;
-  assert.notEqual(explore(explorationA, "a"), explore(explorationB, "b"));
+  })).grant.scopeDigest;
+  assert.notEqual(await explore(explorationA, "a"), await explore(explorationB, "b"));
 
-  const architecture = (h, checkpointDigest) => {
+  const architecture = async (h, checkpointDigest) => {
     h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
     h.review({ verdict: "changes_required", severity: "important", basis: BASIS_D });
-    h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
+    await h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
     h.store.recordConvergenceCheckpoint({
       eventUid: h.eventUid("checkpoint"),
       taskUid: h.task().taskUid,
@@ -809,8 +1161,8 @@ test("exploration and architecture bindings change their canonical scopes", (t) 
     }).grant.scopeDigest;
   };
   assert.notEqual(
-    architecture(architectureA, digestDecisionBasis({ checkpoint: "a" })),
-    architecture(architectureB, digestDecisionBasis({ checkpoint: "b" }))
+    await architecture(architectureA, digestDecisionBasis({ checkpoint: "a" })),
+    await architecture(architectureB, digestDecisionBasis({ checkpoint: "b" }))
   );
 });
 
@@ -830,14 +1182,14 @@ test("rollback target generation changes the canonical scope", async (t) => {
   h.review({ verdict: "approved", basis: BASIS_D });
 
   const rollback = probeResult("rollback_to_generation", "wrong_direction");
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(rollback);
   const generationOne = h.loop();
   const first = h.afterProbe(rollback, { evidence: h.verifiedEvidence(BASIS_A) });
   h.consume(first.grant);
   h.review({ verdict: "approved", basis: BASIS_B });
 
-  h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
+  await h.evaluate({ acceptanceSatisfied: true, addsArchitecture: true });
   await h.completeProbe(rollback);
   const generationTwo = h.loop();
   const second = h.afterProbe(rollback, { evidence: h.verifiedEvidence(BASIS_C) });
@@ -858,12 +1210,12 @@ test("rollback target generation changes the canonical scope", async (t) => {
   }));
 });
 
-test("architecture-fix failure reaches human decision through consumed-grant history", (t) => {
+test("architecture-fix failure reaches human decision through consumed-grant history", async (t) => {
   const h = harness();
   t.after(() => h.close());
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_C });
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_D });
-  h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
+  await h.evaluate({ previousDecisionBasisDigest: BASIS_C, evidenceQuality: "verified" });
   const checkpointDigest = digestDecisionBasis({ checkpoint: "approved" });
   h.store.recordConvergenceCheckpoint({
     eventUid: h.eventUid("checkpoint"),
@@ -894,7 +1246,7 @@ test("architecture-fix failure reaches human decision through consumed-grant his
   h.consume(issued.grant);
   h.review({ verdict: "changes_required", severity: "important", basis: BASIS_A });
 
-  const result = h.evaluate({ previousDecisionBasisDigest: BASIS_D, evidenceQuality: "verified" });
+  const result = await h.evaluate({ previousDecisionBasisDigest: BASIS_D, evidenceQuality: "verified" });
 
   assert.equal(result.action, "human_decision");
   assert.equal(result.decision.reasonCode, "architecture_fix_failed");

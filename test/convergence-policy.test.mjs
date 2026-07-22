@@ -368,6 +368,8 @@ test("public enums are frozen and contain the complete approved vocabulary", () 
     "exploration_grant_available",
     "probe_direction_checkpoint",
     "probe_human_decision",
+    "probe_context_required",
+    "probe_context_invalid",
     "verified_acceptance_complete",
     "basis_changed_or_scope_aligned"
   ]);

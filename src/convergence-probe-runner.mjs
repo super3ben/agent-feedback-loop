@@ -231,7 +231,7 @@ export async function runConvergenceProbeJob({
   } catch (error) {
     const failure = failureDetails(error);
     try {
-      store.failConvergenceProbe({
+      const failed = store.failConvergenceProbe({
         eventUid: identifier(eventUid()),
         taskUid,
         fingerprint,
@@ -241,7 +241,7 @@ export async function runConvergenceProbeJob({
         retryable: failure.retryable,
         backoffMs: failure.retryable ? RETRY_BACKOFF_MS : 0
       });
-      if (!failure.retryable && contextDigest !== null) {
+      if (failed?.probeState !== "retryable" && contextDigest !== null) {
         try {
           await contextStore.remove(contextDigest);
         } catch {

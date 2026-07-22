@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { evaluateConvergence } from "./convergence-policy.mjs";
+import {
+  buildConvergenceProbeEvidence,
+  validateConvergenceProbeHostProjection
+} from "./convergence-probe-context.mjs";
 
 const TRUSTED_EVIDENCE_CLASSES = new Set([
   "explicit_user", "approved_spec", "approved_plan", "verified_runtime"
@@ -288,6 +292,121 @@ function probeLaunch(launchProbe, reservation) {
   }
 }
 
+function probeContextFallback(decision, adapterCapability, reasonCode, loop) {
+  const auditOnly = adapterCapability === "audit_only";
+  const effectiveDecision = auditOnly ? "warn" : "checkpoint_required";
+  return Object.freeze({
+    action: effectiveDecision,
+    decision: Object.freeze({
+      ...decision,
+      decision: effectiveDecision,
+      requestedDecision: auditOnly ? decision.requestedDecision : effectiveDecision,
+      reasonCode,
+      enforcement: auditOnly ? "warn_only" : decision.enforcement,
+      probeRequired: auditOnly ? decision.probeRequired : false
+    }),
+    loop
+  });
+}
+
+function applyProbeContextFallback({
+  store,
+  task,
+  loop,
+  evaluationRequest,
+  decision,
+  reasonCode
+}) {
+  const fallback = probeContextFallback(decision, task.adapterCapability, reasonCode, loop);
+  if (task.adapterCapability === "audit_only") return fallback;
+  const advanced = recordHardDecision({
+    store,
+    task,
+    loop,
+    request: evaluationRequest,
+    decision: fallback.decision
+  });
+  return Object.freeze({ ...fallback, loop: advanced });
+}
+
+function generationEvidenceClass(store, fingerprint, evidenceDigest) {
+  const row = store.database.prepare(`SELECT event_type, facts_json
+    FROM convergence_events WHERE fingerprint=? AND evidence_digest=?
+      AND event_type IN ('review_recorded', 'evidence_recorded')
+    ORDER BY id DESC LIMIT 1`).get(fingerprint, evidenceDigest);
+  if (!row) return "inferred_advisory";
+  if (row.event_type === "review_recorded") return "review_finding";
+  const facts = eventFacts(row);
+  return EVIDENCE_CLASSES.has(facts.evidenceClass)
+    ? facts.evidenceClass
+    : "inferred_advisory";
+}
+
+function probeControllerFacts({ store, task, loop, decision, hostProjection }) {
+  const latest = store.database.prepare(`SELECT event_type, evidence_digest, result_digest
+    FROM convergence_events WHERE task_uid=? AND fingerprint=?
+      AND event_type IN ('review_recorded', 'evidence_recorded')
+    ORDER BY id DESC LIMIT 1`).get(task.taskUid, loop.fingerprint);
+  if (!latest || !DIGEST.test(latest.evidence_digest ?? "")
+      || latest.result_digest !== loop.decisionBasisDigest) {
+    throw coded("probe_context_invalid");
+  }
+  const recentGenerations = hostProjection.generationObservations.map((observation) => {
+    const row = store.database.prepare(`SELECT action, evidence_digest FROM convergence_events
+      WHERE task_uid=? AND fingerprint=? AND event_type='grant_consumed' AND generation=?
+      ORDER BY id DESC LIMIT 1`).get(task.taskUid, loop.fingerprint, observation.generation);
+    if (!row || !DIGEST.test(row.evidence_digest ?? "")) throw coded("probe_context_invalid");
+    return {
+      generation: observation.generation,
+      action: row.action,
+      evidenceClass: generationEvidenceClass(store, loop.fingerprint, row.evidence_digest),
+      evidenceDigest: row.evidence_digest
+    };
+  });
+  return {
+    taskUid: task.taskUid,
+    fingerprint: loop.fingerprint,
+    boundaryId: loop.boundaryId,
+    canonicalInvariantId: loop.canonicalInvariantId,
+    importance: task.importance,
+    importanceAuthority: task.importanceAuthority,
+    contractRevision: task.contractRevision,
+    decision: "reflection_required",
+    breakerReason: decision.reasonCode,
+    failureCount: loop.failureCount,
+    currentGeneration: loop.currentGeneration,
+    decisionBasisDigest: loop.decisionBasisDigest,
+    latestEvidenceDigest: latest.evidence_digest,
+    recentGenerations
+  };
+}
+
+function buildBoundProbeEvidence({ store, task, loop, decision, probeContext }) {
+  const hostProjection = validateConvergenceProbeHostProjection(probeContext);
+  return buildConvergenceProbeEvidence({
+    hostProjection,
+    controllerFacts: probeControllerFacts({
+      store,
+      task,
+      loop,
+      decision,
+      hostProjection
+    })
+  });
+}
+
+async function removeNewUnreferencedContext({ store, contextStore, publication }) {
+  if (publication?.created !== true
+      || typeof store.getLiveConvergenceProbeContextDigests !== "function"
+      || typeof contextStore?.remove !== "function") return;
+  try {
+    const live = store.getLiveConvergenceProbeContextDigests();
+    if (live instanceof Set && !live.has(publication.digest)) {
+      await contextStore.remove(publication.digest);
+    }
+  } catch {}
+}
+
 function issueAuthorizedContinuation({
   store,
   task,
@@ -403,11 +522,13 @@ export function authorizeContinuation(input = {}) {
   });
 }
 
-export function evaluateAndAdvance({
+export async function evaluateAndAdvance({
   store,
   task,
   loop,
   request,
+  probeContext,
+  contextStore,
   launchProbe,
   now = () => new Date()
 } = {}) {
@@ -431,31 +552,125 @@ export function evaluateAndAdvance({
     });
   }
 
-  const advanced = recordHardDecision({
-    store,
-    task,
-    loop: current,
-    request: evaluationRequest,
-    decision
-  });
+  if (decision.probeRequired === true && decision.decision === "warn") {
+    if (probeContext === undefined) {
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_required"
+      });
+    }
+    try {
+      buildBoundProbeEvidence({
+        store,
+        task,
+        loop: current,
+        decision,
+        probeContext
+      });
+    } catch {
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_invalid"
+      });
+    }
+    return Object.freeze({ action: "warn", decision, loop: current });
+  }
   if (decision.decision === "reflection_required") {
+    if (probeContext === undefined) {
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_required"
+      });
+    }
+    let evidence;
+    try {
+      evidence = buildBoundProbeEvidence({
+        store,
+        task,
+        loop: current,
+        decision,
+        probeContext
+      });
+    } catch {
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_invalid"
+      });
+    }
+    if (!contextStore || typeof contextStore.put !== "function") {
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_invalid"
+      });
+    }
+    let publication;
+    try {
+      publication = await contextStore.put(evidence);
+      if (!publication || !DIGEST.test(publication.digest ?? "")
+          || typeof publication.created !== "boolean") throw coded("probe_context_invalid");
+    } catch {
+      await removeNewUnreferencedContext({ store, contextStore, publication });
+      return applyProbeContextFallback({
+        store,
+        task,
+        loop: current,
+        evaluationRequest,
+        decision,
+        reasonCode: "probe_context_invalid"
+      });
+    }
     const probeEventUid = controllerEvent("probe", {
       taskUid: task.taskUid,
       fingerprint: current.fingerprint,
       reasonCode: decision.reasonCode,
-      decisionBasisDigest: current.decisionBasisDigest
+      decisionBasisDigest: current.decisionBasisDigest,
+      contextDigest: publication.digest
     });
-    const priorReservation = store.database.prepare(
-      "SELECT created_at FROM convergence_events WHERE event_uid=?"
-    ).get(probeEventUid);
-    const dueAt = priorReservation?.created_at ?? timestamp(now).toISOString();
-    const reservation = store.requestConvergenceProbe({
-      eventUid: probeEventUid,
-      taskUid: task.taskUid,
-      fingerprint: current.fingerprint,
-      probeKind: "convergence_reflection",
-      dueAt
-    });
+    let reservation;
+    try {
+      recordHardDecision({
+        store,
+        task,
+        loop: current,
+        request: evaluationRequest,
+        decision
+      });
+      const priorReservation = store.database.prepare(
+        "SELECT created_at FROM convergence_events WHERE event_uid=?"
+      ).get(probeEventUid);
+      const dueAt = priorReservation?.created_at ?? timestamp(now).toISOString();
+      reservation = store.requestConvergenceProbe({
+        eventUid: probeEventUid,
+        taskUid: task.taskUid,
+        fingerprint: current.fingerprint,
+        probeKind: "convergence_reflection",
+        dueAt,
+        contextDigest: publication.digest
+      });
+    } catch (error) {
+      await removeNewUnreferencedContext({ store, contextStore, publication });
+      throw error;
+    }
     const currentTime = timestamp(now).getTime();
     const due = ["pending", "retryable"].includes(reservation.probeState)
       && reservation.probeNextAttemptAt !== null
@@ -474,6 +689,13 @@ export function evaluateAndAdvance({
       launch: Object.freeze(launched)
     });
   }
+  const advanced = recordHardDecision({
+    store,
+    task,
+    loop: current,
+    request: evaluationRequest,
+    decision
+  });
   const action = decision.decision === "hold" ? "checkpoint_required" : decision.decision;
   return Object.freeze({ action, decision, loop: advanced });
 }

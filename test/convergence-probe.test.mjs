@@ -1,10 +1,21 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { main } from "../src/cli.mjs";
+import * as cliModule from "../src/cli.mjs";
+import { evaluateAndAdvance } from "../src/convergence-controller.mjs";
+import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
+import { digestDecisionBasis, projectContract } from "../src/convergence-identity.mjs";
 import { launchDetachedConvergenceProbe } from "../src/convergence-probe-launcher.mjs";
 import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
+import { BlobKeyProvider } from "../src/crypto-store.mjs";
+import { initializeControlStore, openControlStore } from "../src/control-store.mjs";
+import { pathsFor } from "../src/index.mjs";
+
+const { main } = cliModule;
 
 const DIGEST = "a".repeat(64);
 const CONTEXT_DIGEST = "b".repeat(64);
@@ -100,6 +111,7 @@ function contextStoreHarness({ value = evidence(), readError = null, removeError
 function storeHarness({
   completeError = null,
   failError = null,
+  failResult = null,
   probeBinding = binding(),
   timeline = null
 } = {}) {
@@ -132,7 +144,7 @@ function storeHarness({
       failConvergenceProbe(input) {
         record("fail", input);
         if (failError) throw failError;
-        return status({ probeState: "failed", probeOwnerId: null });
+        return failResult ?? status({ probeState: "failed", probeOwnerId: null });
       }
     }
   };
@@ -226,7 +238,9 @@ test("runner preserves all six recommendations only as completion advice", async
 });
 
 test("runner records only one bounded lease-fenced failure and never completes invalid output", async () => {
-  const harness = storeHarness();
+  const harness = storeHarness({
+    failResult: status({ probeState: "retryable", probeOwnerId: null })
+  });
   const context = contextStoreHarness();
   const providerError = Object.assign(new Error("sensitive provider output"), {
     code: "reviewer_timeout"
@@ -365,6 +379,47 @@ test("runner removes terminal context only after its Store transition and logs b
   assert.deepEqual(logs, [{ action: "probe_context_cleanup_failed", reason: "context_cleanup_failed" }]);
 });
 
+test("third retryable provider failure follows the Store terminal transition and removes context", async () => {
+  const timeline = [];
+  const harness = storeHarness({
+    failResult: status({ probeState: "failed", probeOwnerId: null }),
+    timeline
+  });
+  const context = contextStoreHarness({ timeline });
+  const providerError = Object.assign(new Error("bounded timeout"), { code: "provider_timeout" });
+
+  await assert.rejects(runConvergenceProbeJob({
+    store: harness.store,
+    contextStore: context.contextStore,
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-1",
+    provider: async () => { throw providerError; }
+  }), (error) => error === providerError);
+
+  assert.deepEqual(timeline, ["claim", "status", "binding", "read", "fail", "remove"]);
+});
+
+test("completion cleanup failure emits one bounded lifecycle log", async () => {
+  const harness = storeHarness();
+  const context = contextStoreHarness({ removeError: new Error("private context path") });
+  const logs = [];
+
+  await runConvergenceProbeJob({
+    store: harness.store,
+    contextStore: context.contextStore,
+    taskUid: "task-1",
+    fingerprint: "fingerprint-1",
+    ownerId: "probe-owner-1",
+    provider: async () => RESULT,
+    logger: (entry) => logs.push(entry)
+  });
+
+  assert.deepEqual(logs, [
+    { action: "probe_context_cleanup_failed", reason: "context_cleanup_failed" }
+  ]);
+});
+
 test("darwin and linux launcher use one exact detached direct-spawn contract", () => {
   for (const platform of ["darwin", "linux"]) {
     const calls = [];
@@ -468,4 +523,125 @@ test("internal convergence-probe-run routes once without writing user-visible st
     fingerprint: "fingerprint-1"
   });
   assert.equal(writes, 0);
+});
+
+test("real CLI Probe runner opens the encrypted context store and performs terminal cleanup", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-probe-cli-runner-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const paths = pathsFor(home);
+  const store = initializeControlStore({ paths });
+  const contextStore = new ConvergenceProbeContextStore({
+    root: paths.probeContextRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+  });
+  const contract = projectContract({
+    sourceKind: "approved_plan",
+    sourceRef: "task-5-cli-runner",
+    sourceRevision: "v1",
+    requirements: [],
+    exclusions: [],
+    importance: "routine",
+    importanceAuthority: "approved_plan"
+  });
+  const policyRevision = createHash("sha256").update("convergence-policy-v2").digest("hex");
+  const basis = digestDecisionBasis({ basis: "cli-runner" });
+  const evidenceDigest = digestDecisionBasis({ evidence: "cli-runner" });
+  const task = store.upsertConvergenceTask({
+    eventUid: "cli-runner-contract",
+    taskUid: "cli-runner-task",
+    lineageDigest: "1".repeat(64),
+    adapterKind: "sdd",
+    adapterCapability: "workflow_gate",
+    nativeTaskDigest: "2".repeat(64),
+    contractSourceKind: contract.sourceKind,
+    contractSourceRefDigest: contract.sourceRefDigest,
+    contractRevision: contract.revision,
+    policyRevision,
+    importance: contract.importance,
+    importanceAuthority: contract.importanceAuthority
+  });
+  const loop = store.recordConvergenceReview({
+    eventUid: "cli-runner-review",
+    taskUid: task.taskUid,
+    fingerprint: "cli-runner-fingerprint",
+    boundaryId: "task-5",
+    canonicalInvariantId: "probe-context",
+    verdict: "changes_required",
+    severity: "important",
+    directionSignal: "none",
+    decisionBasisDigest: basis,
+    evidenceDigest,
+    generation: 0
+  });
+  const request = {
+    adapterCapability: task.adapterCapability,
+    contract,
+    previousDecisionBasisDigest: basis,
+    decisionBasisDigest: basis,
+    currentGeneration: 0,
+    requestedGeneration: 1,
+    failureCount: 1,
+    lastGrantPurpose: null,
+    acceptanceSatisfied: true,
+    addsArchitecture: true,
+    touchesExplicitExclusion: false,
+    oscillationDetected: false,
+    sameInvariant: true,
+    explorationRequested: false,
+    explorationUsed: false,
+    riskHypothesis: null,
+    falsificationTest: null,
+    evidenceQuality: "none",
+    evidenceChanged: false,
+    fileSaveCount: 0,
+    semanticRecommendation: null
+  };
+  await evaluateAndAdvance({
+    store,
+    contextStore,
+    task,
+    loop,
+    request,
+    probeContext: {
+      producer: "sdd",
+      goalSummary: "Deliver a bounded semantic Probe input",
+      acceptanceCriteria: ["The real CLI runner decrypts the bound context"],
+      exclusions: ["No semantic body enters SQLite"],
+      importance: contract.importance,
+      importanceAuthority: contract.importanceAuthority,
+      contractRevision: contract.revision,
+      generationObservations: [],
+      reviewEvidence: {
+        severity: "important",
+        verdict: "changes_required",
+        hypothesis: "The CLI runner may omit the context store",
+        newEvidence: "The detached runner needs encrypted context access",
+        falsificationTest: "Run through the exported real CLI runner",
+        evidenceDigest,
+        decisionBasisDigest: basis
+      }
+    },
+    launchProbe: () => ({ attempted: false, reason: "test_deferred" })
+  });
+  const contextDigest = store.getConvergenceProbeContextBinding({
+    taskUid: task.taskUid,
+    fingerprint: loop.fingerprint
+  }).contextDigest;
+  store.close();
+
+  await cliModule.executeConvergenceProbeRun({
+    home,
+    taskUid: task.taskUid,
+    fingerprint: loop.fingerprint
+  }, {
+    provider: async () => RESULT
+  });
+
+  const reopened = openControlStore({ paths });
+  t.after(() => reopened.close());
+  assert.equal(reopened.getConvergenceStatus({
+    taskUid: task.taskUid,
+    fingerprint: loop.fingerprint
+  }).probeState, "completed");
+  await assert.rejects(contextStore.read(contextDigest));
 });

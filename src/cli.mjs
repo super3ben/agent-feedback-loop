@@ -16,6 +16,7 @@ import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provi
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 import { executeGuardCli } from "./convergence-cli.mjs";
+import { ConvergenceProbeContextStore } from "./convergence-probe-context.mjs";
 import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 import { ensureRepositoryLineage } from "./convergence-identity.mjs";
 
@@ -612,18 +613,21 @@ export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", 
   return structuredLog("review_failed", { ...fields, result: "failed", reason }, writer);
 }
 
-async function executeConvergenceProbeRun({ home, taskUid, fingerprint }) {
+export async function executeConvergenceProbeRun({ home, taskUid, fingerprint }, {
+  provider
+} = {}) {
   const paths = pathsFor(home);
   const store = openControlStore({ paths });
+  const contextStore = new ConvergenceProbeContextStore({
+    root: paths.probeContextRoot,
+    keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+  });
   try {
-    const providerName = "codex";
-    const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
-    await runConvergenceProbeJob({
-      store,
-      taskUid,
-      fingerprint,
-      ownerId: `probe-${process.pid}`,
-      provider: (context, { resultKind }) => runReviewerProvider({
+    let boundedProvider = provider;
+    if (boundedProvider === undefined) {
+      const providerName = "codex";
+      const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
+      boundedProvider = (context, { resultKind }) => runReviewerProvider({
         cli: providerName,
         executable,
         context,
@@ -631,7 +635,15 @@ async function executeConvergenceProbeRun({ home, taskUid, fingerprint }) {
         policyFile: paths.geminiReviewerPolicy,
         geminiSettingsFile: paths.geminiReviewerSettings,
         env: process.env
-      })
+      });
+    }
+    await runConvergenceProbeJob({
+      store,
+      contextStore,
+      taskUid,
+      fingerprint,
+      ownerId: `probe-${process.pid}`,
+      provider: boundedProvider
     });
   } finally {
     store.close();

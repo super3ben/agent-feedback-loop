@@ -156,7 +156,7 @@ function reviewEventUid(taskUid, fingerprint, reviewRunId) {
   return `review:${taskUid.slice(0, 16)}:${fingerprint}:${reviewRunId}`;
 }
 
-function summary(loop, action, exitCode, architectureFixCount = 0) {
+function summary(loop, action, exitCode, architectureFixCount = 0, reasonCode = null) {
   return Object.freeze({
     action,
     exitCode,
@@ -167,7 +167,8 @@ function summary(loop, action, exitCode, architectureFixCount = 0) {
     status: loop.status,
     failure_count: loop.failureCount,
     architecture_fix_count: architectureFixCount,
-    direction_signal: loop.decision === "checkpoint_required" ? "required" : "none"
+    direction_signal: loop.decision === "checkpoint_required" ? "required" : "none",
+    ...(reasonCode === null ? {} : { reason_code: reasonCode })
   });
 }
 
@@ -301,7 +302,15 @@ function reviewCommandInput(parsed) {
   });
 }
 
-async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
+async function recordReview({
+  parsed,
+  repoRoot,
+  store,
+  now,
+  launchProbe,
+  probeContext,
+  contextStore
+}) {
   const request = reviewCommandInput(parsed);
   const { key, severity, verdict, directionSignal, countedFailure, reviewRunId,
     auditEnvelope, evidenceDigest, basis } = request;
@@ -364,14 +373,38 @@ async function recordReview({ parsed, repoRoot, store, now, launchProbe }) {
       priorBasis: prior?.decisionBasisDigest ?? loop.decisionBasisDigest,
       lastPurpose: lastGrantPurpose(store, loop.fingerprint)
     });
-    const advanced = evaluateAndAdvance({
+    const controllerProbeContext = probeContext === undefined ? undefined : {
+      ...probeContext,
+      reviewEvidence: {
+        severity,
+        verdict,
+        hypothesis: auditEnvelope.hypothesis,
+        newEvidence: auditEnvelope.newEvidence,
+        falsificationTest: auditEnvelope.falsificationTest,
+        evidenceDigest,
+        decisionBasisDigest: basis
+      }
+    };
+    const advanced = await evaluateAndAdvance({
       store,
       task,
       loop,
       request,
+      probeContext: controllerProbeContext,
+      contextStore,
       launchProbe,
       now
     });
+    if (["probe_context_required", "probe_context_invalid"].includes(advanced.decision?.reasonCode)) {
+      const fallbackLoop = advanced.loop ?? loop;
+      return summary(
+        fallbackLoop,
+        advanced.action,
+        advanced.action === "warn" ? 0 : 3,
+        architectureFixCount(store, fallbackLoop.fingerprint),
+        advanced.decision.reasonCode
+      );
+    }
     workflowAction = advanced.action;
     loop = advanced.loop ?? store.getConvergenceStatus({
       taskUid: task.taskUid,
@@ -876,6 +909,8 @@ export async function runGuardCommand({
   preflight,
   now = () => new Date(),
   launchProbe = () => ({ attempted: false, reason: "launch_unavailable" }),
+  probeContext,
+  contextStore,
   artifactHooks: rawArtifactHooks
 }) {
   if (typeof repoRoot !== "string" || typeof now !== "function"
@@ -906,7 +941,15 @@ export async function runGuardCommand({
   }
   if (!store) throw coded("control_store_required");
   if (parsed.command === "record-review") {
-    return recordReview({ parsed, repoRoot, store, now, launchProbe });
+    return recordReview({
+      parsed,
+      repoRoot,
+      store,
+      now,
+      launchProbe,
+      probeContext,
+      contextStore
+    });
   }
   if (parsed.command === "add-alias") return addAlias({ parsed, store });
   if (parsed.command === "declare-distinct") return declareDistinct({ parsed, repoRoot, store });

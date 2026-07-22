@@ -929,19 +929,20 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
 
     requestConvergenceProbe(input) {
       const value = exactObject(input, new Set([
-        "eventUid", "taskUid", "fingerprint", "probeKind", "dueAt"
+        "eventUid", "taskUid", "fingerprint", "probeKind", "dueAt", "contextDigest"
       ]), "convergence_probe_request");
       const eventUid = identifier(value.eventUid, "event_uid");
       const taskUid = identifier(value.taskUid, "task_uid");
       const fingerprint = identifier(value.fingerprint, "fingerprint");
       const probeKind = identifier(value.probeKind, "probe_kind");
       const dueAt = isoTimestamp(value.dueAt, "due_at");
+      const contextDigest = digest(value.contextDigest, "context_digest");
       return transaction(() => {
         const loop = requireLoop(database, taskUid, fingerprint);
         const appended = appendEvent({
           eventUid, taskUid, fingerprint, generation: Number(loop.fix_generation),
           eventType: "reflection_requested",
-          sourceDigest: sha256(canonicalJson({ dueAt, probeKind })),
+          sourceDigest: contextDigest,
           facts: { kind: probeKind }
         });
         if (appended.replay) return loopView(loop);
@@ -961,6 +962,44 @@ export function createConvergenceStoreApi({ database, transaction, now, randomBy
         }
         return loopView(requireLoop(database, taskUid, fingerprint));
       });
+    },
+
+    getConvergenceProbeContextBinding(input) {
+      const value = exactObject(input, new Set([
+        "taskUid", "fingerprint"
+      ]), "convergence_probe_context_binding");
+      const taskUid = identifier(value.taskUid, "task_uid");
+      const fingerprint = identifier(value.fingerprint, "fingerprint");
+      const task = requireTask(database, taskUid);
+      const loop = requireLoop(database, taskUid, fingerprint);
+      if (!["pending", "retryable", "running"].includes(loop.probe_state)) {
+        throw coded("probe_context_binding_missing");
+      }
+      const request = database.prepare(`SELECT source_digest FROM convergence_events
+        WHERE task_uid=? AND fingerprint=? AND event_type='reflection_requested'
+        ORDER BY id DESC LIMIT 1`).get(taskUid, fingerprint);
+      if (!request) throw coded("probe_context_binding_missing");
+      return Object.freeze({
+        contextDigest: digest(request.source_digest, "context_digest"),
+        contractRevision: digest(task.contract_revision, "contract_revision"),
+        currentGeneration: integer(Number(loop.fix_generation), "generation", 0),
+        decisionBasisDigest: digest(loop.decision_basis_digest, "decision_basis_digest")
+      });
+    },
+
+    getLiveConvergenceProbeContextDigests() {
+      const rows = database.prepare(`SELECT DISTINCT event.source_digest
+        FROM convergence_loops AS loop
+        JOIN convergence_events AS event
+          ON event.task_uid=loop.task_uid AND event.fingerprint=loop.fingerprint
+        WHERE loop.probe_state IN ('pending', 'retryable', 'running')
+          AND event.event_type='reflection_requested'
+          AND event.id=(SELECT MAX(latest.id) FROM convergence_events AS latest
+            WHERE latest.task_uid=loop.task_uid
+              AND latest.fingerprint=loop.fingerprint
+              AND latest.event_type='reflection_requested')
+        ORDER BY event.source_digest`).all();
+      return new Set(rows.map((row) => digest(row.source_digest, "context_digest")));
     },
 
     claimConvergenceProbe(input) {
