@@ -24,7 +24,7 @@ const SUPPORTED_PLATFORMS = new Set(["darwin", "linux"]);
 const MAX_IDENTIFIER_LENGTH = 128;
 const MAX_TEXT_LENGTH = 16_384;
 const MAX_COLLECTION_LENGTH = 128;
-const IDENTIFIER = /^[a-z][a-z0-9_-]{0,127}$/u;
+const IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
 const LINEAGE_ID = /^[a-f0-9]{64}$/u;
 
 function coded(code) {

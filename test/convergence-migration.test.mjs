@@ -686,6 +686,79 @@ test("lineage-init ignores legacy state while dry-run rejects a repository bindi
   await assert.rejects(stat(h.home));
 });
 
+test("legacy state with slash-bearing boundaries and pre-schema loops imports without normalization fiction", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  // Real SDD history writes boundaries with `/` separators and older schemas
+  // omit direction_signal / last_evidence_sha256. The importer must accept both
+  // without rewriting the stored fingerprint keys.
+  const slashTask = ["task-slash", "stable-identity", "convergence-store/loop-identity-history"];
+  const slashFingerprint = legacyFingerprint(...slashTask);
+  const legacyTask = ["task-legacy", "single-writer", "prompt/control-store-busy-boundary"];
+  const legacyFp = legacyFingerprint(...legacyTask);
+  h.state.loops = {
+    [slashFingerprint]: legacyLoop({ taskId: slashTask[0], invariantId: slashTask[1], boundary: slashTask[2] }),
+    [legacyFp]: {
+      task_id: legacyTask[0], canonical_invariant_id: legacyTask[1], boundary: legacyTask[2],
+      status: "closed", failure_count: 1, seen_review_run_ids: [], local_fix_generations: [],
+      architecture_fix_count: 0, checkpoint: null, active_receipt: null, events: []
+    }
+  };
+  await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
+
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  assert.equal(plan.counts.loops, 2);
+  assert.equal(plan.items.length, 2);
+
+  const imported = await applyGuardImport({ plan, store: h.store });
+  assert.equal(imported.loopCount, 2);
+  const stored = h.store.database.prepare(
+    "SELECT fingerprint FROM convergence_loops ORDER BY fingerprint"
+  ).all().map((row) => row.fingerprint);
+  assert.deepEqual(stored.sort(), [slashFingerprint, legacyFp].sort());
+});
+
+test("legacy state with numeric task ids and evidence-less changes_required reviews imports intact", async (t) => {
+  const h = await migrationHarness();
+  t.after(() => h.store.close());
+  // Real SDD history uses purely numeric task ids (5/7/9) and records some
+  // `changes_required` reviews without hypothesis/new_evidence/falsification_test
+  // or new_evidence_sha256. The importer accepts the hole and stores the review
+  // with a null evidence envelope rather than dropping it.
+  const numericTask = ["7", "single-writer", "convergence-store/decision-projection"];
+  const numericFp = legacyFingerprint(...numericTask);
+  const evidenceLessReview = {
+    at: "2026-07-20T00:00:00Z", action: "review_recorded", review_run_id: "review-7-1",
+    severity: "Important", verdict: "changes_required", commit: "commit-7",
+    review_ref: "review-7.md", receipt_id: null, hypothesis: null, new_evidence: null,
+    new_evidence_sha256: null, falsification_test: null, failure_next_action: null,
+    direction_signal: "none"
+  };
+  h.state.loops = {
+    [numericFp]: legacyLoop({
+      taskId: numericTask[0], invariantId: numericTask[1], boundary: numericTask[2],
+      events: [evidenceLessReview], overrides: { status: "open", failure_count: 1,
+        seen_review_run_ids: ["review-7-1"] }
+    })
+  };
+  await writeFile(h.stateFile, `${JSON.stringify(h.state)}\n`, { mode: 0o600 });
+
+  const plan = await inspectGuardImport({ repoRoot: h.repoRoot, stateFile: h.stateFile, store: h.store });
+  assert.equal(plan.counts.loops, 1);
+  assert.equal(plan.counts.events, 1);
+
+  const imported = await applyGuardImport({ plan, store: h.store });
+  assert.equal(imported.loopCount, 1);
+  const stored = h.store.database.prepare(
+    "SELECT fingerprint FROM convergence_loops"
+  ).all().map((row) => row.fingerprint);
+  assert.deepEqual(stored, [numericFp]);
+  const reviews = h.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM convergence_events WHERE event_type='review_recorded'"
+  ).get().count;
+  assert.equal(reviews, 1);
+});
+
 test("public lineage-init reports a bounded Git discovery failure without path disclosure", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "afl-convergence-not-git-"));
   cleanups.push(root);

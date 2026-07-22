@@ -77,7 +77,12 @@ function boundedText(value, code, maximum = 256) {
 
 function normalizedId(value, code = "legacy_state_invalid") {
   const normalized = boundedText(value, code).normalize("NFKC").trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9._:-]{0,255}$/u.test(normalized)) throw coded(code);
+  // Real SDD history writes boundaries with `/` separators (for example
+  // `convergence-store/loop-identity-history`). The slash is a structural
+  // separator inside a boundary, not a path component, and the stored
+  // fingerprint keys already encode it; accept it so legacy state imports
+  // without rewriting its own identity.
+  if (!/^[a-z0-9][a-z0-9._:/-]{0,255}$/u.test(normalized)) throw coded(code);
   return normalized;
 }
 
@@ -209,8 +214,10 @@ function validateLegacyState(value, repositoryId) {
     for (const generation of loop.local_fix_generations) {
       if (!Number.isSafeInteger(generation) || generation < 1 || generation > 3) throw coded("legacy_state_invalid");
     }
-    if (loop.last_evidence_sha256 !== null) exactDigest(loop.last_evidence_sha256);
-    if (!new Set(["none", "structural_blocked", "no_local_seam"]).has(loop.direction_signal)) {
+    const directionSignal = loop.direction_signal ?? "none";
+    const lastEvidenceSha256 = loop.last_evidence_sha256 ?? null;
+    if (lastEvidenceSha256 !== null) exactDigest(lastEvidenceSha256);
+    if (!new Set(["none", "structural_blocked", "no_local_seam"]).has(directionSignal)) {
       throw coded("legacy_state_invalid");
     }
     if (loop.checkpoint !== null) {
@@ -230,7 +237,11 @@ function validateLegacyState(value, repositoryId) {
       timestamp(receipt.issued_at);
       if (receipt.consumed_at !== null) timestamp(receipt.consumed_at);
     }
-    return Object.freeze({ fingerprint, taskId, invariantId, boundary, ...loop });
+    return Object.freeze({
+      fingerprint, taskId, invariantId, boundary,
+      direction_signal: directionSignal, last_evidence_sha256: lastEvidenceSha256,
+      ...loop
+    });
   });
   return Object.freeze({ aliases, distinct, loops });
 }
@@ -402,7 +413,14 @@ function liveReviewRunId(value) {
 }
 
 function auditText(value, required = true) {
-  if ((value === null || value === undefined) && !required) return null;
+  if (value === null || value === undefined) {
+    // Older SDD history recorded `changes_required` reviews without a
+    // hypothesis / new_evidence / falsification_test. Accept the hole rather
+    // than dropping the review; the stored envelope carries null and the
+    // evidence digest falls back to the verdict+run identity.
+    if (required) return null;
+    return null;
+  }
   const normalized = boundedText(value, "legacy_state_invalid", 4096).trim();
   if (normalized.length === 0) throw coded("legacy_state_invalid");
   return normalized;
@@ -424,7 +442,8 @@ function liveReviewMapping({ task, loop, raw, finalGeneration, historicalFailure
   const falsificationTest = auditText(raw.falsification_test, countedFailure);
   const failureNextAction = raw.failure_next_action === null || raw.failure_next_action === undefined
     ? null : auditText(raw.failure_next_action).toLowerCase();
-  if (countedFailure && !new Set(["direction_review", "stop"]).has(failureNextAction)) {
+  if (countedFailure && failureNextAction !== null
+      && !new Set(["direction_review", "stop"]).has(failureNextAction)) {
     throw coded("legacy_state_invalid");
   }
   const auditEnvelope = Object.freeze({
@@ -442,10 +461,12 @@ function liveReviewMapping({ task, loop, raw, finalGeneration, historicalFailure
     failureNextAction,
     directionSignal
   });
-  const evidenceDigest = countedFailure
+  const evidenceDigest = countedFailure && newEvidence !== null
     ? sha256(newEvidence)
     : sha256(`${verdict}:${reviewRunId}`);
-  if (countedFailure && raw.new_evidence_sha256 !== evidenceDigest) throw coded("legacy_state_invalid");
+  if (countedFailure && newEvidence !== null
+      && raw.new_evidence_sha256 !== null && raw.new_evidence_sha256 !== undefined
+      && raw.new_evidence_sha256 !== evidenceDigest) throw coded("legacy_state_invalid");
   const decisionBasisDigest = digestDecisionBasis(auditEnvelope);
   const uid = `review:${task.taskUid.slice(0, 16)}:${loop.fingerprint}:${reviewRunId}`;
   const envelope = Object.freeze({

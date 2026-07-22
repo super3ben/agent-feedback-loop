@@ -9,7 +9,7 @@ import {
 } from "./convergence-policy.mjs";
 
 const DIGEST = /^[a-f0-9]{64}$/u;
-const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u;
 const ADAPTERS = new Set(["sdd", "openspec", "comet", "generic", "tool"]);
 const CAPABILITIES = new Set(ADAPTER_CAPABILITIES);
 const IMPORTANCE = new Set(["routine", "important", "critical"]);
