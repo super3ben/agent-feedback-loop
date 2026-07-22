@@ -41,6 +41,11 @@ test("legacy database has no normal path alias", async () => {
   assert.match(paths.convergenceProbeSchema, /schemas[\\/]convergence-probe-result\.schema\.json$/);
   assert.equal(path.relative(paths.dataRoot, paths.continuationGrantRoot).startsWith(".."), false);
   assert.match(paths.continuationGrantRoot, /convergence[\\/]grants$/);
+  assert.equal(
+    paths.probeContextRoot,
+    path.join(home, ".agent", "feedback-loop-data", "convergence", "probe-context")
+  );
+  assert.equal(path.relative(paths.dataRoot, paths.probeContextRoot).startsWith(".."), false);
 });
 
 function staticRelativeImportGraph(entry) {

@@ -106,6 +106,7 @@ export function pathsFor(home = os.homedir()) {
     safetyProjection: path.join(dataRoot, "safety", "guard.json.mac"),
     exportsRoot: path.join(dataRoot, "exports"),
     continuationGrantRoot: path.join(dataRoot, "convergence", "grants"),
+    probeContextRoot: path.join(dataRoot, "convergence", "probe-context"),
     promptFile: path.join(packRoot, "prompts", "reflection-agent.md"),
     convergenceProbePrompt: path.join(packRoot, "prompts", "convergence-probe.md"),
     ruleFile: path.join(packRoot, "rules", "feedback-loop.md"),
