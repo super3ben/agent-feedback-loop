@@ -7,6 +7,7 @@ import { launchDetachedConvergenceProbe } from "../src/convergence-probe-launche
 import { runConvergenceProbeJob } from "../src/convergence-probe-runner.mjs";
 
 const DIGEST = "a".repeat(64);
+const CONTEXT_DIGEST = "b".repeat(64);
 const RESULT = Object.freeze({
   assessment: "overdesigned",
   action: "simplify_current_generation",
@@ -49,27 +50,87 @@ function status(overrides = {}) {
   };
 }
 
-function storeHarness({ completeError = null, failError = null } = {}) {
+function evidence(overrides = {}) {
+  return Object.freeze({
+    identity: Object.freeze({
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      boundaryId: "task-5",
+      canonicalInvariantId: "probe-isolation"
+    }),
+    contract: Object.freeze({ contractRevision: DIGEST }),
+    trigger: Object.freeze({
+      currentGeneration: 2,
+      decisionBasisDigest: DIGEST
+    }),
+    ...overrides
+  });
+}
+
+function binding(overrides = {}) {
+  return {
+    contextDigest: CONTEXT_DIGEST,
+    contractRevision: DIGEST,
+    currentGeneration: 2,
+    decisionBasisDigest: DIGEST,
+    ...overrides
+  };
+}
+
+function contextStoreHarness({ value = evidence(), readError = null, removeError = null, timeline = null } = {}) {
+  const calls = [];
+  return {
+    calls,
+    contextStore: {
+      read(contextDigest) {
+        calls.push(["read", contextDigest]);
+        timeline?.push("read");
+        if (readError) throw readError;
+        return value;
+      },
+      remove(contextDigest) {
+        calls.push(["remove", contextDigest]);
+        timeline?.push("remove");
+        if (removeError) throw removeError;
+      }
+    }
+  };
+}
+
+function storeHarness({
+  completeError = null,
+  failError = null,
+  probeBinding = binding(),
+  timeline = null
+} = {}) {
   const calls = [];
   const claimed = status();
+  const record = (name, input) => {
+    calls.push([name, input]);
+    timeline?.push(name);
+  };
   return {
     calls,
     store: {
       claimConvergenceProbe(input) {
-        calls.push(["claim", input]);
+        record("claim", input);
         return claimed;
       },
       getConvergenceStatus(input) {
-        calls.push(["status", input]);
+        record("status", input);
         return status();
       },
+      getConvergenceProbeContextBinding(input) {
+        record("binding", input);
+        return probeBinding;
+      },
       completeConvergenceProbe(input) {
-        calls.push(["complete", input]);
+        record("complete", input);
         if (completeError) throw completeError;
         return status({ probeState: "completed", probeOwnerId: null });
       },
       failConvergenceProbe(input) {
-        calls.push(["fail", input]);
+        record("fail", input);
         if (failError) throw failError;
         return status({ probeState: "failed", probeOwnerId: null });
       }
@@ -79,10 +140,13 @@ function storeHarness({ completeError = null, failError = null } = {}) {
 
 test("runner consumes one real Store lease and completes through its owner and epoch fence", async () => {
   const harness = storeHarness();
+  const evidenceValue = evidence();
+  const context = contextStoreHarness({ value: evidenceValue });
   let providerCall;
 
   const result = await runConvergenceProbeJob({
     store: harness.store,
+    contextStore: context.contextStore,
     taskUid: "task-1",
     fingerprint: "fingerprint-1",
     ownerId: "probe-owner-1",
@@ -98,7 +162,7 @@ test("runner consumes one real Store lease and completes through its owner and e
     resultDigest: result.resultDigest
   });
   assert.match(result.resultDigest, /^[a-f0-9]{64}$/u);
-  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "complete"]);
+  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "complete"]);
   assert.deepEqual(
     { ...harness.calls[0][1], eventUid: "<opaque>" },
     {
@@ -111,8 +175,9 @@ test("runner consumes one real Store lease and completes through its owner and e
   );
   assert.match(harness.calls[0][1].eventUid, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u);
   assert.deepEqual(harness.calls[1][1], { taskUid: "task-1", fingerprint: "fingerprint-1" });
+  assert.deepEqual(harness.calls[2][1], { taskUid: "task-1", fingerprint: "fingerprint-1" });
   assert.deepEqual(
-    { ...harness.calls[2][1], eventUid: "<opaque>", resultDigest: "<digest>" },
+    { ...harness.calls[3][1], eventUid: "<opaque>", resultDigest: "<digest>" },
     {
       eventUid: "<opaque>",
       taskUid: "task-1",
@@ -123,12 +188,15 @@ test("runner consumes one real Store lease and completes through its owner and e
       resultDigest: "<digest>"
     }
   );
+  assert.equal(providerCall.length, 2);
+  assert.deepEqual(Object.keys(providerCall[0]), ["status", "evidence"]);
   assert.deepEqual(providerCall[1], { resultKind: "convergence_probe" });
-  assert.deepEqual(Object.keys(providerCall[0]), ["status"]);
   assert.equal(providerCall[0].status.decisionBasisDigest, DIGEST);
   assert.equal(providerCall[0].status.failureCount, 1);
+  assert.equal(providerCall[0].evidence, evidenceValue);
   assert.equal(Object.hasOwn(providerCall[0].status, "activeGrantId"), false);
   assert.equal(JSON.stringify(providerCall[0]).includes("must-not-reach-provider"), false);
+  assert.deepEqual(context.calls.map(([name]) => name), ["read", "remove"]);
 });
 
 test("runner preserves all six recommendations only as completion advice", async () => {
@@ -142,8 +210,10 @@ test("runner preserves all six recommendations only as completion advice", async
   ];
   for (const action of actions) {
     const harness = storeHarness();
+    const context = contextStoreHarness();
     await runConvergenceProbeJob({
       store: harness.store,
+      contextStore: context.contextStore,
       taskUid: "task-1",
       fingerprint: "fingerprint-1",
       ownerId: "probe-owner-1",
@@ -157,6 +227,7 @@ test("runner preserves all six recommendations only as completion advice", async
 
 test("runner records only one bounded lease-fenced failure and never completes invalid output", async () => {
   const harness = storeHarness();
+  const context = contextStoreHarness();
   const providerError = Object.assign(new Error("sensitive provider output"), {
     code: "reviewer_timeout"
   });
@@ -164,6 +235,7 @@ test("runner records only one bounded lease-fenced failure and never completes i
   await assert.rejects(
     runConvergenceProbeJob({
       store: harness.store,
+      contextStore: context.contextStore,
       taskUid: "task-1",
       fingerprint: "fingerprint-1",
       ownerId: "probe-owner-1",
@@ -172,9 +244,9 @@ test("runner records only one bounded lease-fenced failure and never completes i
     (error) => error === providerError
   );
 
-  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "fail"]);
+  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "fail"]);
   assert.deepEqual(
-    { ...harness.calls[2][1], eventUid: "<opaque>" },
+    { ...harness.calls[3][1], eventUid: "<opaque>" },
     {
       eventUid: "<opaque>",
       taskUid: "task-1",
@@ -186,16 +258,19 @@ test("runner records only one bounded lease-fenced failure and never completes i
       backoffMs: 30_000
     }
   );
-  assert.doesNotMatch(JSON.stringify(harness.calls[2][1]), /sensitive/u);
+  assert.doesNotMatch(JSON.stringify(harness.calls[3][1]), /sensitive/u);
+  assert.deepEqual(context.calls.map(([name]) => name), ["read"]);
 });
 
 test("completion lease loss is propagated without attempting a stale failure write", async () => {
   const lost = Object.assign(new Error("probe_lease_lost"), { code: "probe_lease_lost" });
   const harness = storeHarness({ completeError: lost });
+  const context = contextStoreHarness();
 
   await assert.rejects(
     runConvergenceProbeJob({
       store: harness.store,
+      contextStore: context.contextStore,
       taskUid: "task-1",
       fingerprint: "fingerprint-1",
       ownerId: "probe-owner-1",
@@ -203,7 +278,91 @@ test("completion lease loss is propagated without attempting a stale failure wri
     }),
     (error) => error === lost
   );
-  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "complete"]);
+  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "complete"]);
+  assert.deepEqual(context.calls.map(([name]) => name), ["read"]);
+});
+
+test("runner rejects stale or malformed live bindings before the provider", async () => {
+  const invalidBindings = [
+    binding({ contractRevision: "c".repeat(64) }),
+    binding({ currentGeneration: 3 }),
+    binding({ decisionBasisDigest: "d".repeat(64) }),
+    binding({ contextDigest: "not-a-digest" })
+  ];
+
+  for (const probeBinding of invalidBindings) {
+    const harness = storeHarness({ probeBinding });
+    const context = contextStoreHarness();
+    let providerCalls = 0;
+    await assert.rejects(
+      runConvergenceProbeJob({
+        store: harness.store,
+        contextStore: context.contextStore,
+        taskUid: "task-1",
+        fingerprint: "fingerprint-1",
+        ownerId: "probe-owner-1",
+        provider: async () => { providerCalls += 1; return RESULT; }
+      }),
+      (error) => error.code === "context_invalid"
+    );
+    assert.equal(providerCalls, 0);
+    assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "fail"]);
+  }
+});
+
+test("runner maps an unreadable context to a terminal bounded failure before the provider", async () => {
+  const harness = storeHarness();
+  const context = contextStoreHarness({ readError: new Error("private context path") });
+  let providerCalls = 0;
+
+  await assert.rejects(
+    runConvergenceProbeJob({
+      store: harness.store,
+      contextStore: context.contextStore,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      ownerId: "probe-owner-1",
+      provider: async () => { providerCalls += 1; return RESULT; }
+    }),
+    (error) => error.code === "context_invalid"
+  );
+
+  assert.equal(providerCalls, 0);
+  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "fail"]);
+  assert.deepEqual(context.calls.map(([name]) => name), ["read", "remove"]);
+});
+
+test("runner removes terminal context only after its Store transition and logs bounded cleanup failure", async () => {
+  const providerError = Object.assign(new Error("provider body must not be logged"), {
+    code: "provider_invalid"
+  });
+  const timeline = [];
+  const harness = storeHarness({ timeline });
+  const context = contextStoreHarness({
+    removeError: new Error("private context path"),
+    timeline
+  });
+  const logs = [];
+  let providerCalls = 0;
+
+  await assert.rejects(
+    runConvergenceProbeJob({
+      store: harness.store,
+      contextStore: context.contextStore,
+      taskUid: "task-1",
+      fingerprint: "fingerprint-1",
+      ownerId: "probe-owner-1",
+      provider: async () => { providerCalls += 1; throw providerError; },
+      logger: (entry) => logs.push(entry)
+    }),
+    (error) => error === providerError
+  );
+
+  assert.equal(providerCalls, 1);
+  assert.deepEqual(timeline, ["claim", "status", "binding", "read", "fail", "remove"]);
+  assert.deepEqual(harness.calls.map(([name]) => name), ["claim", "status", "binding", "fail"]);
+  assert.deepEqual(context.calls.map(([name]) => name), ["read", "remove"]);
+  assert.deepEqual(logs, [{ action: "probe_context_cleanup_failed", reason: "context_cleanup_failed" }]);
 });
 
 test("darwin and linux launcher use one exact detached direct-spawn contract", () => {

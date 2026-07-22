@@ -25,6 +25,12 @@ const STATUS_FIELDS = Object.freeze([
   "probeResultDigest",
   "version"
 ]);
+const CONTEXT_BINDING_FIELDS = Object.freeze([
+  "contextDigest",
+  "contractRevision",
+  "currentGeneration",
+  "decisionBasisDigest"
+]);
 function coded(code) {
   return Object.assign(new Error(code), { code });
 }
@@ -85,6 +91,40 @@ function boundedStatus(value) {
   return Object.freeze(result);
 }
 
+function boundedContextBinding(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || !CONTEXT_BINDING_FIELDS.every((field) => Object.hasOwn(value, field))) {
+    throw coded("context_invalid");
+  }
+  return Object.freeze({
+    contextDigest: digest(value.contextDigest),
+    contractRevision: digest(value.contractRevision),
+    currentGeneration: integer(value.currentGeneration),
+    decisionBasisDigest: digest(value.decisionBasisDigest)
+  });
+}
+
+function assertEvidenceBinding({ status, binding, evidence, taskUid, fingerprint }) {
+  if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)
+      || evidence.identity === null || typeof evidence.identity !== "object"
+      || evidence.contract === null || typeof evidence.contract !== "object"
+      || evidence.trigger === null || typeof evidence.trigger !== "object"
+      || status.taskUid !== taskUid
+      || status.fingerprint !== fingerprint
+      || evidence.identity.taskUid !== taskUid
+      || evidence.identity.fingerprint !== fingerprint
+      || evidence.identity.boundaryId !== status.boundaryId
+      || evidence.identity.canonicalInvariantId !== status.canonicalInvariantId
+      || evidence.contract.contractRevision !== binding.contractRevision
+      || evidence.trigger.currentGeneration !== status.currentGeneration
+      || evidence.trigger.currentGeneration !== binding.currentGeneration
+      || evidence.trigger.decisionBasisDigest !== status.decisionBasisDigest
+      || evidence.trigger.decisionBasisDigest !== binding.decisionBasisDigest) {
+    throw coded("context_invalid");
+  }
+  return evidence;
+}
+
 function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -119,20 +159,26 @@ function assertClaim(claimed, ownerId) {
 
 export async function runConvergenceProbeJob({
   store,
+  contextStore,
   taskUid,
   fingerprint,
   ownerId,
   provider,
   leaseMs = DEFAULT_LEASE_MS,
-  eventUid = () => `probe-${randomUUID()}`
+  eventUid = () => `probe-${randomUUID()}`,
+  logger = () => {}
 } = {}) {
   if (!store || typeof store.claimConvergenceProbe !== "function"
       || typeof store.getConvergenceStatus !== "function"
+      || typeof store.getConvergenceProbeContextBinding !== "function"
       || typeof store.completeConvergenceProbe !== "function"
       || typeof store.failConvergenceProbe !== "function"
+      || !contextStore || typeof contextStore.read !== "function"
+      || typeof contextStore.remove !== "function"
       || typeof provider !== "function" || typeof eventUid !== "function") {
     throw coded("context_invalid");
   }
+  if (typeof logger !== "function") throw coded("context_invalid");
   identifier(taskUid);
   identifier(fingerprint);
   identifier(ownerId);
@@ -150,12 +196,36 @@ export async function runConvergenceProbeJob({
   const leaseEpoch = assertClaim(claimed, ownerId);
   let result;
   let digestValue;
+  let contextDigest = null;
   try {
-    const context = Object.freeze({
-      status: boundedStatus(store.getConvergenceStatus({ taskUid, fingerprint }))
+    const status = boundedStatus(store.getConvergenceStatus({ taskUid, fingerprint }));
+    let binding;
+    try {
+      binding = boundedContextBinding(
+        store.getConvergenceProbeContextBinding({ taskUid, fingerprint })
+      );
+    } catch {
+      throw coded("context_invalid");
+    }
+    contextDigest = binding.contextDigest;
+    let evidence;
+    try {
+      evidence = await contextStore.read(contextDigest);
+    } catch {
+      throw coded("context_invalid");
+    }
+    const boundedEvidence = assertEvidenceBinding({
+      status,
+      binding,
+      evidence,
+      taskUid,
+      fingerprint
     });
     result = validateConvergenceProbeResult(
-      await provider(context, { resultKind: "convergence_probe" })
+      await provider(
+        Object.freeze({ status, evidence: boundedEvidence }),
+        Object.freeze({ resultKind: "convergence_probe" })
+      )
     );
     digestValue = resultDigest(result);
   } catch (error) {
@@ -171,6 +241,15 @@ export async function runConvergenceProbeJob({
         retryable: failure.retryable,
         backoffMs: failure.retryable ? RETRY_BACKOFF_MS : 0
       });
+      if (!failure.retryable && contextDigest !== null) {
+        try {
+          await contextStore.remove(contextDigest);
+        } catch {
+          try {
+            logger({ action: "probe_context_cleanup_failed", reason: "context_cleanup_failed" });
+          } catch {}
+        }
+      }
     } catch {}
     throw error;
   }
@@ -184,5 +263,12 @@ export async function runConvergenceProbeJob({
     action: result.action,
     resultDigest: digestValue
   });
+  try {
+    await contextStore.remove(contextDigest);
+  } catch {
+    try {
+      logger({ action: "probe_context_cleanup_failed", reason: "context_cleanup_failed" });
+    } catch {}
+  }
   return Object.freeze({ outcome: result.assessment, action: result.action, resultDigest: digestValue });
 }
