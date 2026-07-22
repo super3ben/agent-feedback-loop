@@ -2,6 +2,7 @@
 change: isolate-feedback-control-plane
 design-doc: docs/superpowers/specs/2026-07-16-isolate-feedback-control-plane-design.md
 base-ref: cc14224444ef26894e407218235c37297714605c
+archived-with: 2026-07-22-isolate-feedback-control-plane
 ---
 
 # 即时 Subagent 反思与 Markdown 记忆实施计划

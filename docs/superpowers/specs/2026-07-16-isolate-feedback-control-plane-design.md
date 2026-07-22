@@ -2,6 +2,8 @@
 comet_change: isolate-feedback-control-plane
 role: technical-design
 canonical_spec: openspec
+archived-with: 2026-07-22-isolate-feedback-control-plane
+status: final
 ---
 
 # Agent Feedback Loop 即时 Subagent 反思与文档记忆技术设计

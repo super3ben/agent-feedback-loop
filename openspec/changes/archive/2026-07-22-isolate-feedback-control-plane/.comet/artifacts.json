@@ -4,5 +4,6 @@
   "openspec_tasks": "openspec/changes/isolate-feedback-control-plane/tasks.md",
   "openspec_delta_spec": "openspec/changes/isolate-feedback-control-plane/specs/immediate-feedback-review/spec.md",
   "handoff_context": null,
-  "handoff_markdown": null
+  "handoff_markdown": null,
+  "archive_directory": "openspec/changes/archive/2026-07-22-isolate-feedback-control-plane"
 }
