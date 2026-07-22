@@ -110,5 +110,161 @@
 - Task 6: complete (commits `8a03391`, `45d3c74`, `ce28ed2`; final frozen re-review clean with Critical 0 / Important 0, retained Minor 1 / Backlog 1). All five Guard invariants are closed with original fingerprints and history retained: evidence provenance, restart-safe post-Probe transition, explicit-invocation Probe recovery, review-to-decision fail-closed atomicity, and controller-owned canonical grant scope. Policy revision v2 and revision-specific task projection revoke stale grants without schema change; detached Probe remains advisory and neutral, while the existing explicit SDD path reconstructs immutable completion/review evidence after restart and applies the sole deterministic policy before hard state or one-shot grant. Verification: final Task 6 77/77, Task 4 Node parity 49/49 plus Python oracle 29/29, affected 246/246, full suite 397/397, and disposable native macOS detached/restart/authorization/idempotent-replay smoke. Retained Minor: a materially different second unconsumed exploration request fails closed with `invalid_transition` instead of a stable budget-exhausted action. Retained Backlog: stale caller task projection may affect synchronous pass/warn output, with no demonstrated authority bypass. Linux remains contract-tested only; live-provider and production acceptance remain later boundaries.
 - Task 7: complete (architecture-boundary correction `04a1837`, implementation `694cd96`, local fix `fa6595b`; final frozen re-review clean with Critical 0 / Important 0 / Minor 0 / Backlog 0). A pre-implementation checkpoint corrected the single-task Store overfit without adding a fifth table: one lineage/source/mapping transaction imports all real legacy task groups under exactly one provenance event, and Store-owned shadow/cutover/rollback events remain the sole authority. The three review invariants are closed with failure count 1 and generation-1 local-fix history retained: legacy Review-Run-ID replay identity, semantic four-field shadow parity, and exact immutable-snapshot rollback. The orchestrator's first `record-review` calls used lowercase `important`; the Guard retained those three non-counted review events and rejected authorization with exit 6. No state was reset or edited: a fresh independent review with exact `Important` supplied new evidence, then the normal record/authorize/consume path issued the three receipts used by the single fixer. Verification: focused 66/66, CLI 31/31, Python Guard oracle 29/29, full suite 415/415, final reviewer-focused 6/6, and disposable native macOS package probes for imported review replay/collision, invalid parity rejection, and drifted-target rollback. The real Guard file, global Skill, and real AFL database were not mutated; Linux remains contract-tested only and no real import/cutover occurred.
 - Task 8: complete (architecture correction `2e788ba`, implementation `65b0f27`; frozen review clean with Critical 0 / Important 0 / retained Minor 1 / Backlog 0). The checkpoint proved the planned automatic effectiveness-to-Markdown path had no real producer, evidence envelope, independent learning-job authority, or source-compatible lesson contract; implementing it would have conflated decision Probe state or fabricated session evidence. The current task therefore contains only pure capability-bounded OpenSpec, Comet, and generic projections in two files. Approved matching native/revision/authority inputs may expose `checkpoint_gate`; every incomplete, stale, mismatched, inferred, or generic input downgrades truthfully, and generic remains `audit_only`/`warn`. Existing real dissatisfaction events remain the sole automatic background reviewer-to-Markdown producer; independent Guard-outcome learning is deferred behind named-producer/evidence/job-contract acceptance. Verification: focused 11/11, affected 72/72, full suite 426/426, disposable macOS direct-import smoke, and reviewer sparse/decorated in-memory probe. Retained Minor: no committed test case names the sparse-array rejection explicitly, although implementation behavior was independently verified. Linux remains contract-tested only.
-- Task 9: pending.
-- Final whole-branch review: pending.
+- Task 9: complete (packaging/docs `4e9b877`, bounded review corrections `13807ce`,
+  final read-only provider correction `dfa6db7`). All three real Task 9 Guard loops
+  are closed with fingerprints and failure history retained. Current package is 0.9.0
+  with 45 files; macOS full regression is 513/513; the network-disabled read-only
+  Linux/arm64 runner is 512 pass / 0 fail / 1 macOS-only skip; Python Guard oracle is
+  29/29. Linux doctor truthfully reports platform support without claiming installed
+  runtime, adapter activation, repository authority, or cutover. Backlog only: the
+  doctor/package-test explicit diagnostic list omits the already-packaged
+  `convergence-probe-context.mjs`, plus known strict-millisecond acceptance timing
+  flakes with no demonstrated production failure. Real lineage-init/import/cutover,
+  global Skill changes, installed canary, release, and production acceptance remain
+  separate user-authorized operations.
+- Final whole-branch review: complete. Review
+  `convergence-kernel-final-branch-review-1` approved range `c609c35..dfa6db7` with
+  C0/I0/M0/Backlog2. Fresh macOS evidence is full 513/513, core focused 153/153,
+  package 0.9.0 with 45 files, and clean range diff. Final Linux/arm64 evidence remains
+  512 pass / 0 fail / 1 macOS-only skip in a network-disabled read-only runner. The two
+  non-blocking backlog items are the doctor explicit module-list omission and the known
+  strict-millisecond held-writer timing observation; neither authorizes another repair
+  generation. The branch is approved for local merge, but not for real import/cutover,
+  global Skill modification, installed canary, release, or production acceptance.
+
+## Convergence Authority and Probe Recovery (2026-07-22)
+
+- Branch: `codex/convergence-kernel`
+- Plan: `docs/superpowers/plans/2026-07-22-convergence-authority-and-probe-recovery-implementation.md`
+- Designs: `docs/superpowers/specs/2026-07-22-repository-guard-authority-lifecycle-recovery-design.md` and `docs/superpowers/specs/2026-07-22-convergence-probe-evidence-envelope-recovery-design.md`
+- Approved base: `d7a6e28`; implementation starts only after closing Task 9 by human decision and consuming one Task 7 architecture receipt.
+- Plan Task 1: complete (real state verified; historical Guard Task 9 closed; Guard Task 7 architecture receipt consumed without resetting history)
+- Plan Task 2: implemented in `6c51b09` with focused 180/180 and final targeted 45/45; full npm test has one baseline-reproduced macOS/Node v26 timing failure; Linux unverified.
+- Plan Task 3: complete after the human-directed Task 7 correction and one bounded repository-binding closeout. Frozen review is approved and the original Guard loop is closed with fingerprint, failure count 2, and architecture-fix count 1 retained.
+- Plan Task 4: complete; Task 7 correction is merged through `8914a56`. Plan Task 5 is complete through `b737ef7`; Plan Task 6 remains pending.
+- On 2026-07-22 the user selected option `A`: one human-directed combined Task 7
+  correction, with no fake/reused receipt and all original Guard history preserved.
+  Mandatory exported-adapter preflight and private bounded SQLite snapshot are the only
+  two frozen fixes; one re-review follows and any Critical/Important recurrence stops.
+  The user also authorized faster execution through isolated parallel subagents. Task 5
+  may therefore start its disjoint pure-envelope and package-path lanes after its real
+  direction checkpoint/architecture receipt is consumed, while shared Store/controller/
+  adapter/runner/CLI integration remains serialized behind Task 7 approval.
+- Human-directed Task 7 correction was implemented in main commit `7d3cb8e` after TDD
+  RED for optional exported-adapter preflight and WAL side effects. macOS evidence is
+  focused 141/141, CLI 31/31 and full 456/456; the exact Task 7 commit also passes
+  control-store/migration/sdd-adapter 141/141 in the isolated Linux/arm64 Node 24 + Git
+  runner. The frozen re-review `task-7-human-correction-rereview-1` approves
+  `guard-read-only-store-open-creates-no-sidecars` but proves a real cross-repository
+  preflight reuse under `guard-unimported-legacy-remains-authoritative`: a verified
+  `afl_sqlite` preflight from repository A can authorize a command against independent
+  legacy-authoritative repository B because provenance is not bound to `repoRoot`.
+  Real Guard recording returned exit 4 with failure_count 2 and
+  `blocked_human_decision`; the WAL invariant is closed. No further fixer is authorized.
+- Task 5 disjoint work completed and is merged as `34b1d99` (runtime path), `0846eea`
+  (exact semantic envelope), `41ecde1` (private encrypted artifacts), and `aa4531c`
+  (runner consumption). Current macOS focused context/Probe/legacy-crypto regression is
+  63/63. Shared Store/controller/adapter/CLI integration is paused at the Task 7 human
+  gate; Task 5's original architecture receipt and fingerprint remain unchanged.
+- The user approved one final bounded Task 7 repository-binding correction. Commit
+  `8914a56` binds each genuine preflight to its canonical repository root before any
+  command side effect. TDD observed the two-real-repository regression fail 0/1 before
+  implementation and pass 1/1 after it. Native macOS focused coverage passed 173/173;
+  the full suite passed 456/457, with the sole two-second installed-hook timing failure
+  independently reproduced unchanged at base `5aa5950`. The exact correction passed
+  Linux/arm64 Node 24 focused coverage 142/142. Frozen re-review
+  `task-7-repository-binding-rereview-1` approved the invariant with C0/I0/M0/B1, and
+  real Guard `record-review` returned exit 0 while retaining fingerprint
+  `8329d812d8b4fc7c86240cc2379f9db67e0316b6aad49cea9f0fc53b2a419ef7`, failure count
+  2, architecture-fix count 1, and final status `closed`. The backlog-only syntax-order
+  observation cannot reopen Task 7.
+- Task 5 shared integration resumed only after the Task 7 gate closed. Its isolated
+  worktree includes the repository-binding correction as `4f9f995`; no new or reused
+  Task 5 Guard receipt was issued, and the original consumed architecture receipt
+  remains the sole authorization.
+- Task 5 shared integration is merged as `c02b352` (implementation source commit
+  `a8dfe9d`). The controller now owns the async encrypted-context publication and
+  fallback path; Store events retain only the context digest; the real CLI runner
+  verifies Store binding before provider input; terminal cleanup follows the Store
+  transition; explicit mutating commands alone perform bounded orphan cleanup. TDD
+  covered the Store binding, publication/commit/launch order, persistent missing/stale
+  fallback, bounded stdin, third-attempt terminal cleanup, real CLI runner, and privacy
+  canaries. Coordinator macOS verification passed the seven-file Task 5 regression
+  182/182 and full suite 498/498. Linux/arm64 Node 24 in a network-disabled, read-only
+  repository container passed the same 182/182 plus syntax and diff checks; the first
+  container attempt was invalid only because tmpfs defaulted to `noexec`, and passed
+  after the disposable executable tmpfs was declared.
+- Frozen re-review `task-5-probe-evidence-rereview-1` returned Changes required with
+  C0/I1/M0/B0 on the original invariant and boundary. It independently proved that the
+  final Probe `reviewEvidence` fields still travel in process argv, and malformed or
+  oversized stdin exits before persisting the hard-adapter `checkpoint_required`
+  fallback. Checklist items 3–7 pass, including digest-only storage, transaction/launch
+  order, retry/terminal lifecycle, explicit-only orphan cleanup, no schema/service/
+  scheduler expansion, and retained Task 7 repository binding. Real Guard
+  `record-review` returned exit 4 and status `blocked_human_decision`, preserving
+  fingerprint `80f45dd42d1343d076ec0d0ba2f5bf1b5d84a9bfdb4241361d8e489a11d2de9c`,
+  failure count 1, architecture-fix count 1, and both review-run IDs. No new receipt or
+  fixer is authorized until the user chooses the direction.
+- The user selected human decision `A`. Decision reference
+  `.superpowers/sdd/task-5-probe-evidence-human-decision.md` freezes one semantic stdin
+  envelope: review evidence and producer context share the bounded input; malformed
+  transport remains a zero-write error, while a valid envelope with missing/invalid/stale
+  Probe context reaches the capability fallback. Real Guard `resolve --action close`
+  returned exit 0 and preserved the original fingerprint, failure count 1,
+  architecture-fix count 1, and both review-run IDs. This authorizes one human-directed
+  bounded correction without a replacement invariant, reset, or reused receipt.
+- Human-directed correction `ce5322c` moves the final Probe review evidence and optional
+  producer context into one exact bounded stdin envelope. Legacy semantic argv flags now
+  fail closed before Store mutation; malformed transport remains zero-write; missing,
+  invalid, or stale typed context still reaches the existing deterministic fallback. No
+  schema, service, scheduler, provider, runner, or additional transport was introduced.
+  The frozen production re-review closed the original evidence-envelope invariant and
+  identified one independent test-harness portability issue only: the live argv privacy
+  acceptance test assumed `ps` exists on every supported Linux environment.
+- The independent test invariant
+  `probe-argv-privacy-acceptance-runs-on-supported-platforms` at
+  `convergence-probe/cli-test-execution` was recorded as a first failure under
+  Review-Run-ID `task-5-probe-evidence-human-rereview-1`. Guard authorized and the task
+  brief consumed exactly one generation-1 local-fix receipt. Commit `b737ef7` changes
+  only `test/cli.test.mjs`: Linux reads `/proc/<pid>/cmdline`, Darwin retains `ps`, and
+  unsupported platforms fail explicitly; there is no skip, installation, or production
+  change. Frozen re-review `task-5-linux-argv-local-fix-rereview-1` approved C0/I0/M0,
+  and Guard closed the new loop while retaining fingerprint
+  `d470b6c05208a3241b07ef3e5989b8070b0719a01932d70cd850b7738e00cb30` and failure
+  count 1. Final evidence: macOS full suite 507/507 with zero skips; macOS focused
+  133/133; minimal Linux/arm64 Node 24 without `ps`, network, or writable repository
+  passed the same focused 133/133 with zero skips and a live argv positive control.
+  Plan Task 5 is frozen complete; later work must not reopen either closed invariant.
+- Plan Task 6 is complete. Frozen final review
+  `task-5-probe-evidence-architecture-review-1` approved the original Probe acceptance
+  boundary with C0/I0/M0 and one unrelated backlog item; real Guard recorded the
+  approved review against the original fingerprint and retained status `closed`,
+  failure count 1, and architecture-fix count 1. Final layered evidence is macOS
+  Probe/Guard 197/197, macOS full regression 507/507, native installed-hook E2E 13/13,
+  native platform reflection-to-later-prompt smoke 3/3, minimal Linux/arm64 focused
+  133/133 with zero skips, and package dry-run 0.9.0 with 45 files including all
+  convergence modules and both Probe assets. Stop remains absent from the runtime path;
+  prompt/reviewer/Probe paths emit no receipt or internal machine instruction to the
+  main conversation. Backlog only: the pre-existing SQLite write-lock prompt timing
+  flake is outside this Probe diff, and the doctor/package-test explicit diagnostic list
+  does not yet name `convergence-probe-context.mjs` even though the file is packaged.
+  No real HOME installation, live provider, Desktop canary, Guard import/cutover,
+  release publication, or production acceptance was performed or claimed. Workstream B
+  is frozen complete and must not continue with another patch round for these backlog
+  observations.
+- Final Task 9 Linux acceptance exposed one real supported-input failure after the
+  Probe workstream had already closed: `readPrivateFile()` mutated immutable packaged
+  reviewer assets with `chmod`, so a read-only Linux installation reported
+  `provider_unavailable`. Review `task-9-linux-full-acceptance-1` opened independent
+  invariant `provider-package-assets-readable-from-read-only-supported-install` at
+  `reviewer-provider/package-assets`; Guard authorized and the brief consumed exactly
+  one generation-1 local-fix receipt. Commit `dfa6db7` now opens static assets read-only
+  with no-follow semantics, validates and reads the same descriptor, rejects symlinks,
+  foreign owners, and group/other-writable files, and leaves all package modes unchanged;
+  provider-created temp/result/transport artifacts retain 0700/0600. Frozen re-review
+  `task-9-readonly-provider-local-fix-rereview-1` approved C0/I0/M0 and closed the loop
+  with fingerprint `49f605d12c777606091c5d9208bf932b4a7624b645f7e84a9d2232f4160f2f6b`
+  and failure count 1 retained. Fresh macOS full is 513/513; the same read-only Linux
+  runner is 512/513 with zero failures and one declared macOS-only skip. This is the
+  final blocking Task 9 closeout; adjacent diagnostic/timing observations remain
+  backlog and do not authorize another patch round.
