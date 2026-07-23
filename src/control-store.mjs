@@ -1099,11 +1099,12 @@ function createStore(database, now) {
       const row = getReviewJob(jobId);
       return row ? { ...row } : null;
     },
-    createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null }) {
+    createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null, reasonCode = "explicit_feedback" }) {
       const safeSourceEventUid = assertString(sourceEventUid, "sourceEventUid", 512);
       const safeReferentEventUid = assertOptionalString(referentEventUid, "referentEventUid", 512);
       const safeSourceIdentity = assertString(sourceIdentity, "sourceIdentity", 2048);
       const safeProjectId = assertOptionalString(projectId, "projectId", 1024);
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
       return transaction(() => {
         const existing = database.prepare("SELECT * FROM reviewer_jobs WHERE source_identity=?")
           .get(safeSourceIdentity);
@@ -1125,11 +1126,18 @@ function createStore(database, now) {
         insertReviewJobEvent({
           jobId,
           eventType: "candidate_created",
-          reasonCode: "explicit_feedback",
+          reasonCode: safeReasonCode,
           timestamp
         });
         return { jobId, created: true };
       });
+    },
+    getReviewCandidateEvent(jobId) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const rows = database.prepare(`SELECT * FROM review_job_events
+        WHERE job_id=? AND event_type='candidate_created'
+        ORDER BY id LIMIT 1`).all(safeJobId);
+      return rows.length === 1 ? { ...rows[0] } : null;
     },
     reserveReviewLaunch({ jobId, cooldownMs }) {
       const safeJobId = assertString(jobId, "jobId", 512);

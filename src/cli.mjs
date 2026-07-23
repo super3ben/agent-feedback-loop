@@ -772,7 +772,20 @@ export async function main(args, {
         store,
         blobs,
         projectDir,
-        provider: (context) => runReviewerProvider({
+        provider: (context, { resultKind } = {}) => {
+          if (resultKind === "semantic_dissatisfaction_gate") {
+            return runReviewerProvider({
+              cli: providerName,
+              executable,
+              context,
+              resultKind,
+              policyFile: paths.geminiReviewerPolicy,
+              geminiSettingsFile: paths.geminiReviewerSettings,
+              timeoutMs,
+              env: process.env
+            });
+          }
+          return runReviewerProvider({
             cli: providerName,
             executable,
             context,
@@ -782,7 +795,8 @@ export async function main(args, {
             geminiSettingsFile: paths.geminiReviewerSettings,
             timeoutMs,
             env: process.env
-          })
+          });
+        },
       });
       reviewerTerminalLog({
         outcome: result.outcome,
