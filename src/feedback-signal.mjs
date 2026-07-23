@@ -21,7 +21,10 @@ const REASON_ORDER = Object.freeze([
   "backward_reference",
   "causal_accountability",
   "expected_process_contrast",
-  "explicit_correction"
+  "explicit_correction",
+  "known_info_forgetting",
+  "recurrence_complaint",
+  "rhetorical_accountability"
 ]);
 
 const EVIDENCE_PATTERNS = Object.freeze({
@@ -49,6 +52,16 @@ const EVIDENCE_PATTERNS = Object.freeze({
     /(?:请|应该|应当|需要)(?:先|直接|改成|改为|不要|停止)/u,
     /(?:不要|别)[^。！？?\n]{0,48}(?:而要|应该|改成|改为)/u,
     /\b(?:please (?:use|change|stop)|should (?:use|change)|use .{1,48} instead)\b/iu
+  ]),
+  known_info_forgetting: Object.freeze([
+    /(?:不是都(?:有|存)了吗?|这些之前都(?:有|存)的呀?)/u,
+    /(?:密码|端口|路径|账号|host|hostname|token|open_id)[^。！？?\n]{0,64}(?:不是都|之前都)/u
+  ]),
+  recurrence_complaint: Object.freeze([
+    /(?:之前出现过好几次了|都第[一二三四五六七八九十0-9]+次了|怎么每次都是|又来问这个)/u
+  ]),
+  rhetorical_accountability: Object.freeze([
+    /(?:怎么又不知道了|还要我再说一遍吗|你为什么之前没有)/u
   ])
 });
 
@@ -394,11 +407,19 @@ export function classifyRetrospectiveEvidence({ userText, hasReferent }) {
     "expected_process_contrast",
     "explicit_correction"
   ].filter((reason) => reasons.has(reason));
-  const required = Boolean(hasReferent) && reasons.has("negative_evaluation");
+  const reasonCodes = REASON_ORDER.filter((reason) => reasons.has(reason));
+  const explicit = Boolean(hasReferent) && reasons.has("negative_evaluation") && supporting.length >= 1;
+  const expanded = Boolean(hasReferent)
+    && !explicit
+    && (
+      (reasons.has("known_info_forgetting") && reasons.has("backward_reference"))
+      || reasons.has("recurrence_complaint")
+      || reasons.has("rhetorical_accountability")
+    );
   return {
-    candidate: required && supporting.length >= 1,
-    reasonCodes: REASON_ORDER.filter((reason) => reasons.has(reason)),
-    score: 40 + supporting.length * 20
+    candidate: explicit || expanded,
+    reasonCodes,
+    score: explicit ? 40 + supporting.length * 20 : 40 + reasonCodes.length * 10
   };
 }
 
