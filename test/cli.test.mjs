@@ -311,6 +311,45 @@ describe("agent-feedback-loop package", () => {
     fixture.controlStore.close();
   });
 
+  it("prompt hook fails open and records a diagnostic when capture cannot be stored", async () => {
+    const fixture = await promptOrchestrationFixture();
+    // Deterministically force the durable session-event write to abort, the same
+    // failure mode the unit tests exercise, but driven through the real hook entrypoint.
+    fixture.controlStore.database.exec(
+      "CREATE TEMP TRIGGER force_hook_capture_abort BEFORE INSERT ON session_events " +
+      "BEGIN SELECT RAISE(ABORT, 'forced session-event abort'); END"
+    );
+    const responses = [];
+
+    const response = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() {
+        throw new Error("reviewer must not launch when capture failed");
+      },
+      async writeResponse(result) {
+        responses.push(result);
+        return result;
+      },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+
+    // Invariant: a capture durability failure must never block the host.
+    assert.equal(response.reason, "capture_failed");
+    assert.deepEqual(response.hostResponse, { continue: true });
+    assert.deepEqual(responses, [{ continue: true }]);
+    assert.equal(reviewJobCount(fixture.controlStore), 0);
+
+    // Invariant: the miss must remain diagnosable via a bounded, queryable reason.
+    const diagnostics = fixture.controlStore.listCaptureFailOpen();
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0].event_type, "capture_fail_open");
+    assert.match(diagnostics[0].reason_code, /^[a-z][a-z0-9_]{0,63}$/);
+    fixture.controlStore.close();
+  });
+
   it("hook replay reuses the job", async () => {
     const fixture = await promptOrchestrationFixture();
     const launches = [];
