@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "is_dissatisfaction": { "type": "boolean" },
+    "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+    "reason_class": {
+      "type": "string",
+      "enum": [
+        "forgetting_known_info",
+        "repeated_failure",
+        "process_complaint",
+        "direct_correction",
+        "accountability_rhetorical",
+        "not_dissatisfaction"
+      ]
+    }
+  },
+  "required": ["is_dissatisfaction", "confidence", "reason_class"]
+}
