@@ -212,10 +212,7 @@ function semanticGateProjection(context) {
     prompt: context.source?.text ?? "",
     referent: context.referent?.text ?? null,
     provider: context.source?.sourceProvider ?? "unknown",
-    sessionUid: context.source?.sessionUid ?? null,
     projectId: context.job?.project_id ?? null,
-    reasonCodes: Array.isArray(context.candidate?.reasonCodes) ? context.candidate.reasonCodes : [],
-    priorEmission: context.recurrence?.priorEmission ?? false,
     recurrenceObserved: context.recurrence?.recurrenceObserved ?? false
   });
 }
