@@ -19,8 +19,11 @@
 
 detached reviewer 在被剥离的环境中运行宿主 CLI（`codex`、`claude` 或 `gemini`）。
 只有 `PATH`、`HOME`、`TMPDIR`、`LANG`、`LC_ALL`、`LC_CTYPE`、`TZ` 以及任意
-`AFL_REVIEW_*` 变量会传入 reviewer 进程。若某个 provider 需要额外变量——例如经由
-第三方 `ANTHROPIC_BASE_URL` 网关中转的 CLI——否则会 fail-closed 并静默超时。通过
+`AFL_REVIEW_*` 变量会传入 reviewer 进程。若某个 CLI 用自己的持久化凭据认证（例如
+`~/.codex/auth.json`，或 `~/.claude/settings.json` 里的 token），则无需额外配置即可
+工作，因为这类状态由 CLI 自身加载，不依赖从 shell 继承。只有当某 provider 纯粹靠
+shell 环境变量认证时——例如把 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` export
+到 shell 而不是存在 CLI 自己的配置里——才需要通过
 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST`（逗号分隔的白名单）放行这些变量名；
 其值还必须列出 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` 和
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 本身，才能传入 detached 进程。单次审查
