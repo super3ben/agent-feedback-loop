@@ -56,6 +56,8 @@ const REVIEW_FAILURE_CODES = new Set([
   "publication_failed",
   "publication_collision"
 ]);
+const CAPTURE_FAIL_OPEN_META_KEY = "capture_fail_open_log";
+const MAX_CAPTURE_FAIL_OPEN_RECORDS = 50;
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
@@ -1535,6 +1537,45 @@ function createStore(database, now) {
         referent_event_uid, content_hash, encrypted_raw_ref, completeness
         FROM session_events WHERE event_uid=?`).get(assertString(eventUid, "event_uid", 512));
       return row ? { ...row } : null;
+    },
+    recordCaptureFailOpen({ eventType, reasonCode, sourceProvider = null, sessionUid = null, eventUid = null, createdAt }) {
+      const record = {
+        event_type: assertString(eventType, "eventType", 128),
+        reason_code: assertString(reasonCode, "reasonCode", 128),
+        source_provider: assertOptionalString(sourceProvider, "sourceProvider", 64),
+        session_uid: assertOptionalString(sessionUid, "sessionUid", 512),
+        event_uid: assertOptionalString(eventUid, "eventUid", 512),
+        created_at: assertString(createdAt, "createdAt", 128)
+      };
+      return transaction(() => {
+        const existing = database.prepare("SELECT value FROM store_meta WHERE key=?").get(CAPTURE_FAIL_OPEN_META_KEY);
+        let records = [];
+        if (existing) {
+          try {
+            const parsed = JSON.parse(existing.value);
+            if (Array.isArray(parsed)) records = parsed;
+          } catch {
+            records = [];
+          }
+        }
+        records = [...records, record].slice(-MAX_CAPTURE_FAIL_OPEN_RECORDS);
+        database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(
+          CAPTURE_FAIL_OPEN_META_KEY,
+          JSON.stringify(records)
+        );
+        return record;
+      });
+    },
+    listCaptureFailOpen() {
+      const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(CAPTURE_FAIL_OPEN_META_KEY);
+      if (!row) return [];
+      try {
+        const parsed = JSON.parse(row.value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
     },
     close() {
       database.close();

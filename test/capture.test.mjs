@@ -6,7 +6,8 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { pathsFor } from "../src/index.mjs";
-import { detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, redactText } from "../src/capture.mjs";
+import { captureObservedSession, detectStructuralFeedbackSignal, extractTranscriptExcerpt, normalizeHookEvent, redactText } from "../src/capture.mjs";
+import { initializeControlStore } from "../src/control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { classifyRetrospectiveEvidence, detectFeedbackCandidate, feedbackSourceIdentity, readDirectAssistantReferent, stripSyntheticAflControlText } from "../src/feedback-signal.mjs";
 
@@ -78,6 +79,97 @@ async function fixture() {
   const blobs = new EncryptedBlobStore({ root: paths.blobRoot, keyProvider });
   return { paths, blobs };
 }
+
+async function controlCaptureFixture() {
+  const { paths, blobs } = await fixture();
+  return { paths, blobs, store: initializeControlStore({ paths }) };
+}
+
+function captureEvent(overrides = {}) {
+  return {
+    event_uid: "fail-open-event-1",
+    session_uid: "fail-open-session-1",
+    cli: "codex",
+    project_id: "project-1",
+    context_epoch: 1,
+    source_event_id: "fail-open-source-1",
+    source_namespace: "prompt_hook",
+    role: "user",
+    referent_event_uid: null,
+    content_hash: createHash("sha256").update("fail-open-event-1").digest("hex"),
+    encrypted_raw_ref: null,
+    completeness: "prompt_only",
+    ...overrides
+  };
+}
+
+test("capture durability failure records a bounded queryable fail-open reason code", async () => {
+  const { store, blobs } = await controlCaptureFixture();
+  store.database.exec(
+    "CREATE TEMP TRIGGER force_capture_abort BEFORE INSERT ON session_events " +
+    "BEGIN SELECT RAISE(ABORT, 'forced session-event abort'); END"
+  );
+
+  await assert.rejects(
+    captureObservedSession({ store, blobs, event: captureEvent(), rawText: "capture durability failure" }),
+    /forced session-event abort/
+  );
+
+  const records = store.listCaptureFailOpen();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].event_type, "capture_fail_open");
+  assert.match(records[0].reason_code, /^[a-z][a-z0-9_]{0,63}$/);
+  assert.equal(records[0].session_uid, "fail-open-session-1");
+  assert.ok(records[0].created_at);
+  store.close();
+});
+
+test("capture fail-open log is bounded and keeps the most recent records", async () => {
+  const { store, blobs } = await controlCaptureFixture();
+  store.database.exec(
+    "CREATE TEMP TRIGGER force_capture_abort_bounded BEFORE INSERT ON session_events " +
+    "BEGIN SELECT RAISE(ABORT, 'forced session-event abort'); END"
+  );
+
+  for (let index = 0; index < 55; index += 1) {
+    await assert.rejects(
+      captureObservedSession({
+        store,
+        blobs,
+        event: captureEvent({
+          event_uid: `fail-open-event-${index}`,
+          source_event_id: `fail-open-source-${index}`
+        }),
+        rawText: `capture durability failure ${index}`
+      })
+    );
+  }
+
+  const records = store.listCaptureFailOpen();
+  assert.ok(records.length <= 50);
+  assert.equal(records[records.length - 1].session_uid, "fail-open-session-1");
+  store.close();
+});
+
+test("capture fail-open recording never masks the original durability error", async () => {
+  const { store, blobs } = await controlCaptureFixture();
+  const originalRecordCaptureFailOpen = store.recordCaptureFailOpen;
+  store.recordCaptureFailOpen = () => {
+    throw new Error("diagnostics backend unavailable");
+  };
+  store.database.exec(
+    "CREATE TEMP TRIGGER force_capture_abort_masked BEFORE INSERT ON session_events " +
+    "BEGIN SELECT RAISE(ABORT, 'forced session-event abort'); END"
+  );
+
+  await assert.rejects(
+    captureObservedSession({ store, blobs, event: captureEvent(), rawText: "capture durability failure" }),
+    /forced session-event abort/
+  );
+
+  store.recordCaptureFailOpen = originalRecordCaptureFailOpen;
+  store.close();
+});
 
 test("normalizes CLI events with namespaced IDs and native timeout units", () => {
   const common = { installationId: "install-1", sessionId: "native-1", eventId: "event-1", cwd: "/tmp/project", prompt: "hello" };
