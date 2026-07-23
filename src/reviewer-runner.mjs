@@ -142,6 +142,16 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
     createdAt: stored.source.source_timestamp ?? stored.source.created_at,
     publishedAt: stored.job.created_at
   };
+  let candidateSource = "explicit_legacy_hit";
+  try {
+    const candidateEvent = store.getReviewCandidateEvent(jobId);
+    if (candidateEvent && candidateEvent.reason_code === "expanded_feedback") {
+      candidateSource = "expanded_coarse_recall";
+    }
+  } catch {
+    // If the store method is unavailable or fails, default to explicit_legacy_hit.
+  }
+
   return {
     job: {
       job_id: stored.job.job_id,
@@ -153,7 +163,8 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
     referent: await contextEvent(stored.referent, blobs),
     prior: await Promise.all(stored.prior.slice(-6).map((row) => contextEvent(row, blobs))),
     following: await Promise.all(stored.following.slice(0, 2).map((row) => contextEvent(row, blobs))),
-    reflectionCatalog
+    reflectionCatalog,
+    candidate: { source: candidateSource }
   };
 }
 
@@ -196,6 +207,19 @@ function recordFailure(store, { jobId, ownerId, leaseEpoch, code }) {
   }
 }
 
+function semanticGateProjection(context) {
+  return Object.freeze({
+    prompt: context.source?.text ?? "",
+    referent: context.referent?.text ?? null,
+    provider: context.source?.sourceProvider ?? "unknown",
+    sessionUid: context.source?.sessionUid ?? null,
+    projectId: context.job?.project_id ?? null,
+    reasonCodes: Array.isArray(context.candidate?.reasonCodes) ? context.candidate.reasonCodes : [],
+    priorEmission: context.recurrence?.priorEmission ?? false,
+    recurrenceObserved: context.recurrence?.recurrenceObserved ?? false
+  });
+}
+
 export async function runReviewJob({
   jobId,
   ownerId,
@@ -221,8 +245,33 @@ export async function runReviewJob({
   }
 
   let rawResult;
+
+  if (context.candidate?.source === "expanded_coarse_recall") {
+    let gateResult;
+    try {
+      gateResult = await provider(semanticGateProjection(context), { resultKind: "semantic_dissatisfaction_gate" });
+    } catch (error) {
+      const failure = new ReviewJobError(providerFailure(error), error);
+      recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+      throw failure;
+    }
+
+    if (!gateResult || !gateResult.is_dissatisfaction) {
+      try {
+        store.completeReviewNoLesson({ jobId, ownerId, leaseEpoch });
+        return { outcome: "reviewed_no_lesson", documentPath: null };
+      } catch (error) {
+        const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
+        recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+        throw failure;
+      }
+    }
+
+    // Gate reports dissatisfaction — fall through to full reviewer context.
+  }
+
   try {
-    rawResult = await provider(context);
+    rawResult = await provider(context, { resultKind: "reviewer" });
   } catch (error) {
     const failure = new ReviewJobError(providerFailure(error), error);
     recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });

@@ -40,7 +40,8 @@ function sha256(value) {
 async function reviewFixture(t, {
   initialNow = "2030-07-20T00:00:00.000Z",
   sourceTimestamp = "2026-07-20T08:09:10+08:00",
-  sourceRawText = "The previous response ignored the requirement. Authorization: Bearer raw-secret"
+  sourceRawText = "The previous response ignored the requirement. Authorization: Bearer raw-secret",
+  candidateReasonCode
 } = {}) {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-home-")));
   const projectDir = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-project-")));
@@ -106,7 +107,8 @@ async function reviewFixture(t, {
     sourceEventUid,
     referentEventUid,
     sourceIdentity: "codex:session-1:feedback-event-10",
-    projectId: projectDir
+    projectId: projectDir,
+    ...(candidateReasonCode ? { reasonCode: candidateReasonCode } : {})
   });
   return {
     home,
@@ -497,4 +499,44 @@ test("a retry adopts identical bytes after a crash following visible publication
   assert.deepEqual(await readFile(visiblePath), before);
   assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
   assert.equal(fixture.store.getReviewJob(fixture.jobId).published_sha256, sha256(before));
+});
+
+test("semantic gate stops the job before full reviewer when candidate is expanded but not real dissatisfaction", async (t) => {
+  const fixture = await reviewFixture(t, { candidateReasonCode: "expanded_feedback" });
+  const calls = [];
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "reviewer-gate-no-dissatisfaction",
+    provider: async (_context, { resultKind }) => {
+      calls.push(resultKind);
+      if (resultKind === "semantic_dissatisfaction_gate") {
+        return { is_dissatisfaction: false, confidence: "high", reason_class: "not_dissatisfaction" };
+      }
+      throw new Error("full reviewer should not run");
+    }
+  });
+
+  assert.deepEqual(calls, ["semantic_dissatisfaction_gate"]);
+  assert.equal(result.outcome, "reviewed_no_lesson");
+  assert.equal(result.documentPath, null);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "reviewed_no_lesson");
+});
+
+test("existing explicit dissatisfaction path still reaches the full reviewer directly", async (t) => {
+  const fixture = await reviewFixture(t);
+  const calls = [];
+  await runReviewJob({
+    ...fixture,
+    ownerId: "reviewer-explicit-hit",
+    provider: async (_context, { resultKind }) => {
+      calls.push(resultKind);
+      if (resultKind === "reviewer") return { outcome: "no_lesson" };
+      throw new Error("semantic gate should be bypassed for explicit hits");
+    }
+  });
+
+  assert.deepEqual(calls, ["reviewer"]);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "reviewed_no_lesson");
 });
