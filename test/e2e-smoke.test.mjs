@@ -495,3 +495,43 @@ console.log(JSON.stringify({ result, returnedAt: Date.now() }));
   const completion = JSON.parse(await readEventually(sentinel));
   assert.ok(completion.writtenAt > parentExitedAt);
 });
+
+test("coarse recall admits repeated known-info complaints into semantic checking", async () => {
+  const { detectFeedbackCandidate } = await import("../src/feedback-signal.mjs");
+  const referent = {
+    eventUid: "assistant:1",
+    sessionUid: "codex:default:demo",
+    projectId: "/tmp/demo",
+    contentHash: "a".repeat(64),
+    text: "I asked for the server password again instead of using the stored credentials."
+  };
+
+  const result = await detectFeedbackCandidate({
+    payload: { cli: "codex", previous_assistant_message: { role: "assistant", content: [{ type: "output_text", text: referent.text }] } },
+    userText: "这些之前都有存的呀怎么又不知道了，密码不是都有吗端口55555",
+    referent
+  });
+
+  assert.equal(result.candidate, true);
+  assert.match(result.reasonCodes.join(","), /known|forget|recurr|accountability|backward/u);
+});
+
+test("coarse recall admits recurrence frustration without requiring fixed negative keywords", async () => {
+  const { detectFeedbackCandidate } = await import("../src/feedback-signal.mjs");
+  const referent = {
+    eventUid: "assistant:2",
+    sessionUid: "codex:default:demo",
+    projectId: "/tmp/demo",
+    contentHash: "b".repeat(64),
+    text: "I asked the user for the same credentials again."
+  };
+
+  const result = await detectFeedbackCandidate({
+    payload: { cli: "codex", previous_assistant_message: { role: "assistant", content: [{ type: "output_text", text: referent.text }] } },
+    userText: "之前出现过好几次了，都第七八次了，怎么每次还是要我再说一遍",
+    referent
+  });
+
+  assert.equal(result.candidate, true);
+  assert.ok(result.reasonCodes.length >= 2);
+});
