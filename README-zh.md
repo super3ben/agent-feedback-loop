@@ -15,6 +15,18 @@
 新发布的文档只能影响后续匹配的提示。精简 control SQLite 数据库只保存生命周期
 状态，不保存 lesson 正文。这是直接 Markdown 选择，不是 RAG。
 
+### Reviewer provider 环境
+
+detached reviewer 在被剥离的环境中运行宿主 CLI（`codex`、`claude` 或 `gemini`）。
+只有 `PATH`、`HOME`、`TMPDIR`、`LANG`、`LC_ALL`、`LC_CTYPE`、`TZ` 以及任意
+`AFL_REVIEW_*` 变量会传入 reviewer 进程。若某个 provider 需要额外变量——例如经由
+第三方 `ANTHROPIC_BASE_URL` 网关中转的 CLI——否则会 fail-closed 并静默超时。通过
+`AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST`（逗号分隔的白名单）放行这些变量名；
+其值还必须列出 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` 和
+`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 本身，才能传入 detached 进程。单次审查
+超时默认 180000 ms；真实 provider 需要更长时间时用
+`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 调高。
+
 ## 收敛控制
 
 Convergence Probe 与 feedback reviewer 职责不同。reviewer 判断真实用户不满是否值得

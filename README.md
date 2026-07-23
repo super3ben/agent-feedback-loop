@@ -19,6 +19,20 @@ fixed at prompt handling time, so a document published during that handling can
 affect only a later matching prompt. The control SQLite database contains lifecycle
 state, not lesson bodies. This is direct Markdown selection, not RAG.
 
+### Reviewer provider environment
+
+The detached reviewer runs the host CLI (`codex`, `claude`, or `gemini`) in a
+scrubbed environment. Only `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`,
+and `TZ`, plus any `AFL_REVIEW_*` variable, reach the reviewer process. A provider
+that needs extra variables — for example a CLI routed through a third-party
+`ANTHROPIC_BASE_URL` gateway — will otherwise fail closed and time out silently.
+Pass those names through `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` (a
+comma-separated allowlist); the value must also list
+`AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` and
+`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` themselves so they survive into the
+detached process. The per-review timeout defaults to 180000 ms; raise it with
+`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` when a real provider needs longer.
+
 ## Convergence control
 
 The convergence Probe is separate from the feedback reviewer. The reviewer decides
