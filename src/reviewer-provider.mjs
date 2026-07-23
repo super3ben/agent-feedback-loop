@@ -28,6 +28,11 @@ const RESULT_KINDS = Object.freeze({
     prompt: path.join("prompts", "convergence-probe.md"),
     schema: path.join("schemas", "convergence-probe-result.schema.json"),
     discriminator: "assessment"
+  }),
+  semantic_dissatisfaction_gate: Object.freeze({
+    prompt: path.join("prompts", "semantic-dissatisfaction-gate.md"),
+    schema: path.join("schemas", "semantic-dissatisfaction-gate.schema.json"),
+    discriminator: "reason_class"
   })
 });
 
