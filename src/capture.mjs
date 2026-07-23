@@ -308,7 +308,34 @@ export function normalizeAssistantReferentEvent({
   };
 }
 
-async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText }) {
+const CAPTURE_FAIL_REASON_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const DEFAULT_CAPTURE_FAIL_REASON = "session_event_write_failed";
+
+function boundedCaptureFailReason(error) {
+  if (!(error instanceof ControlStoreError)) return DEFAULT_CAPTURE_FAIL_REASON;
+  const code = String(error.code || "").toLowerCase();
+  return CAPTURE_FAIL_REASON_PATTERN.test(code) ? code : DEFAULT_CAPTURE_FAIL_REASON;
+}
+
+// Best-effort diagnostics: a durability failure here must never mask the
+// original error, and must never itself become a new source of failure for
+// the (fast, silent) prompt hook path.
+function recordCaptureFailOpen({ store, identity, error, now }) {
+  try {
+    store.recordCaptureFailOpen({
+      eventType: "capture_fail_open",
+      reasonCode: boundedCaptureFailReason(error),
+      sourceProvider: identity?.source_provider ?? null,
+      sessionUid: identity?.session_uid ?? null,
+      eventUid: identity?.event_uid ?? null,
+      createdAt: now().toISOString()
+    });
+  } catch {
+    // Diagnosability is strictly secondary to fail-open safety.
+  }
+}
+
+async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText, now = () => new Date() }) {
   const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
   if (typeof writerRef !== "string" || !writerRef || writerRef.length > 4096) {
     throw new TypeError("authoritativeEncryptedRef must be a bounded non-empty string");
@@ -317,10 +344,16 @@ async function capturePreparedControlSession({ store, blobs, preparedCapture, ra
       && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
     throw new ControlStoreError("control_observation_collision", "control observation collision");
   }
-  const resolution = store.resolveOrInsertCapture({
-    preparedCapture,
-    authoritativeEncryptedRef: writerRef
-  });
+  let resolution;
+  try {
+    resolution = store.resolveOrInsertCapture({
+      preparedCapture,
+      authoritativeEncryptedRef: writerRef
+    });
+  } catch (error) {
+    recordCaptureFailOpen({ store, identity: preparedCapture.identity, error, now });
+    throw error;
+  }
   await blobs.write(preparedCapture.blobContentHash, rawText);
   return {
     ...resolution,
@@ -329,12 +362,12 @@ async function capturePreparedControlSession({ store, blobs, preparedCapture, ra
   };
 }
 
-export async function captureSession({ store, blobs, event, rawText }) {
+export async function captureSession({ store, blobs, event, rawText, now = () => new Date() }) {
   const preparedCapture = prepareCapture({ event, rawText });
-  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
+  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText, now });
 }
 
-export async function captureObservedSession({ store, blobs, event, rawText }) {
+export async function captureObservedSession({ store, blobs, event, rawText, now = () => new Date() }) {
   const preparedCapture = prepareCapture({ event, rawText });
-  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText });
+  return capturePreparedControlSession({ store, blobs, preparedCapture, rawText, now });
 }
