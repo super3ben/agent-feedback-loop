@@ -412,12 +412,14 @@ export function classifyRetrospectiveEvidence({ userText, hasReferent }) {
   const expanded = Boolean(hasReferent)
     && !explicit
     && (
-      (reasons.has("known_info_forgetting") && reasons.has("backward_reference"))
+      reasons.has("known_info_forgetting")
       || reasons.has("recurrence_complaint")
       || reasons.has("rhetorical_accountability")
     );
+  const source = explicit ? "explicit" : (expanded ? "expanded" : null);
   return {
     candidate: explicit || expanded,
+    source,
     reasonCodes,
     score: explicit ? 40 + supporting.length * 20 : 40 + reasonCodes.length * 10
   };
@@ -441,7 +443,7 @@ export async function detectFeedbackCandidate({
 }) {
   const input = payload && typeof payload === "object" ? payload : {};
   if (isSyntheticAflControl(input, userText)) {
-    return { candidate: false, reasonCodes: [], score: 0, referent: null };
+    return { candidate: false, source: null, reasonCodes: [], score: 0, referent: null };
   }
 
   const resolved = referent === undefined
@@ -450,6 +452,7 @@ export async function detectFeedbackCandidate({
   if (STRUCTURAL_CANDIDATE_REASONS.has(resolved.structuralReason)) {
     return {
       candidate: true,
+      source: "explicit",
       reasonCodes: [resolved.structuralReason],
       score: 100,
       referent: resolved.referent || null

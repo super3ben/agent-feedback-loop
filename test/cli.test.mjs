@@ -350,6 +350,47 @@ describe("agent-feedback-loop package", () => {
     fixture.controlStore.close();
   });
 
+  it("expanded coarse-recall admissions are tagged for the semantic gate while explicit hits stay direct", async () => {
+    const fixture = await promptOrchestrationFixture();
+    const candidateReason = (store, jobId) => store.database.prepare(
+      "SELECT reason_code FROM review_job_events WHERE job_id=? AND event_type='candidate_created'"
+    ).get(jobId).reason_code;
+
+    // Real missed case: standalone known-info complaint admits via the
+    // expanded path and must be routed through the semantic gate.
+    const expanded = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload({
+        session_id: "expanded-session-1",
+        event_id: "expanded-event-1",
+        prompt: "密码不是都有吗端口55555"
+      }),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() {},
+      async writeResponse(result) { return result; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(expanded.candidate, true);
+    assert.ok(expanded.jobId);
+    assert.equal(candidateReason(fixture.controlStore, expanded.jobId), "expanded_feedback");
+
+    // Frozen explicit dissatisfaction keeps the direct full-reviewer path.
+    const explicit = await cliModule.handlePromptHook({
+      payload: explicitFeedbackPayload(),
+      cli: "codex",
+      controlStore: fixture.controlStore,
+      blobs: fixture.blobs,
+      launchReviewer() {},
+      async writeResponse(result) { return result; },
+      now: () => new Date(PROMPT_CUTOFF)
+    });
+    assert.equal(explicit.candidate, true);
+    assert.ok(explicit.jobId);
+    assert.equal(candidateReason(fixture.controlStore, explicit.jobId), "explicit_feedback");
+    fixture.controlStore.close();
+  });
+
   it("hook replay reuses the job", async () => {
     const fixture = await promptOrchestrationFixture();
     const launches = [];

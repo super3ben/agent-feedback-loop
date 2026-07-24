@@ -336,6 +336,7 @@ test("classifies the frozen explicit dissatisfaction with ordered independent ev
   const classified = classifyRetrospectiveEvidence({ userText, hasReferent: true });
   assert.deepEqual(classified, {
     candidate: true,
+    source: "explicit",
     reasonCodes: [
       "negative_evaluation",
       "backward_reference",
@@ -350,6 +351,51 @@ test("classifies the frozen explicit dissatisfaction with ordered independent ev
   assert.deepEqual(detected.reasonCodes, classified.reasonCodes);
   assert.equal(detected.score, 100);
   assert.equal(detected.referent, referent);
+});
+
+test("classification exposes explicit vs expanded admission source", async () => {
+  const explicit = classifyRetrospectiveEvidence({
+    userText: "是的，而且为什么你改造这些之前没有去考虑这些东西呢，而是等到我发现事情变复杂了才开始思考这些东西",
+    hasReferent: true
+  });
+  assert.equal(explicit.candidate, true);
+  assert.equal(explicit.source, "explicit");
+
+  const expanded = classifyRetrospectiveEvidence({
+    userText: "之前出现过好几次了，都第七八次了",
+    hasReferent: true
+  });
+  assert.equal(expanded.candidate, true);
+  assert.equal(expanded.source, "expanded");
+
+  const negative = classifyRetrospectiveEvidence({ userText: "帮我看下这个日志", hasReferent: true });
+  assert.equal(negative.candidate, false);
+  assert.equal(negative.source, null);
+});
+
+test("a standalone known-info forgetting complaint is admitted via the expanded path", async () => {
+  // Real missed case p1: the user points out the assistant is asking for a
+  // value it was already given. This must not be dropped just because it lacks
+  // an independent backward_reference token.
+  const result = classifyRetrospectiveEvidence({
+    userText: "密码不是都有吗端口55555",
+    hasReferent: true
+  });
+  assert.equal(result.candidate, true);
+  assert.equal(result.source, "expanded");
+  assert.ok(result.reasonCodes.includes("known_info_forgetting"));
+});
+
+test("detectFeedbackCandidate carries the admission source through to callers", async () => {
+  const referent = { eventUid: "assistant:src", text: "I asked for the port and password again." };
+  const detected = await detectFeedbackCandidate({
+    payload: {},
+    userText: "密码不是都有吗端口55555",
+    referent,
+    now: () => 0
+  });
+  assert.equal(detected.candidate, true);
+  assert.equal(detected.source, "expanded");
 });
 
 test("ordinary prompts, invited design calibration and isolated keywords are not candidates", async () => {
@@ -389,7 +435,7 @@ test("synthetic AFL hook control is rejected before retrospective scoring", asyn
     referent: { eventUid: "assistant:prior", text: "prior answer" },
     now: () => 0
   });
-  assert.deepEqual(detected, { candidate: false, reasonCodes: [], score: 0, referent: null });
+  assert.deepEqual(detected, { candidate: false, source: null, reasonCodes: [], score: 0, referent: null });
 });
 
 test("prefers role-validated explicit Claude and Gemini assistant referents", async () => {
