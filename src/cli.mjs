@@ -390,7 +390,11 @@ export async function handlePromptHook({
             sourceEventId: sourceCapture.eventView.source_event_id,
             referentEventUid: referentEventUid ?? "none"
           }),
-          projectId: event.project_id
+          projectId: event.project_id,
+          // Expanded coarse-recall admissions must be tagged so the detached
+          // runner routes them through the semantic gate instead of straight
+          // into the full reviewer; explicit hits keep the direct path.
+          reasonCode: signal?.source === "expanded" ? "expanded_feedback" : "explicit_feedback"
         });
         result.jobId = candidate.jobId;
         promptLog(candidate.created ? "review_job_created" : "review_job_reused", {
