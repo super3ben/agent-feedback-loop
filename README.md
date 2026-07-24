@@ -19,6 +19,18 @@ fixed at prompt handling time, so a document published during that handling can
 affect only a later matching prompt. The control SQLite database contains lifecycle
 state, not lesson bodies. This is direct Markdown selection, not RAG.
 
+### Natural-language dissatisfaction coverage
+
+Recognizing dissatisfaction no longer requires a fixed negative keyword such as
+"做错了" or "不合理". Natural-language complaints — being asked to restate
+already-known information, frustration about a recurring problem, and rhetorical
+accountability ("how is this unknown again?") — are admitted into a lightweight
+semantic dissatisfaction gate that runs inside the detached reviewer before the full
+reviewer. The gate confirms real dissatisfaction and drops false positives, so the
+prompt hook stays fast and silent. Existing explicit hits are preserved and keep the
+direct full-reviewer path with no gate step; only these expanded, keyword-free
+signals are routed through the gate first.
+
 ### Reviewer provider environment
 
 The detached reviewer runs the host CLI (`codex`, `claude`, or `gemini`) in a

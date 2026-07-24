@@ -535,3 +535,150 @@ test("coarse recall admits recurrence frustration without requiring fixed negati
   assert.equal(result.candidate, true);
   assert.ok(result.reasonCodes.length >= 2);
 });
+
+// End-to-end preserve-and-expand coverage through the installed hook plus the
+// real detached reviewer. A minimal fake `codex` provider stands in for the CLI:
+// it writes the Codex transport envelope { result: <logical> } that the runner
+// unwraps, returning `no_lesson` for both the semantic gate and the full reviewer
+// so every admitted job settles at `reviewed_no_lesson`. The candidate reason_code
+// recorded on `review_job_events` proves which path a prompt took: explicit hits
+// keep the direct full-reviewer path (`explicit_feedback`), while expanded coarse
+// recall is routed through the semantic gate (`expanded_feedback`).
+async function installWithFakeCodexProvider(t) {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-e2e-gate-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const fakeBin = path.join(home, "fake-bin");
+  const fakeProvider = path.join(fakeBin, "codex");
+  await mkdir(fakeBin, { recursive: true, mode: 0o700 });
+  await writeFile(fakeProvider, `#!/usr/bin/env node
+import { chmodSync, writeFileSync } from "node:fs";
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const index = process.argv.indexOf("--output-last-message");
+if (index < 0 || !process.argv[index + 1]) process.exit(23);
+writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson" } }));
+chmodSync(process.argv[index + 1], 0o600);
+`, { mode: 0o700 });
+  await install({ home, codexHost: unavailableCodexHost() });
+  return { home, paths: pathsFor(home), fakeBin };
+}
+
+async function submitInstalledPrompt({ paths, home, fakeBin, projectDir, session, prompt, previousAssistant }) {
+  const payload = JSON.stringify({
+    session_id: `${session}-session`,
+    event_id: `${session}-event`,
+    turn_id: `${session}-turn-2`,
+    cwd: projectDir,
+    timestamp: "2026-07-20T08:00:00.000Z",
+    prompt,
+    previous_assistant_message: {
+      role: "assistant",
+      id: `${session}-assistant`,
+      turn_id: `${session}-turn-1`,
+      timestamp: "2026-07-20T07:59:59.000Z",
+      content: [{ type: "output_text", text: previousAssistant }]
+    }
+  });
+  return runHook(paths.coreHook, payload, {
+    ...process.env,
+    HOME: home,
+    TMPDIR: home,
+    PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ""}`
+  }, ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"]);
+}
+
+function reviewerJobsWithReasonCodes(paths) {
+  const store = openControlStore({ paths });
+  try {
+    return store.database.prepare("SELECT * FROM reviewer_jobs ORDER BY created_at, job_id").all().map((job) => ({
+      ...job,
+      reasonCode: store.database.prepare(
+        "SELECT reason_code FROM review_job_events WHERE job_id=? AND event_type='candidate_created' ORDER BY id LIMIT 1"
+      ).get(job.job_id)?.reason_code ?? null
+    }));
+  } finally {
+    store.close();
+  }
+}
+
+async function waitForReviewedJobs(paths, expected, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let jobs = reviewerJobsWithReasonCodes(paths);
+  while (Date.now() < deadline) {
+    if (jobs.length === expected && jobs.every((job) => job.state === "reviewed_no_lesson")) return jobs;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    jobs = reviewerJobsWithReasonCodes(paths);
+  }
+  return jobs;
+}
+
+// The literal port/credential string is deliberate fixture data for a real user
+// complaint that the shipped keyword detector previously missed; it is only ever
+// hook input and is never echoed to logs or documentation.
+const EXPANDED_MISSED_PROMPTS = Object.freeze([
+  ["installed hook admits repeated known-info frustration into semantic dissatisfaction review",
+    "密码不是都有吗端口55555，root Hik@123++",
+    "I asked again for the already-known root password and port."],
+  ["installed hook admits 这些之前都有存的呀怎么又不知道了 into semantic dissatisfaction review",
+    "这些之前都有存的呀怎么又不知道了",
+    "I asked for the stored connection details again."],
+  ["installed hook admits 之前出现过好几次了 recurrence into semantic dissatisfaction review",
+    "之前出现过好几次了",
+    "I repeated a mistake we already solved."],
+  ["installed hook admits 都第七八次了 rhetorical recurrence into semantic dissatisfaction review",
+    "都第七八次了",
+    "I asked the user to restate the same thing once more."]
+]);
+
+for (const [name, prompt, previousAssistant] of EXPANDED_MISSED_PROMPTS) {
+  test(name, async (t) => {
+    const { home, paths, fakeBin } = await installWithFakeCodexProvider(t);
+    const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
+
+    const result = await submitInstalledPrompt({
+      paths, home, fakeBin, projectDir, session: "expanded", prompt, previousAssistant
+    });
+    assert.equal(result.stdout, '{"continue":true}\n');
+    assert.equal(result.stderr, "");
+
+    const jobs = await waitForReviewedJobs(paths, 1);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].state, "reviewed_no_lesson");
+    assert.equal(jobs[0].reasonCode, "expanded_feedback");
+  });
+}
+
+test("installed flow preserves explicit hits, expands coarse recall, and skips neutral prompts", async (t) => {
+  const { home, paths, fakeBin } = await installWithFakeCodexProvider(t);
+  const cases = [
+    { session: "explicit", prompt: EXPLICIT_FEEDBACK,
+      previousAssistant: "I changed the design before confirming the boundary.", expected: "explicit_feedback" },
+    { session: "expanded-known-info", prompt: "密码不是都有吗端口55555，root Hik@123++",
+      previousAssistant: "I asked again for the already-known root password and port.", expected: "expanded_feedback" },
+    { session: "expanded-recall", prompt: "这些之前都有存的呀怎么又不知道了",
+      previousAssistant: "I asked for the stored connection details again.", expected: "expanded_feedback" },
+    { session: "expanded-recurrence", prompt: "之前出现过好几次了",
+      previousAssistant: "I repeated a mistake we already solved.", expected: "expanded_feedback" },
+    { session: "expanded-rhetorical", prompt: "都第七八次了",
+      previousAssistant: "I asked the user to restate the same thing once more.", expected: "expanded_feedback" },
+    { session: "neutral", prompt: "reviewer job 是干嘛的？",
+      previousAssistant: "The reviewer runs outside the prompt turn.", expected: null }
+  ];
+
+  for (const testCase of cases) {
+    const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
+    const result = await submitInstalledPrompt({ paths, home, fakeBin, projectDir, ...testCase });
+    assert.equal(result.stdout, '{"continue":true}\n', testCase.session);
+    assert.equal(result.stderr, "", testCase.session);
+  }
+
+  const expectedJobs = cases.filter((testCase) => testCase.expected !== null).length;
+  const jobs = await waitForReviewedJobs(paths, expectedJobs);
+  assert.equal(jobs.length, expectedJobs);
+  assert.equal(jobs.every((job) => job.state === "reviewed_no_lesson"), true);
+  const tally = jobs.reduce((totals, job) => {
+    totals[job.reasonCode] = (totals[job.reasonCode] ?? 0) + 1;
+    return totals;
+  }, {});
+  assert.deepEqual(tally, { explicit_feedback: 1, expanded_feedback: 4 });
+});
