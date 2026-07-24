@@ -212,8 +212,7 @@ function semanticGateProjection(context) {
     prompt: context.source?.text ?? "",
     referent: context.referent?.text ?? null,
     provider: context.source?.sourceProvider ?? "unknown",
-    projectId: context.job?.project_id ?? null,
-    recurrenceObserved: context.recurrence?.recurrenceObserved ?? false
+    projectId: context.job?.project_id ?? null
   });
 }
 

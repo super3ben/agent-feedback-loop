@@ -540,3 +540,27 @@ test("existing explicit dissatisfaction path still reaches the full reviewer dir
   const job = fixture.store.getReviewJob(fixture.jobId);
   assert.equal(job.state, "reviewed_no_lesson");
 });
+
+test("semantic gate that confirms dissatisfaction falls through to the full reviewer and publishes", async (t) => {
+  const fixture = await reviewFixture(t, { candidateReasonCode: "expanded_feedback" });
+  const calls = [];
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "reviewer-gate-dissatisfaction",
+    provider: async (_context, { resultKind }) => {
+      calls.push(resultKind);
+      if (resultKind === "semantic_dissatisfaction_gate") {
+        return { is_dissatisfaction: true, confidence: "high", reason_class: "forgetting_known_info" };
+      }
+      return { ...VALID_LESSON };
+    }
+  });
+
+  // Expanded candidate runs the gate first, then falls through to the full reviewer.
+  assert.deepEqual(calls, ["semantic_dissatisfaction_gate", "reviewer"]);
+  assert.equal(result.outcome, "published");
+  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.state, "published");
+  assert.equal(job.published_path, result.documentPath);
+});
