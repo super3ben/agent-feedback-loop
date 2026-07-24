@@ -336,30 +336,33 @@ function recordCaptureFailOpen({ store, identity, error, now }) {
 }
 
 async function capturePreparedControlSession({ store, blobs, preparedCapture, rawText, now = () => new Date() }) {
-  const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
-  if (typeof writerRef !== "string" || !writerRef || writerRef.length > 4096) {
-    throw new TypeError("authoritativeEncryptedRef must be a bounded non-empty string");
-  }
-  if (preparedCapture.suppliedEncryptedRawRef !== null
-      && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
-    throw new ControlStoreError("control_observation_collision", "control observation collision");
-  }
-  let resolution;
   try {
-    resolution = store.resolveOrInsertCapture({
+    const writerRef = await blobs.write(preparedCapture.blobContentHash, rawText);
+    if (typeof writerRef !== "string" || !writerRef || writerRef.length > 4096) {
+      throw new TypeError("authoritativeEncryptedRef must be a bounded non-empty string");
+    }
+    if (preparedCapture.suppliedEncryptedRawRef !== null
+        && preparedCapture.suppliedEncryptedRawRef !== writerRef) {
+      throw new ControlStoreError("control_observation_collision", "control observation collision");
+    }
+    const resolution = store.resolveOrInsertCapture({
       preparedCapture,
       authoritativeEncryptedRef: writerRef
     });
+    await blobs.write(preparedCapture.blobContentHash, rawText);
+    return {
+      ...resolution,
+      event_uid: resolution.eventUid,
+      event: resolution.eventView
+    };
   } catch (error) {
+    // Any capture durability failure — blob write, writer-ref guard, collision,
+    // or the store insert — must leave a queryable fail-open reason so a capture
+    // miss is never indistinguishable from a detector miss. Recording is
+    // best-effort and never masks the original error (see recordCaptureFailOpen).
     recordCaptureFailOpen({ store, identity: preparedCapture.identity, error, now });
     throw error;
   }
-  await blobs.write(preparedCapture.blobContentHash, rawText);
-  return {
-    ...resolution,
-    event_uid: resolution.eventUid,
-    event: resolution.eventView
-  };
 }
 
 export async function captureSession({ store, blobs, event, rawText, now = () => new Date() }) {

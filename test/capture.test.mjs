@@ -124,6 +124,27 @@ test("capture durability failure records a bounded queryable fail-open reason co
   store.close();
 });
 
+test("a blob-write failure is also recorded as a bounded fail-open reason", async () => {
+  const { store, blobs } = await controlCaptureFixture();
+  // The durability failure here happens in blobs.write, before the store
+  // insert — the diagnostic must still fire so this miss stays queryable.
+  const originalWrite = blobs.write.bind(blobs);
+  blobs.write = async () => { throw new Error("blob backend unavailable"); };
+
+  await assert.rejects(
+    captureObservedSession({ store, blobs, event: captureEvent(), rawText: "capture durability failure" }),
+    /blob backend unavailable/
+  );
+
+  blobs.write = originalWrite;
+  const records = store.listCaptureFailOpen();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].event_type, "capture_fail_open");
+  assert.match(records[0].reason_code, /^[a-z][a-z0-9_]{0,63}$/);
+  assert.equal(records[0].session_uid, "fail-open-session-1");
+  store.close();
+});
+
 test("capture fail-open log is bounded and keeps the most recent records", async () => {
   const { store, blobs } = await controlCaptureFixture();
   store.database.exec(
