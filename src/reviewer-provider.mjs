@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -242,7 +242,77 @@ function claudeTransportSchema(schemaText) {
   });
 }
 
-export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null }) {
+// `--ignore-user-config` correctly strips user hooks/rules from the isolated
+// reviewer, but it also drops the model_provider routing (for example a
+// gateway base_url), leaving codex reconnecting against an unreachable
+// default endpoint until the review times out. Extract ONLY the strictly
+// validated routing values from the user's codex config so the isolated
+// reviewer talks to the same endpoint the user's own codex does; hooks,
+// rules, features and every other key stay ignored.
+const CODEX_ROUTING_PATTERNS = Object.freeze({
+  name: /^[A-Za-z0-9_-]{1,64}$/u,
+  model: /^[A-Za-z0-9._\-\[\]]{1,128}$/u,
+  wireApi: /^[a-z_]{1,32}$/u,
+  baseUrl: /^https:\/\/[A-Za-z0-9.-]{1,255}(?::\d{1,5})?(?:\/[A-Za-z0-9._\/-]{0,255})?$/u
+});
+
+function tomlTopLevelString(text, key) {
+  const match = new RegExp(`^${key}\\s*=\\s*"([^"\\\\]{1,255})"\\s*$`, "mu").exec(text);
+  return match ? match[1] : null;
+}
+
+function tomlSectionValue(sectionBody, key) {
+  const stringMatch = new RegExp(`^${key}\\s*=\\s*"([^"\\\\]{1,255})"\\s*$`, "mu").exec(sectionBody);
+  if (stringMatch) return stringMatch[1];
+  const booleanMatch = new RegExp(`^${key}\\s*=\\s*(true|false)\\s*$`, "mu").exec(sectionBody);
+  return booleanMatch ? booleanMatch[1] === "true" : null;
+}
+
+export async function codexProviderRouting({ configFile } = {}) {
+  let text;
+  try {
+    text = await readFile(configFile, "utf8");
+  } catch {
+    return [];
+  }
+  if (typeof text !== "string" || text.length > 262_144) return [];
+  const providerName = tomlTopLevelString(text, "model_provider");
+  if (providerName === null) return [];
+  if (!CODEX_ROUTING_PATTERNS.name.test(providerName)) return [];
+  // providerName is validated to [A-Za-z0-9_-] above, so it is regex-safe as-is.
+  const sectionMatch = new RegExp(
+    `^\\[model_providers\\.${providerName}\\]\\s*$([\\s\\S]*?)(?=^\\[|$(?![\\s\\S]))`,
+    "mu"
+  ).exec(text);
+  if (!sectionMatch) return [];
+  const body = sectionMatch[1];
+  const baseUrl = tomlSectionValue(body, "base_url");
+  if (typeof baseUrl !== "string" || !CODEX_ROUTING_PATTERNS.baseUrl.test(baseUrl)) return [];
+  const routing = ["-c", `model_provider="${providerName}"`];
+  const model = tomlTopLevelString(text, "model");
+  if (model !== null) {
+    if (!CODEX_ROUTING_PATTERNS.model.test(model)) return [];
+    routing.push("-c", `model="${model}"`);
+  }
+  const name = tomlSectionValue(body, "name");
+  if (typeof name === "string") {
+    if (!CODEX_ROUTING_PATTERNS.name.test(name)) return [];
+    routing.push("-c", `model_providers.${providerName}.name="${name}"`);
+  }
+  const wireApi = tomlSectionValue(body, "wire_api");
+  if (typeof wireApi === "string") {
+    if (!CODEX_ROUTING_PATTERNS.wireApi.test(wireApi)) return [];
+    routing.push("-c", `model_providers.${providerName}.wire_api="${wireApi}"`);
+  }
+  const requiresOpenaiAuth = tomlSectionValue(body, "requires_openai_auth");
+  if (typeof requiresOpenaiAuth === "boolean") {
+    routing.push("-c", `model_providers.${providerName}.requires_openai_auth=${requiresOpenaiAuth}`);
+  }
+  routing.push("-c", `model_providers.${providerName}.base_url="${baseUrl}"`);
+  return routing;
+}
+
+export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null, codexRouting = [] }) {
   if (cli === "codex") {
     return {
       command: executable,
@@ -254,6 +324,7 @@ export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, 
         "--skip-git-repo-check",
         "--sandbox", "read-only",
         "--color", "never",
+        ...codexRouting,
         "-C", workDir,
         "--output-schema", schemaFile,
         "--output-last-message", resultFile,
@@ -444,7 +515,10 @@ export async function runReviewerProvider({
       schemaFile: invocationSchemaFile,
       resultFile,
       schemaText: schemaText.trim(),
-      policyFile
+      policyFile,
+      codexRouting: cli === "codex" && typeof env?.HOME === "string" && env.HOME
+        ? await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") })
+        : []
     });
     const isolatedEnv = reviewerEnvironment(env);
     const providerEnv = cli === "gemini"
