@@ -54,8 +54,10 @@ const EVIDENCE_PATTERNS = Object.freeze({
     /\b(?:please (?:use|change|stop)|should (?:use|change)|use .{1,48} instead)\b/iu
   ]),
   known_info_forgetting: Object.freeze([
-    /(?:不是都(?:有|存)了吗?|这些之前都(?:有|存)的呀?)/u,
-    /(?:密码|端口|路径|账号|host|hostname|token|open_id)[^。！？?\n]{0,64}(?:不是都|之前都)/u
+    /(?:不是都(?:有|存)了?吗?|这些之前都(?:有|存)的呀?)/u,
+    // Keyword + "不是都/之前都" alone matches neutral status statements
+    // ("这个端口之前都是通的"), so require a forgetting / re-asking cue.
+    /(?:密码|端口|路径|账号|host|hostname|token|open_id)[^。！？?\n]{0,64}(?:不是都|之前都)[^。！？?\n]{0,24}(?:存|有|给|说|告诉|发过|提供)[^。！？?\n]{0,24}(?:吗|了呀|的呀|怎么|为什么|又)/u
   ]),
   recurrence_complaint: Object.freeze([
     /(?:之前出现过好几次了|都第[一二三四五六七八九十0-9]+次了|怎么每次都是|又来问这个)/u

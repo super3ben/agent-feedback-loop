@@ -433,6 +433,23 @@ test("ordinary prompts, invited design calibration and isolated keywords are not
     assert.equal(result.candidate, false, userText);
   }
 
+  // Neutral status statements that merely mention a known-info keyword next to
+  // "之前都" must not be admitted even when a referent exists.
+  const neutralStatusCases = [
+    "这个端口之前都是通的",
+    "这些路径之前都配置好了，跑一下",
+    "账号之前都在文档里"
+  ];
+  for (const userText of neutralStatusCases) {
+    const result = await detectFeedbackCandidate({
+      payload: {},
+      userText,
+      referent: { eventUid: "assistant:neutral", text: "status context" },
+      now: () => 0
+    });
+    assert.equal(result.candidate, false, userText);
+  }
+
   const invited = await detectFeedbackCandidate({
     payload: { invited_design_calibration: true },
     userText: "为什么不先讨论问题和反思边界？",
