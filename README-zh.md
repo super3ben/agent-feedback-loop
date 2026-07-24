@@ -15,6 +15,15 @@
 新发布的文档只能影响后续匹配的提示。精简 control SQLite 数据库只保存生命周期
 状态，不保存 lesson 正文。这是直接 Markdown 选择，不是 RAG。
 
+### 自然语言不满覆盖
+
+识别不满不再依赖固定的负面关键词（如"做错了""不合理"）。自然语言表达的抱怨——被
+要求重复已知信息、对反复出现的问题不耐烦、以及质问式追责（"怎么又不知道了"）——都会
+被纳入一个轻量的语义不满 gate；该 gate 在 detached reviewer 内、full reviewer 之前
+运行，确认真实不满并过滤误报，因此 prompt hook 保持快速、静默。原有的显式命中保持
+不变，仍走不经过 gate 的 full reviewer 直达路径；只有这些无关键词的扩展信号才先经过
+gate。
+
 ### Reviewer provider 环境
 
 detached reviewer 在被剥离的环境中运行宿主 CLI（`codex`、`claude` 或 `gemini`）。
