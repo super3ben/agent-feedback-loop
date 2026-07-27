@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
@@ -9,6 +8,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
+import { spawnTracked } from "./helpers/child-processes.mjs";
 import { pathsFor } from "../src/index.mjs";
 import { V1_SCHEMA_SQL } from "../src/control-schema.mjs";
 import {
@@ -1130,7 +1130,7 @@ test("concurrent grant consumers across SQLite connections have exactly one winn
   `;
   const base = { token: grant.token, ...grantBinding() };
   const run = (eventUid) => {
-    const child = spawn(process.execPath, [
+    const child = spawnTracked(process.execPath, [
       "--input-type=module", "--eval", script,
       JSON.stringify([paths, { ...base, eventUid }])
     ], { stdio: ["ignore", "pipe", "pipe"] });

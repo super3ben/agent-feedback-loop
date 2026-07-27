@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { killTrackedChild, spawnTracked } from "./helpers/child-processes.mjs";
 import { captureObservedSession } from "../src/capture.mjs";
 import { install, pathsFor } from "../src/index.mjs";
 import { openControlStore } from "../src/control-store.mjs";
@@ -24,14 +25,14 @@ const EXPLICIT_FEEDBACK = "是的，而且为什么你改造这些之前没有�
 
 function runHook(file, input, env, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(file, args, { env });
+    const child = spawnTracked(file, args, { env });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
+    child.on("error", (error) => { killTrackedChild(child); reject(error); });
     child.on("close", (code) => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(stderr)));
     child.stdin.end(input);
   });
@@ -389,7 +390,7 @@ test("installed explicit-feedback hook fails open without waiting for a held con
   const projectDir = await realpath(await mkdtemp(path.join(home, "project-")));
   await install({ home, codexHost: unavailableCodexHost() });
   const paths = pathsFor(home);
-  const holder = spawn(process.execPath, ["-e", `
+  const holder = spawnTracked(process.execPath, ["-e", `
     const { DatabaseSync } = require("node:sqlite");
     const db = new DatabaseSync(process.env.AFL_TEST_CONTROL_STORE);
     db.exec("BEGIN IMMEDIATE");
@@ -399,6 +400,7 @@ test("installed explicit-feedback hook fails open without waiting for a held con
     env: { ...process.env, AFL_TEST_CONTROL_STORE: paths.controlDatabase },
     stdio: ["ignore", "pipe", "pipe"]
   });
+  t.after(() => killTrackedChild(holder));
   const holderExit = once(holder, "exit");
   const [ready] = await once(holder.stdout, "data");
   assert.match(String(ready), /locked/u);

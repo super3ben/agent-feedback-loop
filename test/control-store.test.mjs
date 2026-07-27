@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -9,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { killTrackedChild, spawnTracked } from "./helpers/child-processes.mjs";
 import { pathsFor } from "../src/index.mjs";
 import { captureObservedSession, captureSession, normalizeHookEvent } from "../src/capture.mjs";
 import { SCHEMA_SQL } from "../src/control-schema.mjs";
@@ -769,7 +769,7 @@ test("runtime control capture waits for a short concurrent writer", async () => 
   const initialized = initializeControlStore({ paths });
   initialized.close();
   const store = openControlStore({ paths });
-  const holder = spawn(process.execPath, ["-e", `
+  const holder = spawnTracked(process.execPath, ["-e", `
     const { DatabaseSync } = require("node:sqlite");
     const db = new DatabaseSync(process.env.AFL_TEST_CONTROL_STORE);
     db.exec("BEGIN IMMEDIATE");
@@ -780,17 +780,21 @@ test("runtime control capture waits for a short concurrent writer", async () => 
     stdio: ["ignore", "pipe", "pipe"]
   });
   const exitPromise = once(holder, "exit");
-  const [ready] = await once(holder.stdout, "data");
-  assert.match(String(ready), /locked/);
+  try {
+    const [ready] = await once(holder.stdout, "data");
+    assert.match(String(ready), /locked/);
 
-  const startedAt = Date.now();
-  const captured = store.captureSessionEvent(event());
-  const elapsedMs = Date.now() - startedAt;
-  assert.equal(captured.duplicate, false);
-  assert.ok(elapsedMs >= 150, `expected control capture to wait for writer, waited ${elapsedMs}ms`);
-  const [exitCode] = await exitPromise;
-  assert.equal(exitCode, 0);
-  store.close();
+    const startedAt = Date.now();
+    const captured = store.captureSessionEvent(event());
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(captured.duplicate, false);
+    assert.ok(elapsedMs >= 150, `expected control capture to wait for writer, waited ${elapsedMs}ms`);
+    const [exitCode] = await exitPromise;
+    assert.equal(exitCode, 0);
+  } finally {
+    killTrackedChild(holder);
+    store.close();
+  }
 });
 
 test("runtime busy timeout defaults to 5000ms and accepts only bounded non-negative overrides", () => {
