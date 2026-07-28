@@ -211,6 +211,46 @@ test("one threshold snapshot returns one stop message and reserves one detached 
   assert.equal(monitor.failureCount, 0);
 });
 
+test("a growing over-threshold session stays soft-stopped after its Probe completes", async (t) => {
+  const context = await fixture(t);
+  const transcriptPath = await writeTranscript(context.home, thresholdRecords(), "continuous-session.jsonl");
+  let launches = 0;
+  const launchProbe = () => { launches += 1; return { attempted: true }; };
+
+  const first = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "continuous-session"),
+    cli: "codex",
+    controlStore: context.store,
+    launchProbe
+  });
+  const monitorId = deriveExecutionMonitorId({ cli: "codex", sessionId: "continuous-session" });
+  const firstReservation = context.store.getExecutionMonitor({ monitorId });
+  await runExecutionMonitorProbe({
+    store: context.store,
+    monitorId,
+    reservationEpoch: firstReservation.reservationEpoch,
+    ownerId: "continuous-session-owner",
+    provider: async () => RESULT
+  });
+
+  const continued = thresholdRecords();
+  continued.push(assistantRecord("2026-07-28T00:45:00.001Z", [
+    { type: "tool_use", name: "bounded-tool", input: { omitted: true } }
+  ]));
+  await writeFile(transcriptPath, `${continued.map((record) => JSON.stringify(record)).join("\n")}\n`, { mode: 0o600 });
+  const second = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "continuous-session"),
+    cli: "codex",
+    controlStore: context.store,
+    launchProbe
+  });
+
+  assert.deepEqual(first, { continue: true, systemMessage: STOP_MESSAGE });
+  assert.deepEqual(second, { continue: true });
+  assert.equal(launches, 1);
+  assert.equal(context.store.getExecutionMonitor({ monitorId }).reservationEpoch, 1);
+});
+
 test("concurrent duplicate hooks have one winner and complete without deadlock", async (t) => {
   const context = await fixture(t);
   const transcriptPath = await writeTranscript(context.home, thresholdRecords());
@@ -283,6 +323,79 @@ test("monitor identity isolates CLI sessions and retained store_meta state is gl
   ).get().count, 128);
 });
 
+test("retention keeps a reserved monitor claimable while admitting newer inactive monitors", async (t) => {
+  const context = await fixture(t);
+  const reservedMonitorId = "0".repeat(64);
+  const metrics = { turnCount: 1, toolCallCount: 32, elapsedMs: 2_700_000, consecutiveNoProgress: 16 };
+  const reserved = context.store.observeExecutionMonitor({
+    monitorId: reservedMonitorId,
+    cli: "codex",
+    metrics,
+    snapshotDigest: "a".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+
+  for (let index = 0; index < 128; index += 1) {
+    context.advance(1);
+    context.store.observeExecutionMonitor({
+      monitorId: `${"f".repeat(62)}${index.toString(16).padStart(2, "0")}`,
+      cli: "codex",
+      metrics: { turnCount: 1, toolCallCount: index, elapsedMs: index, consecutiveNoProgress: index },
+      snapshotDigest: index.toString(16).padStart(64, "0"),
+      thresholdReached: false,
+      reservationMs: 60_000
+    });
+  }
+
+  const claimed = context.store.claimExecutionMonitorProbe({
+    monitorId: reservedMonitorId,
+    reservationEpoch: reserved.reservationEpoch,
+    ownerId: "retention-owner",
+    leaseMs: 60_000
+  });
+  assert.equal(claimed.probeState, "running");
+  assert.equal(context.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM store_meta WHERE key LIKE 'execution_monitor:v1:%'"
+  ).get().count, 128);
+});
+
+test("full live retention refuses a new reservation without evicting a fenced monitor", async (t) => {
+  const context = await fixture(t);
+  const metrics = { turnCount: 1, toolCallCount: 32, elapsedMs: 2_700_000, consecutiveNoProgress: 16 };
+  const activeMonitorIds = [];
+  for (let index = 0; index < 128; index += 1) {
+    const monitorId = index.toString(16).padStart(64, "0");
+    activeMonitorIds.push(monitorId);
+    context.store.observeExecutionMonitor({
+      monitorId,
+      cli: "claude",
+      metrics,
+      snapshotDigest: index.toString(16).padStart(64, "0"),
+      thresholdReached: true,
+      reservationMs: 60_000
+    });
+  }
+
+  const rejectedMonitorId = "f".repeat(64);
+  const rejected = context.store.observeExecutionMonitor({
+    monitorId: rejectedMonitorId,
+    cli: "claude",
+    metrics,
+    snapshotDigest: "f".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+
+  assert.equal(rejected.reserved, false);
+  assert.equal(rejected.reason, "capacity_exhausted");
+  assert.notEqual(context.store.getExecutionMonitor({ monitorId: activeMonitorIds[0] }), null);
+  assert.equal(context.store.getExecutionMonitor({ monitorId: rejectedMonitorId }), null);
+  assert.equal(context.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM store_meta WHERE key LIKE 'execution_monitor:v1:%'"
+  ).get().count, 128);
+});
+
 test("detached Probe completion validates result and controls the bounded failure count", async (t) => {
   const context = await fixture(t);
   const monitorId = deriveExecutionMonitorId({ cli: "gemini", sessionId: "runner-session" });
@@ -324,6 +437,14 @@ test("detached Probe completion validates result and controls the bounded failur
   assert.equal(context.store.getExecutionMonitor({ monitorId }).failureCount, 1);
 
   for (let index = 0; index < 4; index += 1) {
+    context.store.observeExecutionMonitor({
+      monitorId,
+      cli: "gemini",
+      metrics: { ...metrics, toolCallCount: 33 + index, consecutiveNoProgress: 0 },
+      snapshotDigest: String(index + 6).repeat(64),
+      thresholdReached: false,
+      reservationMs: 60_000
+    });
     const next = context.store.observeExecutionMonitor({
       monitorId,
       cli: "gemini",

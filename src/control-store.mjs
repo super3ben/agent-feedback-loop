@@ -1746,9 +1746,8 @@ function createStore(database, now) {
           const active = ["reserved", "running"].includes(state.probeState)
             && activeUntil !== null && Date.parse(activeUntil) > currentTime;
           const sameReservationSnapshot = state.reservationSnapshotDigest === safeSnapshotDigest;
-          const alreadyHandled = sameReservationSnapshot && ["completed", "failed"].includes(state.probeState);
-          const attemptsExhausted = sameReservationSnapshot
-            && state.reservationAttempt >= EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS;
+          const alreadyHandled = ["completed", "failed"].includes(state.probeState);
+          const attemptsExhausted = state.reservationAttempt >= EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS;
           if (!active && !alreadyHandled && !attemptsExhausted) {
             state.probeState = "reserved";
             state.reservationEpoch += 1;
@@ -1770,15 +1769,42 @@ function createStore(database, now) {
             state.leaseUntil = null;
             state.reasonCode = "attempts_exhausted";
           }
+        } else if (!["reserved", "running"].includes(state.probeState)) {
+          state.probeState = "idle";
+          state.reservationAttempt = 0;
+          state.reservationSnapshotDigest = null;
+          state.reservationMetrics = null;
+          state.reservationUntil = null;
+          state.ownerId = null;
+          state.leaseUntil = null;
         }
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
           ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(state));
-        database.prepare(`DELETE FROM store_meta WHERE key IN (
-          SELECT key FROM store_meta WHERE key LIKE ?
-          ORDER BY key=? DESC,
-            CASE WHEN json_valid(value) THEN json_extract(value, '$.updatedAt') ELSE '' END DESC, key
-          LIMIT -1 OFFSET ?
-        )`).run(`${EXECUTION_MONITOR_META_PREFIX}%`, key, EXECUTION_MONITOR_MAX_STORED);
+        const retainedRows = database.prepare("SELECT key, value FROM store_meta WHERE key LIKE ?")
+          .all(`${EXECUTION_MONITOR_META_PREFIX}%`);
+        const overflow = retainedRows.length - EXECUTION_MONITOR_MAX_STORED;
+        if (overflow > 0) {
+          const inactiveRows = retainedRows.flatMap((row) => {
+            try {
+              const retained = executionMonitorState(
+                JSON.parse(row.value),
+                row.key.slice(EXECUTION_MONITOR_META_PREFIX.length)
+              );
+              return ["reserved", "running"].includes(retained.probeState) ? [] : [{ key: row.key, updatedAt: retained.updatedAt }];
+            } catch {
+              return [];
+            }
+          }).sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.key.localeCompare(right.key));
+          if (inactiveRows.length < overflow) {
+            if (!existingRow) {
+              database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+              return { ...state, reserved: false, reason: "capacity_exhausted" };
+            }
+            throw new ControlStoreError("execution_monitor_capacity_exhausted", "execution monitor capacity exhausted");
+          }
+          const deleteRow = database.prepare("DELETE FROM store_meta WHERE key=?");
+          for (const inactiveRow of inactiveRows.slice(0, overflow)) deleteRow.run(inactiveRow.key);
+        }
         return { ...state, reserved };
       });
     },
