@@ -1487,6 +1487,7 @@ function createStore(database, now) {
         FROM reviewer_jobs AS historic_job
         JOIN session_events AS historic_event ON historic_event.event_uid=historic_job.source_event_uid
         WHERE historic_job.project_id=? AND historic_job.job_id<>?
+          AND historic_event.encrypted_raw_ref IS NOT NULL
           AND (historic_event.created_at<? OR (historic_event.created_at=? AND historic_event.event_uid<?))
         ORDER BY historic_event.created_at DESC, historic_event.event_uid DESC LIMIT ?`).all(
         currentJob.project_id,

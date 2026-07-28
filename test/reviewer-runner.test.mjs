@@ -227,6 +227,36 @@ test("same-project Termius complaints add bounded plaintext-free recurrence evid
   assert.deepEqual(observedContext.reflectionCatalog, []);
 });
 
+test("newer null historical references do not starve readable Termius recurrence candidates", async (t) => {
+  const fixture = await reviewFixture(t, {
+    sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
+    priorCandidates: [
+      { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
+      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" },
+      ...Array.from({ length: 8 }, (_, index) => ({ rawText: `newer unavailable historical candidate ${index}` }))
+    ]
+  });
+  const historic = fixture.store.getReviewRecurrenceCandidates({ jobId: fixture.jobId });
+  assert.equal(historic.length, 8);
+  for (const row of historic) {
+    fixture.store.database.prepare("UPDATE session_events SET encrypted_raw_ref=NULL WHERE event_uid=?")
+      .run(row.event_uid);
+  }
+  let observedContext;
+
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-historical-null-window",
+    provider: async (context) => {
+      observedContext = context;
+      return { ...VALID_LESSON };
+    }
+  });
+
+  assert.equal(result.outcome, "published");
+  assert.equal(observedContext.recurrence.similar_complaint_count, 2);
+});
+
 for (const [label, encryptedRawRef] of [
   ["null", null],
   ["missing", "/private/blobs/missing-historical-source.enc"]
