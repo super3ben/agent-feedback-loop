@@ -144,7 +144,12 @@ async function recurrenceSummary({ store, blobs, jobId, source }) {
   const matchingReasonCodes = new Set();
   let similarComplaintCount = 0;
   for (const historic of historicRows) {
-    const candidate = await classifiedSourceEvent(historic, blobs);
+    let candidate;
+    try {
+      candidate = await classifiedSourceEvent(historic, blobs);
+    } catch {
+      continue;
+    }
     const overlap = current.reasonCodes.filter((code) => candidate.reasonCodes.includes(code));
     if (overlap.length === 0 || !isLexicallySimilar(current.text, candidate.text)) continue;
     similarComplaintCount += 1;

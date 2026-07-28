@@ -227,6 +227,37 @@ test("same-project Termius complaints add bounded plaintext-free recurrence evid
   assert.deepEqual(observedContext.reflectionCatalog, []);
 });
 
+for (const [label, encryptedRawRef] of [
+  ["null", null],
+  ["missing", "/private/blobs/missing-historical-source.enc"]
+]) {
+  test(`historical ${label} encrypted source reference is omitted from recurrence evidence`, async (t) => {
+    const fixture = await reviewFixture(t, {
+      sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
+      priorCandidates: [
+        { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
+        { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" }
+      ]
+    });
+    const historic = fixture.store.getReviewRecurrenceCandidates({ jobId: fixture.jobId });
+    fixture.store.database.prepare("UPDATE session_events SET encrypted_raw_ref=? WHERE event_uid=?")
+      .run(encryptedRawRef, historic[0].event_uid);
+    let observedContext;
+
+    const result = await runReviewJob({
+      ...fixture,
+      ownerId: `owner-historical-${label}-ref`,
+      provider: async (context) => {
+        observedContext = context;
+        return { ...VALID_LESSON };
+      }
+    });
+
+    assert.equal(result.outcome, "published");
+    assert.equal(observedContext.recurrence.similar_complaint_count, 1);
+  });
+}
+
 test("runReviewJob publishes one stable Markdown document and only updates control state", async (t) => {
   const fixture = await reviewFixture(t);
   let observedContext;
