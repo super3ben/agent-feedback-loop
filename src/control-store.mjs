@@ -1745,13 +1745,11 @@ function createStore(database, now) {
           const activeUntil = state.probeState === "running" ? state.leaseUntil : state.reservationUntil;
           const active = ["reserved", "running"].includes(state.probeState)
             && activeUntil !== null && Date.parse(activeUntil) > currentTime;
-          const sameReservationSnapshot = state.reservationSnapshotDigest === safeSnapshotDigest;
-          const alreadyHandled = ["completed", "failed"].includes(state.probeState);
-          const attemptsExhausted = state.reservationAttempt >= EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS;
-          if (!active && !alreadyHandled && !attemptsExhausted) {
+          const expired = ["reserved", "running"].includes(state.probeState) && !active;
+          if (state.probeState === "idle") {
             state.probeState = "reserved";
             state.reservationEpoch += 1;
-            state.reservationAttempt = sameReservationSnapshot ? state.reservationAttempt + 1 : 1;
+            state.reservationAttempt = 1;
             state.reservationSnapshotDigest = safeSnapshotDigest;
             state.reservationMetrics = safeMetrics;
             state.reservationUntil = new Date(currentTime + safeReservationMs).toISOString();
@@ -1762,14 +1760,15 @@ function createStore(database, now) {
             state.resultDigest = null;
             state.reasonCode = null;
             reserved = true;
-          } else if (!active && attemptsExhausted && !alreadyHandled) {
+          } else if (expired) {
+            const expiredProbeState = state.probeState;
             state.probeState = "failed";
             state.reservationUntil = null;
             state.ownerId = null;
             state.leaseUntil = null;
-            state.reasonCode = "attempts_exhausted";
+            state.reasonCode = expiredProbeState === "running" ? "lease_expired" : "reservation_expired";
           }
-        } else if (!["reserved", "running"].includes(state.probeState)) {
+        } else {
           state.probeState = "idle";
           state.reservationAttempt = 0;
           state.reservationSnapshotDigest = null;
@@ -1820,8 +1819,7 @@ function createStore(database, now) {
           throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
         }
         if (state.probeState !== "reserved" || state.reservationEpoch !== safeEpoch) return { released: false };
-        state.probeState = state.reservationAttempt < EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS
-          ? "retryable" : "failed";
+        state.probeState = "failed";
         state.reservationUntil = null;
         state.reasonCode = "spawn_failed";
         state.updatedAt = nowIso(now);
@@ -1918,8 +1916,7 @@ function createStore(database, now) {
         if (state.probeState !== "running" || state.reservationEpoch !== safeEpoch
             || state.ownerId !== safeOwnerId || state.leaseUntil === null
             || Date.parse(state.leaseUntil) <= Date.parse(timestamp)) throw executionProbeLeaseLost();
-        state.probeState = state.reservationAttempt < EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS
-          ? "retryable" : "failed";
+        state.probeState = "failed";
         state.ownerId = null;
         state.leaseUntil = null;
         state.reasonCode = safeReasonCode;

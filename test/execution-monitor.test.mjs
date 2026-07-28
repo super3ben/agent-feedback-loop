@@ -251,6 +251,71 @@ test("a growing over-threshold session stays soft-stopped after its Probe comple
   assert.equal(context.store.getExecutionMonitor({ monitorId }).reservationEpoch, 1);
 });
 
+test("a growing over-threshold session stays soft-stopped after its Probe fails", async (t) => {
+  const context = await fixture(t);
+  const transcriptPath = await writeTranscript(context.home, thresholdRecords(), "failed-session.jsonl");
+  let launches = 0;
+  const launchProbe = () => { launches += 1; return { attempted: true }; };
+
+  const first = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "failed-session"),
+    cli: "codex",
+    controlStore: context.store,
+    launchProbe
+  });
+  const monitorId = deriveExecutionMonitorId({ cli: "codex", sessionId: "failed-session" });
+  const firstReservation = context.store.getExecutionMonitor({ monitorId });
+  await assert.rejects(runExecutionMonitorProbe({
+    store: context.store,
+    monitorId,
+    reservationEpoch: firstReservation.reservationEpoch,
+    ownerId: "failed-session-owner",
+    provider: async () => { throw new Error("provider rejected"); }
+  }), /provider rejected/u);
+
+  const continued = thresholdRecords({ toolCalls: 33 });
+  await writeFile(transcriptPath, `${continued.map((record) => JSON.stringify(record)).join("\n")}\n`, { mode: 0o600 });
+  const second = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "failed-session"),
+    cli: "codex",
+    controlStore: context.store,
+    launchProbe
+  });
+
+  assert.deepEqual(first, { continue: true, systemMessage: STOP_MESSAGE });
+  assert.deepEqual(second, { continue: true });
+  assert.equal(launches, 1);
+  assert.equal(context.store.getExecutionMonitor({ monitorId }).reservationEpoch, 1);
+});
+
+test("a synchronous launch release closes the over-threshold episode", async (t) => {
+  const context = await fixture(t);
+  const transcriptPath = await writeTranscript(context.home, thresholdRecords(), "released-session.jsonl");
+  let launches = 0;
+  const launchProbe = () => { launches += 1; return { attempted: false, reason: "spawn_failed" }; };
+
+  const first = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "released-session"),
+    cli: "claude",
+    controlStore: context.store,
+    launchProbe
+  });
+  const continued = thresholdRecords({ toolCalls: 33 });
+  await writeFile(transcriptPath, `${continued.map((record) => JSON.stringify(record)).join("\n")}\n`, { mode: 0o600 });
+  const second = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "released-session"),
+    cli: "claude",
+    controlStore: context.store,
+    launchProbe
+  });
+  const monitorId = deriveExecutionMonitorId({ cli: "claude", sessionId: "released-session" });
+
+  assert.deepEqual(first, { continue: true, systemMessage: STOP_MESSAGE });
+  assert.deepEqual(second, { continue: true });
+  assert.equal(launches, 1);
+  assert.equal(context.store.getExecutionMonitor({ monitorId }).reservationEpoch, 1);
+});
+
 test("concurrent duplicate hooks have one winner and complete without deadlock", async (t) => {
   const context = await fixture(t);
   const transcriptPath = await writeTranscript(context.home, thresholdRecords());
@@ -270,35 +335,92 @@ test("concurrent duplicate hooks have one winner and complete without deadlock",
   assert.equal(launches, 1);
 });
 
-test("stale reservations retry with a new epoch while live reservations stay deduplicated", async (t) => {
+test("an expired reservation closes the over-threshold episode", async (t) => {
   const context = await fixture(t);
-  const monitorId = deriveExecutionMonitorId({ cli: "claude", sessionId: "lease-session" });
-  const metrics = { turnCount: 1, toolCallCount: 32, elapsedMs: 2_700_000, consecutiveNoProgress: 16 };
-  const snapshotDigest = "a".repeat(64);
+  const transcriptPath = await writeTranscript(context.home, thresholdRecords(), "expired-session.jsonl");
+  let launches = 0;
+  const launchProbe = () => { launches += 1; return { attempted: true }; };
 
-  const first = context.store.observeExecutionMonitor({
-    monitorId, cli: "claude", metrics, snapshotDigest, thresholdReached: true, reservationMs: 60_000
-  });
-  const liveDuplicate = context.store.observeExecutionMonitor({
-    monitorId, cli: "claude", metrics, snapshotDigest, thresholdReached: true, reservationMs: 60_000
-  });
-  const staleSnapshot = context.store.observeExecutionMonitor({
-    monitorId,
+  const first = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "expired-session"),
     cli: "claude",
-    metrics: { ...metrics, toolCallCount: 31, elapsedMs: 2_699_999 },
-    snapshotDigest: "f".repeat(64),
+    controlStore: context.store,
+    launchProbe
+  });
+  context.advance(60_001);
+  const continued = thresholdRecords({ toolCalls: 33 });
+  await writeFile(transcriptPath, `${continued.map((record) => JSON.stringify(record)).join("\n")}\n`, { mode: 0o600 });
+  const second = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "expired-session"),
+    cli: "claude",
+    controlStore: context.store,
+    launchProbe
+  });
+  const monitorId = deriveExecutionMonitorId({ cli: "claude", sessionId: "expired-session" });
+  const afterExpiration = context.store.getExecutionMonitor({ monitorId });
+
+  assert.deepEqual(first, { continue: true, systemMessage: STOP_MESSAGE });
+  assert.deepEqual(second, { continue: true });
+  assert.equal(launches, 1);
+  assert.equal(afterExpiration.reservationEpoch, 1);
+  assert.equal(afterExpiration.probeState, "failed");
+  assert.equal(afterExpiration.metrics.toolCallCount, 33);
+});
+
+test("a below-threshold observation rearms exactly one later execution episode", async (t) => {
+  const context = await fixture(t);
+  const monitorId = deriveExecutionMonitorId({ cli: "gemini", sessionId: "rearmed-session" });
+  const metrics = { turnCount: 1, toolCallCount: 32, elapsedMs: 2_700_000, consecutiveNoProgress: 16 };
+  const first = context.store.observeExecutionMonitor({
+    monitorId,
+    cli: "gemini",
+    metrics,
+    snapshotDigest: "1".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+  context.store.releaseExecutionMonitorProbe({
+    monitorId,
+    reservationEpoch: first.reservationEpoch
+  });
+  const stillOverThreshold = context.store.observeExecutionMonitor({
+    monitorId,
+    cli: "gemini",
+    metrics: { ...metrics, toolCallCount: 33 },
+    snapshotDigest: "2".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+  const rearmed = context.store.observeExecutionMonitor({
+    monitorId,
+    cli: "gemini",
+    metrics: { ...metrics, toolCallCount: 33, consecutiveNoProgress: 0 },
+    snapshotDigest: "3".repeat(64),
     thresholdReached: false,
     reservationMs: 60_000
   });
-  context.advance(60_001);
-  const retry = context.store.observeExecutionMonitor({
-    monitorId, cli: "claude", metrics, snapshotDigest, thresholdReached: true, reservationMs: 60_000
+  const secondEpisode = context.store.observeExecutionMonitor({
+    monitorId,
+    cli: "gemini",
+    metrics: { ...metrics, toolCallCount: 49 },
+    snapshotDigest: "4".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+  const duplicate = context.store.observeExecutionMonitor({
+    monitorId,
+    cli: "gemini",
+    metrics: { ...metrics, toolCallCount: 50 },
+    snapshotDigest: "5".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
   });
 
-  assert.deepEqual([first.reserved, liveDuplicate.reserved, retry.reserved], [true, false, true]);
-  assert.deepEqual([first.reservationEpoch, liveDuplicate.reservationEpoch, retry.reservationEpoch], [1, 1, 2]);
-  assert.equal(staleSnapshot.reason, "stale_snapshot");
-  assert.equal(context.store.getExecutionMonitor({ monitorId }).metrics.toolCallCount, 32);
+  assert.equal(stillOverThreshold.reserved, false);
+  assert.equal(rearmed.probeState, "idle");
+  assert.equal(secondEpisode.reserved, true);
+  assert.equal(secondEpisode.reservationEpoch, 2);
+  assert.equal(duplicate.reserved, false);
 });
 
 test("monitor identity isolates CLI sessions and retained store_meta state is globally bounded", async (t) => {
