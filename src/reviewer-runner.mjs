@@ -2,6 +2,7 @@ import { lstat } from "node:fs/promises";
 import path from "node:path";
 
 import { redactText } from "./capture.mjs";
+import { classifyRetrospectiveEvidence } from "./feedback-signal.mjs";
 import {
   publishReflectionDocument,
   readReflectionCatalog,
@@ -23,6 +24,10 @@ const FAILURE_CODES = new Set([
 const EVENT_TEXT_FIELDS = ["text", "prompt", "message", "content", "output", "response"];
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const TIMEZONE_TIMESTAMP = /(?:Z|[+-]\d{2}:\d{2})$/iu;
+const RECURRENCE_LIMIT = 8;
+const RECURRENCE_STOP_TOKENS = new Set([
+  "之前", "为什么", "为什", "什么", "怎么", "每次", "已经", "不是", "都有", "又要", "要我", "提供", "重复", "again", "before", "every", "please", "with", "that", "this", "have", "from", "were"
+]);
 
 class ReviewJobError extends Error {
   constructor(code, cause) {
@@ -93,6 +98,64 @@ async function catalogSummaries(projectDir, publishedBefore) {
   }));
 }
 
+function lexicalTokens(text) {
+  const normalized = String(text ?? "").normalize("NFKC").toLowerCase();
+  const tokens = new Set();
+  for (const fragment of normalized.match(/[a-z0-9][a-z0-9_-]{1,}|[\p{Script=Han}]{2,}/gu) || []) {
+    if (/^[\p{Script=Han}]+$/u.test(fragment)) {
+      for (let index = 0; index < fragment.length - 1; index += 1) {
+        const token = fragment.slice(index, index + 2);
+        if (!RECURRENCE_STOP_TOKENS.has(token)) tokens.add(token);
+      }
+    } else if (!RECURRENCE_STOP_TOKENS.has(fragment)) {
+      tokens.add(fragment);
+    }
+  }
+  return tokens;
+}
+
+function isLexicallySimilar(left, right) {
+  const leftTokens = lexicalTokens(left);
+  const rightTokens = lexicalTokens(right);
+  if (leftTokens.size === 0 || rightTokens.size === 0) return false;
+  let shared = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) shared += 1;
+  }
+  return shared >= 2 && shared / Math.min(leftTokens.size, rightTokens.size) >= 0.1;
+}
+
+async function classifiedSourceEvent(row, blobs) {
+  if (!row?.encrypted_raw_ref) throw new ReviewJobError("context_invalid");
+  const raw = await blobs.read(row.encrypted_raw_ref);
+  const text = hostText(raw);
+  return {
+    text,
+    reasonCodes: classifyRetrospectiveEvidence({
+      userText: text,
+      hasReferent: Boolean(row.referent_event_uid)
+    }).reasonCodes
+  };
+}
+
+async function recurrenceSummary({ store, blobs, jobId, source }) {
+  const current = await classifiedSourceEvent(source, blobs);
+  const historicRows = store.getReviewRecurrenceCandidates({ jobId, limit: RECURRENCE_LIMIT });
+  const matchingReasonCodes = new Set();
+  let similarComplaintCount = 0;
+  for (const historic of historicRows) {
+    const candidate = await classifiedSourceEvent(historic, blobs);
+    const overlap = current.reasonCodes.filter((code) => candidate.reasonCodes.includes(code));
+    if (overlap.length === 0 || !isLexicallySimilar(current.text, candidate.text)) continue;
+    similarComplaintCount += 1;
+    for (const code of overlap) matchingReasonCodes.add(code);
+  }
+  return {
+    similar_complaint_count: similarComplaintCount,
+    matching_reason_codes: [...matchingReasonCodes]
+  };
+}
+
 function controllerRecurrenceEntry(emission, familyId) {
   if (!emission || emission.family_id !== familyId
       || !SHA256_PATTERN.test(String(emission.document_sha256 ?? ""))
@@ -137,21 +200,12 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
   }
   await assertProjectBoundary(projectDir);
   const reflectionCatalog = await catalogSummaries(projectDir, stored.job.created_at);
+  const recurrence = await recurrenceSummary({ store, blobs, jobId, source: stored.source });
   const sourceEnvelope = {
     sourceIdentity: stored.job.source_identity,
     createdAt: stored.source.source_timestamp ?? stored.source.created_at,
     publishedAt: stored.job.created_at
   };
-  let candidateSource = "explicit_legacy_hit";
-  try {
-    const candidateEvent = store.getReviewCandidateEvent(jobId);
-    if (candidateEvent && candidateEvent.reason_code === "expanded_feedback") {
-      candidateSource = "expanded_coarse_recall";
-    }
-  } catch {
-    // If the store method is unavailable or fails, default to explicit_legacy_hit.
-  }
-
   return {
     job: {
       job_id: stored.job.job_id,
@@ -164,7 +218,7 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
     prior: await Promise.all(stored.prior.slice(-6).map((row) => contextEvent(row, blobs))),
     following: await Promise.all(stored.following.slice(0, 2).map((row) => contextEvent(row, blobs))),
     reflectionCatalog,
-    candidate: { source: candidateSource }
+    recurrence
   };
 }
 
@@ -207,15 +261,6 @@ function recordFailure(store, { jobId, ownerId, leaseEpoch, code }) {
   }
 }
 
-function semanticGateProjection(context) {
-  return Object.freeze({
-    prompt: context.source?.text ?? "",
-    referent: context.referent?.text ?? null,
-    provider: context.source?.sourceProvider ?? "unknown",
-    projectId: context.job?.project_id ?? null
-  });
-}
-
 export async function runReviewJob({
   jobId,
   ownerId,
@@ -241,33 +286,8 @@ export async function runReviewJob({
   }
 
   let rawResult;
-
-  if (context.candidate?.source === "expanded_coarse_recall") {
-    let gateResult;
-    try {
-      gateResult = await provider(semanticGateProjection(context), { resultKind: "semantic_dissatisfaction_gate" });
-    } catch (error) {
-      const failure = new ReviewJobError(providerFailure(error), error);
-      recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
-      throw failure;
-    }
-
-    if (!gateResult || !gateResult.is_dissatisfaction) {
-      try {
-        store.completeReviewNoLesson({ jobId, ownerId, leaseEpoch });
-        return { outcome: "reviewed_no_lesson", documentPath: null };
-      } catch (error) {
-        const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
-        recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
-        throw failure;
-      }
-    }
-
-    // Gate reports dissatisfaction — fall through to full reviewer context.
-  }
-
   try {
-    rawResult = await provider(context, { resultKind: "reviewer" });
+    rawResult = await provider(context, { resultKind: "lesson" });
   } catch (error) {
     const failure = new ReviewJobError(providerFailure(error), error);
     recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
@@ -289,7 +309,7 @@ export async function runReviewJob({
 
   if (result.outcome === "no_lesson") {
     try {
-      store.completeReviewNoLesson({ jobId, ownerId, leaseEpoch });
+      store.completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode: result.reason_code });
       return { outcome: "reviewed_no_lesson", documentPath: null };
     } catch (error) {
       const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);

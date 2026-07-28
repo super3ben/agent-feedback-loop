@@ -350,14 +350,14 @@ describe("agent-feedback-loop package", () => {
     fixture.controlStore.close();
   });
 
-  it("expanded coarse-recall admissions are tagged for the semantic gate while explicit hits stay direct", async () => {
+  it("expanded coarse-recall admissions retain their bounded candidate source", async () => {
     const fixture = await promptOrchestrationFixture();
     const candidateReason = (store, jobId) => store.database.prepare(
       "SELECT reason_code FROM review_job_events WHERE job_id=? AND event_type='candidate_created'"
     ).get(jobId).reason_code;
 
-    // Real missed case: standalone known-info complaint admits via the
-    // expanded path and must be routed through the semantic gate.
+    // Real missed case: standalone known-info complaint admits through the
+    // expanded path for the detached full reviewer.
     const expanded = await cliModule.handlePromptHook({
       payload: explicitFeedbackPayload({
         session_id: "expanded-session-1",
@@ -1374,6 +1374,22 @@ describe("agent-feedback-loop package", () => {
 
     for (const file of obsolete) await assert.rejects(stat(file));
     assert.equal((await stat(paths.coreHook)).mode & 0o111, 0o111);
+  });
+
+  it("install removes deleted reviewer assets from an existing prompt pack", async () => {
+    const home = await tempHome();
+    const paths = pathsFor(home);
+    await install({ home, codexHost: unavailableCodexHost() });
+    const removedStem = ["semantic", "dissatisfaction", "gate"].join("-");
+    const obsolete = [
+      path.join(paths.packRoot, "prompts", `${removedStem}.md`),
+      path.join(paths.packRoot, "schemas", `${removedStem}.schema.json`)
+    ];
+    for (const file of obsolete) await writeFile(file, "obsolete\n", "utf8");
+
+    await install({ home, codexHost: unavailableCodexHost() });
+
+    for (const file of obsolete) await assert.rejects(stat(file));
   });
 
   it("core hook preserves native response schemas and emits no diagnostics", async () => {

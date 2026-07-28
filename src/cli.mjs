@@ -391,9 +391,8 @@ export async function handlePromptHook({
             referentEventUid: referentEventUid ?? "none"
           }),
           projectId: event.project_id,
-          // Expanded coarse-recall admissions must be tagged so the detached
-          // runner routes them through the semantic gate instead of straight
-          // into the full reviewer; explicit hits keep the direct path.
+          // Preserve the detector source as bounded candidate evidence; every
+          // admitted candidate is evaluated by the detached full reviewer.
           reasonCode: signal?.source === "expanded" ? "expanded_feedback" : "explicit_feedback"
         });
         result.jobId = candidate.jobId;
@@ -776,31 +775,17 @@ export async function main(args, {
         store,
         blobs,
         projectDir,
-        provider: (context, { resultKind } = {}) => {
-          if (resultKind === "semantic_dissatisfaction_gate") {
-            return runReviewerProvider({
-              cli: providerName,
-              executable,
-              context,
-              resultKind,
-              policyFile: paths.geminiReviewerPolicy,
-              geminiSettingsFile: paths.geminiReviewerSettings,
-              timeoutMs,
-              env: process.env
-            });
-          }
-          return runReviewerProvider({
-            cli: providerName,
-            executable,
-            context,
-            promptFile: paths.promptFile,
-            schemaFile: paths.reviewerSchema,
-            policyFile: paths.geminiReviewerPolicy,
-            geminiSettingsFile: paths.geminiReviewerSettings,
-            timeoutMs,
-            env: process.env
-          });
-        },
+        provider: (context) => runReviewerProvider({
+          cli: providerName,
+          executable,
+          context,
+          promptFile: paths.promptFile,
+          schemaFile: paths.reviewerSchema,
+          policyFile: paths.geminiReviewerPolicy,
+          geminiSettingsFile: paths.geminiReviewerSettings,
+          timeoutMs,
+          env: process.env
+        }),
       });
       reviewerTerminalLog({
         outcome: result.outcome,

@@ -5,9 +5,19 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "outcome": { "const": "no_lesson" }
+        "outcome": { "const": "no_lesson" },
+        "reason_code": {
+          "enum": [
+            "insufficient_evidence",
+            "external_limit",
+            "user_misunderstanding",
+            "shared_ambiguity",
+            "minor_issue",
+            "not_agent_fault"
+          ]
+        }
       },
-      "required": ["outcome"]
+      "required": ["outcome", "reason_code"]
     },
     {
       "type": "object",

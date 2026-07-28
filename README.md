@@ -24,12 +24,10 @@ state, not lesson bodies. This is direct Markdown selection, not RAG.
 Recognizing dissatisfaction no longer requires a fixed negative keyword such as
 "做错了" or "不合理". Natural-language complaints — being asked to restate
 already-known information, frustration about a recurring problem, and rhetorical
-accountability ("how is this unknown again?") — are admitted into a lightweight
-semantic dissatisfaction gate that runs inside the detached reviewer before the full
-reviewer. The gate confirms real dissatisfaction and drops false positives, so the
-prompt hook stays fast and silent. Existing explicit hits are preserved and keep the
-direct full-reviewer path with no gate step; only these expanded, keyword-free
-signals are routed through the gate first.
+accountability ("how is this unknown again?") — are admitted for the detached full
+reviewer, while the prompt hook remains fast and silent. The reviewer compares only
+bounded, same-project prior candidate evidence and may use corroborated recurrence
+to form a Major lesson.
 
 ### Reviewer provider environment
 

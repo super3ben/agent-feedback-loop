@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createConvergenceStoreApi } from "./convergence-store.mjs";
+import { NO_LESSON_REASON_CODES } from "./reviewer-result.mjs";
 
 import {
   CONVERGENCE_SCHEMA_SQL,
@@ -43,6 +44,7 @@ const MAX_SQLITE_BUSY_TIMEOUT_MS = 60_000;
 const MAX_CONTEXT_EPOCH = 2_147_483_647;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const FAMILY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const NO_LESSON_REASON_CODE_SET = new Set(NO_LESSON_REASON_CODES);
 const TIMEZONE_TIMESTAMP = /(?:Z|[+-]\d{2}:\d{2})$/iu;
 const MAX_REVIEW_ATTEMPTS = 3;
 const DEFAULT_REVIEW_LEASE_MS = 185_000;
@@ -997,6 +999,10 @@ function createStore(database, now) {
   };
   const eventContextColumns = `event_uid, session_uid, source_provider, role, referent_event_uid,
     content_hash, encrypted_raw_ref, completeness, source_timestamp, created_at`;
+  const recurrenceEventContextColumns = `historic_event.event_uid, historic_event.session_uid,
+    historic_event.source_provider, historic_event.role, historic_event.referent_event_uid,
+    historic_event.content_hash, historic_event.encrypted_raw_ref, historic_event.completeness,
+    historic_event.source_timestamp, historic_event.created_at`;
   const readContextEvent = (eventUid) => {
     if (eventUid === null || eventUid === undefined) return null;
     return database.prepare(`SELECT ${eventContextColumns} FROM session_events WHERE event_uid=?`)
@@ -1324,10 +1330,14 @@ function createStore(database, now) {
         return { ...renewed, leaseEpoch: safeLeaseEpoch };
       });
     },
-    completeReviewNoLesson({ jobId, ownerId, leaseEpoch }) {
+    completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 64);
+      if (!NO_LESSON_REASON_CODE_SET.has(safeReasonCode)) {
+        throw new TypeError("reasonCode is not controlled for reviewed_no_lesson");
+      }
       const timestamp = nowIso(now);
       return transaction(() => {
         const completed = database.prepare(`UPDATE reviewer_jobs
@@ -1340,6 +1350,7 @@ function createStore(database, now) {
         insertReviewJobEvent({
           jobId: safeJobId,
           eventType: "reviewed_no_lesson",
+          reasonCode: safeReasonCode,
           leaseEpoch: safeLeaseEpoch,
           timestamp
         });
@@ -1463,6 +1474,28 @@ function createStore(database, now) {
         prior: prior.map((row) => ({ ...row })),
         following: following.map((row) => ({ ...row }))
       };
+    },
+    getReviewRecurrenceCandidates({ jobId, limit = 8 }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeLimit = assertLimit(limit, "limit", 8, 8);
+      if (safeLimit === 0) return [];
+      const currentJob = getReviewJob(safeJobId);
+      if (!currentJob?.project_id) return [];
+      const currentSource = readContextEvent(currentJob.source_event_uid);
+      if (!currentSource) throw reviewCandidateCollision();
+      return database.prepare(`SELECT ${recurrenceEventContextColumns}
+        FROM reviewer_jobs AS historic_job
+        JOIN session_events AS historic_event ON historic_event.event_uid=historic_job.source_event_uid
+        WHERE historic_job.project_id=? AND historic_job.job_id<>?
+          AND (historic_event.created_at<? OR (historic_event.created_at=? AND historic_event.event_uid<?))
+        ORDER BY historic_event.created_at DESC, historic_event.event_uid DESC LIMIT ?`).all(
+        currentJob.project_id,
+        safeJobId,
+        currentSource.created_at,
+        currentSource.created_at,
+        currentSource.event_uid,
+        safeLimit
+      ).reverse().map((row) => ({ ...row }));
     },
     assertCaptureAllowed(event) {
       return eventFields(event);

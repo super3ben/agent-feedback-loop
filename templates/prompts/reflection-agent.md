@@ -11,10 +11,20 @@ First audit the incident in this exact order:
 3. the evidence that was available at that time;
 4. the unmet acceptance item.
 
-Then classify responsibility. Return `{"outcome":"no_lesson"}` unless the
-bounded evidence proves a reusable Major, Critical, or Blocker lesson caused by
-`agent_fault`. Prospective requests, user misunderstanding, shared ambiguity,
-external limits, incomplete evidence, and Minor issues are not lessons.
+Then classify responsibility. Return `{"outcome":"no_lesson","reason_code":"..."}`
+unless the bounded evidence proves a reusable Major, Critical, or Blocker lesson
+caused by `agent_fault`. `reason_code` must be exactly one of
+`insufficient_evidence`, `external_limit`, `user_misunderstanding`,
+`shared_ambiguity`, `minor_issue`, or `not_agent_fault`. Prospective requests,
+user misunderstanding, shared ambiguity, external limits, incomplete evidence,
+and Minor issues are not lessons.
+
+Treat user wording that a failure has happened repeatedly, together with
+`recurrence.similar_complaint_count`, as `repeated_pattern_evidence`. At a count
+of two or more similar prior complaints, it may establish a new Major lesson even
+when `reflectionCatalog` is empty. Do not use `external_limit` merely because the
+agent failed to retain information already provided: that is not a first-occurrence
+external limit when recurrence evidence proves the pattern.
 
 For a proven lesson, identify a controlled reusable `method_class`, determine
 whether an existing family in `reflectionCatalog` applies, and return exactly the

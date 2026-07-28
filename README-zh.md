@@ -19,10 +19,8 @@
 
 识别不满不再依赖固定的负面关键词（如"做错了""不合理"）。自然语言表达的抱怨——被
 要求重复已知信息、对反复出现的问题不耐烦、以及质问式追责（"怎么又不知道了"）——都会
-被纳入一个轻量的语义不满 gate；该 gate 在 detached reviewer 内、full reviewer 之前
-运行，确认真实不满并过滤误报，因此 prompt hook 保持快速、静默。原有的显式命中保持
-不变，仍走不经过 gate 的 full reviewer 直达路径；只有这些无关键词的扩展信号才先经过
-gate。
+进入 detached full reviewer；prompt hook 仍保持快速、静默。reviewer 只比较同项目、
+有界的历史候选证据，并可用经佐证的复发模式形成 Major 经验。
 
 ### Reviewer provider 环境
 

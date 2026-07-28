@@ -40,6 +40,9 @@ const CONVERGENCE_MODULES = Object.freeze([
   "convergence-sdd-adapter.mjs",
   "convergence-store.mjs"
 ]);
+const REMOVED_GATE_ASSET_STEMS = Object.freeze([
+  ["semantic", "dissatisfaction", "gate"].join("-")
+]);
 
 const CODEX_MARKER_START = "# agent-feedback-loop:start";
 const CODEX_MARKER_END = "# agent-feedback-loop:end";
@@ -120,7 +123,11 @@ export function pathsFor(home = os.homedir()) {
     // prompt pack. Remove it on upgrade so stale tests do not reference
     // deleted per-CLI hooks.
     stalePackEntries: [
-      path.join(packRoot, "tests")
+      path.join(packRoot, "tests"),
+      ...REMOVED_GATE_ASSET_STEMS.flatMap((stem) => [
+        path.join(packRoot, "prompts", `${stem}.md`),
+        path.join(packRoot, "schemas", `${stem}.schema.json`)
+      ])
     ],
     // Per-CLI hooks from <=0.1.x, replaced by the single core-hook.sh.
     // Deleted on install/uninstall so stale copies can't confuse the model.
@@ -395,7 +402,7 @@ async function removeLegacyHooks(paths, dryRun, actions) {
 async function removeStalePromptPackEntries(paths, dryRun, actions) {
   for (const entry of paths.stalePackEntries) {
     if (!(await exists(entry))) continue;
-    actions.push(`remove stale tests ${entry}`);
+    actions.push(`remove stale managed asset ${entry}`);
     if (!dryRun) await rm(entry, { recursive: true, force: true });
   }
 }

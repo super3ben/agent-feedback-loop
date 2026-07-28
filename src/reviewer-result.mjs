@@ -17,6 +17,15 @@ const LESSON_KEYS = new Set([
   "recurrence_of"
 ]);
 const SEVERITIES = new Set(["Major", "Critical", "Blocker"]);
+export const NO_LESSON_REASON_CODES = Object.freeze([
+  "insufficient_evidence",
+  "external_limit",
+  "user_misunderstanding",
+  "shared_ambiguity",
+  "minor_issue",
+  "not_agent_fault"
+]);
+const NO_LESSON_REASON_CODE_SET = new Set(NO_LESSON_REASON_CODES);
 const METHOD_CLASS_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 const FAMILY_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const FAMILY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -113,8 +122,12 @@ export function validateReviewerResult(value, {
 } = {}) {
   if (!isRecord(value)) fail("reviewer result must be an object");
   if (value.outcome === "no_lesson") {
-    exactKeys(value, new Set(["outcome"]));
-    return { outcome: "no_lesson" };
+    exactKeys(value, new Set(["outcome", "reason_code"]));
+    const reasonCode = normalizedString(value.reason_code, {
+      name: "reason_code", maxLength: 64, canonical: true
+    });
+    if (!NO_LESSON_REASON_CODE_SET.has(reasonCode)) fail("reason_code is unsupported");
+    return { outcome: "no_lesson", reason_code: reasonCode };
   }
   if (value.outcome !== "lesson") fail("reviewer result has an unsupported outcome");
   exactKeys(value, LESSON_KEYS);

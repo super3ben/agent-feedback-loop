@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { buildReviewerInvocation, codexProviderRouting, resolveReviewerExecutable, runProcessWithInput, runReviewerProvider } from "../src/reviewer-provider.mjs";
 
-const RESULT = { outcome: "no_lesson" };
+const RESULT = { outcome: "no_lesson", reason_code: "insufficient_evidence" };
 const PROBE_RESULT = Object.freeze({
   assessment: "overdesigned",
   action: "simplify_current_generation",
@@ -575,36 +575,20 @@ test("each provider keeps isolation while convergence_probe selects only its pac
   }
 });
 
-test("semantic gate result kind routes to the lightweight prompt and schema", async () => {
+test("removed gate result kind is rejected", async () => {
   const files = await inputFiles();
   const { promptFile: _promptFile, schemaFile: _schemaFile, ...providerFiles } = files;
-  let observed;
-  const result = await runReviewerProvider({
-    cli: "claude",
-    executable: "/opt/claude",
-    ...providerFiles,
-    resultKind: "semantic_dissatisfaction_gate",
-    context: { prompt: "这些之前都有存的呀怎么又不知道了", referent: { text: "I asked for the password again." } },
-    runProcess: async (input) => {
-      observed = input;
-      return {
-        stdout: JSON.stringify({ type: "result", structured_output: { result: {
-          is_dissatisfaction: true,
-          confidence: "high",
-          reason_class: "forgetting_known_info"
-        } } }),
-        stderr: ""
-      };
-    }
-  });
-
-  assert.deepEqual(result, {
-    is_dissatisfaction: true,
-    confidence: "high",
-    reason_class: "forgetting_known_info"
-  });
-  assert.match(observed.input, /dissatisfaction/i);
-  assert.doesNotMatch(observed.input, /method_changes|root_cause|final_severity/);
+  await assert.rejects(
+    runReviewerProvider({
+      cli: "claude",
+      executable: "/opt/claude",
+      ...providerFiles,
+      resultKind: "removed_gate_kind",
+      context: {},
+      runProcess: async () => { throw new Error("must not launch"); }
+    }),
+    (error) => error.code === "provider_invalid"
+  );
 });
 
 test("explicit result kinds reject caller-selected prompt or schema paths", async () => {

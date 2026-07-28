@@ -111,7 +111,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const index = process.argv.indexOf("--output-last-message");
 if (index < 0 || !process.argv[index + 1]) process.exit(23);
-writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson" } }));
+writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence" } }));
 chmodSync(process.argv[index + 1], 0o600);
 const jobId = /"job_id":"([^"]+)"/.exec(input)?.[1] || "unknown";
 writeFileSync(process.env.AFL_REVIEW_PROVIDER_SENTINEL + "." + jobId, JSON.stringify({
@@ -498,7 +498,7 @@ console.log(JSON.stringify({ result, returnedAt: Date.now() }));
   assert.ok(completion.writtenAt > parentExitedAt);
 });
 
-test("coarse recall admits repeated known-info complaints into semantic checking", async () => {
+test("coarse recall admits repeated known-info complaints into detached full review", async () => {
   const { detectFeedbackCandidate } = await import("../src/feedback-signal.mjs");
   const referent = {
     eventUid: "assistant:1",
@@ -541,11 +541,9 @@ test("coarse recall admits recurrence frustration without requiring fixed negati
 // End-to-end preserve-and-expand coverage through the installed hook plus the
 // real detached reviewer. A minimal fake `codex` provider stands in for the CLI:
 // it writes the Codex transport envelope { result: <logical> } that the runner
-// unwraps, returning `no_lesson` for both the semantic gate and the full reviewer
-// so every admitted job settles at `reviewed_no_lesson`. The candidate reason_code
-// recorded on `review_job_events` proves which path a prompt took: explicit hits
-// keep the direct full-reviewer path (`explicit_feedback`), while expanded coarse
-// recall is routed through the semantic gate (`expanded_feedback`).
+// unwraps and returns a controlled `no_lesson`, so every admitted job settles at
+// `reviewed_no_lesson`. The candidate reason_code recorded on `review_job_events`
+// preserves whether admission came from explicit feedback or expanded recall.
 async function installWithFakeCodexProvider(t) {
   const home = await mkdtemp(path.join(tmpdir(), "afl-e2e-gate-"));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -558,7 +556,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const index = process.argv.indexOf("--output-last-message");
 if (index < 0 || !process.argv[index + 1]) process.exit(23);
-writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson" } }));
+writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence" } }));
 chmodSync(process.argv[index + 1], 0o600);
 `, { mode: 0o700 });
   await install({ home, codexHost: unavailableCodexHost() });
@@ -618,16 +616,16 @@ async function waitForReviewedJobs(paths, expected, timeoutMs = 15_000) {
 // complaint that the shipped keyword detector previously missed; it is only ever
 // hook input and is never echoed to logs or documentation.
 const EXPANDED_MISSED_PROMPTS = Object.freeze([
-  ["installed hook admits repeated known-info frustration into semantic dissatisfaction review",
+  ["installed hook admits repeated known-info frustration into detached full review",
     "密码不是都有吗端口22222，root Example@Pass1",
     "I asked again for the already-known root password and port."],
-  ["installed hook admits 这些之前都有存的呀怎么又不知道了 into semantic dissatisfaction review",
+  ["installed hook admits 这些之前都有存的呀怎么又不知道了 into detached full review",
     "这些之前都有存的呀怎么又不知道了",
     "I asked for the stored connection details again."],
-  ["installed hook admits 之前出现过好几次了 recurrence into semantic dissatisfaction review",
+  ["installed hook admits 之前出现过好几次了 recurrence into detached full review",
     "之前出现过好几次了",
     "I repeated a mistake we already solved."],
-  ["installed hook admits 都第七八次了 rhetorical recurrence into semantic dissatisfaction review",
+  ["installed hook admits 都第七八次了 rhetorical recurrence into detached full review",
     "都第七八次了",
     "I asked the user to restate the same thing once more."]
 ]);

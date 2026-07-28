@@ -41,7 +41,8 @@ async function reviewFixture(t, {
   initialNow = "2030-07-20T00:00:00.000Z",
   sourceTimestamp = "2026-07-20T08:09:10+08:00",
   sourceRawText = "The previous response ignored the requirement. Authorization: Bearer raw-secret",
-  candidateReasonCode
+  candidateReasonCode,
+  priorCandidates = []
 } = {}) {
   const home = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-home-")));
   const projectDir = await realpath(await mkdtemp(path.join(tmpdir(), "afl-review-runner-project-")));
@@ -87,6 +88,25 @@ async function reviewFixture(t, {
     currentNow = new Date(currentNow.getTime() + 1_000);
     return result.eventUid;
   };
+  for (const [index, historical] of priorCandidates.entries()) {
+    const historicalReferentEventUid = await capture({
+      role: "assistant",
+      rawText: `historical-referent-${index}`
+    });
+    const historicalSourceEventUid = await capture({
+      role: "user",
+      rawText: historical.rawText,
+      referentEventUid: historicalReferentEventUid,
+      sourceTimestamp: historical.sourceTimestamp ?? `2026-07-20T08:${String(index).padStart(2, "0")}:00+08:00`
+    });
+    store.createReviewCandidate({
+      sourceEventUid: historicalSourceEventUid,
+      referentEventUid: historicalReferentEventUid,
+      sourceIdentity: `codex:historical:${index}:feedback`,
+      projectId: historical.projectId ?? projectDir,
+      reasonCode: "expanded_feedback"
+    });
+  }
   for (let index = 0; index < 8; index += 1) {
     await capture({ role: index % 2 ? "assistant" : "user", rawText: `prior-${index}` });
   }
@@ -157,7 +177,7 @@ test("runReviewJob commits no_lesson without creating a reflection document", as
   const result = await runReviewJob({
     ...fixture,
     ownerId: "owner-no-lesson",
-    provider: async () => ({ outcome: "no_lesson" })
+    provider: async () => ({ outcome: "no_lesson", reason_code: "insufficient_evidence" })
   });
 
   assert.deepEqual(result, { outcome: "reviewed_no_lesson", documentPath: null });
@@ -166,6 +186,45 @@ test("runReviewJob commits no_lesson without creating a reflection document", as
   assert.equal(job.state, "reviewed_no_lesson");
   assert.equal(job.published_path, null);
   assert.equal(job.published_sha256, null);
+  assert.equal(fixture.store.database.prepare(`SELECT reason_code FROM review_job_events
+    WHERE job_id=? AND event_type='reviewed_no_lesson'`).get(fixture.jobId).reason_code, "insufficient_evidence");
+});
+
+test("same-project Termius complaints add bounded plaintext-free recurrence evidence", async (t) => {
+  const fixture = await reviewFixture(t, {
+    sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
+    priorCandidates: [
+      { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
+      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" },
+      { rawText: "数据库导出路径之前都给过了，为什么又要我重复提供？" },
+      {
+        rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？",
+        projectId: "/another-project"
+      }
+    ]
+  });
+  let observedContext;
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-termius-recurrence",
+    provider: async (context, options) => {
+      observedContext = context;
+      assert.deepEqual(options, { resultKind: "lesson" });
+      return { ...VALID_LESSON };
+    }
+  });
+
+  assert.equal(result.outcome, "published");
+  assert.deepEqual(observedContext.recurrence, {
+    similar_complaint_count: 2,
+    matching_reason_codes: [
+      "backward_reference",
+      "causal_accountability",
+      "known_info_forgetting"
+    ]
+  });
+  assert.doesNotMatch(JSON.stringify(observedContext.recurrence), /Termius|SSH|密码|账号/u);
+  assert.deepEqual(observedContext.reflectionCatalog, []);
 });
 
 test("runReviewJob publishes one stable Markdown document and only updates control state", async (t) => {
@@ -293,7 +352,7 @@ for (const { name, sourceRawText, secret, normalText } of [
       ownerId: `owner-redaction-${name}`,
       provider: async (context) => {
         observedContext = context;
-        return { outcome: "no_lesson" };
+        return { outcome: "no_lesson", reason_code: "insufficient_evidence" };
       }
     });
 
@@ -501,66 +560,21 @@ test("a retry adopts identical bytes after a crash following visible publication
   assert.equal(fixture.store.getReviewJob(fixture.jobId).published_sha256, sha256(before));
 });
 
-test("semantic gate stops the job before full reviewer when candidate is expanded but not real dissatisfaction", async (t) => {
+test("expanded candidate runs the full reviewer directly", async (t) => {
   const fixture = await reviewFixture(t, { candidateReasonCode: "expanded_feedback" });
   const calls = [];
   const result = await runReviewJob({
     ...fixture,
-    ownerId: "reviewer-gate-no-dissatisfaction",
+    ownerId: "reviewer-expanded-direct",
     provider: async (_context, { resultKind }) => {
       calls.push(resultKind);
-      if (resultKind === "semantic_dissatisfaction_gate") {
-        return { is_dissatisfaction: false, confidence: "high", reason_class: "not_dissatisfaction" };
-      }
-      throw new Error("full reviewer should not run");
+      return { outcome: "no_lesson", reason_code: "insufficient_evidence" };
     }
   });
 
-  assert.deepEqual(calls, ["semantic_dissatisfaction_gate"]);
+  assert.deepEqual(calls, ["lesson"]);
   assert.equal(result.outcome, "reviewed_no_lesson");
   assert.equal(result.documentPath, null);
   const job = fixture.store.getReviewJob(fixture.jobId);
   assert.equal(job.state, "reviewed_no_lesson");
-});
-
-test("existing explicit dissatisfaction path still reaches the full reviewer directly", async (t) => {
-  const fixture = await reviewFixture(t);
-  const calls = [];
-  await runReviewJob({
-    ...fixture,
-    ownerId: "reviewer-explicit-hit",
-    provider: async (_context, { resultKind }) => {
-      calls.push(resultKind);
-      if (resultKind === "reviewer") return { outcome: "no_lesson" };
-      throw new Error("semantic gate should be bypassed for explicit hits");
-    }
-  });
-
-  assert.deepEqual(calls, ["reviewer"]);
-  const job = fixture.store.getReviewJob(fixture.jobId);
-  assert.equal(job.state, "reviewed_no_lesson");
-});
-
-test("semantic gate that confirms dissatisfaction falls through to the full reviewer and publishes", async (t) => {
-  const fixture = await reviewFixture(t, { candidateReasonCode: "expanded_feedback" });
-  const calls = [];
-  const result = await runReviewJob({
-    ...fixture,
-    ownerId: "reviewer-gate-dissatisfaction",
-    provider: async (_context, { resultKind }) => {
-      calls.push(resultKind);
-      if (resultKind === "semantic_dissatisfaction_gate") {
-        return { is_dissatisfaction: true, confidence: "high", reason_class: "forgetting_known_info" };
-      }
-      return { ...VALID_LESSON };
-    }
-  });
-
-  // Expanded candidate runs the gate first, then falls through to the full reviewer.
-  assert.deepEqual(calls, ["semantic_dissatisfaction_gate", "reviewer"]);
-  assert.equal(result.outcome, "published");
-  assert.equal((await reflectionFiles(fixture.projectDir)).length, 1);
-  const job = fixture.store.getReviewJob(fixture.jobId);
-  assert.equal(job.state, "published");
-  assert.equal(job.published_path, result.documentPath);
 });

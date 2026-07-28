@@ -2989,7 +2989,7 @@ test("review context is opaque, chronological and bounded", () => {
   fixture.store.close();
 });
 
-test("review no-lesson completion is terminal and fenced", () => {
+test("review no-lesson completion records a controlled reason atomically", () => {
   const fixture = reviewJobFixture();
   const source = fixture.capture({ event_uid: "no-lesson-source" });
   const candidate = fixture.store.createReviewCandidate({
@@ -3000,11 +3000,35 @@ test("review no-lesson completion is terminal and fenced", () => {
   const completed = fixture.store.completeReviewNoLesson({
     jobId: candidate.jobId,
     ownerId: "no-lesson-owner",
-    leaseEpoch: claim.leaseEpoch
+    leaseEpoch: claim.leaseEpoch,
+    reasonCode: "insufficient_evidence"
   });
   assert.equal(completed.state, "reviewed_no_lesson");
   assert.equal(completed.result_code, "reviewed_no_lesson");
+  assert.equal(fixture.store.database.prepare(`SELECT reason_code FROM review_job_events
+    WHERE job_id=? AND event_type='reviewed_no_lesson'`).get(candidate.jobId).reason_code, "insufficient_evidence");
   assert.equal(fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 0 }).launch, false);
   assert.equal(fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "late-owner" }).job, null);
+  fixture.store.close();
+});
+
+test("review no-lesson rejects missing or uncontrolled reasons before terminal state", () => {
+  const fixture = reviewJobFixture();
+  const source = fixture.capture({ event_uid: "no-lesson-invalid-source" });
+  const candidate = fixture.store.createReviewCandidate({
+    sourceEventUid: source.eventUid,
+    sourceIdentity: "codex:no-lesson-invalid:source:none"
+  });
+  const claim = fixture.store.claimReviewJob({ jobId: candidate.jobId, ownerId: "no-lesson-invalid-owner" });
+
+  for (const reasonCode of [undefined, "uncontrolled_reason"]) {
+    assert.throws(() => fixture.store.completeReviewNoLesson({
+      jobId: candidate.jobId,
+      ownerId: "no-lesson-invalid-owner",
+      leaseEpoch: claim.leaseEpoch,
+      reasonCode
+    }));
+    assert.equal(fixture.store.getReviewJob(candidate.jobId).state, "running");
+  }
   fixture.store.close();
 });
