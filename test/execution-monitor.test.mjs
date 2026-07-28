@@ -518,6 +518,58 @@ test("full live retention refuses a new reservation without evicting a fenced mo
   ).get().count, 128);
 });
 
+test("retention preserves terminal episodes and refuses admission when no idle row remains", async (t) => {
+  const context = await fixture(t);
+  const metrics = { turnCount: 1, toolCallCount: 32, elapsedMs: 2_700_000, consecutiveNoProgress: 16 };
+  const originalMonitorId = deriveExecutionMonitorId({ cli: "claude", sessionId: "terminal-episode" });
+  const original = context.store.observeExecutionMonitor({
+    monitorId: originalMonitorId,
+    cli: "claude",
+    metrics,
+    snapshotDigest: "a".repeat(64),
+    thresholdReached: true,
+    reservationMs: 60_000
+  });
+  context.store.releaseExecutionMonitorProbe({
+    monitorId: originalMonitorId,
+    reservationEpoch: original.reservationEpoch
+  });
+
+  // Fill the bound with newer terminal episodes; none has observed a rearm state.
+  let rejectedNewMonitor = null;
+  for (let index = 0; index < 128; index += 1) {
+    const monitorId = deriveExecutionMonitorId({ cli: "claude", sessionId: `terminal-${index}` });
+    const reserved = context.store.observeExecutionMonitor({
+      monitorId,
+      cli: "claude",
+      metrics,
+      snapshotDigest: (index + 1).toString(16).padStart(64, "0"),
+      thresholdReached: true,
+      reservationMs: 60_000
+    });
+    if (reserved.reason === "capacity_exhausted") rejectedNewMonitor = monitorId;
+    if (reserved.reserved) {
+      context.store.releaseExecutionMonitorProbe({ monitorId, reservationEpoch: reserved.reservationEpoch });
+    }
+  }
+
+  const transcriptPath = await writeTranscript(context.home, thresholdRecords({ toolCalls: 33 }), "terminal-episode.jsonl");
+  let launches = 0;
+  const originalAgain = await handleExecutionHook({
+    payload: thresholdPayload(transcriptPath, "terminal-episode"),
+    cli: "claude",
+    controlStore: context.store,
+    launchProbe() { launches += 1; return { attempted: true }; }
+  });
+
+  assert.deepEqual(originalAgain, { continue: true });
+  assert.equal(launches, 0);
+  assert.equal(context.store.database.prepare(
+    "SELECT COUNT(*) AS count FROM store_meta WHERE key LIKE 'execution_monitor:v1:%'"
+  ).get().count, 128);
+  assert.notEqual(rejectedNewMonitor, null);
+});
+
 test("detached Probe completion validates result and controls the bounded failure count", async (t) => {
   const context = await fixture(t);
   const monitorId = deriveExecutionMonitorId({ cli: "gemini", sessionId: "runner-session" });

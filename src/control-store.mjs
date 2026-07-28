@@ -1789,7 +1789,8 @@ function createStore(database, now) {
                 JSON.parse(row.value),
                 row.key.slice(EXECUTION_MONITOR_META_PREFIX.length)
               );
-              return ["reserved", "running"].includes(retained.probeState) ? [] : [{ key: row.key, updatedAt: retained.updatedAt }];
+              // Terminal episodes remain fenced until a below-threshold observation rearms them.
+              return retained.probeState === "idle" ? [{ key: row.key, updatedAt: retained.updatedAt }] : [];
             } catch {
               return [];
             }
