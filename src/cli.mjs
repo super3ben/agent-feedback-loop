@@ -19,8 +19,12 @@ import { executeGuardCli } from "./convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "./convergence-probe-context.mjs";
 import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 import { ensureRepositoryLineage } from "./convergence-identity.mjs";
+import { handleExecutionHook } from "./execution-hook.mjs";
+import { launchDetachedExecutionProbe } from "./execution-probe-launcher.mjs";
+import { runExecutionMonitorProbe } from "./execution-probe-runner.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
+const EXECUTION_HOOK_EVENTS = new Set(["PostToolUse", "AfterTool"]);
 
 function optionValue(args, name, fallback = null) {
   const index = args.indexOf(name);
@@ -653,8 +657,42 @@ export async function executeConvergenceProbeRun({ home, taskUid, fingerprint },
   }
 }
 
+export async function executeExecutionProbeRun({ home, monitorId, reservationEpoch }, {
+  provider
+} = {}) {
+  const paths = pathsFor(home);
+  const store = openControlStore({ paths });
+  try {
+    const monitor = store.getExecutionMonitor({ monitorId });
+    if (!monitor) throw Object.assign(new Error("execution_monitor_not_found"), { code: "execution_monitor_not_found" });
+    let boundedProvider = provider;
+    if (boundedProvider === undefined) {
+      const executable = await resolveReviewerExecutable({ cli: monitor.cli, env: process.env });
+      boundedProvider = (context, { resultKind }) => runReviewerProvider({
+        cli: monitor.cli,
+        executable,
+        context,
+        resultKind,
+        policyFile: paths.geminiReviewerPolicy,
+        geminiSettingsFile: paths.geminiReviewerSettings,
+        env: process.env
+      });
+    }
+    return await runExecutionMonitorProbe({
+      store,
+      monitorId,
+      reservationEpoch,
+      ownerId: `execution-probe-${process.pid}`,
+      provider: boundedProvider
+    });
+  } finally {
+    store.close();
+  }
+}
+
 export async function main(args, {
-  runConvergenceProbeCommand = executeConvergenceProbeRun
+  runConvergenceProbeCommand = executeConvergenceProbeRun,
+  runExecutionProbeCommand = executeExecutionProbeRun
 } = {}) {
   if (args[0] === "lineage-init") {
     const machine = await executeLineageInitCli(args);
@@ -752,6 +790,14 @@ export async function main(args, {
     });
     return;
   }
+  if (command === "execution-probe-run") {
+    await runExecutionProbeCommand({
+      home: options.home,
+      monitorId: optionValue(options.args, "--monitor-id"),
+      reservationEpoch: Number(optionValue(options.args, "--reservation-epoch"))
+    });
+    return;
+  }
   if (command === "reviewer-run") {
     const paths = pathsFor(options.home);
     const store = openControlStore({ paths });
@@ -808,7 +854,9 @@ export async function main(args, {
     const cli = options.cli || options.args[0] || "unknown";
     const nativeHookEventName = optionValue(args, "--event", "UserPromptSubmit");
     const withContinue = options.args.includes("--continue");
-    const nativeResponse = withContinue ? { continue: true } : {};
+    const nativeResponse = EXECUTION_HOOK_EVENTS.has(nativeHookEventName) || withContinue
+      ? { continue: true }
+      : {};
     let responseWritten = false;
     const writeResponse = async (response = nativeResponse) => {
       if (!responseWritten) console.log(JSON.stringify(response));
@@ -821,7 +869,9 @@ export async function main(args, {
       rawPayload = await readPromptInput();
       payload = JSON.parse(rawPayload || "{}");
     } catch (error) {
-      promptLog("feedback_signal_evaluated", { reason: "invalid_input" });
+      if (!EXECUTION_HOOK_EVENTS.has(nativeHookEventName)) {
+        promptLog("feedback_signal_evaluated", { reason: "invalid_input" });
+      }
       await writeResponse();
       return;
     }
@@ -830,6 +880,27 @@ export async function main(args, {
     let controlStore = null;
     try {
       controlStore = openControlStore({ paths, busyTimeoutMs: 250 });
+      if (EXECUTION_HOOK_EVENTS.has(nativeHookEventName)) {
+        await handleExecutionHook({
+          payload,
+          cli,
+          controlStore,
+          launchProbe({ monitorId, reservationEpoch }) {
+            return launchDetachedExecutionProbe({
+              platform: process.platform,
+              nodeExecutable: process.execPath,
+              cliFile: CLI_FILE,
+              home: paths.home,
+              monitorId,
+              reservationEpoch,
+              env: process.env
+            });
+          },
+          writeResponse,
+          nativeResponse: { continue: true }
+        });
+        return;
+      }
       const blobs = new EncryptedBlobStore({
         root: paths.blobRoot,
         keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
@@ -873,7 +944,9 @@ export async function main(args, {
         now: () => new Date()
       });
     } catch (error) {
-      promptLog("feedback_signal_evaluated", { reason: "hook_failed" });
+      if (!EXECUTION_HOOK_EVENTS.has(nativeHookEventName)) {
+        promptLog("feedback_signal_evaluated", { reason: "hook_failed" });
+      }
       await writeResponse();
     } finally {
       controlStore?.close();

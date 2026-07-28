@@ -38,7 +38,11 @@ const CONVERGENCE_MODULES = Object.freeze([
   "convergence-probe-result.mjs",
   "convergence-probe-runner.mjs",
   "convergence-sdd-adapter.mjs",
-  "convergence-store.mjs"
+  "convergence-store.mjs",
+  "execution-hook.mjs",
+  "execution-monitor.mjs",
+  "execution-probe-launcher.mjs",
+  "execution-probe-runner.mjs"
 ]);
 const REMOVED_GATE_ASSET_STEMS = Object.freeze([
   ["semantic", "dissatisfaction", "gate"].join("-")
@@ -60,6 +64,8 @@ const CLIS = [
     configPath: [".codex", "config.toml"],
     hookEvent: "UserPromptSubmit",
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"],
+    executionHookEvent: "PostToolUse",
+    executionHookArgs: ["--event", "PostToolUse", "--cli", "codex", "--continue"],
     legacyStopEvent: "Stop",
     hookTimeout: 5,
     timeoutUnit: "seconds"
@@ -72,6 +78,8 @@ const CLIS = [
     configPath: [".claude", "settings.json"],
     hookEvent: "UserPromptSubmit",
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "claude"],
+    executionHookEvent: "PostToolUse",
+    executionHookArgs: ["--event", "PostToolUse", "--cli", "claude", "--continue"],
     legacyStopEvent: "Stop",
     hookTimeout: 5,
     timeoutUnit: "seconds"
@@ -84,6 +92,8 @@ const CLIS = [
     configPath: [".gemini", "settings.json"],
     hookEvent: "BeforeAgent",
     hookArgs: ["--event", "BeforeAgent", "--cli", "gemini"],
+    executionHookEvent: "AfterTool",
+    executionHookArgs: ["--event", "AfterTool", "--cli", "gemini", "--continue"],
     legacyStopEvent: "AfterAgent",
     hookTimeout: 5000,
     timeoutUnit: "milliseconds"
@@ -163,8 +173,9 @@ function shellArgument(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function hookCommand(paths, cli) {
-  return [paths.coreHook, ...cli.hookArgs].map(shellArgument).join(" ");
+function hookCommand(paths, cli, kind = "prompt") {
+  const args = kind === "execution" ? cli.executionHookArgs : cli.hookArgs;
+  return [paths.coreHook, ...args].map(shellArgument).join(" ");
 }
 
 function writeRuntimeLauncher(paths, dryRun, actions) {
@@ -346,14 +357,19 @@ async function cleanupLegacyScheduler({ home, platform, dryRun, activate, host }
 }
 
 function codexHookBlock(paths, cli) {
+  const eventBlock = (event, kind) => [
+    `[[hooks.${event}]]`,
+    "",
+    `[[hooks.${event}.hooks]]`,
+    'type = "command"',
+    `command = ${tomlString(hookCommand(paths, cli, kind))}`,
+    `timeout = ${cli.hookTimeout}`
+  ];
   return [
     CODEX_MARKER_START,
-    `[[hooks.${cli.hookEvent}]]`,
+    ...eventBlock(cli.hookEvent, "prompt"),
     "",
-    `[[hooks.${cli.hookEvent}.hooks]]`,
-    'type = "command"',
-    `command = ${tomlString(hookCommand(paths, cli))}`,
-    `timeout = ${cli.hookTimeout}`,
+    ...eventBlock(cli.executionHookEvent, "execution"),
     CODEX_MARKER_END
   ].join("\n");
 }
@@ -371,7 +387,7 @@ function removeJsonHookEntries(settings, paths, cli) {
       || command.includes("claude-hook.sh")
       || prompt.includes(paths.promptFile);
   };
-  for (const event of [cli.hookEvent, cli.legacyStopEvent]) {
+  for (const event of [cli.hookEvent, cli.executionHookEvent, cli.legacyStopEvent]) {
     const hooks = settings.hooks?.[event];
     if (!Array.isArray(hooks)) continue;
     settings.hooks[event] = hooks
@@ -464,11 +480,13 @@ async function installJsonHooks(paths, cli, dryRun, actions) {
   await backup(configFile, dryRun, actions);
   const settings = removeJsonHookEntries(await readJsonSettings(configFile), paths, cli);
   settings.hooks = settings.hooks || {};
-  settings.hooks[cli.hookEvent] = settings.hooks[cli.hookEvent] || [];
-  settings.hooks[cli.hookEvent].push({
-    matcher: "",
-    hooks: [{ type: "command", command: hookCommand(paths, cli), timeout: cli.hookTimeout }]
-  });
+  for (const [event, kind] of [[cli.hookEvent, "prompt"], [cli.executionHookEvent, "execution"]]) {
+    settings.hooks[event] = settings.hooks[event] || [];
+    settings.hooks[event].push({
+      matcher: "",
+      hooks: [{ type: "command", command: hookCommand(paths, cli, kind), timeout: cli.hookTimeout }]
+    });
+  }
   actions.push(`connect ${cli.label} hook -> ${paths.coreHook}`);
   if (!dryRun) {
     await mkdir(path.dirname(configFile), { recursive: true });

@@ -63,6 +63,22 @@ const MAX_CAPTURE_FAIL_OPEN_RECORDS = 50;
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
+const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
+const EXECUTION_MONITOR_MAX_FAILURES = 3;
+const EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS = 3;
+const EXECUTION_MONITOR_MAX_STORED = 128;
+const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
+const EXECUTION_MONITOR_STATES = new Set(["idle", "reserved", "running", "retryable", "completed", "failed"]);
+const EXECUTION_MONITOR_FAILURE_ASSESSMENTS = new Set([
+  "wrong_direction", "overdesigned", "overoptimized", "scope_drift", "acceptance_already_satisfied"
+]);
+const EXECUTION_MONITOR_ASSESSMENTS = new Set([
+  ...EXECUTION_MONITOR_FAILURE_ASSESSMENTS, "aligned_and_necessary", "insufficient_evidence"
+]);
+const EXECUTION_MONITOR_ACTIONS = new Set([
+  "continue_once", "simplify_current_generation", "rollback_to_generation",
+  "direction_checkpoint", "human_decision", "finish_now"
+]);
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
 const READ_ONLY_COPY_CHUNK_BYTES = 64 * 1024;
@@ -448,6 +464,84 @@ function reviewCandidateCollision() {
 
 function reviewLeaseLost() {
   return new ControlStoreError("review_lease_lost", "review lease lost");
+}
+
+function executionProbeLeaseLost() {
+  return new ControlStoreError("execution_probe_lease_lost", "execution probe lease lost");
+}
+
+function executionMonitorId(value) {
+  const monitorId = assertString(value, "monitorId", 64);
+  if (!SHA256_PATTERN.test(monitorId)) throw new TypeError("monitorId must be an opaque sha256");
+  return monitorId;
+}
+
+function executionMonitorMetrics(value) {
+  const fields = ["turnCount", "toolCallCount", "elapsedMs", "consecutiveNoProgress"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) {
+    throw new TypeError("execution monitor metrics are invalid");
+  }
+  return Object.fromEntries(fields.map((field) => {
+    const metric = value[field];
+    if (!Number.isSafeInteger(metric) || metric < 0 || metric > MAX_CONTEXT_EPOCH) {
+      throw new TypeError("execution monitor metrics are invalid");
+    }
+    return [field, metric];
+  }));
+}
+
+function optionalExecutionTimestamp(value, field) {
+  if (value === null) return null;
+  return timezoneTimestamp(value, field);
+}
+
+function executionMonitorState(value, monitorId) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.version !== 1 || value.monitorId !== monitorId
+      || !EXECUTION_MONITOR_CLIS.has(value.cli)
+      || !EXECUTION_MONITOR_STATES.has(value.probeState)
+      || !Number.isSafeInteger(value.failureCount) || value.failureCount < 0
+      || value.failureCount > EXECUTION_MONITOR_MAX_FAILURES
+      || !Number.isSafeInteger(value.reservationEpoch) || value.reservationEpoch < 0
+      || !Number.isSafeInteger(value.reservationAttempt) || value.reservationAttempt < 0
+      || value.reservationAttempt > EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS) {
+    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  }
+  const snapshotDigest = assertString(value.snapshotDigest, "snapshotDigest", 64);
+  if (!SHA256_PATTERN.test(snapshotDigest)) throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  let reservationSnapshotDigest = null;
+  if (value.reservationSnapshotDigest !== null) {
+    reservationSnapshotDigest = assertString(value.reservationSnapshotDigest, "reservationSnapshotDigest", 64);
+    if (!SHA256_PATTERN.test(reservationSnapshotDigest)) {
+      throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+    }
+  }
+  const resultDigest = value.resultDigest === null ? null : assertString(value.resultDigest, "resultDigest", 64);
+  if (resultDigest !== null && !SHA256_PATTERN.test(resultDigest)) {
+    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  }
+  return {
+    version: 1,
+    monitorId,
+    cli: value.cli,
+    metrics: executionMonitorMetrics(value.metrics),
+    snapshotDigest,
+    failureCount: value.failureCount,
+    probeState: value.probeState,
+    reservationEpoch: value.reservationEpoch,
+    reservationAttempt: value.reservationAttempt,
+    reservationSnapshotDigest,
+    reservationMetrics: value.reservationMetrics === null ? null : executionMonitorMetrics(value.reservationMetrics),
+    reservationUntil: optionalExecutionTimestamp(value.reservationUntil, "reservationUntil"),
+    ownerId: assertOptionalString(value.ownerId, "ownerId", 512),
+    leaseUntil: optionalExecutionTimestamp(value.leaseUntil, "leaseUntil"),
+    assessment: assertOptionalString(value.assessment, "assessment", 64),
+    action: assertOptionalString(value.action, "action", 64),
+    resultDigest,
+    reasonCode: assertOptionalString(value.reasonCode, "reasonCode", 64),
+    updatedAt: timezoneTimestamp(value.updatedAt, "updatedAt")
+  };
 }
 
 function observationKey(provider, sessionUid, contextEpoch, sourceNamespace, sourceId) {
@@ -1571,6 +1665,242 @@ function createStore(database, now) {
         referent_event_uid, content_hash, encrypted_raw_ref, completeness
         FROM session_events WHERE event_uid=?`).get(assertString(eventUid, "event_uid", 512));
       return row ? { ...row } : null;
+    },
+    getExecutionMonitor({ monitorId }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const row = database.prepare("SELECT value FROM store_meta WHERE key=?")
+        .get(`${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`);
+      if (!row) return null;
+      let parsed;
+      try {
+        parsed = JSON.parse(row.value);
+      } catch {
+        throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+      }
+      return executionMonitorState(parsed, safeMonitorId);
+    },
+    observeExecutionMonitor({
+      monitorId,
+      cli,
+      metrics,
+      snapshotDigest,
+      thresholdReached,
+      reservationMs
+    }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeCli = assertString(cli, "cli", 64);
+      if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
+      const safeMetrics = executionMonitorMetrics(metrics);
+      const safeSnapshotDigest = assertString(snapshotDigest, "snapshotDigest", 64);
+      if (!SHA256_PATTERN.test(safeSnapshotDigest)) throw new TypeError("snapshotDigest must be a sha256");
+      if (typeof thresholdReached !== "boolean") throw new TypeError("thresholdReached must be boolean");
+      const safeReservationMs = assertMilliseconds(reservationMs, "reservationMs");
+      if (safeReservationMs < 1 || safeReservationMs > 300_000) throw new TypeError("reservationMs is out of range");
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const timestamp = nowIso(now);
+        const currentTime = Date.parse(timestamp);
+        const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        let state;
+        if (existingRow) {
+          let parsed;
+          try { parsed = JSON.parse(existingRow.value); } catch {
+            throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+          }
+          state = executionMonitorState(parsed, safeMonitorId);
+          if (state.cli !== safeCli) throw new ControlStoreError("execution_monitor_collision", "execution monitor collision");
+          if (safeMetrics.toolCallCount < state.metrics.toolCallCount
+              || safeMetrics.elapsedMs < state.metrics.elapsedMs
+              || safeMetrics.turnCount < state.metrics.turnCount) {
+            return { ...state, reserved: false, reason: "stale_snapshot" };
+          }
+        } else {
+          state = {
+            version: 1,
+            monitorId: safeMonitorId,
+            cli: safeCli,
+            metrics: safeMetrics,
+            snapshotDigest: safeSnapshotDigest,
+            failureCount: 0,
+            probeState: "idle",
+            reservationEpoch: 0,
+            reservationAttempt: 0,
+            reservationSnapshotDigest: null,
+            reservationMetrics: null,
+            reservationUntil: null,
+            ownerId: null,
+            leaseUntil: null,
+            assessment: null,
+            action: null,
+            resultDigest: null,
+            reasonCode: null,
+            updatedAt: timestamp
+          };
+        }
+        state.metrics = safeMetrics;
+        state.snapshotDigest = safeSnapshotDigest;
+        state.updatedAt = timestamp;
+        let reserved = false;
+        if (thresholdReached) {
+          const activeUntil = state.probeState === "running" ? state.leaseUntil : state.reservationUntil;
+          const active = ["reserved", "running"].includes(state.probeState)
+            && activeUntil !== null && Date.parse(activeUntil) > currentTime;
+          const sameReservationSnapshot = state.reservationSnapshotDigest === safeSnapshotDigest;
+          const alreadyHandled = sameReservationSnapshot && ["completed", "failed"].includes(state.probeState);
+          const attemptsExhausted = sameReservationSnapshot
+            && state.reservationAttempt >= EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS;
+          if (!active && !alreadyHandled && !attemptsExhausted) {
+            state.probeState = "reserved";
+            state.reservationEpoch += 1;
+            state.reservationAttempt = sameReservationSnapshot ? state.reservationAttempt + 1 : 1;
+            state.reservationSnapshotDigest = safeSnapshotDigest;
+            state.reservationMetrics = safeMetrics;
+            state.reservationUntil = new Date(currentTime + safeReservationMs).toISOString();
+            state.ownerId = null;
+            state.leaseUntil = null;
+            state.assessment = null;
+            state.action = null;
+            state.resultDigest = null;
+            state.reasonCode = null;
+            reserved = true;
+          } else if (!active && attemptsExhausted && !alreadyHandled) {
+            state.probeState = "failed";
+            state.reservationUntil = null;
+            state.ownerId = null;
+            state.leaseUntil = null;
+            state.reasonCode = "attempts_exhausted";
+          }
+        }
+        database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(state));
+        database.prepare(`DELETE FROM store_meta WHERE key IN (
+          SELECT key FROM store_meta WHERE key LIKE ?
+          ORDER BY key=? DESC,
+            CASE WHEN json_valid(value) THEN json_extract(value, '$.updatedAt') ELSE '' END DESC, key
+          LIMIT -1 OFFSET ?
+        )`).run(`${EXECUTION_MONITOR_META_PREFIX}%`, key, EXECUTION_MONITOR_MAX_STORED);
+        return { ...state, reserved };
+      });
+    },
+    releaseExecutionMonitorProbe({ monitorId, reservationEpoch }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!row) return { released: false };
+        let state;
+        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
+          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+        }
+        if (state.probeState !== "reserved" || state.reservationEpoch !== safeEpoch) return { released: false };
+        state.probeState = state.reservationAttempt < EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS
+          ? "retryable" : "failed";
+        state.reservationUntil = null;
+        state.reasonCode = "spawn_failed";
+        state.updatedAt = nowIso(now);
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
+        return { released: true };
+      });
+    },
+    claimExecutionMonitorProbe({ monitorId, reservationEpoch, ownerId, leaseMs }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseMs = assertMilliseconds(leaseMs, "leaseMs");
+      if (safeLeaseMs < 1 || safeLeaseMs > 300_000) throw new TypeError("leaseMs is out of range");
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const timestamp = nowIso(now);
+        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!row) throw executionProbeLeaseLost();
+        let state;
+        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
+          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+        }
+        if (state.probeState !== "reserved" || state.reservationEpoch !== safeEpoch
+            || state.reservationUntil === null || Date.parse(state.reservationUntil) <= Date.parse(timestamp)) {
+          throw executionProbeLeaseLost();
+        }
+        state.probeState = "running";
+        state.ownerId = safeOwnerId;
+        state.reservationUntil = null;
+        state.leaseUntil = new Date(Date.parse(timestamp) + safeLeaseMs).toISOString();
+        state.updatedAt = timestamp;
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
+        return { ...state };
+      });
+    },
+    completeExecutionMonitorProbe({
+      monitorId,
+      reservationEpoch,
+      ownerId,
+      assessment,
+      action = null,
+      resultDigest
+    }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeAssessment = assertString(assessment, "assessment", 64);
+      if (!EXECUTION_MONITOR_ASSESSMENTS.has(safeAssessment)) throw new TypeError("assessment is invalid");
+      const safeAction = action === null ? null : assertString(action, "action", 64);
+      if (safeAction !== null && !EXECUTION_MONITOR_ACTIONS.has(safeAction)) throw new TypeError("action is invalid");
+      const safeResultDigest = assertString(resultDigest, "resultDigest", 64);
+      if (!SHA256_PATTERN.test(safeResultDigest)) throw new TypeError("resultDigest must be a sha256");
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const timestamp = nowIso(now);
+        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!row) throw executionProbeLeaseLost();
+        let state;
+        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
+          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+        }
+        if (state.probeState !== "running" || state.reservationEpoch !== safeEpoch
+            || state.ownerId !== safeOwnerId || state.leaseUntil === null
+            || Date.parse(state.leaseUntil) <= Date.parse(timestamp)) throw executionProbeLeaseLost();
+        if (EXECUTION_MONITOR_FAILURE_ASSESSMENTS.has(safeAssessment)) {
+          state.failureCount = Math.min(EXECUTION_MONITOR_MAX_FAILURES, state.failureCount + 1);
+        }
+        state.probeState = "completed";
+        state.ownerId = null;
+        state.leaseUntil = null;
+        state.assessment = safeAssessment;
+        state.action = safeAction;
+        state.resultDigest = safeResultDigest;
+        state.reasonCode = null;
+        state.updatedAt = timestamp;
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
+        return { ...state };
+      });
+    },
+    failExecutionMonitorProbe({ monitorId, reservationEpoch, ownerId, reasonCode }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 64);
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const timestamp = nowIso(now);
+        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!row) throw executionProbeLeaseLost();
+        let state;
+        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
+          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+        }
+        if (state.probeState !== "running" || state.reservationEpoch !== safeEpoch
+            || state.ownerId !== safeOwnerId || state.leaseUntil === null
+            || Date.parse(state.leaseUntil) <= Date.parse(timestamp)) throw executionProbeLeaseLost();
+        state.probeState = state.reservationAttempt < EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS
+          ? "retryable" : "failed";
+        state.ownerId = null;
+        state.leaseUntil = null;
+        state.reasonCode = safeReasonCode;
+        state.updatedAt = timestamp;
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
+        return { ...state };
+      });
     },
     recordCaptureFailOpen({ eventType, reasonCode, sourceProvider = null, sessionUid = null, eventUid = null, createdAt }) {
       const record = {
