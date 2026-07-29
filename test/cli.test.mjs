@@ -1080,6 +1080,7 @@ describe("agent-feedback-loop package", () => {
       "promptHook",
       "ready",
       "reflectionDirectory",
+      "reflectionLanguages",
       "reviewerProvider"
     ]);
     assert.equal(health.status.promptHook.configured, true);

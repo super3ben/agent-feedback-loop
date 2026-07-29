@@ -20,6 +20,7 @@ import { detectAllReviewerAdapters } from "./reviewer-adapter.mjs";
 import { createCodexHost } from "./codex-host.mjs";
 import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { SCHEMA_VERSION } from "./control-schema.mjs";
+import { readReflectionCatalog } from "./reflection-document.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
@@ -609,6 +610,41 @@ async function inspectControlStore(paths) {
   }
 }
 
+// Which languages a lesson can be matched from. Selection is word overlap, so a
+// condition written only in English cannot be reached by a Chinese prompt and
+// vice versa — the lesson is stored but never delivered. This is only a defect
+// when the catalog and the prompts disagree, so it is reported, not gated.
+function appliesWhenReach(appliesWhen) {
+  const text = (Array.isArray(appliesWhen) ? appliesWhen : []).join(" ");
+  return {
+    cjk: /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text),
+    latin: /[\p{Script=Latin}]/u.test(text)
+  };
+}
+
+async function inspectReflectionLanguages(projectDir) {
+  try {
+    const catalog = await readReflectionCatalog({
+      projectDir,
+      publishedBefore: new Date(Date.now() + 60_000).toISOString()
+    });
+    const counts = { total: 0, bilingual: 0, cjkOnly: 0, latinOnly: 0 };
+    for (const document of catalog.documents) {
+      const reach = appliesWhenReach(document.appliesWhen);
+      counts.total += 1;
+      if (reach.cjk && reach.latin) counts.bilingual += 1;
+      else if (reach.cjk) counts.cjkOnly += 1;
+      else if (reach.latin) counts.latinOnly += 1;
+    }
+    // A lesson reachable from only one language is invisible to prompts written
+    // in the other one.
+    const singleLanguage = counts.cjkOnly + counts.latinOnly;
+    return { ...counts, singleLanguage, available: true };
+  } catch {
+    return { available: false };
+  }
+}
+
 async function inspectReflectionDirectory(directory) {
   try {
     const info = await lstat(directory);
@@ -819,9 +855,11 @@ export async function doctor(options = {}) {
   }
   const legacyStopRemoved = CLIS.every((cli) => !clis[cli.id].legacyStopPresent);
   const reflectionDirectoryPath = path.join(options.cwd || process.cwd(), ".agent", "reflections");
-  const [controlStore, reflectionDirectory] = await Promise.all([
+  const reflectionProjectDir = options.cwd || process.cwd();
+  const [controlStore, reflectionDirectory, reflectionLanguages] = await Promise.all([
     inspectControlStore(paths),
-    inspectReflectionDirectory(reflectionDirectoryPath)
+    inspectReflectionDirectory(reflectionDirectoryPath),
+    inspectReflectionLanguages(reflectionProjectDir)
   ]);
   const codePackage = await inspectConvergencePackage();
   const installedRuntime = await inspectInstalledConvergence({
@@ -843,6 +881,7 @@ export async function doctor(options = {}) {
     },
     controlStore,
     reflectionDirectory,
+    reflectionLanguages,
     reviewerProvider: Object.fromEntries(CLIS.map((cli) => {
       const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
       return [cli.id, {

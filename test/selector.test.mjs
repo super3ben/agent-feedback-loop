@@ -283,3 +283,33 @@ test("applies_when accepts both renderings of every condition", async (t) => {
   assert.equal(documents.documents.length, 1, "16 conditions stay within bounds");
   assert.equal(documents.documents[0].appliesWhen.length, 16);
 });
+
+// A lesson reachable from only one language is stored but never delivered to
+// prompts written in the other. That failure is silent, so doctor counts it.
+test("doctor counts lessons reachable from only one language", async (t) => {
+  const { doctor } = await import("../src/index.mjs");
+  const projectDir = await projectFixture(t, [
+    ["00.md", renderReflectionMarkdown(model(1, {
+      applies_when: ["Debug output includes environment variables"]
+    }))],
+    ["01.md", renderReflectionMarkdown(model(2, {
+      family_id: "family-2",
+      applies_when: ["调试输出包含环境变量时"]
+    }))],
+    ["02.md", renderReflectionMarkdown(model(3, {
+      family_id: "family-3",
+      applies_when: ["Debug output includes environment variables", "调试输出包含环境变量时"]
+    }))]
+  ]);
+  const home = await mkdtemp(path.join(os.tmpdir(), "afl-doctor-lang-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const result = await doctor({ home, cwd: projectDir });
+  const languages = result.status.reflectionLanguages;
+
+  assert.equal(languages.total, 3);
+  assert.equal(languages.bilingual, 1);
+  assert.equal(languages.latinOnly, 1);
+  assert.equal(languages.cjkOnly, 1);
+  assert.equal(languages.singleLanguage, 2, "both single-language lessons are surfaced");
+});
