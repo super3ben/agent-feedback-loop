@@ -15,9 +15,15 @@
             "minor_issue",
             "not_agent_fault"
           ]
+        },
+        "family_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
         }
       },
-      "required": ["outcome", "reason_code"]
+      "required": ["outcome", "reason_code", "family_key"]
     },
     {
       "type": "object",

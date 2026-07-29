@@ -99,13 +99,29 @@ async function reviewFixture(t, {
       referentEventUid: historicalReferentEventUid,
       sourceTimestamp: historical.sourceTimestamp ?? `2026-07-20T08:${String(index).padStart(2, "0")}:00+08:00`
     });
-    store.createReviewCandidate({
+    const candidate = store.createReviewCandidate({
       sourceEventUid: historicalSourceEventUid,
       referentEventUid: historicalReferentEventUid,
       sourceIdentity: `codex:historical:${index}:feedback`,
       projectId: historical.projectId ?? projectDir,
       reasonCode: "expanded_feedback"
     });
+    // A prior review that produced no lesson still recorded the family it
+    // looked at; that record is what makes this complaint countable later.
+    if (historical.familyKey) {
+      const claimed = store.claimReviewJob({
+        jobId: candidate.jobId,
+        ownerId: `historical-owner-${index}`,
+        leaseMs: 60_000
+      });
+      store.completeReviewNoLesson({
+        jobId: candidate.jobId,
+        ownerId: `historical-owner-${index}`,
+        leaseEpoch: claimed.leaseEpoch,
+        reasonCode: historical.reasonCode ?? "minor_issue",
+        familyKey: historical.familyKey
+      });
+    }
   }
   for (let index = 0; index < 8; index += 1) {
     await capture({ role: index % 2 ? "assistant" : "user", rawText: `prior-${index}` });
@@ -177,7 +193,7 @@ test("runReviewJob commits no_lesson without creating a reflection document", as
   const result = await runReviewJob({
     ...fixture,
     ownerId: "owner-no-lesson",
-    provider: async () => ({ outcome: "no_lesson", reason_code: "insufficient_evidence" })
+    provider: async () => ({ outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" })
   });
 
   assert.deepEqual(result, { outcome: "reviewed_no_lesson", documentPath: null });
@@ -190,23 +206,28 @@ test("runReviewJob commits no_lesson without creating a reflection document", as
     WHERE job_id=? AND event_type='reviewed_no_lesson'`).get(fixture.jobId).reason_code, "insufficient_evidence");
 });
 
-test("same-project Termius complaints add bounded plaintext-free recurrence evidence", async (t) => {
+// The window this replaces returned the eight most recent jobs and filtered
+// them afterwards, so a complaint that recurred after enough unrelated prompts
+// fell outside it and counted zero. Counting per family key removes the window.
+test("a recurring complaint is counted across many unrelated prompts in between", async (t) => {
   const fixture = await reviewFixture(t, {
     sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
     priorCandidates: [
-      { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
-      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" },
-      { rawText: "数据库导出路径之前都给过了，为什么又要我重复提供？" },
-      {
-        rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？",
-        projectId: "/another-project"
-      }
+      { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？", familyKey: "stored-credential-lookup" },
+      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？", familyKey: "stored-credential-lookup" },
+      // Far more unrelated jobs in between than any bounded window would hold.
+      ...Array.from({ length: 18 }, (_, index) => ({
+        rawText: `继续 ${index}`,
+        familyKey: "unrelated-continue-prompt"
+      })),
+      { rawText: "另一个项目的相同抱怨", familyKey: "stored-credential-lookup", projectId: "/another-project" }
     ]
   });
   let observedContext;
+
   const result = await runReviewJob({
     ...fixture,
-    ownerId: "owner-termius-recurrence",
+    ownerId: "owner-family-recurrence",
     provider: async (context, options) => {
       observedContext = context;
       assert.deepEqual(options, { resultKind: "lesson" });
@@ -215,78 +236,73 @@ test("same-project Termius complaints add bounded plaintext-free recurrence evid
   });
 
   assert.equal(result.outcome, "published");
-  assert.deepEqual(observedContext.recurrence, {
-    similar_complaint_count: 2,
-    matching_reason_codes: [
-      "backward_reference",
-      "causal_accountability",
-      "known_info_forgetting"
-    ]
-  });
+  const families = new Map(observedContext.recurrence.known_families.map((entry) => [entry.family_key, entry.occurrences]));
+  assert.equal(families.get("stored-credential-lookup"), 2, "both prior complaints are still counted");
+  assert.equal(families.get("unrelated-continue-prompt"), 18, "unrelated prompts do not crowd the signal out");
+  // Recurrence evidence must stay free of the complaint text itself.
   assert.doesNotMatch(JSON.stringify(observedContext.recurrence), /Termius|SSH|密码|账号/u);
   assert.deepEqual(observedContext.reflectionCatalog, []);
 });
 
-test("newer null historical references do not starve readable Termius recurrence candidates", async (t) => {
+test("recurrence counts are scoped to the project and exclude the job under review", async (t) => {
   const fixture = await reviewFixture(t, {
-    sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
     priorCandidates: [
-      { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
-      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" },
-      ...Array.from({ length: 8 }, (_, index) => ({ rawText: `newer unavailable historical candidate ${index}` }))
+      { rawText: "same project complaint", familyKey: "stored-credential-lookup" },
+      { rawText: "other project complaint", familyKey: "stored-credential-lookup", projectId: "/another-project" }
     ]
   });
-  const historic = fixture.store.getReviewRecurrenceCandidates({ jobId: fixture.jobId });
-  assert.equal(historic.length, 8);
-  for (const row of historic) {
-    fixture.store.database.prepare("UPDATE session_events SET encrypted_raw_ref=NULL WHERE event_uid=?")
-      .run(row.event_uid);
-  }
-  let observedContext;
 
-  const result = await runReviewJob({
-    ...fixture,
-    ownerId: "owner-historical-null-window",
-    provider: async (context) => {
-      observedContext = context;
-      return { ...VALID_LESSON };
-    }
-  });
-
-  assert.equal(result.outcome, "published");
-  assert.equal(observedContext.recurrence.similar_complaint_count, 2);
+  assert.equal(fixture.store.countReviewFamilyRecurrence({
+    jobId: fixture.jobId, familyKey: "stored-credential-lookup"
+  }), 1, "another project's history must not count here");
+  assert.equal(fixture.store.countReviewFamilyRecurrence({
+    jobId: fixture.jobId, familyKey: "never-seen-key"
+  }), 0);
 });
 
-for (const [label, encryptedRawRef] of [
-  ["null", null],
-  ["missing", "/private/blobs/missing-historical-source.enc"]
-]) {
-  test(`historical ${label} encrypted source reference is omitted from recurrence evidence`, async (t) => {
-    const fixture = await reviewFixture(t, {
-      sourceRawText: "Termius SSH 的密码不是都已经有了吗？之前出现过好几次了，为什么每次又要我再提供？",
-      priorCandidates: [
-        { rawText: "Termius SSH 密码之前都给过了，为什么又要我重复提供？" },
-        { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？" }
-      ]
-    });
-    const historic = fixture.store.getReviewRecurrenceCandidates({ jobId: fixture.jobId });
-    fixture.store.database.prepare("UPDATE session_events SET encrypted_raw_ref=? WHERE event_uid=?")
-      .run(encryptedRawRef, historic[0].event_uid);
-    let observedContext;
-
-    const result = await runReviewJob({
-      ...fixture,
-      ownerId: `owner-historical-${label}-ref`,
-      provider: async (context) => {
-        observedContext = context;
-        return { ...VALID_LESSON };
-      }
-    });
-
-    assert.equal(result.outcome, "published");
-    assert.equal(observedContext.recurrence.similar_complaint_count, 1);
+// The same prompt really does get captured twice in practice, as two separate
+// jobs. A single complaint must not reach the recurrence threshold on its own.
+test("duplicate captures of one complaint do not inflate the recurrence count", async (t) => {
+  const complaint = "Termius SSH 密码之前都给过了，为什么又要我重复提供？";
+  const fixture = await reviewFixture(t, {
+    priorCandidates: [
+      { rawText: complaint, familyKey: "stored-credential-lookup" },
+      { rawText: complaint, familyKey: "stored-credential-lookup" }
+    ]
   });
-}
+
+  assert.equal(fixture.store.countReviewFamilyRecurrence({
+    jobId: fixture.jobId, familyKey: "stored-credential-lookup"
+  }), 1, "one complaint captured twice is still one occurrence");
+
+  const distinct = await reviewFixture(t, {
+    priorCandidates: [
+      { rawText: complaint, familyKey: "stored-credential-lookup" },
+      { rawText: "Termius SSH 密码之前都有存，怎么又不知道了？", familyKey: "stored-credential-lookup" }
+    ]
+  });
+  assert.equal(distinct.store.countReviewFamilyRecurrence({
+    jobId: distinct.jobId, familyKey: "stored-credential-lookup"
+  }), 2, "two genuinely different complaints are two occurrences");
+});
+
+test("a no_lesson review records the family it looked at so the next one can count it", async (t) => {
+  const fixture = await reviewFixture(t);
+  const result = await runReviewJob({
+    ...fixture,
+    ownerId: "owner-no-lesson-family",
+    provider: async () => ({
+      outcome: "no_lesson",
+      reason_code: "minor_issue",
+      family_key: "stored-credential-lookup"
+    })
+  });
+
+  assert.equal(result.outcome, "reviewed_no_lesson");
+  const job = fixture.store.getReviewJob(fixture.jobId);
+  assert.equal(job.family_key, "stored-credential-lookup");
+  assert.equal(job.result_code, "reviewed_no_lesson");
+});
 
 test("runReviewJob publishes one stable Markdown document and only updates control state", async (t) => {
   const fixture = await reviewFixture(t);
@@ -413,7 +429,7 @@ for (const { name, sourceRawText, secret, normalText } of [
       ownerId: `owner-redaction-${name}`,
       provider: async (context) => {
         observedContext = context;
-        return { outcome: "no_lesson", reason_code: "insufficient_evidence" };
+        return { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" };
       }
     });
 
@@ -629,7 +645,7 @@ test("expanded candidate runs the full reviewer directly", async (t) => {
     ownerId: "reviewer-expanded-direct",
     provider: async (_context, { resultKind }) => {
       calls.push(resultKind);
-      return { outcome: "no_lesson", reason_code: "insufficient_evidence" };
+      return { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" };
     }
   });
 

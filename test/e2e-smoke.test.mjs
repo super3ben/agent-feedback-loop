@@ -111,7 +111,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const index = process.argv.indexOf("--output-last-message");
 if (index < 0 || !process.argv[index + 1]) process.exit(23);
-writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence" } }));
+writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" } }));
 chmodSync(process.argv[index + 1], 0o600);
 const jobId = /"job_id":"([^"]+)"/.exec(input)?.[1] || "unknown";
 writeFileSync(process.env.AFL_REVIEW_PROVIDER_SENTINEL + "." + jobId, JSON.stringify({
@@ -556,7 +556,7 @@ let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const index = process.argv.indexOf("--output-last-message");
 if (index < 0 || !process.argv[index + 1]) process.exit(23);
-writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence" } }));
+writeFileSync(process.argv[index + 1], JSON.stringify({ result: { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" } }));
 chmodSync(process.argv[index + 1], 0o600);
 `, { mode: 0o700 });
   await install({ home, codexHost: unavailableCodexHost() });

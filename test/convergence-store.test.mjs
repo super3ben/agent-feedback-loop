@@ -10,7 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { spawnTracked } from "./helpers/child-processes.mjs";
 import { pathsFor } from "../src/index.mjs";
-import { V1_SCHEMA_SQL } from "../src/control-schema.mjs";
+import { SCHEMA_VERSION, V1_SCHEMA_SQL } from "../src/control-schema.mjs";
 import {
   initializeControlStore,
   listUserTables,
@@ -201,16 +201,19 @@ function policyRequest(overrides = {}) {
   };
 }
 
-test("v1 upgrades transactionally to the exact canonical v2 schema", () => {
+test("v1 upgrades transactionally to the exact canonical current schema", () => {
   const paths = v1Fixture();
   const store = initializeControlStore({
     paths,
     now: () => new Date("2026-07-21T00:00:00.000Z")
   });
 
-  assert.equal(store.database.prepare("SELECT version FROM schema_migrations").get().version, 2);
+  assert.equal(store.database.prepare("SELECT version FROM schema_migrations").get().version, SCHEMA_VERSION);
   assert.deepEqual(listUserTables(store.database), EXPECTED_V2_TABLES);
   assert.equal(store.getReviewJob("existing-job").state, "pending");
+  // Recurrence is counted per family key, so the upgrade must carry the column.
+  assert.equal(store.database.prepare("SELECT COUNT(*) AS n FROM pragma_table_info(?) WHERE name=?")
+    .get("reviewer_jobs", "family_key").n, 1);
   store.close();
 });
 

@@ -93,7 +93,7 @@ function assertTrimmedStringSchema(property, maxLength) {
 }
 
 test("no_lesson requires exactly one controlled reason code", () => {
-  const input = { outcome: "no_lesson", reason_code: "insufficient_evidence" };
+  const input = { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" };
   const result = validateReviewerResult(input, { allowedFamilyIds: [] });
   assert.deepEqual(result, input);
   assert.notEqual(result, input);
@@ -103,6 +103,10 @@ test("no_lesson requires exactly one controlled reason code", () => {
   }
   reject({ outcome: "no_lesson" });
   reject({ outcome: "no_lesson", reason_code: "uncontrolled_reason" });
+  // A no_lesson review must still name the family it looked at, or the next
+  // occurrence of the same problem has nothing to be counted against.
+  reject({ outcome: "no_lesson", reason_code: "insufficient_evidence" });
+  reject({ outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "Not A Key" });
   reject({ outcome: "unknown" });
 });
 
@@ -285,8 +289,8 @@ test("reviewer-result JSON Schema parses and mirrors the static validator contra
   const noLesson = branches.get("no_lesson");
   assert.equal(noLesson.type, "object");
   assert.equal(noLesson.additionalProperties, false);
-  assert.deepEqual(noLesson.required, ["outcome", "reason_code"]);
-  assert.deepEqual(Object.keys(noLesson.properties).sort(), ["outcome", "reason_code"]);
+  assert.deepEqual(noLesson.required, ["outcome", "reason_code", "family_key"]);
+  assert.deepEqual(Object.keys(noLesson.properties).sort(), ["family_key", "outcome", "reason_code"]);
   assert.deepEqual(valuesFor(noLesson.properties.reason_code), [
     "insufficient_evidence",
     "external_limit",

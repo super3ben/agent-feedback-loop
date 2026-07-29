@@ -23,6 +23,7 @@ import { NO_LESSON_REASON_CODES } from "./reviewer-result.mjs";
 
 import {
   CONVERGENCE_SCHEMA_SQL,
+  REVIEWER_FAMILY_KEY_SQL,
   CONTROL_SCHEMA_SIGNATURE,
   CONTROL_SCHEMA_SQL_SIGNATURE,
   CONTROL_SCHEMA_V1_SIGNATURE,
@@ -63,6 +64,7 @@ const MAX_CAPTURE_FAIL_OPEN_RECORDS = 50;
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
+const FAMILY_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 const EXECUTION_MONITOR_MAX_STORED = 128;
 const EXECUTION_MONITOR_MAX_TOOLS = 64;
@@ -1370,7 +1372,7 @@ function createStore(database, now) {
         return { ...renewed, leaseEpoch: safeLeaseEpoch };
       });
     },
-    completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode }) {
+    completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode, familyKey }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
@@ -1378,14 +1380,19 @@ function createStore(database, now) {
       if (!NO_LESSON_REASON_CODE_SET.has(safeReasonCode)) {
         throw new TypeError("reasonCode is not controlled for reviewed_no_lesson");
       }
+      // The family key is what makes a repeat complaint countable later, so it
+      // is recorded even though this review produced no lesson.
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
       const timestamp = nowIso(now);
       return transaction(() => {
         const completed = database.prepare(`UPDATE reviewer_jobs
           SET state='reviewed_no_lesson', owner_id=NULL, lease_until=NULL,
-              next_attempt_at=NULL, completed_at=?, result_code='reviewed_no_lesson', error_code=NULL
+              next_attempt_at=NULL, completed_at=?, result_code='reviewed_no_lesson', error_code=NULL,
+              family_key=?
           WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
             AND lease_until IS NOT NULL AND lease_until>?
-          RETURNING *`).get(timestamp, safeJobId, safeOwnerId, safeLeaseEpoch, timestamp);
+          RETURNING *`).get(timestamp, safeFamilyKey, safeJobId, safeOwnerId, safeLeaseEpoch, timestamp);
         if (!completed) throw reviewLeaseLost();
         insertReviewJobEvent({
           jobId: safeJobId,
@@ -1396,6 +1403,46 @@ function createStore(database, now) {
         });
         return { ...completed };
       });
+    },
+    // Exact count of prior reviews that landed on the same family in this
+    // project. This is an indexed lookup over all history: no window to fall
+    // outside of, and no need to decrypt and re-compare past complaints.
+    //
+    // Counting is per distinct source identity because the same prompt can be
+    // captured more than once, and a single complaint must not reach the
+    // recurrence threshold on its own.
+    countReviewFamilyRecurrence({ jobId, familyKey }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
+      const currentJob = getReviewJob(safeJobId);
+      if (!currentJob?.project_id) return 0;
+      const row = database.prepare(`SELECT COUNT(DISTINCT source_event.content_hash) AS total
+        FROM reviewer_jobs AS historic_job
+        JOIN session_events AS source_event ON source_event.event_uid=historic_job.source_event_uid
+        WHERE historic_job.project_id=? AND historic_job.job_id<>? AND historic_job.family_key=?`)
+        .get(currentJob.project_id, safeJobId, safeFamilyKey);
+      return Number(row?.total ?? 0);
+    },
+    // The family keys this project has already seen, with how often each was
+    // reached. Feeding these back is what lets a later review recognise a
+    // repeat instead of inventing a fresh key for the same problem.
+    listReviewFamilyKeys({ jobId, limit = 32 }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeLimit = assertLimit(limit, "limit", 32, 128);
+      if (safeLimit === 0) return [];
+      const currentJob = getReviewJob(safeJobId);
+      if (!currentJob?.project_id) return [];
+      return database.prepare(`SELECT historic_job.family_key AS familyKey,
+          COUNT(DISTINCT source_event.content_hash) AS occurrences
+        FROM reviewer_jobs AS historic_job
+        JOIN session_events AS source_event ON source_event.event_uid=historic_job.source_event_uid
+        WHERE historic_job.project_id=? AND historic_job.job_id<>? AND historic_job.family_key IS NOT NULL
+        GROUP BY historic_job.family_key
+        ORDER BY occurrences DESC, historic_job.family_key
+        LIMIT ?`)
+        .all(currentJob.project_id, safeJobId, safeLimit)
+        .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
     },
     completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256 }) {
       const safeJobId = assertString(jobId, "jobId", 512);
@@ -1514,29 +1561,6 @@ function createStore(database, now) {
         prior: prior.map((row) => ({ ...row })),
         following: following.map((row) => ({ ...row }))
       };
-    },
-    getReviewRecurrenceCandidates({ jobId, limit = 8 }) {
-      const safeJobId = assertString(jobId, "jobId", 512);
-      const safeLimit = assertLimit(limit, "limit", 8, 8);
-      if (safeLimit === 0) return [];
-      const currentJob = getReviewJob(safeJobId);
-      if (!currentJob?.project_id) return [];
-      const currentSource = readContextEvent(currentJob.source_event_uid);
-      if (!currentSource) throw reviewCandidateCollision();
-      return database.prepare(`SELECT ${recurrenceEventContextColumns}
-        FROM reviewer_jobs AS historic_job
-        JOIN session_events AS historic_event ON historic_event.event_uid=historic_job.source_event_uid
-        WHERE historic_job.project_id=? AND historic_job.job_id<>?
-          AND historic_event.encrypted_raw_ref IS NOT NULL
-          AND (historic_event.created_at<? OR (historic_event.created_at=? AND historic_event.event_uid<?))
-        ORDER BY historic_event.created_at DESC, historic_event.event_uid DESC LIMIT ?`).all(
-        currentJob.project_id,
-        safeJobId,
-        currentSource.created_at,
-        currentSource.created_at,
-        currentSource.event_uid,
-        safeLimit
-      ).reverse().map((row) => ({ ...row }));
     },
     assertCaptureAllowed(event) {
       return eventFields(event);
@@ -1805,11 +1829,31 @@ function configureConnection(database, busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS) {
   database.exec(`PRAGMA busy_timeout = ${timeoutMs}; PRAGMA foreign_keys = ON;`);
 }
 
+// Recurrence is counted per family key, so an existing database needs the
+// column before a no_lesson review can record which family it looked at.
+
+
+export function migrateControlSchemaV2ToV3(database, now = () => new Date()) {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(REVIEWER_FAMILY_KEY_SQL);
+    database.prepare("DELETE FROM schema_migrations").run();
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(SCHEMA_VERSION, nowIso(now));
+    verifyControlSchema(database, SCHEMA_VERSION);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
+
 export function migrateControlSchemaV1ToV2(database, now = () => new Date()) {
   database.exec("BEGIN IMMEDIATE");
   try {
     verifyControlSchema(database, 1, CONTROL_SCHEMA_V1_SIGNATURE, CONTROL_SCHEMA_V1_SQL_SIGNATURE);
     database.exec(CONVERGENCE_SCHEMA_SQL);
+    database.exec(REVIEWER_FAMILY_KEY_SQL);
     database.prepare("DELETE FROM schema_migrations").run();
     database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
       .run(SCHEMA_VERSION, nowIso(now));
@@ -1843,6 +1887,10 @@ function initializeOrMigrateSchema(database, now) {
     .all().map((row) => Number(row.version));
   if (versions.length === 1 && versions[0] === SCHEMA_VERSION) {
     verifyControlSchema(database, SCHEMA_VERSION);
+    return;
+  }
+  if (versions.length === 1 && versions[0] === 2) {
+    migrateControlSchemaV2ToV3(database, now);
     return;
   }
   if (versions.length !== 1 || versions[0] !== 1) {

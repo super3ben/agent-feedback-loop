@@ -122,12 +122,18 @@ export function validateReviewerResult(value, {
 } = {}) {
   if (!isRecord(value)) fail("reviewer result must be an object");
   if (value.outcome === "no_lesson") {
-    exactKeys(value, new Set(["outcome", "reason_code"]));
+    exactKeys(value, new Set(["outcome", "reason_code", "family_key"]));
     const reasonCode = normalizedString(value.reason_code, {
       name: "reason_code", maxLength: 64, canonical: true
     });
     if (!NO_LESSON_REASON_CODE_SET.has(reasonCode)) fail("reason_code is unsupported");
-    return { outcome: "no_lesson", reason_code: reasonCode };
+    // A no_lesson review still has to name the family it looked at. Discarding
+    // that classification is what left recurrence invisible: every review of a
+    // repeat complaint started from nothing and concluded no_lesson again.
+    const familyKey = normalizedString(value.family_key, {
+      name: "family_key", maxLength: 128, canonical: true, pattern: FAMILY_KEY_PATTERN
+    });
+    return { outcome: "no_lesson", reason_code: reasonCode, family_key: familyKey };
   }
   if (value.outcome !== "lesson") fail("reviewer result has an unsupported outcome");
   exactKeys(value, LESSON_KEYS);

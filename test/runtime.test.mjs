@@ -8,6 +8,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { RUNTIME_VERSION, doctor, install, pathsFor, uninstall } from "../src/index.mjs";
+import { SCHEMA_VERSION } from "../src/control-schema.mjs";
 import { listUserTables, openControlStore } from "../src/control-store.mjs";
 
 const ALLOWED_CONTROL_TABLES = [
@@ -116,7 +117,7 @@ test("stable launcher resolves an atomically selected versioned runtime", async 
   assert.doesNotMatch(launcher, /versions\/[0-9.]+\/bin\/agent-feedback-loop/);
   assert.equal(current.runtimeRoot, paths.runtimeRoot);
   assert.equal(current.runtimeVersion, RUNTIME_VERSION);
-  assert.equal(current.schemaVersion, 2);
+  assert.equal(current.schemaVersion, SCHEMA_VERSION);
 });
 
 test("0.9.0 package includes every convergence module and exact Probe asset", async () => {
@@ -172,7 +173,7 @@ test("doctor separates package installed capability and repository authority evi
   assert.equal(convergence.codePackage.available, true);
   assert.equal(convergence.codePackage.version, RUNTIME_VERSION);
   assert.equal(convergence.installedRuntime.selected, true);
-  assert.equal(convergence.installedRuntime.schema.expectedVersion, 2);
+  assert.equal(convergence.installedRuntime.schema.expectedVersion, SCHEMA_VERSION);
   assert.equal(convergence.installedRuntime.schema.available, true);
   assert.match(convergence.installedRuntime.platform.status, /^(?:supported|unsupported)$/u);
   assert.deepEqual(Object.fromEntries(Object.entries(convergence.adapters).map(([name, value]) => [name, value.capability])), {

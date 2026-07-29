@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { buildReviewerInvocation, codexProviderRouting, resolveReviewerExecutable, runProcessWithInput, runReviewerProvider } from "../src/reviewer-provider.mjs";
 
-const RESULT = { outcome: "no_lesson", reason_code: "insufficient_evidence" };
+const RESULT = { outcome: "no_lesson", reason_code: "insufficient_evidence", family_key: "stored-credential-lookup" };
 const PROBE_RESULT = Object.freeze({
   assessment: "overdesigned",
   action: "simplify_current_generation",

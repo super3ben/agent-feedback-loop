@@ -3001,10 +3001,14 @@ test("review no-lesson completion records a controlled reason atomically", () =>
     jobId: candidate.jobId,
     ownerId: "no-lesson-owner",
     leaseEpoch: claim.leaseEpoch,
-    reasonCode: "insufficient_evidence"
+    reasonCode: "insufficient_evidence",
+    familyKey: "stored-credential-lookup"
   });
   assert.equal(completed.state, "reviewed_no_lesson");
   assert.equal(completed.result_code, "reviewed_no_lesson");
+  // The family is recorded even with no lesson, so a later complaint in the
+  // same family has something to be counted against.
+  assert.equal(completed.family_key, "stored-credential-lookup");
   assert.equal(fixture.store.database.prepare(`SELECT reason_code FROM review_job_events
     WHERE job_id=? AND event_type='reviewed_no_lesson'`).get(candidate.jobId).reason_code, "insufficient_evidence");
   assert.equal(fixture.store.reserveReviewLaunch({ jobId: candidate.jobId, cooldownMs: 0 }).launch, false);

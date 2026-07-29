@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const REVIEW_JOB_STATES = Object.freeze([
   "pending", "running", "retryable", "reviewed_no_lesson", "published", "failed"
@@ -23,20 +23,32 @@ CREATE TABLE IF NOT EXISTS convergence_events(id INTEGER PRIMARY KEY AUTOINCREME
 CREATE TABLE IF NOT EXISTS continuation_grants(grant_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, task_uid TEXT NOT NULL REFERENCES convergence_tasks(task_uid), fingerprint TEXT NOT NULL REFERENCES convergence_loops(fingerprint), current_generation INTEGER NOT NULL, next_generation INTEGER NOT NULL, purpose TEXT NOT NULL, scope_digest TEXT NOT NULL, contract_revision TEXT NOT NULL, policy_revision TEXT NOT NULL, decision_basis_digest TEXT NOT NULL, evidence_digest TEXT NOT NULL, state TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT, revoked_at TEXT);
 `;
 
-export const SCHEMA_SQL = `${V1_SCHEMA_SQL}${CONVERGENCE_SCHEMA_SQL}`;
+export const REVIEWER_FAMILY_KEY_SQL = "ALTER TABLE reviewer_jobs ADD COLUMN family_key TEXT;\n";
+export const SCHEMA_SQL = `${V1_SCHEMA_SQL}${CONVERGENCE_SCHEMA_SQL}${REVIEWER_FAMILY_KEY_SQL}`;
 
 function sqlSignature(sqlText) {
-  return Object.fromEntries(
-    sqlText.split("\n")
-    .map((statement) => statement.trim())
+  const statements = sqlText.split("\n").map((statement) => statement.trim());
+  const tables = new Map(statements
     .filter((statement) => statement.startsWith("CREATE TABLE IF NOT EXISTS "))
     .map((statement) => {
       const sql = statement
         .replace(/^CREATE TABLE IF NOT EXISTS /, "CREATE TABLE ")
         .replace(/;$/, "");
-      const name = sql.slice("CREATE TABLE ".length, sql.indexOf("("));
-      return [name, sql];
+      return [sql.slice("CREATE TABLE ".length, sql.indexOf("(")), sql];
     }));
+  // SQLite rewrites a table's stored SQL when a column is added, so the
+  // expected text has to be rewritten the same way. Otherwise a database that
+  // reached the current schema by migration would never match one created
+  // fresh, even though the two are identical.
+  for (const statement of statements) {
+    const added = /^ALTER TABLE (\w+) ADD COLUMN (.+?);$/u.exec(statement);
+    if (!added) continue;
+    const [, table, column] = added;
+    const existing = tables.get(table);
+    if (!existing) continue;
+    tables.set(table, `${existing.slice(0, existing.lastIndexOf(")"))}, ${column})`);
+  }
+  return Object.fromEntries(tables);
 }
 
 export const CONTROL_SCHEMA_SQL_SIGNATURE = Object.freeze(sqlSignature(SCHEMA_SQL));
@@ -244,7 +256,8 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["result_code", "TEXT", 0, null, 0],
       ["error_code", "TEXT", 0, null, 0],
       ["published_path", "TEXT", 0, null, 0],
-      ["published_sha256", "TEXT", 0, null, 0]
+      ["published_sha256", "TEXT", 0, null, 0],
+      ["family_key", "TEXT", 0, null, 0]
     ),
     indexes: [
       canonicalUniqueIndex("pk", [[0, "job_id"]]),
@@ -314,6 +327,19 @@ const CONVERGENCE_TABLES = new Set([
   "convergence_tasks"
 ]);
 
+// v1 is a historical shape: it predates both the convergence tables and the
+// reviewer family key, so columns added since must not leak into its signature.
+const V1_ADDED_COLUMNS = Object.freeze({ reviewer_jobs: new Set(["family_key"]) });
+
 export const CONTROL_SCHEMA_V1_SIGNATURE = Object.freeze(Object.fromEntries(
-  Object.entries(CONTROL_SCHEMA_SIGNATURE).filter(([name]) => !CONVERGENCE_TABLES.has(name))
+  Object.entries(CONTROL_SCHEMA_SIGNATURE)
+    .filter(([name]) => !CONVERGENCE_TABLES.has(name))
+    .map(([name, signature]) => {
+      const added = V1_ADDED_COLUMNS[name];
+      if (!added) return [name, signature];
+      return [name, {
+        ...signature,
+        columns: signature.columns.filter(([column]) => !added.has(column))
+      }];
+    })
 ));
