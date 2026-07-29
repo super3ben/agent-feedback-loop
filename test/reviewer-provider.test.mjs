@@ -279,7 +279,7 @@ test("Codex reviewer derives one private supported transport schema without chan
   );
   assert.deepEqual(transportSchema.properties.result.anyOf[1].properties.responsibility.enum, ["agent_fault"]);
   assert.equal(transportSchema.properties.result.anyOf[1].properties.applies_when.minItems, 1);
-  assert.equal(transportSchema.properties.result.anyOf[1].properties.applies_when.maxItems, 8);
+  assert.equal(transportSchema.properties.result.anyOf[1].properties.applies_when.maxItems, 16);
   assert.deepEqual(schemaKeywordPaths(transportSchema, UNSUPPORTED_CODEX_SCHEMA_KEYWORDS), []);
   assert.match(observedInput, /Codex transport/i);
   assert.match(observedInput, /\{"result":\s*<logical-result>\}/i);

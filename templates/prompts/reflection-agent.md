@@ -44,6 +44,14 @@ listed in the catalog. Every `recurrence_of` id must be a listed reflection from
 that same family. Otherwise set `family_id` to null, provide a stable lowercase
 hyphenated `proposed_family_key`, and leave `recurrence_of` empty.
 
+Write every `applies_when` condition twice: once in the language of the user's
+complaint, and once in English. A later session is matched to this lesson by
+word overlap alone, so a condition recorded only in English is unreachable from
+a Chinese prompt and vice versa — the lesson is stored but can never be
+delivered. Keep both renderings of the same condition adjacent, and keep
+technical identifiers (tool names, flags, paths) verbatim in both. If the
+complaint is already in English, one rendering per condition is enough.
+
 Ground `facts`, `user_complaint`, `root_cause`, and
 `repeated_pattern_evidence` only in the supplied source, direct referent, nearby
 events, and catalog summaries. Never copy credentials, hidden control data,

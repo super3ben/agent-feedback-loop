@@ -173,7 +173,7 @@ test("severity, responsibility and family proposal identifiers are controlled", 
 
 test("all bounded arrays enforce item type, trimming, count and length limits", () => {
   const cases = [
-    ["applies_when", 8, 160, true],
+    ["applies_when", 16, 160, true],
     ["facts", 12, 512, true],
     ["method_changes", 8, 512, true],
     ["repeated_pattern_evidence", 8, 512, false],
@@ -320,7 +320,7 @@ test("reviewer-result JSON Schema parses and mirrors the static validator contra
   assert.ok(schemaForType(lessonBranch.properties.proposed_family_key, "null"));
 
   for (const [field, minItems, maxItems, maxLength] of [
-    ["applies_when", 1, 8, 160],
+    ["applies_when", 1, 16, 160],
     ["facts", 1, 12, 512],
     ["method_changes", 1, 8, 512],
     ["repeated_pattern_evidence", 0, 8, 512],

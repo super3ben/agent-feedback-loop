@@ -145,7 +145,7 @@ export function validateReflectionModel(result, source) {
     responsibility: "agent_fault",
     method_class: methodClass,
     family_id: familyId,
-    applies_when: boundedStrings(result.applies_when, "applies_when", { min: 1, max: 8, itemMax: 160 }),
+    applies_when: boundedStrings(result.applies_when, "applies_when", { min: 1, max: 16, itemMax: 160 }),
     effectiveness: "unknown",
     source_identity_hash: identityHash,
     title: titleFromMistakeClass(classOfMistake, methodClass),

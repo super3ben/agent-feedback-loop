@@ -191,7 +191,7 @@ export function validateReviewerResult(value, {
     family_id: familyId,
     proposed_family_key: proposedFamilyKey,
     applies_when: normalizedArray(value.applies_when, {
-      name: "applies_when", minItems: 1, maxItems: 8, maxLength: 160, scan: true
+      name: "applies_when", minItems: 1, maxItems: 16, maxLength: 160, scan: true
     }),
     facts: normalizedArray(value.facts, {
       name: "facts", minItems: 1, maxItems: 12, maxLength: 512, scan: true

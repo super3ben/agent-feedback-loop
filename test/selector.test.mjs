@@ -235,3 +235,51 @@ test("document hashes identify the exact Markdown bytes already loaded", async (
   const expected = (await import("node:crypto")).createHash("sha256").update(bytes).digest("hex");
   assert.equal(loaded.documents[0].documentHash, expected);
 });
+
+// Selection is word overlap alone, so a lesson whose conditions exist only in
+// English is unreachable from a Chinese prompt even when it is exactly the
+// lesson that applies. Real catalogs hit this: a stored lesson about leaking
+// credentials into terminal output scored zero against 打印环境变量调试一下.
+test("a condition recorded in one language only is unreachable from the other", async (t) => {
+  const englishOnly = model(1, {
+    applies_when: [
+      "Debug or diagnostic output includes environment variables",
+      "Log or terminal output may contain tokens, keys, or other credentials"
+    ],
+    class_of_mistake: "Emitting credentials into terminal output without redaction",
+    method_changes: ["Redact tokens before printing environment variables"]
+  });
+  const bilingual = model(1, {
+    applies_when: [
+      "Debug or diagnostic output includes environment variables",
+      "调试输出包含环境变量时",
+      "Log or terminal output may contain tokens, keys, or other credentials",
+      "日志或终端输出可能包含 token、密钥或凭据时"
+    ],
+    class_of_mistake: "Emitting credentials into terminal output without redaction",
+    method_changes: ["Redact tokens before printing environment variables"]
+  });
+
+  const englishDocs = await load(t, [englishOnly]);
+  const bilingualDocs = await load(t, [bilingual]);
+  const chinesePrompt = { prompt: "打印环境变量调试一下" };
+  const englishPrompt = { prompt: "print the environment variables for debugging" };
+
+  assert.equal(select(englishDocs.documents, chinesePrompt).selected.length, 0,
+    "an English-only lesson cannot be reached from a Chinese prompt");
+  assert.equal(select(bilingualDocs.documents, chinesePrompt).selected.length, 1,
+    "recording the condition in both languages makes it reachable");
+  // The added rendering must not cost recall in the original language.
+  assert.equal(select(englishDocs.documents, englishPrompt).selected.length, 1);
+  assert.equal(select(bilingualDocs.documents, englishPrompt).selected.length, 1);
+});
+
+test("applies_when accepts both renderings of every condition", async (t) => {
+  const conditions = Array.from({ length: 8 }, (_, index) => [
+    `English condition ${index}`,
+    `中文条件 ${index}`
+  ]).flat();
+  const documents = await load(t, [model(1, { applies_when: conditions })]);
+  assert.equal(documents.documents.length, 1, "16 conditions stay within bounds");
+  assert.equal(documents.documents[0].appliesWhen.length, 16);
+});
