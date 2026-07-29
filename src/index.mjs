@@ -628,13 +628,17 @@ async function inspectReflectionLanguages(projectDir) {
       projectDir,
       publishedBefore: new Date(Date.now() + 60_000).toISOString()
     });
-    const counts = { total: 0, bilingual: 0, cjkOnly: 0, latinOnly: 0 };
+    const counts = { total: 0, bilingual: 0, cjkOnly: 0, latinOnly: 0, noConditions: 0 };
     for (const document of catalog.documents) {
       const reach = appliesWhenReach(document.appliesWhen);
       counts.total += 1;
       if (reach.cjk && reach.latin) counts.bilingual += 1;
       else if (reach.cjk) counts.cjkOnly += 1;
       else if (reach.latin) counts.latinOnly += 1;
+      // applies_when carries the heaviest matching weight, so a lesson without
+      // it is barely reachable from any prompt. Legacy hand-written documents
+      // predate the field entirely.
+      else counts.noConditions += 1;
     }
     // A lesson reachable from only one language is invisible to prompts written
     // in the other one.

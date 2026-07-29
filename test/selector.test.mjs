@@ -312,4 +312,25 @@ test("doctor counts lessons reachable from only one language", async (t) => {
   assert.equal(languages.latinOnly, 1);
   assert.equal(languages.cjkOnly, 1);
   assert.equal(languages.singleLanguage, 2, "both single-language lessons are surfaced");
+  assert.equal(languages.noConditions, 0);
+});
+
+// A legacy hand-written document has no applies_when at all, which is a
+// different and worse failure than being single-language: the heaviest matching
+// field is simply absent. Reporting them in the same bucket hides that.
+test("doctor separates lessons with no conditions from single-language ones", async (t) => {
+  const { doctor } = await import("../src/index.mjs");
+  const withConditions = renderReflectionMarkdown(model(1, {
+    applies_when: ["调试输出包含环境变量时"]
+  }));
+  const projectDir = await projectFixture(t, [
+    ["00.md", withConditions],
+    ["01.md", withConditions.replace(/^- applies_when: .*$/mu, "- applies_when: ")]
+  ]);
+  const home = await mkdtemp(path.join(os.tmpdir(), "afl-doctor-nocond-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const languages = (await doctor({ home, cwd: projectDir })).status.reflectionLanguages;
+  assert.equal(languages.cjkOnly, 1);
+  assert.equal(languages.noConditions, 1, "an empty applies_when is counted apart");
 });
