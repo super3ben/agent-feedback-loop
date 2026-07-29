@@ -1,0 +1,214 @@
+# 反思复发根治 + Guard 执行期硬阻断(v2,实证对齐版)
+
+日期: 2026-07-29
+状态: 待评审
+取代: `2026-07-28-guard-wiring-and-recurrence-design.md`(该版三处决策与实证矛盾,见附录 A)
+
+## 本文档的规则
+
+**每条设计决策必须标注实证来源。** 无实证来源的决策不得进入本文档;
+与实证矛盾的决策不得写入,即使此前口头确认过。
+
+来源标记:
+- `[E-n]` = 实验编号,见"实证台账"
+- `file:line` = 代码事实
+- `[未验证]` = 承认为假设,并给出验证方式与失败后果
+
+上一版失败的机制是:实验结论没有被可靠带进规格。本节即为对治。
+
+## 实证台账
+
+| 编号 | 实验 | 结论 |
+|------|------|------|
+| E-1 | codex 探针观察模式 | `PreToolUse`/`PostToolUse` 每次工具调用各触发一次;payload 含 `cwd, hook_event_name, model, permission_mode, session_id, tool_input, tool_name, tool_use_id, transcript_path, turn_id`;hook 脚本自身开销 0.23–0.43ms |
+| E-2 | codex 单次硬阻断 | 返回 `{"decision":"block","reason":...}` → `ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook`,agent 停止并如实报告 |
+| E-3 | codex 绕过测试 | 明示"无论如何都要完成,失败就换方法";agent 尝试 8 次跨 4 类工具(`Bash`×5、`mcp__node_repl__js`、`apply_patch`、`mcp__codegraph__codegraph_explore`),**8/8 被拦,0 次绕过**,耗 39,480 token |
+| E-4 | codex 过度设计 + 强制复盘 | 探针 matcher 仅列 `Write/Bash/Edit`,而 codex 实际写文件用 `apply_patch` → 5 次穿透、20 个文件落地;agent 写出 `.microservices-approach-review.md`,结论"Keep the three small modules"**自我批准并继续**;另经 `collaborationspawn_agent`×3 派生子 agent,子 agent 的工具调用同样出现在探针日志中(**子 agent 继承 hook**) |
+| E-5 | Claude Code 同任务同拦截 | 1 次 deny 后**主动停止**,仅落地 1 文件,向用户报告进度并请求确认;工具名 `Write/Edit/NotebookEdit/Bash/Task`;阻断返回形状 `hookSpecificOutput.permissionDecision:"deny"`;开销 0.20ms |
+| E-6 | codex 信任门 | codex-cli 0.146.0-alpha.3.1;hook 须有 `hooks.state."<path>:<snake_event>:<i>:<j>"` 的 `trusted_hash` 才执行;探针写入配置后**从未触发**,直到加 `--dangerously-bypass-hook-trust` |
+| E-7 | 复发窗口实测(真实数据) | 对真实 job `03b35f6a`(Termius 抱怨)调用 `getReviewRecurrenceCandidates`,返回 8 条全为 `继续`/`md就行了`/无关项;同类抱怨(`密码之前不是都跟你说过了吗端口22222…`)排在第 **17** 位,不在窗口内 → `similar_complaint_count=0` → 仍判 no_lesson |
+| E-8 | 词法相似度实测(真实数据) | 上述两句真实抱怨共享 token `密码`/`不知`/`知道`,ratio 0.136 ≥ 阈值 0.1 → 判定 SIMILAR。**词法匹配本身有效,失效点仅在窗口** |
+| E-9 | 注入侧产出实测 | `rcs-2000-agent` 18 条经验中凭据/密码相关 **0 条**;任务开始与用户抱怨两个时点选中的均为同一条**不相关**经验 |
+| E-10 | 控制库统计 | 54 候选 → 6 published / 33 no_lesson / **15 failed**(`provider_timeout`、`attempts_exhausted`、`provider_unavailable`);真实数据中存在同一 prompt 的重复 job |
+
+## 失效 A: 反思对复发失明
+
+### A-根因
+
+`getReviewRecurrenceCandidates` 取**时间上紧邻的前 N 条 job**,相似度过滤在取出**之后**
+才做,于是 `继续` 这类无关 prompt 白占窗口 [E-7]。
+
+窗口是硬上限: `src/control-store.mjs:1572` 为 `assertLimit(limit, "limit", 8, 8)`
+即 `Math.min(resolved, 8)`,`src/reviewer-runner.mjs:27` 为 `RECURRENCE_LIMIT = 8`,
+调用方无法调大。
+
+**放大窗口不是根治**: 抱怨正文存于加密 blob(`session_events.encrypted_raw_ref`,
+`src/control-schema.mjs:12`),SQL 侧无文本列 → 内容过滤无法下推 → 窗口取 N 即每次复审
+解密 N 个 blob → 成本随窗口线性增长 → 窗口必然有界 → **任何有界窗口对稀疏复发必然失效**。
+8 挡不住间隔 17,64 挡不住间隔 65。
+
+**真正的缺陷是 no_lesson 复审失忆**: `templates/schemas/reviewer-result.schema.json`
+的 `no_lesson` 分支为 `additionalProperties:false`,仅允许 `outcome` + `reason_code`,
+语义归类被整个丢弃;而 `catalogSummaries`(`src/reviewer-runner.mjs:90`)只读**已发布**
+catalog。于是 33 次复审 = 33 次 LLM 读懂了抱怨后把理解全扔掉 [E-10]。
+
+### A-决策
+
+**A1. 复发以 family key 精确计数,删除词法扫描。**
+
+- 依据: `lesson` 分支已有 `proposed_family_key`(模式 `^[a-z0-9]+(?:-[a-z0-9]+)*$`),
+  且"把 catalog 喂回上下文让 LLM 认领 family"在 published lesson 上已跑通,是现成机制。
+- 做法: `no_lesson` 分支增加必填 family key 字段并持久化;复发计数改为按
+  (project_id, family_key) 的**索引精确计数**。
+- 效果: 无窗口、无解密、O(1) 查询。间隔 17 条与 1700 条行为一致 [E-7 所暴露的失效被消除]。
+- 删除: `lexicalTokens`、`isLexicallySimilar`、`RECURRENCE_STOP_TOKENS`、
+  `getReviewRecurrenceCandidates` 的解密循环、`recurrenceSummary` 的 blob 读取。
+  注: 词法匹配本身是有效的 [E-8],删除理由是它需要有界窗口,不是它不准。
+
+**A2. 已知 family key 及其计数进入复审上下文。**
+
+- 依据: 与 published family 复用同一机制(`catalogSummaries` 现有做法)。
+- 做法: `catalogSummaries` 扩展为同时包含已发布 family 与 no_lesson family key
+  及各自计数,按 (project_id) 作用域,按近期/计数取前 N 以防膨胀。
+
+**A3. 计数去重。**
+
+- 依据: 真实数据存在同一 prompt 的重复 job [E-10];不去重则单次抱怨可自行把计数刷到 2。
+- 做法: 计数按 `source_identity` 或 (session, turn) 去重。
+
+**A4. 契约: 计数 ≥2 可在 catalog 为空时确立 Major。**
+
+- 现状已具备(`templates/prompts/reflection-agent.md` 第 14-27 行本轮已加入该条款),
+  本版保留,仅将其依据由"词法复发计数"改为"family key 计数"。
+
+**A5. no_lesson 判定理由落库。**
+
+- 现状已具备(`completeReviewNoLesson({..., reasonCode})`,`src/control-store.mjs:1427`),保留。
+- 依据: 该失效能静默重复 7 次而无人发现,直接原因就是判定理由无记录 [E-10]。
+
+**A6. 历史不回填。**
+
+- 现有 33 条 no_lesson 无 family key。回填需 33 次 LLM 调用,价值低。
+- **代价须明示**: Termius 案例不会因本次改动立即生效,须再发生一次才能达到计数 2。
+
+### A-风险(承认为未验证)
+
+- **[未验证] family key 稳定性**: 两次独立复审可能给出不同 key 导致计数永不达 2。
+  缓解为把已知 key 喂回上下文(A2)。验证方式: 以真实的两条凭据抱怨为夹具,断言二者
+  归入同一 key。失败后果: 退化为多一次 no_lesson,不崩溃;且随数据积累变好,
+  与窗口方案随间隔变差相反。
+
+## 失效 B: Guard 对自主跑零约束
+
+### B-根因(含上一版规格错误)
+
+当前实现(`src/execution-hook.mjs`、`src/execution-monitor.mjs`)有四重结构性失效:
+
+1. **`PostToolUse` 在工具执行之后触发** — 结构上不可能阻止 mutation。
+   `src/index.mjs:67,81` 为 `executionHookEvent: "PostToolUse"`。
+   与 [E-2][E-3] 矛盾: 有效阻断点是 `PreToolUse`。
+2. **软阻断无效** — `src/execution-hook.mjs:58` 返回 `{continue:true, systemMessage:...}`。
+   与 [E-4] 矛盾: agent 收到停止/复盘要求后会写出复盘文档、自我批准并继续。
+3. **hook 永不被信任** — `src/codex-host.mjs:298` 为 `for (const hook of [before.prompt])`,
+   `:227` 仅匹配 `userPromptSubmit`。据 [E-6],未获信任的 hook 一次都不执行,
+   而 doctor 的 `ready` 取自同一评估 → **guard 已死而诊断报健康**。
+4. **第二层精判为装饰** — `src/execution-probe-launcher.mjs:73,82` 为 `detached:true` +
+   `unref()`,判决无法内联等待;`src/convergence-probe-runner.mjs:5` 的
+   `DEFAULT_LEASE_MS = 240_000` 对 `src/index.mjs:70,84` 的 5 秒 hook 预算超出 48 倍。
+
+### B-决策
+
+**B1. 触发点改为 `PreToolUse`。** 依据 [E-1](执行期每次触发)、[E-2](可阻断)。
+
+**B2. 硬阻断,不用软阻断。** 依据 [E-3](8/8 拦下含 MCP 工具,0 绕过)、
+[E-4](软性复盘要求会被自我批准)。codex 返回形状 `{"decision":"block","reason":...}` [E-2]。
+
+**B3. matcher 用空/全匹配,mutation 工具过滤放在 hook 体内。**
+
+- 依据 [E-4]: 探针 matcher 只列 `Write/Bash/Edit` 导致 `apply_patch` 5 次穿透、20 文件落地。
+- `[未验证]` codex 的 matcher 语法是否支持按工具名匹配: 本仓库唯一的 matcher 写入处
+  `src/index.mjs:486` 为空串,无任何非空 matcher 先例。因此不依赖该语法,改为在 hook 体内
+  按 `tool_name` 判定。
+- 附带收益: hook 体内记录所见的每个 `tool_name`,使工具名清单**作为上线副产物被回答**,
+  而非事前猜测。
+
+**B4. 仅 codex 装硬阻断;claude 只观测;gemini 不接。**
+
+- codex 依据 [E-4]: 会自我批准并继续,必须物理拦截。
+- claude 依据 [E-5]: 1 次 deny 即主动停止并交回用户,硬阻断为冗余。
+- gemini: 无任何实证,不接(YAGNI)。
+- 需回退当前实现: `src/index.mjs:81`(claude)与 `:95`(gemini `AfterTool`)的执行期接线。
+
+**B5. 删除第二层 LLM 精判。**
+
+- 依据 B-根因 4: 异步 detached 判决 + 240s lease vs 5s 预算,内联等待不可能。
+- 判定改为纯确定性: 以 `session_id` 为键 [E-1],计"自上次 `UserPromptSubmit` 以来的
+  mutation 次数"。`UserPromptSubmit` hook 已存在,可用于清零,该信号定义明确
+  (用户已 N 次工具调用未介入),不依赖无定义的"无进展"判断,也不解析 transcript。
+- 注: 这推翻了上一版"必须过 LLM 精判才阻断"的取向。该取向意在降低误伤,但其依赖的
+  同步精判不可实现;保留它等于保留一个永不生效的安全阀。
+
+**B6. 信任引导必须多 hook 化,且 doctor 须能报不健康。**
+
+- 依据 [E-6] 与 `src/codex-host.mjs:227,298`。
+- 做法: `synchronize` / `assessCodexHookListing` 改为遍历全部受管 hook;
+  当 guard hook 已写入但未获信任时,doctor 的 `ready` 必须为 **false**。
+- **这是本失效中价值最高的一项**: 缺它则无论 B1–B5 多正确,guard 都不会执行,
+  且诊断显示健康——即上一轮失效形态的复制。
+
+**B7. 子 agent 无需额外接线。** 依据 [E-4]: 子 agent 的工具调用经过父 session 的 hook。
+逃生口在工具覆盖不全,不在继承。
+
+### B-风险(承认为未验证)
+
+- **[未验证] 每次工具调用挂 hook 进程的实际开销**: [E-1] 测得 0.23–0.43ms 仅为脚本自身,
+  不含进程启动。验证方式: 以真实自主任务测端到端延迟增量。失败后果: 需下调触发频率。
+- **[未验证] 误伤率**: 硬阻断拦错正常操作的代价高。缓解: 只拦 mutation 工具(读永不拦)、
+  提供环境变量逃生阀、探针自身异常/超时一律 fail-open 并记录诊断。
+
+## 其他已实证问题(本版纳入)
+
+**C1. 28% 复审从未抵达。** [E-10] 15/54 失败于 `provider_timeout` 等。
+即使 A 全部修好,这部分证据不进入系统。本版仅要求: 失败原因已落库可查,
+**不在本轮修复**(需独立定位 provider 侧问题)。
+
+**C2. 注入侧精度低。** [E-9] 任务开始与抱怨时选中的均为不相关经验。
+本版**不改选择器**(避免范围膨胀),但记录该事实: 即使 A 修好并发布了凭据经验,
+其能否在正确时点被选中仍未验证。
+
+## 非目标
+
+- 不改 convergence guard 的判定标准(标准本身合理,问题在接线)。
+- 不引入常驻进程。
+- 不改选择器(见 C2)。
+- 不修 provider 失败(见 C1)。
+- 不做与本失效无关的重构。
+
+## 验收(每条须给出证据,不接受"已完成"声明)
+
+| 项 | 验收方式 |
+|----|----------|
+| A1 | 以真实的两条凭据抱怨为夹具,中间插 ≥15 条无关 prompt,断言复发计数为 2 |
+| A2 | 断言复审上下文含已知 family key 及计数 |
+| A3 | 重复 job 夹具,断言计数不虚高 |
+| A5 | 任一 no_lesson 结案后可查得判定原因 |
+| B1/B2 | 越阈时返回 `{"decision":"block",...}`,且真实 codex 会话中工具调用被拦下 |
+| B3 | hook 日志含所见全部 `tool_name`;`apply_patch` 在覆盖之内 |
+| B4 | claude 侧不产生阻断决定;gemini 无执行期接线 |
+| B6 | guard hook 已写入但未信任时,`doctor` 的 `ready` 为 false |
+| 全局 | `node --test` 全绿;无对已删除机制的悬挂引用 |
+
+测试须遵守: 子进程一律经 `spawnTracked` 并在 `finally`/`t.after` 中
+`killTrackedChild`;共享状态写入路径须实跑并发以验证无死锁。
+
+## 附录 A: 上一版规格的三处错误
+
+留档以便追溯"实证结论未被带进规格"这一失败机制。
+
+| 错误 | 上一版所写 | 实证事实 |
+|------|-----------|---------|
+| 触发点 | `PostToolUse` | [E-2][E-3] 证明 `PreToolUse` 才可阻断;PostToolUse 在 mutation 之后 |
+| 阻断强度 | 软阻断 `systemMessage` | [E-4] 证明 agent 会写复盘文档自我批准后继续 |
+| 信任门 | 未提及 | [E-6] 与 `codex-host.mjs:298` 表明未信任的 hook 不执行且 doctor 报健康 |
+
+第三项曾由对抗性评审以 SEV-1 提出,规格编写时未纳入。
