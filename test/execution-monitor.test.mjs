@@ -26,7 +26,11 @@ async function storeFixture(t) {
 }
 
 function payload({ sessionId = "session-a", toolName = "apply_patch", file = "a.txt" } = {}) {
-  const patch = ["*** Begin Patch", "*** Update File: " + file, "*** End Patch"].join("\n");
+  // Rework replaces earlier content; a patch that only appends does not count.
+  const patch = [
+    "*** Begin Patch", "*** Update File: " + file, "@@",
+    "-previous line", "+replacement line", "*** End Patch"
+  ].join("\n");
   return {
     session_id: sessionId,
     tool_name: toolName,
@@ -243,7 +247,9 @@ test("repeated file creation is not counted as rework", async (t) => {
 });
 
 test("rework targets are opaque and identify the artifact, not its path", () => {
-  const patch = (file) => ({ command: ["*** Begin Patch", `*** Update File: ${file}`, "*** End Patch"].join("\n") });
+  const patch = (file) => ({
+    command: ["*** Begin Patch", `*** Update File: ${file}`, "@@", "-old", "+new", "*** End Patch"].join("\n")
+  });
   const a = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/a.txt") });
   const b = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/a.txt") });
   const c = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/b.txt") });
@@ -258,44 +264,54 @@ test("rework targets are opaque and identify the artifact, not its path", () => 
   assert.equal(deriveReworkTarget({ toolName: "Bash", toolInput: { command: "ls -la" } }), null);
 });
 
-// A progress log is meant to be appended to as work proceeds. Counting it as
-// rework stopped a run that was converging: the agent had made two code passes
-// and was recording evidence for each review item, and the guard read those
-// bookkeeping writes as the same file being refined over and over.
-test("bookkeeping files are never counted as rework", () => {
-  const patch = (file) => ({
-    command: ["*** Begin Patch", `*** Update File: ${file}`, "*** End Patch"].join("\n")
+// Repeated writes to one file come in two shapes. Recording progress appends;
+// reworking deletes what was written before and replaces it. Deciding on that
+// difference — rather than on a list of "bookkeeping paths" — is what keeps the
+// guard from stopping a run for updating a file nobody thought to enumerate.
+test("a pure append is never rework, whatever the file is called", () => {
+  const patch = (file, body) => ({
+    command: ["*** Begin Patch", `*** Update File: ${file}`, "@@", ...body, "*** End Patch"].join("\n")
   });
-  const target = (file) => deriveReworkTarget({ toolName: "apply_patch", toolInput: patch(file) });
+  const target = (file, body) => deriveReworkTarget({ toolName: "apply_patch", toolInput: patch(file, body) });
 
-  for (const file of [
-    "openspec/changes/feature/.comet/subagent-progress.md",
-    ".comet/subagent-progress.md",
-    ".superpowers/state.md",
-    "openspec/changes/feature/tasks.md",
-    ".agent/reflections/20260729-lesson.md",
-    "build/run.log",
-    "events.jsonl"
-  ]) {
-    assert.equal(target(file), null, `${file} records progress; it is not rework`);
+  // Names that appear on no list anywhere still escape, because appending is
+  // the file accumulating rather than the task circling.
+  for (const file of [".comet/subagent-progress.md", "notes.md", "report-xyz.md", "src/code.mjs"]) {
+    assert.equal(target(file, ["+one more line"]), null, `${file} was only appended to`);
   }
 
-  for (const file of ["src/index.mjs", "lib/handler.ts", "docs/design.md", "README.md"]) {
-    assert.match(target(file) ?? "", /^[a-f0-9]{16}$/u, `${file} is real work and still counts`);
-  }
+  // And a progress file genuinely being rewritten is still caught, which a
+  // path-based exclusion would have missed forever.
+  assert.match(
+    target(".comet/subagent-progress.md", ["-- [x] step one", "+- [ ] step one redo"]) ?? "",
+    /^[a-f0-9]{16}$/u,
+    "replacing earlier content is rework wherever it happens"
+  );
+  assert.match(
+    target("src/code.mjs", ["-const a = 1;", "+const a = 2;"]) ?? "",
+    /^[a-f0-9]{16}$/u
+  );
 });
 
-test("a run editing only progress files is never stopped", async (t) => {
+test("an explicit edit tool counts unless it only appends", () => {
+  const edit = (input) => deriveReworkTarget({ toolName: "Edit", toolInput: input });
+  assert.match(edit({ file_path: "/tmp/x.mjs", old_string: "a", new_string: "b" }) ?? "", /^[a-f0-9]{16}$/u);
+  // An empty old_string is an insertion, not a replacement.
+  assert.equal(edit({ file_path: "/tmp/x.mjs", old_string: "", new_string: "b" }), null);
+  assert.equal(edit({ file_path: "/tmp/x.mjs", mode: "append" }), null);
+});
+
+test("a run that only appends is never stopped", async (t) => {
   const store = await storeFixture(t);
-  const progress = {
+  const appendOnly = {
     session_id: "session-a",
     tool_name: "apply_patch",
     tool_input: {
-      command: ["*** Begin Patch", "*** Update File: .comet/subagent-progress.md", "*** End Patch"].join("\n")
+      command: ["*** Begin Patch", "*** Update File: progress.md", "@@", "+- done", "*** End Patch"].join("\n")
     },
     hook_event_name: "PreToolUse"
   };
   for (let index = 0; index < 20; index += 1) {
-    assert.deepEqual(await callHook(store, progress, 2), { continue: true });
+    assert.deepEqual(await callHook(store, appendOnly, 2), { continue: true });
   }
 });

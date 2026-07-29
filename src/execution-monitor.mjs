@@ -26,26 +26,31 @@ const READ_ONLY_TOOLS = new Set([
 
 const MAX_TARGET_LABEL = 200;
 
-// Files whose whole purpose is to be appended to as work proceeds. Rewriting a
-// progress log ten times is the log working, not the task circling, and
-// counting it stops a run that was converging perfectly well.
-const BOOKKEEPING_TARGET = new RegExp([
-  // Workflow state written by orchestration skills as each step completes.
-  "(^|/)\\.comet(/|$)",
-  "(^|/)\\.superpowers(/|$)",
-  "(^|/)openspec/",
-  "(^|/)\\.agent/(reflections|rules)(/|$)",
-  // Progress, task and checkpoint notes under any of the above or beside them.
-  "(^|/)(subagent-)?progress\\.md$",
-  "(^|/)tasks\\.md$",
-  "(^|/)checkpoint\\.json$",
-  "(^|/)(CHANGELOG|TODO)\\.md$",
-  // Append-only by nature.
-  "\\.(log|jsonl)$"
-].join("|"), "u");
+// Repeated writes to one file come in two shapes, and only one is rework.
+//
+// Recording progress appends: each write adds lines and removes none, because
+// the file's purpose is to accumulate. Reworking rewrites: the agent deletes
+// what it wrote before and replaces it, which is what circling looks like.
+//
+// Deciding on content rather than on a list of "bookkeeping paths" matters
+// because that list is an open set. A run was once stopped for updating
+// .comet/subagent-progress.md; excluding that path would have left the same
+// mistake waiting under notes.md, report.md, or any name not yet enumerated.
+const PATCH_ADDED_LINE = /^\+(?!\+\+)/u;
+const PATCH_REMOVED_LINE = /^-(?!--)/u;
 
-function isBookkeepingTarget(value) {
-  return BOOKKEEPING_TARGET.test(value);
+/**
+ * Whether a patch replaces existing content rather than only adding to it.
+ * A pure append is the file doing its job; deleting prior lines to write them
+ * differently is the signal this guard is looking for.
+ */
+export function rewritesExistingContent(command) {
+  if (typeof command !== "string" || !command) return false;
+  let removed = 0;
+  for (const line of command.split("\n")) {
+    if (PATCH_REMOVED_LINE.test(line)) removed += 1;
+  }
+  return removed > 0;
 }
 
 function boundedIdentity(value) {
@@ -97,19 +102,19 @@ export function deriveReworkTarget({ toolName, toolInput } = {}) {
   if (!isMutatingTool(toolName)) return null;
   if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return null;
 
+  // An explicit edit tool names its target and always replaces content.
   for (const field of ["file_path", "filePath", "path", "notebook_path"]) {
     const value = toolInput[field];
-    if (typeof value === "string" && value.trim()) {
-      const target = value.trim();
-      return isBookkeepingTarget(target) ? null : hashedTarget(target);
-    }
+    if (typeof value !== "string" || !value.trim()) continue;
+    // A write that only appends is accumulating, not reworking.
+    const appendOnly = toolInput.old_string === "" || toolInput.mode === "append";
+    return appendOnly ? null : hashedTarget(value.trim());
   }
 
   const command = typeof toolInput.command === "string" ? toolInput.command : "";
   if (!command) return null;
-  // Only an edit to existing content is rework; creating a file is first work.
+  // Creating a file is first work, never rework.
   const updated = /^\*\*\* Update File: (.+)$/mu.exec(command);
   if (!updated) return null;
-  const target = updated[1].trim();
-  return isBookkeepingTarget(target) ? null : hashedTarget(target);
+  return rewritesExistingContent(command) ? hashedTarget(updated[1].trim()) : null;
 }

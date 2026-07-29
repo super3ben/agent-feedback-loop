@@ -1466,7 +1466,10 @@ describe("agent-feedback-loop package", () => {
     const paths = pathsFor(home);
     const env = { ...process.env, HOME: home, TMPDIR: home };
     // The guard counts rework of one artifact, so the payload has to say which.
-    const hookPatch = ["*** Begin Patch", "*** Update File: guarded.txt", "*** End Patch"].join("\n");
+    const hookPatch = [
+      "*** Begin Patch", "*** Update File: guarded.txt", "@@",
+      "-previous", "+replacement", "*** End Patch"
+    ].join("\n");
     const hookInput = JSON.stringify({
       session_id: "installed-execution-session",
       tool_name: "apply_patch",
