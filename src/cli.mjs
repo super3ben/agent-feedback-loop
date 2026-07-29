@@ -19,12 +19,10 @@ import { executeGuardCli } from "./convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "./convergence-probe-context.mjs";
 import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 import { ensureRepositoryLineage } from "./convergence-identity.mjs";
-import { handleExecutionHook } from "./execution-hook.mjs";
-import { launchDetachedExecutionProbe } from "./execution-probe-launcher.mjs";
-import { runExecutionMonitorProbe } from "./execution-probe-runner.mjs";
+import { handleExecutionHook, resetExecutionMonitorForPrompt } from "./execution-hook.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
-const EXECUTION_HOOK_EVENTS = new Set(["PostToolUse", "AfterTool"]);
+const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
 
 function optionValue(args, name, fallback = null) {
   const index = args.indexOf(name);
@@ -657,42 +655,9 @@ export async function executeConvergenceProbeRun({ home, taskUid, fingerprint },
   }
 }
 
-export async function executeExecutionProbeRun({ home, monitorId, reservationEpoch }, {
-  provider
-} = {}) {
-  const paths = pathsFor(home);
-  const store = openControlStore({ paths });
-  try {
-    const monitor = store.getExecutionMonitor({ monitorId });
-    if (!monitor) throw Object.assign(new Error("execution_monitor_not_found"), { code: "execution_monitor_not_found" });
-    let boundedProvider = provider;
-    if (boundedProvider === undefined) {
-      const executable = await resolveReviewerExecutable({ cli: monitor.cli, env: process.env });
-      boundedProvider = (context, { resultKind }) => runReviewerProvider({
-        cli: monitor.cli,
-        executable,
-        context,
-        resultKind,
-        policyFile: paths.geminiReviewerPolicy,
-        geminiSettingsFile: paths.geminiReviewerSettings,
-        env: process.env
-      });
-    }
-    return await runExecutionMonitorProbe({
-      store,
-      monitorId,
-      reservationEpoch,
-      ownerId: `execution-probe-${process.pid}`,
-      provider: boundedProvider
-    });
-  } finally {
-    store.close();
-  }
-}
 
 export async function main(args, {
   runConvergenceProbeCommand = executeConvergenceProbeRun,
-  runExecutionProbeCommand = executeExecutionProbeRun
 } = {}) {
   if (args[0] === "lineage-init") {
     const machine = await executeLineageInitCli(args);
@@ -790,14 +755,6 @@ export async function main(args, {
     });
     return;
   }
-  if (command === "execution-probe-run") {
-    await runExecutionProbeCommand({
-      home: options.home,
-      monitorId: optionValue(options.args, "--monitor-id"),
-      reservationEpoch: Number(optionValue(options.args, "--reservation-epoch"))
-    });
-    return;
-  }
   if (command === "reviewer-run") {
     const paths = pathsFor(options.home);
     const store = openControlStore({ paths });
@@ -885,22 +842,14 @@ export async function main(args, {
           payload,
           cli,
           controlStore,
-          launchProbe({ monitorId, reservationEpoch }) {
-            return launchDetachedExecutionProbe({
-              platform: process.platform,
-              nodeExecutable: process.execPath,
-              cliFile: CLI_FILE,
-              home: paths.home,
-              monitorId,
-              reservationEpoch,
-              env: process.env
-            });
-          },
           writeResponse,
           nativeResponse: { continue: true }
         });
         return;
       }
+      // The user submitting a prompt is the intervention the execution counter
+      // measures, so clear it before the prompt path runs.
+      resetExecutionMonitorForPrompt({ payload, cli, controlStore });
       const blobs = new EncryptedBlobStore({
         root: paths.blobRoot,
         keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })

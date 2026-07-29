@@ -64,21 +64,9 @@ const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
 const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
-const EXECUTION_MONITOR_MAX_FAILURES = 3;
-const EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS = 3;
 const EXECUTION_MONITOR_MAX_STORED = 128;
+const EXECUTION_MONITOR_MAX_TOOLS = 64;
 const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
-const EXECUTION_MONITOR_STATES = new Set(["idle", "reserved", "running", "retryable", "completed", "failed"]);
-const EXECUTION_MONITOR_FAILURE_ASSESSMENTS = new Set([
-  "wrong_direction", "overdesigned", "overoptimized", "scope_drift", "acceptance_already_satisfied"
-]);
-const EXECUTION_MONITOR_ASSESSMENTS = new Set([
-  ...EXECUTION_MONITOR_FAILURE_ASSESSMENTS, "aligned_and_necessary", "insufficient_evidence"
-]);
-const EXECUTION_MONITOR_ACTIONS = new Set([
-  "continue_once", "simplify_current_generation", "rollback_to_generation",
-  "direction_checkpoint", "human_decision", "finish_now"
-]);
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
 const READ_ONLY_COPY_CHUNK_BYTES = 64 * 1024;
@@ -476,71 +464,29 @@ function executionMonitorId(value) {
   return monitorId;
 }
 
-function executionMonitorMetrics(value) {
-  const fields = ["turnCount", "toolCallCount", "elapsedMs", "consecutiveNoProgress"];
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).length !== fields.length || fields.some((field) => !Object.hasOwn(value, field))) {
-    throw new TypeError("execution monitor metrics are invalid");
-  }
-  return Object.fromEntries(fields.map((field) => {
-    const metric = value[field];
-    if (!Number.isSafeInteger(metric) || metric < 0 || metric > MAX_CONTEXT_EPOCH) {
-      throw new TypeError("execution monitor metrics are invalid");
-    }
-    return [field, metric];
-  }));
-}
-
-function optionalExecutionTimestamp(value, field) {
-  if (value === null) return null;
-  return timezoneTimestamp(value, field);
-}
-
 function executionMonitorState(value, monitorId) {
   if (!value || typeof value !== "object" || Array.isArray(value)
-      || value.version !== 1 || value.monitorId !== monitorId
+      || value.monitorId !== monitorId
       || !EXECUTION_MONITOR_CLIS.has(value.cli)
-      || !EXECUTION_MONITOR_STATES.has(value.probeState)
-      || !Number.isSafeInteger(value.failureCount) || value.failureCount < 0
-      || value.failureCount > EXECUTION_MONITOR_MAX_FAILURES
-      || !Number.isSafeInteger(value.reservationEpoch) || value.reservationEpoch < 0
-      || !Number.isSafeInteger(value.reservationAttempt) || value.reservationAttempt < 0
-      || value.reservationAttempt > EXECUTION_MONITOR_MAX_RESERVATION_ATTEMPTS) {
+      || !Number.isSafeInteger(value.count) || value.count < 0 || value.count > MAX_CONTEXT_EPOCH
+      || typeof value.overLimit !== "boolean"
+      || !value.seenTools || typeof value.seenTools !== "object" || Array.isArray(value.seenTools)) {
     throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
   }
-  const snapshotDigest = assertString(value.snapshotDigest, "snapshotDigest", 64);
-  if (!SHA256_PATTERN.test(snapshotDigest)) throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
-  let reservationSnapshotDigest = null;
-  if (value.reservationSnapshotDigest !== null) {
-    reservationSnapshotDigest = assertString(value.reservationSnapshotDigest, "reservationSnapshotDigest", 64);
-    if (!SHA256_PATTERN.test(reservationSnapshotDigest)) {
+  const seenTools = {};
+  for (const [label, seen] of Object.entries(value.seenTools)) {
+    if (label.length < 1 || label.length > 64 || !/^[A-Za-z0-9_.:-]+$/u.test(label)
+        || !Number.isSafeInteger(seen) || seen < 0 || seen > MAX_CONTEXT_EPOCH) {
       throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
     }
-  }
-  const resultDigest = value.resultDigest === null ? null : assertString(value.resultDigest, "resultDigest", 64);
-  if (resultDigest !== null && !SHA256_PATTERN.test(resultDigest)) {
-    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+    seenTools[label] = seen;
   }
   return {
-    version: 1,
     monitorId,
     cli: value.cli,
-    metrics: executionMonitorMetrics(value.metrics),
-    snapshotDigest,
-    failureCount: value.failureCount,
-    probeState: value.probeState,
-    reservationEpoch: value.reservationEpoch,
-    reservationAttempt: value.reservationAttempt,
-    reservationSnapshotDigest,
-    reservationMetrics: value.reservationMetrics === null ? null : executionMonitorMetrics(value.reservationMetrics),
-    reservationUntil: optionalExecutionTimestamp(value.reservationUntil, "reservationUntil"),
-    ownerId: assertOptionalString(value.ownerId, "ownerId", 512),
-    leaseUntil: optionalExecutionTimestamp(value.leaseUntil, "leaseUntil"),
-    assessment: assertOptionalString(value.assessment, "assessment", 64),
-    action: assertOptionalString(value.action, "action", 64),
-    resultDigest,
-    reasonCode: assertOptionalString(value.reasonCode, "reasonCode", 64),
-    updatedAt: timezoneTimestamp(value.updatedAt, "updatedAt")
+    count: value.count,
+    overLimit: value.overLimit,
+    seenTools
   };
 }
 
@@ -1679,251 +1625,70 @@ function createStore(database, now) {
       }
       return executionMonitorState(parsed, safeMonitorId);
     },
-    observeExecutionMonitor({
-      monitorId,
-      cli,
-      metrics,
-      snapshotDigest,
-      thresholdReached,
-      reservationMs
-    }) {
+    // Counts one tool call for a session and reports whether the run has passed
+    // the point where the user should be handed control back. The count is
+    // "tool calls since the user last spoke", so the prompt hook resets it.
+    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, limit }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
-      const safeMetrics = executionMonitorMetrics(metrics);
-      const safeSnapshotDigest = assertString(snapshotDigest, "snapshotDigest", 64);
-      if (!SHA256_PATTERN.test(safeSnapshotDigest)) throw new TypeError("snapshotDigest must be a sha256");
-      if (typeof thresholdReached !== "boolean") throw new TypeError("thresholdReached must be boolean");
-      const safeReservationMs = assertMilliseconds(reservationMs, "reservationMs");
-      if (safeReservationMs < 1 || safeReservationMs > 300_000) throw new TypeError("reservationMs is out of range");
+      if (typeof mutating !== "boolean") throw new TypeError("mutating must be boolean");
+      const safeLabel = assertString(toolLabel, "toolLabel", 64);
+      const safeLimit = assertLimit(limit, "limit", 48, 4096);
+      if (safeLimit < 1) throw new TypeError("limit must be positive");
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
-        const timestamp = nowIso(now);
-        const currentTime = Date.parse(timestamp);
         const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        let state;
+        let state = null;
         if (existingRow) {
           let parsed;
-          try { parsed = JSON.parse(existingRow.value); } catch {
+          try {
+            parsed = JSON.parse(existingRow.value);
+          } catch {
             throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
           }
           state = executionMonitorState(parsed, safeMonitorId);
-          if (state.cli !== safeCli) throw new ControlStoreError("execution_monitor_collision", "execution monitor collision");
-          if (safeMetrics.toolCallCount < state.metrics.toolCallCount
-              || safeMetrics.elapsedMs < state.metrics.elapsedMs
-              || safeMetrics.turnCount < state.metrics.turnCount) {
-            return { ...state, reserved: false, reason: "stale_snapshot" };
+          if (state.cli !== safeCli) {
+            throw new ControlStoreError("execution_monitor_collision", "execution monitor collision");
           }
-        } else {
-          state = {
-            version: 1,
-            monitorId: safeMonitorId,
-            cli: safeCli,
-            metrics: safeMetrics,
-            snapshotDigest: safeSnapshotDigest,
-            failureCount: 0,
-            probeState: "idle",
-            reservationEpoch: 0,
-            reservationAttempt: 0,
-            reservationSnapshotDigest: null,
-            reservationMetrics: null,
-            reservationUntil: null,
-            ownerId: null,
-            leaseUntil: null,
-            assessment: null,
-            action: null,
-            resultDigest: null,
-            reasonCode: null,
-            updatedAt: timestamp
-          };
         }
-        state.metrics = safeMetrics;
-        state.snapshotDigest = safeSnapshotDigest;
-        state.updatedAt = timestamp;
-        let reserved = false;
-        if (thresholdReached) {
-          const activeUntil = state.probeState === "running" ? state.leaseUntil : state.reservationUntil;
-          const active = ["reserved", "running"].includes(state.probeState)
-            && activeUntil !== null && Date.parse(activeUntil) > currentTime;
-          const expired = ["reserved", "running"].includes(state.probeState) && !active;
-          if (state.probeState === "idle") {
-            state.probeState = "reserved";
-            state.reservationEpoch += 1;
-            state.reservationAttempt = 1;
-            state.reservationSnapshotDigest = safeSnapshotDigest;
-            state.reservationMetrics = safeMetrics;
-            state.reservationUntil = new Date(currentTime + safeReservationMs).toISOString();
-            state.ownerId = null;
-            state.leaseUntil = null;
-            state.assessment = null;
-            state.action = null;
-            state.resultDigest = null;
-            state.reasonCode = null;
-            reserved = true;
-          } else if (expired) {
-            const expiredProbeState = state.probeState;
-            state.probeState = "failed";
-            state.reservationUntil = null;
-            state.ownerId = null;
-            state.leaseUntil = null;
-            state.reasonCode = expiredProbeState === "running" ? "lease_expired" : "reservation_expired";
-          }
-        } else {
-          state.probeState = "idle";
-          state.reservationAttempt = 0;
-          state.reservationSnapshotDigest = null;
-          state.reservationMetrics = null;
-          state.reservationUntil = null;
-          state.ownerId = null;
-          state.leaseUntil = null;
+        const count = Math.min(MAX_CONTEXT_EPOCH, (state?.count ?? 0) + 1);
+        const seenTools = { ...(state?.seenTools ?? {}) };
+        if (Object.hasOwn(seenTools, safeLabel) || Object.keys(seenTools).length < EXECUTION_MONITOR_MAX_TOOLS) {
+          seenTools[safeLabel] = Math.min(MAX_CONTEXT_EPOCH, (seenTools[safeLabel] ?? 0) + 1);
         }
+        const next = {
+          monitorId: safeMonitorId,
+          cli: safeCli,
+          count,
+          seenTools,
+          overLimit: count > safeLimit
+        };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
-          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(state));
-        const retainedRows = database.prepare("SELECT key, value FROM store_meta WHERE key LIKE ?")
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(next));
+        const retainedRows = database.prepare("SELECT key FROM store_meta WHERE key LIKE ? ORDER BY key")
           .all(`${EXECUTION_MONITOR_META_PREFIX}%`);
-        const overflow = retainedRows.length - EXECUTION_MONITOR_MAX_STORED;
-        if (overflow > 0) {
-          const inactiveRows = retainedRows.flatMap((row) => {
-            try {
-              const retained = executionMonitorState(
-                JSON.parse(row.value),
-                row.key.slice(EXECUTION_MONITOR_META_PREFIX.length)
-              );
-              // Terminal episodes remain fenced until a below-threshold observation rearms them.
-              return retained.probeState === "idle" ? [{ key: row.key, updatedAt: retained.updatedAt }] : [];
-            } catch {
-              return [];
-            }
-          }).sort((left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.key.localeCompare(right.key));
-          if (inactiveRows.length < overflow) {
-            if (!existingRow) {
-              database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
-              return { ...state, reserved: false, reason: "capacity_exhausted" };
-            }
-            throw new ControlStoreError("execution_monitor_capacity_exhausted", "execution monitor capacity exhausted");
-          }
+        if (retainedRows.length > EXECUTION_MONITOR_MAX_STORED) {
           const deleteRow = database.prepare("DELETE FROM store_meta WHERE key=?");
-          for (const inactiveRow of inactiveRows.slice(0, overflow)) deleteRow.run(inactiveRow.key);
+          for (const stale of retainedRows.slice(0, retainedRows.length - EXECUTION_MONITOR_MAX_STORED)) {
+            if (stale.key !== key) deleteRow.run(stale.key);
+          }
         }
-        return { ...state, reserved };
+        // Only mutating calls are stopped: a read can still run so the agent is
+        // able to summarise and hand back rather than being struck mute.
+        return { ...next, stop: next.overLimit && mutating };
       });
     },
-    releaseExecutionMonitorProbe({ monitorId, reservationEpoch }) {
+    // The user speaking is the intervention the counter measures, so the prompt
+    // hook clears it. Absent state is not an error: the session may be new.
+    resetExecutionMonitor({ monitorId }) {
       const safeMonitorId = executionMonitorId(monitorId);
-      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
-        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        if (!row) return { released: false };
-        let state;
-        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
-          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
-        }
-        if (state.probeState !== "reserved" || state.reservationEpoch !== safeEpoch) return { released: false };
-        state.probeState = "failed";
-        state.reservationUntil = null;
-        state.reasonCode = "spawn_failed";
-        state.updatedAt = nowIso(now);
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
-        return { released: true };
-      });
-    },
-    claimExecutionMonitorProbe({ monitorId, reservationEpoch, ownerId, leaseMs }) {
-      const safeMonitorId = executionMonitorId(monitorId);
-      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
-      const safeOwnerId = assertString(ownerId, "ownerId", 512);
-      const safeLeaseMs = assertMilliseconds(leaseMs, "leaseMs");
-      if (safeLeaseMs < 1 || safeLeaseMs > 300_000) throw new TypeError("leaseMs is out of range");
-      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
-      return transaction(() => {
-        const timestamp = nowIso(now);
-        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        if (!row) throw executionProbeLeaseLost();
-        let state;
-        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
-          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
-        }
-        if (state.probeState !== "reserved" || state.reservationEpoch !== safeEpoch
-            || state.reservationUntil === null || Date.parse(state.reservationUntil) <= Date.parse(timestamp)) {
-          throw executionProbeLeaseLost();
-        }
-        state.probeState = "running";
-        state.ownerId = safeOwnerId;
-        state.reservationUntil = null;
-        state.leaseUntil = new Date(Date.parse(timestamp) + safeLeaseMs).toISOString();
-        state.updatedAt = timestamp;
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
-        return { ...state };
-      });
-    },
-    completeExecutionMonitorProbe({
-      monitorId,
-      reservationEpoch,
-      ownerId,
-      assessment,
-      action = null,
-      resultDigest
-    }) {
-      const safeMonitorId = executionMonitorId(monitorId);
-      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
-      const safeOwnerId = assertString(ownerId, "ownerId", 512);
-      const safeAssessment = assertString(assessment, "assessment", 64);
-      if (!EXECUTION_MONITOR_ASSESSMENTS.has(safeAssessment)) throw new TypeError("assessment is invalid");
-      const safeAction = action === null ? null : assertString(action, "action", 64);
-      if (safeAction !== null && !EXECUTION_MONITOR_ACTIONS.has(safeAction)) throw new TypeError("action is invalid");
-      const safeResultDigest = assertString(resultDigest, "resultDigest", 64);
-      if (!SHA256_PATTERN.test(safeResultDigest)) throw new TypeError("resultDigest must be a sha256");
-      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
-      return transaction(() => {
-        const timestamp = nowIso(now);
-        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        if (!row) throw executionProbeLeaseLost();
-        let state;
-        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
-          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
-        }
-        if (state.probeState !== "running" || state.reservationEpoch !== safeEpoch
-            || state.ownerId !== safeOwnerId || state.leaseUntil === null
-            || Date.parse(state.leaseUntil) <= Date.parse(timestamp)) throw executionProbeLeaseLost();
-        if (EXECUTION_MONITOR_FAILURE_ASSESSMENTS.has(safeAssessment)) {
-          state.failureCount = Math.min(EXECUTION_MONITOR_MAX_FAILURES, state.failureCount + 1);
-        }
-        state.probeState = "completed";
-        state.ownerId = null;
-        state.leaseUntil = null;
-        state.assessment = safeAssessment;
-        state.action = safeAction;
-        state.resultDigest = safeResultDigest;
-        state.reasonCode = null;
-        state.updatedAt = timestamp;
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
-        return { ...state };
-      });
-    },
-    failExecutionMonitorProbe({ monitorId, reservationEpoch, ownerId, reasonCode }) {
-      const safeMonitorId = executionMonitorId(monitorId);
-      const safeEpoch = requiredEpoch(reservationEpoch, "reservationEpoch");
-      const safeOwnerId = assertString(ownerId, "ownerId", 512);
-      const safeReasonCode = assertString(reasonCode, "reasonCode", 64);
-      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
-      return transaction(() => {
-        const timestamp = nowIso(now);
-        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        if (!row) throw executionProbeLeaseLost();
-        let state;
-        try { state = executionMonitorState(JSON.parse(row.value), safeMonitorId); } catch {
-          throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
-        }
-        if (state.probeState !== "running" || state.reservationEpoch !== safeEpoch
-            || state.ownerId !== safeOwnerId || state.leaseUntil === null
-            || Date.parse(state.leaseUntil) <= Date.parse(timestamp)) throw executionProbeLeaseLost();
-        state.probeState = "failed";
-        state.ownerId = null;
-        state.leaseUntil = null;
-        state.reasonCode = safeReasonCode;
-        state.updatedAt = timestamp;
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(state), key);
-        return { ...state };
+        const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!existingRow) return { reset: false };
+        database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+        return { reset: true };
       });
     },
     recordCaptureFailOpen({ eventType, reasonCode, sourceProvider = null, sessionUid = null, eventUid = null, createdAt }) {

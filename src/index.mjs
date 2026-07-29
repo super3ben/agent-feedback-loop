@@ -40,9 +40,7 @@ const CONVERGENCE_MODULES = Object.freeze([
   "convergence-sdd-adapter.mjs",
   "convergence-store.mjs",
   "execution-hook.mjs",
-  "execution-monitor.mjs",
-  "execution-probe-launcher.mjs",
-  "execution-probe-runner.mjs"
+  "execution-monitor.mjs"
 ]);
 const REMOVED_GATE_ASSET_STEMS = Object.freeze([
   ["semantic", "dissatisfaction", "gate"].join("-")
@@ -64,8 +62,8 @@ const CLIS = [
     configPath: [".codex", "config.toml"],
     hookEvent: "UserPromptSubmit",
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "codex", "--continue"],
-    executionHookEvent: "PostToolUse",
-    executionHookArgs: ["--event", "PostToolUse", "--cli", "codex", "--continue"],
+    executionHookEvent: "PreToolUse",
+    executionHookArgs: ["--event", "PreToolUse", "--cli", "codex", "--continue"],
     legacyStopEvent: "Stop",
     hookTimeout: 5,
     timeoutUnit: "seconds"
@@ -78,8 +76,6 @@ const CLIS = [
     configPath: [".claude", "settings.json"],
     hookEvent: "UserPromptSubmit",
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "claude"],
-    executionHookEvent: "PostToolUse",
-    executionHookArgs: ["--event", "PostToolUse", "--cli", "claude", "--continue"],
     legacyStopEvent: "Stop",
     hookTimeout: 5,
     timeoutUnit: "seconds"
@@ -92,8 +88,6 @@ const CLIS = [
     configPath: [".gemini", "settings.json"],
     hookEvent: "BeforeAgent",
     hookArgs: ["--event", "BeforeAgent", "--cli", "gemini"],
-    executionHookEvent: "AfterTool",
-    executionHookArgs: ["--event", "AfterTool", "--cli", "gemini", "--continue"],
     legacyStopEvent: "AfterAgent",
     hookTimeout: 5000,
     timeoutUnit: "milliseconds"
@@ -368,8 +362,7 @@ function codexHookBlock(paths, cli) {
   return [
     CODEX_MARKER_START,
     ...eventBlock(cli.hookEvent, "prompt"),
-    "",
-    ...eventBlock(cli.executionHookEvent, "execution"),
+    ...(cli.executionHookEvent ? ["", ...eventBlock(cli.executionHookEvent, "execution")] : []),
     CODEX_MARKER_END
   ].join("\n");
 }
@@ -388,6 +381,7 @@ function removeJsonHookEntries(settings, paths, cli) {
       || prompt.includes(paths.promptFile);
   };
   for (const event of [cli.hookEvent, cli.executionHookEvent, cli.legacyStopEvent]) {
+    if (!event) continue;
     const hooks = settings.hooks?.[event];
     if (!Array.isArray(hooks)) continue;
     settings.hooks[event] = hooks
@@ -480,7 +474,9 @@ async function installJsonHooks(paths, cli, dryRun, actions) {
   await backup(configFile, dryRun, actions);
   const settings = removeJsonHookEntries(await readJsonSettings(configFile), paths, cli);
   settings.hooks = settings.hooks || {};
-  for (const [event, kind] of [[cli.hookEvent, "prompt"], [cli.executionHookEvent, "execution"]]) {
+  const events = [[cli.hookEvent, "prompt"]];
+  if (cli.executionHookEvent) events.push([cli.executionHookEvent, "execution"]);
+  for (const [event, kind] of events) {
     settings.hooks[event] = settings.hooks[event] || [];
     settings.hooks[event].push({
       matcher: "",

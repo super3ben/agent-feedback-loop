@@ -12,6 +12,8 @@ import { doctor, install, pathsFor, uninstall } from "../src/index.mjs";
 import * as cliModule from "../src/cli.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore, openControlStore } from "../src/control-store.mjs";
+import { EXECUTION_STOP_REASON } from "../src/execution-hook.mjs";
+import { EXECUTION_MUTATION_LIMIT, deriveExecutionMonitorId } from "../src/execution-monitor.mjs";
 import { executeGuardCli } from "../src/convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
 import { ensureRepositoryLineage, projectContract } from "../src/convergence-identity.mjs";
@@ -1288,7 +1290,7 @@ describe("agent-feedback-loop package", () => {
     assert.doesNotMatch(lines.join(""), /private|secret-user-text|full-review-body/u);
   });
 
-  it("installs prompt and execution host config and uninstalls only AFL entries", async () => {
+  it("installs the Codex-only execution guard and uninstalls only AFL entries", async () => {
     const home = await tempHome();
     const paths = pathsFor(home);
     await mkdir(path.dirname(paths.claudeSettings), { recursive: true });
@@ -1305,14 +1307,21 @@ describe("agent-feedback-loop package", () => {
     const claude = JSON.parse(await readFile(paths.claudeSettings, "utf8"));
     const gemini = JSON.parse(await readFile(paths.geminiSettings, "utf8"));
     assert.match(codex, /\[\[hooks\.UserPromptSubmit\]\]/);
-    assert.match(codex, /\[\[hooks\.PostToolUse\]\]/);
-    assert.match(codex, /--event' 'PostToolUse'.*--continue/u);
+    // The guard blocks before a tool runs; a post-run hook cannot stop a
+    // mutation that already happened.
+    assert.match(codex, /\[\[hooks\.PreToolUse\]\]/);
+    assert.match(codex, /--event' 'PreToolUse'.*--continue/u);
+    assert.doesNotMatch(codex, /\[\[hooks\.PostToolUse\]\]/);
     assert.doesNotMatch(codex, /\[\[hooks\.Stop\]\]|stop-hook\.sh/);
     assert.equal(claude.hooks.UserPromptSubmit.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("core-hook.sh") && hook.timeout === 5), true);
-    assert.equal(claude.hooks.PostToolUse.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("--event' 'PostToolUse") && hook.command?.includes("--continue") && hook.timeout === 5), true);
+    // Claude Code halts by itself after one refusal, so it gets no execution
+    // guard — and the user's own PostToolUse entry must survive untouched.
+    assert.equal(claude.hooks.PostToolUse.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("core-hook.sh")), false);
+    assert.equal(claude.hooks.PostToolUse.flatMap((entry) => entry.hooks).some((hook) => hook.command === "/opt/user/claude-post-tool"), true);
     assert.equal(claude.hooks.Stop?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("feedback-loop"))) ?? false, false);
     assert.equal(gemini.hooks.BeforeAgent.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("core-hook.sh") && hook.timeout === 5000), true);
-    assert.equal(gemini.hooks.AfterTool.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("--event' 'AfterTool") && hook.command?.includes("--continue") && hook.timeout === 5000), true);
+    assert.equal(gemini.hooks.AfterTool.flatMap((entry) => entry.hooks).some((hook) => hook.command?.includes("core-hook.sh")), false);
+    assert.equal(gemini.hooks.AfterTool.flatMap((entry) => entry.hooks).some((hook) => hook.command === "/opt/user/gemini-after-tool"), true);
     assert.equal(gemini.hooks.AfterAgent?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("feedback-loop"))) ?? false, false);
     assert.equal((await stat(paths.coreHook)).mode & 0o111, 0o111);
 
@@ -1321,10 +1330,8 @@ describe("agent-feedback-loop package", () => {
     const claudeAfter = JSON.parse(await readFile(paths.claudeSettings, "utf8"));
     const geminiAfter = JSON.parse(await readFile(paths.geminiSettings, "utf8"));
     assert.equal(claudeAfter.hooks.UserPromptSubmit?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("core-hook.sh"))) ?? false, false);
-    assert.equal(claudeAfter.hooks.PostToolUse?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("core-hook.sh"))) ?? false, false);
     assert.equal(claudeAfter.hooks.PostToolUse?.some((entry) => entry.hooks?.some((hook) => hook.command === "/opt/user/claude-post-tool")) ?? false, true);
     assert.equal(geminiAfter.hooks.BeforeAgent?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("core-hook.sh"))) ?? false, false);
-    assert.equal(geminiAfter.hooks.AfterTool?.some((entry) => entry.hooks?.some((hook) => hook.command?.includes("core-hook.sh"))) ?? false, false);
     assert.equal(geminiAfter.hooks.AfterTool?.some((entry) => entry.hooks?.some((hook) => hook.command === "/opt/user/gemini-after-tool")) ?? false, true);
   });
 
@@ -1452,61 +1459,50 @@ describe("agent-feedback-loop package", () => {
     assert.equal(`${codex.stderr}${claude.stderr}${gemini.stderr}`, "");
   });
 
-  it("installed execution hook returns the native soft-stop contract without entering prompt feedback", async (t) => {
+  it("installed execution hook hard-blocks past the limit without entering prompt feedback", async (t) => {
     const home = await tempHome();
     await install({ home, codexHost: unavailableCodexHost() });
     const paths = pathsFor(home);
-    const start = Date.parse("2026-07-28T00:00:00.000Z");
-    const records = [
-      { timestamp: new Date(start).toISOString(), type: "user", message: { role: "user", content: "begin" } },
-      { timestamp: new Date(start + 1).toISOString(), type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Progress." }] } }
-    ];
-    for (let index = 0; index < 32; index += 1) {
-      records.push({
-        timestamp: new Date(start + Math.round((2_700_000 * (index + 1)) / 32)).toISOString(),
-        type: "assistant",
-        message: { role: "assistant", content: [{ type: "tool_use", name: "bounded-tool", input: {} }] }
-      });
-    }
-    const transcriptPath = path.join(home, "execution-transcript.jsonl");
-    await writeFile(transcriptPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, { mode: 0o600 });
-    const env = {
-      ...process.env,
-      HOME: home,
-      TMPDIR: home,
-      AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST: "AGENT_FEEDBACK_LOOP_CODEX_COMMAND",
-      AGENT_FEEDBACK_LOOP_CODEX_COMMAND: path.join(home, "missing-codex")
-    };
-
-    const result = await runWithTrackedInput(t, paths.coreHook, JSON.stringify({
+    const env = { ...process.env, HOME: home, TMPDIR: home };
+    const hookInput = JSON.stringify({
       session_id: "installed-execution-session",
-      transcript_path: transcriptPath,
-      tool_name: "bounded-tool"
-    }), env, ["--event", "PostToolUse", "--cli", "codex", "--continue"]);
-
-    assert.deepEqual(JSON.parse(result.stdout), {
-      continue: true,
-      systemMessage: "Stop tool use now. Report verified results and finish with the smallest necessary next step."
+      tool_name: "apply_patch"
     });
-    assert.equal(result.stderr, "");
+    const guardArgs = ["--event", "PreToolUse", "--cli", "codex", "--continue"];
 
-    let state = null;
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const store = openControlStore({ paths });
-      try {
-        assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count, 0);
-        assert.equal(store.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
-        const row = store.database.prepare(
-          "SELECT value FROM store_meta WHERE key LIKE 'execution_monitor:v1:%'"
-        ).get();
-        state = row ? JSON.parse(row.value) : null;
-      } finally {
-        store.close();
+    const allowed = await runWithTrackedInput(t, paths.coreHook, hookInput, env, guardArgs);
+    assert.deepEqual(JSON.parse(allowed.stdout), { continue: true });
+    assert.equal(allowed.stderr, "");
+
+    // Drive the counter to the limit through the store the hook itself writes,
+    // so the block below exercises the real installed path rather than a stub.
+    const monitorId = deriveExecutionMonitorId({ cli: "codex", sessionId: "installed-execution-session" });
+    const store = openControlStore({ paths });
+    try {
+      for (let index = 0; index < EXECUTION_MUTATION_LIMIT; index += 1) {
+        store.recordExecutionToolCall({
+          monitorId, cli: "codex", mutating: true, toolLabel: "apply_patch", limit: EXECUTION_MUTATION_LIMIT
+        });
       }
-      if (["retryable", "failed"].includes(state?.probeState)) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      store.close();
     }
-    assert.equal(["retryable", "failed"].includes(state?.probeState), true);
+
+    const blocked = await runWithTrackedInput(t, paths.coreHook, hookInput, env, guardArgs);
+    assert.deepEqual(JSON.parse(blocked.stdout), {
+      decision: "block",
+      reason: EXECUTION_STOP_REASON
+    });
+    assert.equal(blocked.stderr, "");
+
+    // The guard path must never enter prompt feedback: no capture, no review.
+    const verify = openControlStore({ paths });
+    try {
+      assert.equal(verify.database.prepare("SELECT COUNT(*) AS count FROM reviewer_jobs").get().count, 0);
+      assert.equal(verify.database.prepare("SELECT COUNT(*) AS count FROM session_events").get().count, 0);
+    } finally {
+      verify.close();
+    }
   });
 
   it("dry-run install reports actions without writing files", async () => {

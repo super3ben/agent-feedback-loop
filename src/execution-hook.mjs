@@ -1,65 +1,73 @@
-import { deriveExecutionMonitorId, inspectExecutionTranscript } from "./execution-monitor.mjs";
+import {
+  EXECUTION_MUTATION_LIMIT,
+  deriveExecutionMonitorId,
+  executionToolLabel,
+  isMutatingTool
+} from "./execution-monitor.mjs";
 
-export const EXECUTION_STOP_MESSAGE = "Stop tool use now. Report verified results and finish with the smallest necessary next step.";
+export const EXECUTION_STOP_REASON = "Convergence guard: this run has made too many tool calls without the user stepping in. Stop, report what is verified and what is not, and wait for the user to decide the next step.";
 
-const SUPPORTED_CLIS = new Set(["codex", "claude", "gemini"]);
-const DEFAULT_RESERVATION_MS = 60_000;
+// Only Codex is hard-blocked. Claude Code halts on its own after one refusal
+// and hands control back, so blocking it buys nothing; Gemini has no evidence
+// behind it at all and is deliberately not wired.
+const GUARDED_CLIS = new Set(["codex"]);
 
+/**
+ * PreToolUse guard. Blocks before the tool runs — a post-run hook cannot stop a
+ * mutation that already happened, and an advisory message does not stop this
+ * agent either: when asked to review its own direction it wrote a review, then
+ * approved itself and carried on.
+ *
+ * Fails open on every internal error: a broken guard must not break the run.
+ */
 export async function handleExecutionHook({
   payload,
   cli,
   controlStore,
-  launchProbe = () => ({ attempted: false, reason: "unsupported_platform" }),
   writeResponse = async () => null,
-  nativeResponse = { continue: true }
+  nativeResponse = { continue: true },
+  limit = EXECUTION_MUTATION_LIMIT
 } = {}) {
   let response = { ...nativeResponse, continue: true };
   try {
-    if (!SUPPORTED_CLIS.has(cli) || !payload || typeof payload !== "object" || Array.isArray(payload)
-        || typeof controlStore?.observeExecutionMonitor !== "function") {
+    if (!GUARDED_CLIS.has(cli) || !payload || typeof payload !== "object" || Array.isArray(payload)
+        || typeof controlStore?.recordExecutionToolCall !== "function") {
       await writeResponse(response);
       return response;
     }
     const sessionId = payload.session_id ?? payload.sessionId;
-    const transcriptPath = payload.transcript_path ?? payload.transcriptPath;
+    const toolName = payload.tool_name ?? payload.toolName;
     const monitorId = deriveExecutionMonitorId({ cli, sessionId });
-    const inspected = await inspectExecutionTranscript({ transcriptPath });
-    if (!inspected) {
-      await writeResponse(response);
-      return response;
-    }
-    const observed = controlStore.observeExecutionMonitor({
+    const observed = controlStore.recordExecutionToolCall({
       monitorId,
       cli,
-      metrics: inspected.metrics,
-      snapshotDigest: inspected.snapshotDigest,
-      thresholdReached: inspected.thresholdReached,
-      reservationMs: DEFAULT_RESERVATION_MS
+      mutating: isMutatingTool(toolName),
+      toolLabel: executionToolLabel(toolName),
+      limit
     });
-    if (observed.reserved) {
-      try {
-        const launch = launchProbe({ monitorId, reservationEpoch: observed.reservationEpoch, cli });
-        if (launch?.attempted === false) {
-          try {
-            controlStore.releaseExecutionMonitorProbe({
-              monitorId,
-              reservationEpoch: observed.reservationEpoch
-            });
-          } catch {}
-        }
-      } catch {
-        try {
-          controlStore.releaseExecutionMonitorProbe({
-            monitorId,
-            reservationEpoch: observed.reservationEpoch
-          });
-        } catch {}
-      }
-      response = { ...response, systemMessage: EXECUTION_STOP_MESSAGE };
+    if (observed?.stop) {
+      response = { decision: "block", reason: EXECUTION_STOP_REASON };
     }
   } catch {
     response = { ...nativeResponse, continue: true };
   }
   try { await writeResponse(response); } catch {}
   return response;
+}
+
+/**
+ * Clears the counter when the user speaks. The counter means "tool calls since
+ * the user last intervened", so a new prompt is exactly the reset condition.
+ */
+export function resetExecutionMonitorForPrompt({ payload, cli, controlStore } = {}) {
+  try {
+    if (!GUARDED_CLIS.has(cli) || !payload || typeof payload !== "object" || Array.isArray(payload)
+        || typeof controlStore?.resetExecutionMonitor !== "function") return { reset: false };
+    const sessionId = payload.session_id ?? payload.sessionId;
+    return controlStore.resetExecutionMonitor({
+      monitorId: deriveExecutionMonitorId({ cli, sessionId })
+    });
+  } catch {
+    return { reset: false };
+  }
 }
