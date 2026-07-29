@@ -533,7 +533,8 @@ export async function install(options = {}) {
     codex = await codexHost.synchronize({
       home,
       cwd: options.cwd || process.cwd(),
-      promptCommand: hookCommand(paths, cli)
+      promptCommand: hookCommand(paths, cli),
+      guardCommand: cli.executionHookArgs ? hookCommand(paths, cli, "execution") : null
     });
     if (codex.runnable) {
       actions.push(`Codex prompt hook verified for a newly spawned app-server via ${codex.hostCommand || "host inspector"}`);
@@ -751,20 +752,28 @@ export async function doctor(options = {}) {
       const text = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
       const promptConnected = text.includes(paths.coreHook);
       const legacyStopPresent = text.includes(path.join(paths.packRoot, "hooks", "stop-hook.sh"));
-      const configured = promptConnected;
+      const guardCommand = cli.executionHookArgs ? hookCommand(paths, cli, "execution") : null;
+      const guardConfigured = Boolean(guardCommand) && text.includes(guardCommand);
+      const configured = promptConnected && (!guardCommand || guardConfigured);
       const codexHost = options.codexHost || createCodexHost({ version: RUNTIME_VERSION });
       const host = await codexHost.inspect({
         home,
         cwd: options.cwd || process.cwd(),
-        promptCommand: hookCommand(paths, cli)
+        promptCommand: hookCommand(paths, cli),
+        guardCommand
       });
       const runnable = configured && host.runnable;
       clis[cli.id] = {
         connected: runnable,
         configured,
         runnable,
-        promptConnected: configured && Boolean(host.prompt?.runnable),
+        promptConnected: promptConnected && Boolean(host.prompt?.runnable),
         promptConfigured: promptConnected,
+        // A guard written into config but never trusted does not fire, so it is
+        // surfaced separately instead of hiding behind the prompt hook's status.
+        guardConnected: guardConfigured && Boolean(host.guard?.runnable),
+        guardConfigured,
+        guardTrustStatus: host.guard?.trustStatus || "unknown",
         legacyStopPresent,
         promptTrustStatus: host.prompt?.trustStatus || "unknown",
         status: host.status,

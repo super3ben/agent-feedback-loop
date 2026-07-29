@@ -202,7 +202,15 @@ function hookSummary(hook) {
   };
 }
 
-export function assessCodexHookListing({ listing, cwd, home, promptCommand }) {
+// The app-server has reported `userPromptSubmit` for the prompt hook; the exact
+// spelling it uses for other events is not pinned down, so every event we match
+// on accepts the camelCase, snake_case, and PascalCase spellings.
+const EVENT_ALIASES = Object.freeze({
+  userPromptSubmit: ["userPromptSubmit", "user_prompt_submit", "UserPromptSubmit"],
+  preToolUse: ["preToolUse", "pre_tool_use", "PreToolUse"]
+});
+
+export function assessCodexHookListing({ listing, cwd, home, promptCommand, guardCommand = null }) {
   const rows = Array.isArray(listing?.data) ? listing.data : [];
   const target = rows.find((row) => row?.cwd && canonicalPath(row.cwd) === canonicalPath(cwd));
   if (!target) {
@@ -212,13 +220,14 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand }) {
       runnable: false,
       status: "cwd_missing",
       prompt: hookSummary(null),
+      guard: guardCommand ? hookSummary(null) : null,
       warnings: [],
       errors: []
     };
   }
   const hooks = Array.isArray(target.hooks) ? target.hooks : [];
   const expectedSourcePath = path.join(home, ".codex", "config.toml");
-  const matchesIdentity = (hook, eventName, command) => hook?.eventName === eventName
+  const matchesIdentity = (hook, eventName, command) => EVENT_ALIASES[eventName].includes(hook?.eventName)
     && hook?.handlerType === "command"
     && hook?.source === "user"
     && hook?.sourcePath
@@ -226,12 +235,19 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand }) {
     && hook?.command === command;
   const promptHook = hooks.find((hook) => matchesIdentity(hook, "userPromptSubmit", promptCommand));
   const prompt = hookSummary(promptHook);
-  const configured = prompt.found;
-  const runnable = configured && prompt.runnable;
+  // The execution-period guard only counts when the caller supplies its command,
+  // so CLIs without one — and older callers — keep the previous shape.
+  const guard = guardCommand
+    ? hookSummary(hooks.find((hook) => matchesIdentity(hook, "preToolUse", guardCommand)))
+    : null;
+  // A guard that is written but untrusted never fires. Reporting that as healthy
+  // is how an unwired guard stays invisible, so it must fail both checks.
+  const configured = prompt.found && (!guard || guard.found);
+  const runnable = configured && prompt.runnable && (!guard || guard.runnable);
   let status = "trusted";
   if (!configured) status = "missing";
   else if (!runnable) {
-    const statuses = [prompt.trustStatus];
+    const statuses = [prompt.trustStatus, ...(guard ? [guard.trustStatus] : [])];
     status = statuses.includes("modified") ? "modified"
       : statuses.includes("untrusted") ? "untrusted"
         : statuses.includes("missing") ? "missing"
@@ -243,6 +259,7 @@ export function assessCodexHookListing({ listing, cwd, home, promptCommand }) {
     runnable,
     status,
     prompt,
+    guard,
     warnings: target.warnings || [],
     errors: target.errors || []
   };
@@ -258,6 +275,7 @@ function unavailableAssessment(error) {
     activeDesktopState: "not_observed",
     reason: boundedReason(error),
     prompt: { found: false, enabled: false, trustStatus: "unknown", runnable: false },
+    guard: { found: false, enabled: false, trustStatus: "unknown", runnable: false },
     warnings: [],
     errors: []
   };
@@ -295,8 +313,8 @@ export function createCodexHost(options = {}) {
         if (!before.configured) return { ...before, hostCommand, inspectionScope: "spawned_app_server", activeDesktopState: "not_observed" };
         if (!before.runnable) {
           const state = {};
-          for (const hook of [before.prompt]) {
-            if (!hook.key || !hook.currentHash) continue;
+          for (const hook of [before.prompt, before.guard]) {
+            if (!hook?.key || !hook.currentHash) continue;
             state[hook.key] = { trusted_hash: hook.currentHash, enabled: true };
           }
           await session.request("config/batchWrite", {

@@ -94,6 +94,128 @@ test("Codex hook assessment never falls back to another cwd or wrong source", ()
   assert.equal(wrongSource.configured, false);
 });
 
+// Trust is granted per hook, so bootstrapping only the prompt hook leaves the
+// guard written-but-silent. Both must be trusted in one batch write.
+test("Codex host synchronization trusts the guard hook alongside the prompt hook", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "afl-codex-guard-"));
+  const server = path.join(home, "fake-codex.mjs");
+  const trustedFile = path.join(home, "trusted");
+  const promptCommand = "'/managed/core-hook.sh' '--event' 'UserPromptSubmit'";
+  const guardCommand = "'/managed/core-hook.sh' '--event' 'PreToolUse'";
+  const configPath = path.join(home, ".codex", "config.toml");
+  await writeFile(server, `#!/usr/bin/env node
+import { existsSync, writeFileSync } from "node:fs";
+import readline from "node:readline";
+const trustedFile = ${JSON.stringify(trustedFile)};
+const promptCommand = ${JSON.stringify(promptCommand)};
+const guardCommand = ${JSON.stringify(guardCommand)};
+const sourcePath = ${JSON.stringify(configPath)};
+const trust = () => (existsSync(trustedFile) ? "trusted" : "untrusted");
+const hooks = () => [
+  { key: "prompt", eventName: "userPromptSubmit", handlerType: "command", sourcePath, source: "user", command: promptCommand, enabled: true, isManaged: false, currentHash: "sha256:prompt", trustStatus: trust() },
+  { key: "guard", eventName: "preToolUse", handlerType: "command", sourcePath, source: "user", command: guardCommand, enabled: true, isManaged: false, currentHash: "sha256:guard", trustStatus: trust() }
+];
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id == null) return;
+  if (message.method === "initialize") return console.log(JSON.stringify({ id: message.id, result: {} }));
+  if (message.method === "hooks/list") return console.log(JSON.stringify({ id: message.id, result: { data: [{ cwd: message.params.cwds[0], hooks: hooks(), warnings: [], errors: [] }] } }));
+  if (message.method === "config/batchWrite") {
+    const state = message.params.edits[0].value;
+    if (Object.keys(state).sort().join(",") !== "guard,prompt"
+        || state.prompt.trusted_hash !== "sha256:prompt" || state.prompt.enabled !== true
+        || state.guard.trusted_hash !== "sha256:guard" || state.guard.enabled !== true) {
+      return console.log(JSON.stringify({ id: message.id, error: { message: "guard hook was not trusted" } }));
+    }
+    writeFileSync(trustedFile, "ok");
+    return console.log(JSON.stringify({ id: message.id, result: {} }));
+  }
+  console.log(JSON.stringify({ id: message.id, error: { message: "unsupported" } }));
+});
+`, { mode: 0o700 });
+  await chmod(server, 0o700);
+
+  const host = createCodexHost({ command: server, timeoutMs: 8_000, version: "test" });
+  const synchronized = await host.synchronize({ home, cwd: home, promptCommand, guardCommand });
+
+  assert.equal(synchronized.changed, true);
+  assert.equal(synchronized.runnable, true, "both hooks must be runnable after bootstrap");
+  assert.equal(synchronized.status, "trusted");
+  assert.equal(synchronized.guard.runnable, true);
+  await access(trustedFile);
+});
+
+// A guard hook that is written into config but never trusted does not fire.
+test("Codex hook assessment fails when the guard hook is written but untrusted", () => {
+  const home = "/tmp/home";
+  const sourcePath = "/tmp/home/.codex/config.toml";
+  const promptCommand = "'/managed/core-hook.sh' '--event' 'UserPromptSubmit'";
+  const guardCommand = "'/managed/core-hook.sh' '--event' 'PreToolUse'";
+  const hook = (key, eventName, command, trustStatus) => ({
+    key, eventName, handlerType: "command", sourcePath, source: "user",
+    command, enabled: true, isManaged: false, currentHash: `sha256:${key}`, trustStatus
+  });
+  const listingWith = (guardTrust) => ({
+    data: [{
+      cwd: "/tmp/project",
+      hooks: [
+        hook("prompt", "userPromptSubmit", promptCommand, "trusted"),
+        ...(guardTrust ? [hook("guard", "preToolUse", guardCommand, guardTrust)] : [])
+      ],
+      warnings: [],
+      errors: []
+    }]
+  });
+  const assess = (listing) => assessCodexHookListing({
+    listing, cwd: "/tmp/project", home, promptCommand, guardCommand
+  });
+
+  const untrusted = assess(listingWith("untrusted"));
+  assert.equal(untrusted.configured, true, "both hooks are present in config");
+  assert.equal(untrusted.runnable, false, "an untrusted guard must not report runnable");
+  assert.equal(untrusted.status, "untrusted");
+
+  const absent = assess(listingWith(null));
+  assert.equal(absent.configured, false, "a missing guard is not fully configured");
+  assert.equal(absent.runnable, false);
+  assert.equal(absent.guard.found, false);
+
+  const trusted = assess(listingWith("trusted"));
+  assert.equal(trusted.runnable, true);
+  assert.equal(trusted.status, "trusted");
+
+  // Callers that supply no guard command keep the previous prompt-only shape.
+  const promptOnly = assessCodexHookListing({
+    listing: listingWith(null), cwd: "/tmp/project", home, promptCommand
+  });
+  assert.equal(promptOnly.runnable, true);
+  assert.equal(promptOnly.guard, null);
+});
+
+test("Codex hook assessment tolerates alternate event-name spellings", () => {
+  const sourcePath = "/tmp/home/.codex/config.toml";
+  const promptCommand = "'/managed/core-hook.sh' '--event' 'UserPromptSubmit'";
+  const guardCommand = "'/managed/core-hook.sh' '--event' 'PreToolUse'";
+  const listing = {
+    data: [{
+      cwd: "/tmp/project",
+      hooks: [
+        { key: "prompt", eventName: "user_prompt_submit", handlerType: "command", sourcePath, source: "user", command: promptCommand, enabled: true, isManaged: false, currentHash: "sha256:p", trustStatus: "trusted" },
+        { key: "guard", eventName: "PreToolUse", handlerType: "command", sourcePath, source: "user", command: guardCommand, enabled: true, isManaged: false, currentHash: "sha256:g", trustStatus: "trusted" }
+      ],
+      warnings: [],
+      errors: []
+    }]
+  };
+
+  const result = assessCodexHookListing({
+    listing, cwd: "/tmp/project", home: "/tmp/home", promptCommand, guardCommand
+  });
+
+  assert.equal(result.runnable, true);
+  assert.equal(result.guard.key, "guard");
+});
+
 test("Codex host does not fall back after an initialized desktop host operation fails", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "afl-codex-fallback-"));
   const first = path.join(home, "first-codex.mjs");
