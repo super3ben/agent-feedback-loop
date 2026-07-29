@@ -1436,6 +1436,25 @@ function createStore(database, now) {
         .get(currentJob.project_id, safeJobId, safeFamilyKey);
       return Number(row?.total ?? 0);
     },
+    // How often each family has been reached in this project, keyed the way a
+    // published document identifies its family. A lesson the user has hit five
+    // times deserves to outrank one seen once, and that ordering is only
+    // possible if the count survives past the review that produced it.
+    listFamilyRecurrenceByProject({ projectId, limit = 128 }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeLimit = assertLimit(limit, "limit", 128, 512);
+      if (safeLimit === 0) return [];
+      return database.prepare(`SELECT historic_job.family_key AS familyKey,
+          COUNT(DISTINCT source_event.content_hash) AS occurrences
+        FROM reviewer_jobs AS historic_job
+        JOIN session_events AS source_event ON source_event.event_uid=historic_job.source_event_uid
+        WHERE historic_job.project_id=? AND historic_job.family_key IS NOT NULL
+        GROUP BY historic_job.family_key
+        ORDER BY occurrences DESC, historic_job.family_key
+        LIMIT ?`)
+        .all(safeProjectId, safeLimit)
+        .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
+    },
     // The family keys this project has already seen, with how often each was
     // reached. Feeding these back is what lets a later review recognise a
     // repeat instead of inventing a fresh key for the same problem.
@@ -1456,23 +1475,29 @@ function createStore(database, now) {
         .all(currentJob.project_id, safeJobId, safeLimit)
         .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
     },
-    completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256 }) {
+    completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256, familyKey = null }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
       const safePublishedPath = assertString(publishedPath, "path", 4096);
       const safeSha256 = assertString(sha256, "sha256", 64);
+      // A published lesson records its family too, so how often the problem has
+      // recurred stays countable after it becomes a lesson.
+      const safeFamilyKey = familyKey === null ? null : assertString(familyKey, "familyKey", 128);
+      if (safeFamilyKey !== null && !FAMILY_KEY_PATTERN.test(safeFamilyKey)) {
+        throw new TypeError("familyKey is not a controlled key");
+      }
       if (!/^[a-f0-9]{64}$/.test(safeSha256)) throw new TypeError("sha256 must be lowercase hexadecimal");
       const timestamp = nowIso(now);
       return transaction(() => {
         const completed = database.prepare(`UPDATE reviewer_jobs
           SET state='published', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
               completed_at=?, result_code='published', error_code=NULL,
-              published_path=?, published_sha256=?
+              published_path=?, published_sha256=?, family_key=COALESCE(?, family_key)
           WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
             AND lease_until IS NOT NULL AND lease_until>?
           RETURNING *`).get(
-          timestamp, safePublishedPath, safeSha256,
+          timestamp, safePublishedPath, safeSha256, safeFamilyKey,
           safeJobId, safeOwnerId, safeLeaseEpoch, timestamp
         );
         if (!completed) throw reviewLeaseLost();

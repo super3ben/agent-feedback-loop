@@ -190,7 +190,8 @@ export function selectReflections({
   task,
   budget,
   priorEmissions = [],
-  publishedBefore
+  publishedBefore,
+  familyRecurrence = {}
 }) {
   const limits = limitsFrom(budget);
   const cutoffMs = Date.parse(publishedBefore);
@@ -211,8 +212,16 @@ export function selectReflections({
     loaded.push(document);
   }
 
+  // How often each family has actually recurred. Counting documents instead
+  // only ever yields 1, because family projection keeps one document per
+  // family — so without this the tie-break carried no information at all.
   const recurrence = new Map();
   for (const document of loaded) recurrence.set(document.familyId, (recurrence.get(document.familyId) ?? 0) + 1);
+  for (const [familyId, occurrences] of Object.entries(familyRecurrence ?? {})) {
+    if (Number.isSafeInteger(occurrences) && occurrences > 0) {
+      recurrence.set(familyId, Math.max(recurrence.get(familyId) ?? 0, occurrences));
+    }
+  }
   const applicable = [];
   for (const document of loaded) {
     const score = relevanceScore(document, prompt, task);

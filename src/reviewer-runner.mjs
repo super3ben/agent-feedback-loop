@@ -321,7 +321,10 @@ export async function runReviewJob({
       ownerId,
       leaseEpoch,
       path: published.path,
-      sha256: published.sha256
+      sha256: published.sha256,
+      // A new family proposes its key; an existing one already has recurrence
+      // recorded against the key its earlier reviews used.
+      familyKey: result.proposed_family_key ?? null
     });
     return { outcome: "published", documentPath: published.path };
   } catch (error) {

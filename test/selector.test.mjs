@@ -366,3 +366,37 @@ test("conditions phrased as the trigger reach a session before the mistake", asy
   assert.equal(select(triggerForm.documents, unrelated).selected.length, 0,
     "without injecting into unrelated requests");
 });
+
+// A lesson the user has hit repeatedly is worth more than one seen once, even
+// at equal relevance: recurrence is evidence that the default behaviour is
+// unreliable here. Counting documents cannot express that, because family
+// projection keeps exactly one document per family.
+test("a repeatedly hit family outranks an equally relevant one seen once", async (t) => {
+  const shared = { applies_when: ["修改已有架构前先核对用户目标"] };
+  const documents = await load(t, [
+    model(1, { ...shared, family_id: "family-rare", method_class: "rare_case" }),
+    model(2, { ...shared, family_id: "family-common", method_class: "common_case" })
+  ]);
+  const rare = documents.documents.find((d) => d.familyId === "family-rare");
+  const common = documents.documents.find((d) => d.familyId === "family-common");
+  assert.ok(rare && common, "both fixtures load");
+
+  const budget = { maxCards: 1, maxTotalTokens: 900, maxDocumentTokens: 320 };
+  const winner = (familyRecurrence) =>
+    select(documents.documents, { budget, familyRecurrence }).selected[0]?.familyId;
+
+  // Whichever family carries the count takes the single slot, in both
+  // directions — so the ordering follows recurrence, not document identity.
+  assert.equal(winner({ "family-common": 5 }), "family-common");
+  assert.equal(winner({ "family-rare": 5 }), "family-rare");
+});
+
+test("recurrence counts never fabricate relevance", async (t) => {
+  const documents = await load(t, [model(1, { applies_when: ["修改已有架构前先核对用户目标"] })]);
+  const unrelated = select(documents.documents, {
+    prompt: "今天天气怎么样",
+    familyRecurrence: { "family-1": 99 }
+  });
+  assert.equal(unrelated.selected.length, 0,
+    "a lesson that does not apply stays out no matter how often it recurred");
+});

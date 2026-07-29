@@ -14,6 +14,7 @@ import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
+import { deriveReviewerFamilyId } from "./reviewer-result.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 import { executeGuardCli } from "./convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "./convergence-probe-context.mjs";
@@ -509,8 +510,30 @@ export async function handlePromptHook({
       publishedBefore: selectionPublishedBefore,
       maxFileBytes: result.selectionInput.maxFileBytes
     });
+    let familyRecurrence = {};
+    try {
+      const counts = controlStore.listFamilyRecurrenceByProject({
+        projectId: result.selectionInput.projectDir
+      });
+      const byKey = new Map(counts.map((entry) => [entry.familyKey, entry.occurrences]));
+      // A document names its family by id; the store counts by key. The id is
+      // derived from (methodClass, key), so the document supplies both halves.
+      for (const document of catalog.documents) {
+        for (const [key, occurrences] of byKey) {
+          try {
+            if (deriveReviewerFamilyId(document.methodClass, key) === document.familyId) {
+              familyRecurrence[document.familyId] = occurrences;
+              break;
+            }
+          } catch {}
+        }
+      }
+    } catch {
+      familyRecurrence = {};
+    }
     const selection = selectDocuments({
       documents: catalog.documents,
+      familyRecurrence,
       prompt: result.selectionInput.prompt,
       session: result.selectionInput.session,
       task: result.selectionInput.task,
