@@ -30,11 +30,12 @@ that already has a listed equivalent is a lost recurrence.
 
 Treat user wording that a failure has happened repeatedly, together with the
 `occurrences` recorded for the matching family, as `repeated_pattern_evidence`.
-When that family already has two or more occurrences, it may establish a new
-Major lesson even when `reflectionCatalog` is empty. Do not use `external_limit`
-merely because the agent failed to retain information already provided: that is
-not a first-occurrence external limit when recurrence evidence proves the
-pattern.
+`occurrences` counts earlier incidents only, so a matching family with one or
+more occurrences means this is at least the second time — and that may establish
+a new Major lesson even when `reflectionCatalog` is empty. Do not use
+`external_limit` merely because the agent failed to retain information already
+provided: that is not a first-occurrence external limit when recurrence evidence
+proves the pattern.
 
 For a proven lesson, identify a controlled reusable `method_class`, determine
 whether an existing family in `reflectionCatalog` applies, and return exactly the
