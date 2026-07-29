@@ -334,3 +334,35 @@ test("doctor separates lessons with no conditions from single-language ones", as
   assert.equal(languages.cjkOnly, 1);
   assert.equal(languages.noConditions, 1, "an empty applies_when is counted apart");
 });
+
+// A condition phrased as the complaint only matches once the mistake has been
+// repeated. Phrased as the situation the session is entering, it arrives while
+// it can still prevent it — and it has to reuse the user's own words, because
+// matching is literal and 连接 never matches 登录.
+test("conditions phrased as the trigger reach a session before the mistake", async (t) => {
+  const lesson = (applies_when) => model(1, {
+    applies_when,
+    class_of_mistake: "重复索要已提供的 SSH 凭据",
+    method_changes: ["先查已保存的连接配置再向用户索要"]
+  });
+  const complaintForm = await load(t, [lesson([
+    "当用户表示 SSH 账号密码此前已提供、又被要求重新提供时",
+    "When a user says SSH credentials were already provided and is asked again"
+  ])]);
+  const triggerForm = await load(t, [lesson([
+    "当需要 ssh 登录远程服务器、需要账号密码端口时",
+    "when you need to ssh or log in to a remote server and need its password or port"
+  ])]);
+  const beforeMistake = { prompt: "登录 10.7.132.150 看下 frpc 的状态" };
+  const atComplaint = { prompt: "为什么又要打开这个Termius？ssh不能登录吗" };
+  const unrelated = { prompt: "今天天气怎么样" };
+
+  assert.equal(select(complaintForm.documents, beforeMistake).selected.length, 0,
+    "a complaint-shaped condition arrives only after the mistake repeats");
+  assert.equal(select(triggerForm.documents, beforeMistake).selected.length, 1,
+    "a trigger-shaped condition arrives while it can still prevent it");
+  assert.equal(select(triggerForm.documents, atComplaint).selected.length, 1,
+    "and still applies once the user complains");
+  assert.equal(select(triggerForm.documents, unrelated).selected.length, 0,
+    "without injecting into unrelated requests");
+});

@@ -44,6 +44,19 @@ listed in the catalog. Every `recurrence_of` id must be a listed reflection from
 that same family. Otherwise set `family_id` to null, provide a stable lowercase
 hyphenated `proposed_family_key`, and leave `recurrence_of` empty.
 
+Each `applies_when` condition describes the situation a future session is
+**about to enter**, not the moment this failure was noticed. A future session is
+matched to this lesson by its opening request, so a condition phrased as the
+complaint ("when the user says the credentials were already provided") only
+matches after the mistake has been repeated. Phrase it as the trigger instead
+("when connecting to a remote server over ssh", "when server credentials are
+needed") so the lesson arrives while it can still prevent the mistake.
+
+Build those conditions out of the words the user actually typed, not a tidier
+paraphrase. Matching is literal, so a lesson that says 连接 never matches a
+request that says 登录. Carry the user's own terms — and the concrete tool,
+host, and command names from the evidence — into the conditions verbatim.
+
 Write every `applies_when` condition twice: once in the language of the user's
 complaint, and once in English. A later session is matched to this lesson by
 word overlap alone, so a condition recorded only in English is unreachable from
