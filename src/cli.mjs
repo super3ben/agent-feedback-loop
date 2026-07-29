@@ -163,8 +163,8 @@ const REVIEW_LAUNCH_COOLDOWN_MS = 5_000;
 const PROMPT_SELECTION_LIMITS = Object.freeze({
   maxFileBytes: 131_072,
   maxCards: 4,
-  maxDocumentTokens: 320,
-  maxTotalTokens: 900
+  maxDocumentTokens: 640,
+  maxTotalTokens: 1600
 });
 const LOG_EVENTS = new Set([
   "prompt_capture_completed",

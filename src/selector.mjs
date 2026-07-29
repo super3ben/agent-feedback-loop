@@ -5,8 +5,8 @@ import { readReflectionCatalog } from "./reflection-document.mjs";
 const HARD_LIMITS = Object.freeze({
   maxFileBytes: 131_072,
   maxCards: 4,
-  maxDocumentTokens: 320,
-  maxTotalTokens: 900
+  maxDocumentTokens: 640,
+  maxTotalTokens: 1600
 });
 const SEVERITY_RANK = Object.freeze({ Major: 1, Critical: 2, Blocker: 3 });
 const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
