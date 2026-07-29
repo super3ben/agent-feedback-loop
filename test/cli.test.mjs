@@ -13,7 +13,7 @@ import * as cliModule from "../src/cli.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "../src/crypto-store.mjs";
 import { initializeControlStore, openControlStore } from "../src/control-store.mjs";
 import { EXECUTION_STOP_REASON } from "../src/execution-hook.mjs";
-import { EXECUTION_MUTATION_LIMIT, deriveExecutionMonitorId } from "../src/execution-monitor.mjs";
+import { EXECUTION_REWORK_LIMIT, deriveExecutionMonitorId, deriveReworkTarget } from "../src/execution-monitor.mjs";
 import { executeGuardCli } from "../src/convergence-cli.mjs";
 import { ConvergenceProbeContextStore } from "../src/convergence-probe-context.mjs";
 import { ensureRepositoryLineage, projectContract } from "../src/convergence-identity.mjs";
@@ -1465,9 +1465,12 @@ describe("agent-feedback-loop package", () => {
     await install({ home, codexHost: unavailableCodexHost() });
     const paths = pathsFor(home);
     const env = { ...process.env, HOME: home, TMPDIR: home };
+    // The guard counts rework of one artifact, so the payload has to say which.
+    const hookPatch = ["*** Begin Patch", "*** Update File: guarded.txt", "*** End Patch"].join("\n");
     const hookInput = JSON.stringify({
       session_id: "installed-execution-session",
-      tool_name: "apply_patch"
+      tool_name: "apply_patch",
+      tool_input: { command: hookPatch }
     });
     const guardArgs = ["--event", "PreToolUse", "--cli", "codex", "--continue"];
 
@@ -1480,9 +1483,14 @@ describe("agent-feedback-loop package", () => {
     const monitorId = deriveExecutionMonitorId({ cli: "codex", sessionId: "installed-execution-session" });
     const store = openControlStore({ paths });
     try {
-      for (let index = 0; index < EXECUTION_MUTATION_LIMIT; index += 1) {
+      const target = deriveReworkTarget({
+        toolName: "apply_patch",
+        toolInput: { command: hookPatch }
+      });
+      for (let index = 0; index <= EXECUTION_REWORK_LIMIT; index += 1) {
         store.recordExecutionToolCall({
-          monitorId, cli: "codex", mutating: true, toolLabel: "apply_patch", limit: EXECUTION_MUTATION_LIMIT
+          monitorId, cli: "codex", mutating: true, toolLabel: "apply_patch",
+          target, limit: EXECUTION_REWORK_LIMIT
         });
       }
     } finally {

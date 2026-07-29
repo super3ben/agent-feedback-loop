@@ -5,8 +5,9 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
-  EXECUTION_MUTATION_LIMIT,
+  EXECUTION_REWORK_LIMIT,
   deriveExecutionMonitorId,
+  deriveReworkTarget,
   executionToolLabel,
   isMutatingTool
 } from "../src/execution-monitor.mjs";
@@ -24,11 +25,17 @@ async function storeFixture(t) {
   return store;
 }
 
-function payload({ sessionId = "session-a", toolName = "Bash" } = {}) {
-  return { session_id: sessionId, tool_name: toolName, hook_event_name: "PreToolUse" };
+function payload({ sessionId = "session-a", toolName = "apply_patch", file = "a.txt" } = {}) {
+  const patch = ["*** Begin Patch", "*** Update File: " + file, "*** End Patch"].join("\n");
+  return {
+    session_id: sessionId,
+    tool_name: toolName,
+    tool_input: file === null ? {} : { command: patch },
+    hook_event_name: "PreToolUse"
+  };
 }
 
-async function callHook(controlStore, input, limit = EXECUTION_MUTATION_LIMIT) {
+async function callHook(controlStore, input, limit = EXECUTION_REWORK_LIMIT) {
   const written = [];
   const response = await handleExecutionHook({
     payload: input,
@@ -190,4 +197,63 @@ test("retained monitor state is globally bounded", async (t) => {
     monitorId: deriveExecutionMonitorId({ cli: "codex", sessionId: "session-139" })
   });
   assert.equal(live.count, 1, "the newest monitor survives pruning");
+});
+
+// The signal is rework, not activity. A busy task that touches many different
+// files is healthy; one that rewrites a single file over and over without new
+// input is circling. The previous shape counted tool calls and would have
+// stopped the first while letting the second run.
+test("many files edited once each never trips the guard", async (t) => {
+  const store = await storeFixture(t);
+  for (let index = 0; index < 40; index += 1) {
+    const response = await callHook(store, payload({ file: `file-${index}.txt` }), 3);
+    assert.deepEqual(response, { continue: true }, "breadth of work is not rework");
+  }
+});
+
+test("one file rewritten past the limit trips it", async (t) => {
+  const store = await storeFixture(t);
+  for (let index = 0; index < 3; index += 1) {
+    assert.deepEqual(await callHook(store, payload({ file: "same.txt" }), 3), { continue: true });
+  }
+  const blocked = await callHook(store, payload({ file: "same.txt" }), 3);
+  assert.equal(blocked.decision, "block");
+});
+
+// A file circling does not make the rest of the run unusable.
+test("an unrelated file still proceeds while another is over the limit", async (t) => {
+  const store = await storeFixture(t);
+  for (let index = 0; index < 4; index += 1) await callHook(store, payload({ file: "hot.txt" }), 3);
+  assert.equal((await callHook(store, payload({ file: "hot.txt" }), 3)).decision, "block");
+  assert.deepEqual(await callHook(store, payload({ file: "other.txt" }), 3), { continue: true });
+});
+
+// Creating a file is first work; only editing existing content is rework.
+test("repeated file creation is not counted as rework", async (t) => {
+  const store = await storeFixture(t);
+  const add = (index) => ({
+    session_id: "session-a",
+    tool_name: "apply_patch",
+    tool_input: { command: ["*** Begin Patch", `*** Add File: new-${index}.txt`, "*** End Patch"].join("\n") },
+    hook_event_name: "PreToolUse"
+  });
+  for (let index = 0; index < 10; index += 1) {
+    assert.deepEqual(await callHook(store, add(index), 3), { continue: true });
+  }
+});
+
+test("rework targets are opaque and identify the artifact, not its path", () => {
+  const patch = (file) => ({ command: ["*** Begin Patch", `*** Update File: ${file}`, "*** End Patch"].join("\n") });
+  const a = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/a.txt") });
+  const b = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/a.txt") });
+  const c = deriveReworkTarget({ toolName: "apply_patch", toolInput: patch("src/secret-project/b.txt") });
+  assert.equal(a, b, "the same artifact yields the same key");
+  assert.notEqual(a, c);
+  assert.match(a, /^[a-f0-9]{16}$/u, "the key carries no path text");
+
+  // Claude Code passes an explicit path field instead of a patch script.
+  assert.match(deriveReworkTarget({ toolName: "Edit", toolInput: { file_path: "/tmp/x.txt" } }), /^[a-f0-9]{16}$/u);
+  // A read, or a call with nothing identifiable to rework, is not counted.
+  assert.equal(deriveReworkTarget({ toolName: "update_plan", toolInput: { file_path: "/tmp/x.txt" } }), null);
+  assert.equal(deriveReworkTarget({ toolName: "Bash", toolInput: { command: "ls -la" } }), null);
 });

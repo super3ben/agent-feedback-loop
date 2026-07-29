@@ -68,6 +68,7 @@ const FAMILY_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 const EXECUTION_MONITOR_MAX_STORED = 128;
 const EXECUTION_MONITOR_MAX_TOOLS = 64;
+const EXECUTION_MONITOR_MAX_TARGETS = 64;
 const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
@@ -472,7 +473,9 @@ function executionMonitorState(value, monitorId) {
       || !EXECUTION_MONITOR_CLIS.has(value.cli)
       || !Number.isSafeInteger(value.count) || value.count < 0 || value.count > MAX_CONTEXT_EPOCH
       || typeof value.overLimit !== "boolean"
-      || !value.seenTools || typeof value.seenTools !== "object" || Array.isArray(value.seenTools)) {
+      || !value.seenTools || typeof value.seenTools !== "object" || Array.isArray(value.seenTools)
+      || (value.rework !== undefined
+          && (!value.rework || typeof value.rework !== "object" || Array.isArray(value.rework)))) {
     throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
   }
   const seenTools = {};
@@ -483,12 +486,21 @@ function executionMonitorState(value, monitorId) {
     }
     seenTools[label] = seen;
   }
+  const rework = {};
+  for (const [target, seen] of Object.entries(value.rework ?? {})) {
+    if (!/^[a-f0-9]{1,64}$/u.test(target)
+        || !Number.isSafeInteger(seen) || seen < 0 || seen > MAX_CONTEXT_EPOCH) {
+      throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+    }
+    rework[target] = seen;
+  }
   return {
     monitorId,
     cli: value.cli,
     count: value.count,
     overLimit: value.overLimit,
-    seenTools
+    seenTools,
+    rework
   };
 }
 
@@ -1652,13 +1664,21 @@ function createStore(database, now) {
     // Counts one tool call for a session and reports whether the run has passed
     // the point where the user should be handed control back. The count is
     // "tool calls since the user last spoke", so the prompt hook resets it.
-    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, limit }) {
+    // Counts how many times one artifact has been rewritten while the user has
+    // stayed silent. Activity alone is not the signal: a task that runs many
+    // tools and finishes is healthy, while one that rewrites the same file over
+    // and over without new input is circling.
+    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, limit }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
       if (typeof mutating !== "boolean") throw new TypeError("mutating must be boolean");
       const safeLabel = assertString(toolLabel, "toolLabel", 64);
-      const safeLimit = assertLimit(limit, "limit", 48, 4096);
+      const safeTarget = target === null ? null : assertString(target, "target", 64);
+      if (safeTarget !== null && !/^[a-f0-9]{1,64}$/u.test(safeTarget)) {
+        throw new TypeError("target must be an opaque digest");
+      }
+      const safeLimit = assertLimit(limit, "limit", 6, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
@@ -1681,12 +1701,23 @@ function createStore(database, now) {
         if (Object.hasOwn(seenTools, safeLabel) || Object.keys(seenTools).length < EXECUTION_MONITOR_MAX_TOOLS) {
           seenTools[safeLabel] = Math.min(MAX_CONTEXT_EPOCH, (seenTools[safeLabel] ?? 0) + 1);
         }
+        const rework = { ...(state?.rework ?? {}) };
+        let reworkCount = 0;
+        if (safeTarget !== null) {
+          if (Object.hasOwn(rework, safeTarget) || Object.keys(rework).length < EXECUTION_MONITOR_MAX_TARGETS) {
+            reworkCount = Math.min(MAX_CONTEXT_EPOCH, (rework[safeTarget] ?? 0) + 1);
+            rework[safeTarget] = reworkCount;
+          } else {
+            reworkCount = rework[safeTarget] ?? 0;
+          }
+        }
         const next = {
           monitorId: safeMonitorId,
           cli: safeCli,
           count,
           seenTools,
-          overLimit: count > safeLimit
+          rework,
+          overLimit: reworkCount > safeLimit
         };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
           ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(next));
@@ -1698,9 +1729,9 @@ function createStore(database, now) {
             if (stale.key !== key) deleteRow.run(stale.key);
           }
         }
-        // Only mutating calls are stopped: a read can still run so the agent is
-        // able to summarise and hand back rather than being struck mute.
-        return { ...next, stop: next.overLimit && mutating };
+        // Only the artifact being reworked is stopped: unrelated work, and any
+        // read, still runs so the agent can summarise and hand back.
+        return { ...next, reworkCount, stop: next.overLimit && mutating };
       });
     },
     // The user speaking is the intervention the counter measures, so the prompt

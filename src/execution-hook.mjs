@@ -1,11 +1,12 @@
 import {
-  EXECUTION_MUTATION_LIMIT,
+  EXECUTION_REWORK_LIMIT,
   deriveExecutionMonitorId,
+  deriveReworkTarget,
   executionToolLabel,
   isMutatingTool
 } from "./execution-monitor.mjs";
 
-export const EXECUTION_STOP_REASON = "Convergence guard: this run has made too many tool calls without the user stepping in. Stop, report what is verified and what is not, and wait for the user to decide the next step.";
+export const EXECUTION_STOP_REASON = "Convergence guard: this file has been reworked repeatedly without the user stepping in. Further passes are refining, not converging. Stop, report what is done and what is still open, and let the user decide the next step.";
 
 // Only Codex is hard-blocked. Claude Code halts on its own after one refusal
 // and hands control back, so blocking it buys nothing; Gemini has no evidence
@@ -13,7 +14,8 @@ export const EXECUTION_STOP_REASON = "Convergence guard: this run has made too m
 const GUARDED_CLIS = new Set(["codex"]);
 
 /**
- * PreToolUse guard. Blocks before the tool runs — a post-run hook cannot stop a
+ * PreToolUse guard. Counts how often one artifact is rewritten while the user
+ * stays silent, and blocks before the tool runs — a post-run hook cannot stop a
  * mutation that already happened, and an advisory message does not stop this
  * agent either: when asked to review its own direction it wrote a review, then
  * approved itself and carried on.
@@ -26,7 +28,7 @@ export async function handleExecutionHook({
   controlStore,
   writeResponse = async () => null,
   nativeResponse = { continue: true },
-  limit = EXECUTION_MUTATION_LIMIT
+  limit = EXECUTION_REWORK_LIMIT
 } = {}) {
   let response = { ...nativeResponse, continue: true };
   try {
@@ -37,12 +39,14 @@ export async function handleExecutionHook({
     }
     const sessionId = payload.session_id ?? payload.sessionId;
     const toolName = payload.tool_name ?? payload.toolName;
+    const toolInput = payload.tool_input ?? payload.toolInput;
     const monitorId = deriveExecutionMonitorId({ cli, sessionId });
     const observed = controlStore.recordExecutionToolCall({
       monitorId,
       cli,
       mutating: isMutatingTool(toolName),
       toolLabel: executionToolLabel(toolName),
+      target: deriveReworkTarget({ toolName, toolInput }),
       limit
     });
     if (observed?.stop) {
