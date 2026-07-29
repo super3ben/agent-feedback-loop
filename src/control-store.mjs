@@ -1678,7 +1678,7 @@ function createStore(database, now) {
       if (safeTarget !== null && !/^[a-f0-9]{1,64}$/u.test(safeTarget)) {
         throw new TypeError("target must be an opaque digest");
       }
-      const safeLimit = assertLimit(limit, "limit", 6, 4096);
+      const safeLimit = assertLimit(limit, "limit", 2, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {

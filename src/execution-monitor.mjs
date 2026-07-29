@@ -1,14 +1,17 @@
 import { createHash } from "node:crypto";
 
 // How many times one artifact may be rewritten while the user stays silent.
+// Creating a file is free; only edits to existing content count. At 2 the third
+// rewrite is stopped, which is where refining an artifact nobody asked to
+// refine starts to look like circling rather than converging.
 //
 // The signal is rework, not activity: a task that runs 44 tools and finishes is
-// healthy, while one that rewrites the same file eight times without new input
-// is circling. Advanced models reach this state by review-then-improve loops
-// that never fail — each pass looks reasonable, and nothing ever errors.
+// healthy, while one that rewrites the same file again and again without new
+// input is circling. Advanced models reach this state by review-then-improve
+// loops that never fail — each pass looks reasonable, and nothing ever errors.
 //
 // The user speaking resets it, because a new instruction is new evidence.
-export const EXECUTION_REWORK_LIMIT = 6;
+export const EXECUTION_REWORK_LIMIT = 2;
 
 // Tool calls that cannot change anything. Everything else — including every
 // tool this list has never heard of — counts as mutating.
