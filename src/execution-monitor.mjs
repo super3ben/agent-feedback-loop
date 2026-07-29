@@ -26,6 +26,28 @@ const READ_ONLY_TOOLS = new Set([
 
 const MAX_TARGET_LABEL = 200;
 
+// Files whose whole purpose is to be appended to as work proceeds. Rewriting a
+// progress log ten times is the log working, not the task circling, and
+// counting it stops a run that was converging perfectly well.
+const BOOKKEEPING_TARGET = new RegExp([
+  // Workflow state written by orchestration skills as each step completes.
+  "(^|/)\\.comet(/|$)",
+  "(^|/)\\.superpowers(/|$)",
+  "(^|/)openspec/",
+  "(^|/)\\.agent/(reflections|rules)(/|$)",
+  // Progress, task and checkpoint notes under any of the above or beside them.
+  "(^|/)(subagent-)?progress\\.md$",
+  "(^|/)tasks\\.md$",
+  "(^|/)checkpoint\\.json$",
+  "(^|/)(CHANGELOG|TODO)\\.md$",
+  // Append-only by nature.
+  "\\.(log|jsonl)$"
+].join("|"), "u");
+
+function isBookkeepingTarget(value) {
+  return BOOKKEEPING_TARGET.test(value);
+}
+
 function boundedIdentity(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 512 && !value.includes("\0");
 }
@@ -77,13 +99,17 @@ export function deriveReworkTarget({ toolName, toolInput } = {}) {
 
   for (const field of ["file_path", "filePath", "path", "notebook_path"]) {
     const value = toolInput[field];
-    if (typeof value === "string" && value.trim()) return hashedTarget(value.trim());
+    if (typeof value === "string" && value.trim()) {
+      const target = value.trim();
+      return isBookkeepingTarget(target) ? null : hashedTarget(target);
+    }
   }
 
   const command = typeof toolInput.command === "string" ? toolInput.command : "";
   if (!command) return null;
   // Only an edit to existing content is rework; creating a file is first work.
   const updated = /^\*\*\* Update File: (.+)$/mu.exec(command);
-  if (updated) return hashedTarget(updated[1].trim());
-  return null;
+  if (!updated) return null;
+  const target = updated[1].trim();
+  return isBookkeepingTarget(target) ? null : hashedTarget(target);
 }

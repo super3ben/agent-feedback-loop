@@ -353,8 +353,10 @@ test("conditions phrased as the trigger reach a session before the mistake", asy
     "当需要 ssh 登录远程服务器、需要账号密码端口时",
     "when you need to ssh or log in to a remote server and need its password or port"
   ])]);
-  const beforeMistake = { prompt: "登录 10.7.132.150 看下 frpc 的状态" };
-  const atComplaint = { prompt: "为什么又要打开这个Termius？ssh不能登录吗" };
+  // The opening request of a session that is about to hit this problem: it
+  // describes what is being done, never that anything was "already provided".
+  const beforeMistake = { prompt: "帮我登录服务器看下端口通不通" };
+  const atComplaint = { prompt: "账号密码此前已提供，为什么又要求重新提供" };
   const unrelated = { prompt: "今天天气怎么样" };
 
   assert.equal(select(complaintForm.documents, beforeMistake).selected.length, 0,

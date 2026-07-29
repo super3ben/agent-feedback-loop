@@ -26,7 +26,7 @@
 | E-4 | codex 过度设计 + 强制复盘 | 探针 matcher 仅列 `Write/Bash/Edit`,而 codex 实际写文件用 `apply_patch` → 5 次穿透、20 个文件落地;agent 写出 `.microservices-approach-review.md`,结论"Keep the three small modules"**自我批准并继续**;另经 `collaborationspawn_agent`×3 派生子 agent,子 agent 的工具调用同样出现在探针日志中(**子 agent 继承 hook**) |
 | E-5 | Claude Code 同任务同拦截 | 1 次 deny 后**主动停止**,仅落地 1 文件,向用户报告进度并请求确认;工具名 `Write/Edit/NotebookEdit/Bash/Task`;阻断返回形状 `hookSpecificOutput.permissionDecision:"deny"`;开销 0.20ms |
 | E-6 | codex 信任门 | codex-cli 0.146.0-alpha.3.1;hook 须有 `hooks.state."<path>:<snake_event>:<i>:<j>"` 的 `trusted_hash` 才执行;探针写入配置后**从未触发**,直到加 `--dangerously-bypass-hook-trust` |
-| E-7 | 复发窗口实测(真实数据) | 对真实 job `03b35f6a`(Termius 抱怨)调用 `getReviewRecurrenceCandidates`,返回 8 条全为 `继续`/`md就行了`/无关项;同类抱怨(`密码之前不是都跟你说过了吗端口22222…`)排在第 **17** 位,不在窗口内 → `similar_complaint_count=0` → 仍判 no_lesson |
+| E-7 | 复发窗口实测(真实数据) | 对真实 job `03b35f6a`(Termius 抱怨)调用 `getReviewRecurrenceCandidates`,返回 8 条全为 `继续`/`md就行了`/无关项;同类抱怨(同一凭据问题的早前一次)排在第 **17** 位,不在窗口内 → `similar_complaint_count=0` → 仍判 no_lesson |
 | E-8 | 词法相似度实测(真实数据) | 上述两句真实抱怨共享 token `密码`/`不知`/`知道`,ratio 0.136 ≥ 阈值 0.1 → 判定 SIMILAR。**词法匹配本身有效,失效点仅在窗口** |
 | E-9 | 注入侧产出实测 | `rcs-2000-agent` 18 条经验中凭据/密码相关 **0 条**;任务开始与用户抱怨两个时点选中的均为同一条**不相关**经验 |
 | E-10 | 控制库统计 | 54 候选 → 6 published / 33 no_lesson / **15 failed**(`provider_timeout`、`attempts_exhausted`、`provider_unavailable`);真实数据中存在同一 prompt 的重复 job |

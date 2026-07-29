@@ -257,3 +257,45 @@ test("rework targets are opaque and identify the artifact, not its path", () => 
   assert.equal(deriveReworkTarget({ toolName: "update_plan", toolInput: { file_path: "/tmp/x.txt" } }), null);
   assert.equal(deriveReworkTarget({ toolName: "Bash", toolInput: { command: "ls -la" } }), null);
 });
+
+// A progress log is meant to be appended to as work proceeds. Counting it as
+// rework stopped a run that was converging: the agent had made two code passes
+// and was recording evidence for each review item, and the guard read those
+// bookkeeping writes as the same file being refined over and over.
+test("bookkeeping files are never counted as rework", () => {
+  const patch = (file) => ({
+    command: ["*** Begin Patch", `*** Update File: ${file}`, "*** End Patch"].join("\n")
+  });
+  const target = (file) => deriveReworkTarget({ toolName: "apply_patch", toolInput: patch(file) });
+
+  for (const file of [
+    "openspec/changes/feature/.comet/subagent-progress.md",
+    ".comet/subagent-progress.md",
+    ".superpowers/state.md",
+    "openspec/changes/feature/tasks.md",
+    ".agent/reflections/20260729-lesson.md",
+    "build/run.log",
+    "events.jsonl"
+  ]) {
+    assert.equal(target(file), null, `${file} records progress; it is not rework`);
+  }
+
+  for (const file of ["src/index.mjs", "lib/handler.ts", "docs/design.md", "README.md"]) {
+    assert.match(target(file) ?? "", /^[a-f0-9]{16}$/u, `${file} is real work and still counts`);
+  }
+});
+
+test("a run editing only progress files is never stopped", async (t) => {
+  const store = await storeFixture(t);
+  const progress = {
+    session_id: "session-a",
+    tool_name: "apply_patch",
+    tool_input: {
+      command: ["*** Begin Patch", "*** Update File: .comet/subagent-progress.md", "*** End Patch"].join("\n")
+    },
+    hook_event_name: "PreToolUse"
+  };
+  for (let index = 0; index < 20; index += 1) {
+    assert.deepEqual(await callHook(store, progress, 2), { continue: true });
+  }
+});
