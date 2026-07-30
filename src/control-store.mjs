@@ -69,6 +69,13 @@ const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 const EXECUTION_MONITOR_MAX_STORED = 128;
 const EXECUTION_MONITOR_MAX_TOOLS = 64;
 const EXECUTION_MONITOR_MAX_TARGETS = 64;
+// A direction correction is dispatched, then either answered or given up on.
+const EXECUTION_DIAGNOSIS_STATES = new Set(["pending", "ready", "failed"]);
+// How many times a run may correct its own direction before a person is asked.
+// Two automatic corrections that did not converge is evidence that the problem
+// is the plan rather than the execution, and a third self-correction would only
+// be a faster way of arriving at the same place.
+const EXECUTION_MAX_SELF_CORRECTIONS = 2;
 const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
@@ -494,13 +501,34 @@ function executionMonitorState(value, monitorId) {
     }
     rework[target] = seen;
   }
+  // How many times the direction has already been corrected in this session,
+  // and the verdict currently being waited on or delivered.
+  const corrections = value.corrections ?? 0;
+  if (!Number.isSafeInteger(corrections) || corrections < 0 || corrections > MAX_CONTEXT_EPOCH) {
+    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  }
+  let diagnosis = null;
+  if (value.diagnosis !== undefined && value.diagnosis !== null) {
+    const source = value.diagnosis;
+    if (!source || typeof source !== "object" || Array.isArray(source)
+        || !EXECUTION_DIAGNOSIS_STATES.has(source.state)) {
+      throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+    }
+    diagnosis = {
+      state: source.state,
+      requestedAt: assertOptionalString(source.requestedAt, "requestedAt", 64),
+      verdict: assertOptionalString(source.verdict, "verdict", 4096)
+    };
+  }
   return {
     monitorId,
     cli: value.cli,
     count: value.count,
     overLimit: value.overLimit,
     seenTools,
-    rework
+    rework,
+    corrections,
+    diagnosis
   };
 }
 
@@ -1743,13 +1771,40 @@ function createStore(database, now) {
         // once or twice is a direction that keeps widening. The second kind
         // holds every per-file counter below its limit, so it needs its own.
         const spreadCount = Object.keys(rework).length;
+        const tripped = reworkCount > safeLimit || spreadCount > safeSpreadLimit;
+        const corrections = state?.corrections ?? 0;
+        let diagnosis = state?.diagnosis ?? null;
+        // Once two corrections have failed to converge, stop producing a third
+        // verdict and hand the direction to a person instead. A verdict that is
+        // ready but not yet delivered still gets handed over: it was earned
+        // before the limit was reached, and withholding it would waste the
+        // diagnosis and tell the agent nothing about what to narrow.
+        const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS;
+        let outcome = null;
+        if (tripped && mutating) {
+          if (diagnosis?.state === "ready") outcome = "correct";
+          else if (exhausted) outcome = "human";
+          else if (diagnosis?.state === "pending") outcome = "await";
+          else outcome = "dispatch";
+        }
+        if (outcome === "dispatch") {
+          diagnosis = { state: "pending", requestedAt: nowIso(now), verdict: null };
+        }
+        // A verdict is handed over once. Clearing it here means the next time
+        // this run trips, it dispatches a fresh diagnosis of where it has got
+        // to — rather than being handed the same answer again, which it has
+        // already acted on.
+        const delivered = outcome === "correct" ? diagnosis?.verdict ?? null : null;
+        if (outcome === "correct") diagnosis = null;
         const next = {
           monitorId: safeMonitorId,
           cli: safeCli,
           count,
           seenTools,
           rework,
-          overLimit: reworkCount > safeLimit || spreadCount > safeSpreadLimit
+          overLimit: tripped,
+          corrections,
+          diagnosis
         };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
           ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(next));
@@ -1770,20 +1825,81 @@ function createStore(database, now) {
           reworkCount,
           spreadCount,
           shape,
+          // What the caller should do about this block: dispatch a diagnosis,
+          // wait for one already running, deliver its verdict, or stop
+          // correcting and ask a person.
+          outcome,
+          verdict: delivered,
           stop: next.overLimit && mutating
         };
       });
     },
-    // The user speaking is the intervention the counter measures, so the prompt
-    // hook clears it. Absent state is not an error: the session may be new.
+    // Records the verdict a detached diagnosis produced, so the next blocked
+    // call can hand it to the agent. Counting the correction here — not when it
+    // is dispatched — means a diagnosis that never returns does not consume one
+    // of the two attempts.
+    recordExecutionDiagnosis({ monitorId, verdict, failed = false }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeVerdict = failed ? null : assertString(verdict, "verdict", 4096);
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!existingRow) return { recorded: false };
+        let state;
+        try {
+          state = executionMonitorState(JSON.parse(existingRow.value), safeMonitorId);
+        } catch {
+          return { recorded: false };
+        }
+        if (state.diagnosis?.state !== "pending") return { recorded: false };
+        const next = {
+          ...state,
+          corrections: failed
+            ? state.corrections
+            : Math.min(MAX_CONTEXT_EPOCH, state.corrections + 1),
+          diagnosis: failed
+            ? { state: "failed", requestedAt: state.diagnosis.requestedAt, verdict: null }
+            : { state: "ready", requestedAt: state.diagnosis.requestedAt, verdict: safeVerdict }
+        };
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(next), key);
+        return { recorded: true, corrections: next.corrections };
+      });
+    },
+    // The user speaking is new evidence, so the rework counters clear. How many
+    // times the direction has already been corrected does not: that is a fact
+    // about whether self-correction is working, and saying "continue" does not
+    // make two failed corrections un-happen. Clearing it here would let the run
+    // cycle forever — correct twice, user speaks, correct twice again — and
+    // never reach the point where a person is asked to look.
     resetExecutionMonitor({ monitorId }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
         const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
         if (!existingRow) return { reset: false };
-        database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
-        return { reset: true };
+        let state = null;
+        try {
+          state = executionMonitorState(JSON.parse(existingRow.value), safeMonitorId);
+        } catch {
+          database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+          return { reset: true };
+        }
+        if (!state.corrections) {
+          database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+          return { reset: true };
+        }
+        const carried = {
+          monitorId: safeMonitorId,
+          cli: state.cli,
+          count: 0,
+          seenTools: {},
+          rework: {},
+          overLimit: false,
+          corrections: state.corrections,
+          diagnosis: null
+        };
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(carried), key);
+        return { reset: true, corrections: state.corrections };
       });
     },
     recordCaptureFailOpen({ eventType, reasonCode, sourceProvider = null, sessionUid = null, eventUid = null, createdAt }) {
