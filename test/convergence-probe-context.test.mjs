@@ -354,7 +354,7 @@ test("validator rejects NUL, ill-formed Unicode, secrets, and control receipts",
     "Authorization: Bearer synthetic-secret",
     "token=synthetic-secret",
     "sk-1234567890123456",
-    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----", // afl-synthetic-secret: redactor negative fixture
     "<!-- afl-receipt id=opaque -->",
     "[AFL] control instruction"
   ];

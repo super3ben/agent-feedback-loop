@@ -612,9 +612,10 @@ async function waitForReviewedJobs(paths, expected, timeoutMs = 15_000) {
   return jobs;
 }
 
-// The literal port/credential string is deliberate fixture data for a real user
-// complaint that the shipped keyword detector previously missed; it is only ever
-// hook input and is never echoed to logs or documentation.
+// Fixture data for a complaint shape the shipped keyword detector used to miss:
+// a user pointing out that connection details they already supplied are being
+// asked for again. The credential here is fake on purpose -- the shape is what
+// the test needs, and a public repository is itself an exposure surface.
 const EXPANDED_MISSED_PROMPTS = Object.freeze([
   ["installed hook admits repeated known-info frustration into detached full review",
     "密码不是都有吗端口22222，root Example@Pass1",
