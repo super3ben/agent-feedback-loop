@@ -13,3 +13,10 @@ npm-debug.log*
 # whitelist) and consumers have no use for them. Keep them runnable here --
 # node --test is the only thing that catches a change that merely looks correct.
 test/
+
+# Internal design records and workflow state: specs, plans, task reports and
+# change proposals from building this. They are not shipped in the npm package
+# and a consumer cloning the repository has no use for them. Kept on disk.
+docs/
+openspec/
+.superpowers/
