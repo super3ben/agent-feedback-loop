@@ -1693,7 +1693,7 @@ function createStore(database, now) {
     // stayed silent. Activity alone is not the signal: a task that runs many
     // tools and finishes is healthy, while one that rewrites the same file over
     // and over without new input is circling.
-    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, limit }) {
+    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, limit, spreadLimit }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
@@ -1705,6 +1705,8 @@ function createStore(database, now) {
       }
       const safeLimit = assertLimit(limit, "limit", 2, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
+      const safeSpreadLimit = assertLimit(spreadLimit, "spreadLimit", 8, EXECUTION_MONITOR_MAX_TARGETS);
+      if (safeSpreadLimit < 1) throw new TypeError("spreadLimit must be positive");
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
         const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
@@ -1736,13 +1738,18 @@ function createStore(database, now) {
             reworkCount = rework[safeTarget] ?? 0;
           }
         }
+        // Two shapes of non-convergence, counted separately. One artifact coming
+        // back repeatedly is circling in place; many artifacts each rewritten
+        // once or twice is a direction that keeps widening. The second kind
+        // holds every per-file counter below its limit, so it needs its own.
+        const spreadCount = Object.keys(rework).length;
         const next = {
           monitorId: safeMonitorId,
           cli: safeCli,
           count,
           seenTools,
           rework,
-          overLimit: reworkCount > safeLimit
+          overLimit: reworkCount > safeLimit || spreadCount > safeSpreadLimit
         };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
           ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, JSON.stringify(next));
@@ -1754,9 +1761,17 @@ function createStore(database, now) {
             if (stale.key !== key) deleteRow.run(stale.key);
           }
         }
-        // Only the artifact being reworked is stopped: unrelated work, and any
-        // read, still runs so the agent can summarise and hand back.
-        return { ...next, reworkCount, stop: next.overLimit && mutating };
+        // Reads always run, so the agent can still inspect and hand back. Which
+        // signal tripped is reported, because the two shapes need different
+        // instructions: narrow one artifact, or narrow the whole direction.
+        const shape = reworkCount > safeLimit ? "rework" : spreadCount > safeSpreadLimit ? "spread" : null;
+        return {
+          ...next,
+          reworkCount,
+          spreadCount,
+          shape,
+          stop: next.overLimit && mutating
+        };
       });
     },
     // The user speaking is the intervention the counter measures, so the prompt

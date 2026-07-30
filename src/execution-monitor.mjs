@@ -13,6 +13,20 @@ import { createHash } from "node:crypto";
 // The user speaking resets it, because a new instruction is new evidence.
 export const EXECUTION_REWORK_LIMIT = 2;
 
+// How many distinct artifacts may be rewritten in one session before the
+// direction itself is stopped, rather than any single file.
+//
+// Per-file counting alone misses the shape that actually costs the most. A real
+// session rewrote 20 different artifacts, each one or two times, and never
+// tripped the per-file limit: it had turned "make one ledger candidate
+// traceable" into a general git-lineage policy across every package. Circling
+// in place and spreading sideways are both non-convergence; only the second one
+// keeps every individual counter low.
+//
+// 8 is set from observed sessions: the spreading run reached 20 distinct
+// rewritten artifacts, while a healthy 160-call run touched 3.
+export const EXECUTION_SPREAD_LIMIT = 8;
+
 // Tool calls that cannot change anything. Everything else — including every
 // tool this list has never heard of — counts as mutating.
 //
