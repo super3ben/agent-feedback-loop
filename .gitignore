@@ -8,3 +8,8 @@ npm-debug.log*
 /.comet/
 .cutover-snapshot-*/
 .claude/worktrees/
+
+# Tests stay local: they are not shipped in the npm package (see the files
+# whitelist) and consumers have no use for them. Keep them runnable here --
+# node --test is the only thing that catches a change that merely looks correct.
+test/
