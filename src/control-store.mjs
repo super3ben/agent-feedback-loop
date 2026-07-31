@@ -1735,7 +1735,8 @@ function createStore(database, now) {
     // stayed silent. Activity alone is not the signal: a task that runs many
     // tools and finishes is healthy, while one that rewrites the same file over
     // and over without new input is circling.
-    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, tested = false, limit, spreadLimit }) {
+    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, tested = false,
+      limit, spreadLimit, canReview = false, diagnosisExpired = () => false }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
@@ -1746,6 +1747,8 @@ function createStore(database, now) {
         throw new TypeError("target must be an opaque digest");
       }
       if (typeof tested !== "boolean") throw new TypeError("tested must be boolean");
+      if (typeof canReview !== "boolean") throw new TypeError("canReview must be boolean");
+      if (typeof diagnosisExpired !== "function") throw new TypeError("diagnosisExpired must be a function");
       const safeLimit = assertLimit(limit, "limit", 2, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
       const safeSpreadLimit = assertLimit(spreadLimit, "spreadLimit", 8, EXECUTION_MONITOR_MAX_TARGETS);
@@ -1794,22 +1797,45 @@ function createStore(database, now) {
         const tripped = reworkCount > safeLimit || spreadCount > safeSpreadLimit;
         const corrections = state?.corrections ?? 0;
         let diagnosis = state?.diagnosis ?? null;
+        // A review that never returned must not hold the run forever. Blocks
+        // while one is pending do not advance the escalation counter, so without
+        // a deadline a dead provider would make "ask a person" unreachable — the
+        // shape that left one session waiting 2h20m. Treating it as failed puts
+        // ordinary counting back in charge.
+        if (diagnosis?.state === "pending" && diagnosisExpired(diagnosis)) {
+          diagnosis = { state: "failed", requestedAt: diagnosis.requestedAt, verdict: null };
+        }
+        const blocking = tripped && mutating;
+        const waiting = blocking && diagnosis?.state === "pending";
         // This call is itself a block when the counters have tripped, so it is
         // counted before the escalation test — otherwise the first block would
-        // be judged against a count that does not yet include it.
-        const blocking = tripped && mutating;
-        const blocks = blocking
+        // be judged against a count that does not yet include it. A block spent
+        // waiting is exempt: escalating for the guard's own latency would hand
+        // the run to a person for the crime of waiting.
+        const blocks = blocking && !waiting
           ? Math.min(MAX_CONTEXT_EPOCH, (state?.blocks ?? 0) + 1)
           : state?.blocks ?? 0;
-        // Enough blocks to show the attribution text is being ignored hands the
-        // direction to a person. The corrections term is the older route, kept
-        // because stored records carry the count, but nothing increments it now.
+        // Two routes reach a person: corrections that did not converge, or
+        // enough blocks to show the attribution text is being ignored.
         const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS
           || blocks > EXECUTION_MAX_GUARDED_BLOCKS;
         let outcome = null;
         if (blocking) {
-          if (exhausted) outcome = "human";
+          // Order matters. A verdict in hand is delivered even at the limit: it
+          // was earned before the limit was reached, and withholding it would
+          // waste the review and tell the run nothing about what to narrow.
+          if (diagnosis?.state === "ready" && diagnosis.verdict) outcome = "correct";
+          else if (exhausted) outcome = "human";
+          else if (waiting) outcome = "await";
+          else if (canReview) outcome = "dispatch";
         }
+        if (outcome === "dispatch") {
+          diagnosis = { state: "pending", requestedAt: nowIso(now), verdict: null };
+        }
+        // Handed over once, then cleared, so the next block reviews where the run
+        // got to rather than repeating an answer it has already acted on.
+        const delivered = outcome === "correct" ? diagnosis.verdict : null;
+        if (outcome === "correct") diagnosis = null;
         const next = {
           monitorId: safeMonitorId,
           cli: safeCli,
@@ -1829,8 +1855,23 @@ function createStore(database, now) {
           // ends up at a person. Escalation is deliberately excluded — that text
           // says do not retry the write, so granting a budget alongside it would
           // contradict the instruction being given.
-          rework: blocking && outcome !== "human" ? {} : rework,
-          overLimit: blocking && outcome !== "human" ? false : tripped,
+          // "dispatch" and "await" are excluded as well. Granting a budget when
+          // the review is launched would clear the counters that trip the next
+          // block, so the run would sail through the whole wait unguarded and no
+          // second block would ever collect the verdict. Measured: the call
+          // after a dispatch came back allowed instead of waiting.
+          // A verdict is granted one too: it names what to withdraw, and
+          // withdrawing means rewriting the artifact the block was about, so
+          // refusing that write would deadlock the verdict path exactly as it
+          // deadlocked the attribution path.
+          //
+          // "dispatch" and "await" are refused. Granting a budget when the
+          // review is launched would clear the counters that trip the next
+          // block, so the run would sail through the whole wait unguarded and no
+          // later block would ever collect the verdict. Measured: the call after
+          // a dispatch came back allowed instead of waiting.
+          rework: blocking && (outcome === null || outcome === "correct") ? {} : rework,
+          overLimit: blocking && (outcome === null || outcome === "correct") ? false : tripped,
           corrections,
           blocks,
           diagnosis
@@ -1859,10 +1900,12 @@ function createStore(database, now) {
           reworkCount,
           spreadCount,
           shape,
-          // What the caller should do about this block: null asks the run to
-          // attribute the over-reach, "human" stops correcting and asks a
-          // person. Only these two occur — nothing produces a verdict.
+          // What the caller should do about this block: "dispatch" launches a
+          // review and says so, "await" reports one already running, "correct"
+          // hands over the verdict below, "human" stops correcting and asks a
+          // person, and null asks the run to attribute the over-reach itself.
           outcome,
+          verdict: delivered,
           stop: blocking
         };
       });
