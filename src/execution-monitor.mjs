@@ -98,11 +98,68 @@ export function executionToolLabel(toolName) {
   return /^[A-Za-z0-9_.:-]+$/u.test(trimmed) ? trimmed : "unsupported";
 }
 
+// Codex sends the patch as an argv array — its own tool instructions read
+// {"command":["apply_patch","*** Begin Patch\n..."]} — so reading `command` as a
+// string found nothing and every Codex edit went uncounted. A live run rewrote
+// one file five times and the guard recorded one, which is why it never fired.
+// Both shapes are accepted: the array member carrying the patch, or a plain
+// string for callers that send one.
+function patchScript(command) {
+  if (typeof command === "string") return command;
+  if (!Array.isArray(command)) return "";
+  for (const part of command) {
+    if (typeof part === "string" && part.includes("*** Begin Patch")) return part;
+  }
+  return "";
+}
+
 function hashedTarget(value) {
   // The path is hashed: rework only needs to know that the same artifact came
   // back, and a file path can carry information that should not be stored.
   return createHash("sha256").update(String(value).slice(0, MAX_TARGET_LABEL), "utf8")
     .digest("hex").slice(0, 16);
+}
+
+// Rewriting one file repeatedly is what red-green-refactor looks like, so the
+// shape the guard counts is also the shape of the discipline it must not
+// punish. What separates them is not the file — paths are hashed here, and a
+// name like `foo.test.mjs` proves nothing anyway — but whether a suite actually
+// ran in between. Running one is a real act with a real cost; talking about
+// testing is free, and a measured run wrote a 37KB "testing strategy" section
+// while never invoking a suite once.
+//
+// So this looks for a command that runs tests, not for the word. It is used to
+// forgive a rewrite, never to cause a block: a false negative just leaves the
+// ordinary counters in charge.
+const TEST_COMMAND = new RegExp([
+  "(?:^|[;&|]\\s*|\\s)(?:",
+  [
+    "(?:npm|pnpm|yarn|bun)\\s+(?:run\\s+)?test",
+    "node\\s+--test",
+    "(?:python3?\\s+-m\\s+)?pytest",
+    "python3?\\s+-m\\s+unittest",
+    "(?:cargo|go|mvn|gradle|swift|dotnet)\\s+test",
+    "(?:npx\\s+)?(?:vitest|jest|mocha|ava|tap|rspec|phpunit|ctest)",
+    // Usually invoked by path, as ./gradlew or ./mvnw.
+    "(?:[.~]?[\\w./-]*/)?(?:gradlew|mvnw)\\s+(?:[\\w:.-]+\\s+)*(?:test|check|verify)",
+    "make\\s+(?:test|check)"
+  ].join("|"),
+  ")"
+].join(""), "u");
+
+/**
+ * Whether a tool call runs a test suite. Reads the command a shell tool is
+ * about to execute; anything else is not a test run.
+ */
+export function runsTests({ toolName, toolInput } = {}) {
+  if (typeof toolName !== "string" || !toolInput || typeof toolInput !== "object"
+      || Array.isArray(toolInput)) return false;
+  const { command } = toolInput;
+  const text = typeof command === "string"
+    ? command
+    : Array.isArray(command) ? command.filter((part) => typeof part === "string").join(" ") : "";
+  if (!text) return false;
+  return TEST_COMMAND.test(text.slice(0, 4096));
 }
 
 /**
@@ -125,7 +182,7 @@ export function deriveReworkTarget({ toolName, toolInput } = {}) {
     return appendOnly ? null : hashedTarget(value.trim());
   }
 
-  const command = typeof toolInput.command === "string" ? toolInput.command : "";
+  const command = patchScript(toolInput.command);
   if (!command) return null;
   // Creating a file is first work, never rework.
   const updated = /^\*\*\* Update File: (.+)$/mu.exec(command);

@@ -77,6 +77,8 @@ const CLIS = [
     configPath: [".claude", "settings.json"],
     hookEvent: "UserPromptSubmit",
     hookArgs: ["--event", "UserPromptSubmit", "--cli", "claude"],
+    executionHookEvent: "PreToolUse",
+    executionHookArgs: ["--event", "PreToolUse", "--cli", "claude"],
     legacyStopEvent: "Stop",
     hookTimeout: 5,
     timeoutUnit: "seconds"

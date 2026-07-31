@@ -76,6 +76,13 @@ const EXECUTION_DIAGNOSIS_STATES = new Set(["pending", "ready", "failed"]);
 // is the plan rather than the execution, and a third self-correction would only
 // be a faster way of arriving at the same place.
 const EXECUTION_MAX_SELF_CORRECTIONS = 2;
+// Escalation without a verdict: how many blocks this run may absorb before the
+// direction goes to a person. Each block hands over an instruction to stop and
+// attribute; an agent that complies stops writing, so a further write means the
+// instruction was read and not followed. Two blocks past the first are allowed
+// for writes already in flight when the first one landed — past that, repeating
+// the same text a fourth time is not going to work either.
+const EXECUTION_MAX_GUARDED_BLOCKS = 3;
 const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
@@ -507,6 +514,12 @@ function executionMonitorState(value, monitorId) {
   if (!Number.isSafeInteger(corrections) || corrections < 0 || corrections > MAX_CONTEXT_EPOCH) {
     throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
   }
+  // Blocks absorbed in this session. Defaults to 0 so a record written by an
+  // older runtime stays readable rather than tripping the invalid-state path.
+  const blocks = value.blocks ?? 0;
+  if (!Number.isSafeInteger(blocks) || blocks < 0 || blocks > MAX_CONTEXT_EPOCH) {
+    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  }
   let diagnosis = null;
   if (value.diagnosis !== undefined && value.diagnosis !== null) {
     const source = value.diagnosis;
@@ -528,6 +541,7 @@ function executionMonitorState(value, monitorId) {
     seenTools,
     rework,
     corrections,
+    blocks,
     diagnosis
   };
 }
@@ -1721,7 +1735,7 @@ function createStore(database, now) {
     // stayed silent. Activity alone is not the signal: a task that runs many
     // tools and finishes is healthy, while one that rewrites the same file over
     // and over without new input is circling.
-    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, limit, spreadLimit }) {
+    recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, tested = false, limit, spreadLimit }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
@@ -1731,6 +1745,7 @@ function createStore(database, now) {
       if (safeTarget !== null && !/^[a-f0-9]{1,64}$/u.test(safeTarget)) {
         throw new TypeError("target must be an opaque digest");
       }
+      if (typeof tested !== "boolean") throw new TypeError("tested must be boolean");
       const safeLimit = assertLimit(limit, "limit", 2, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
       const safeSpreadLimit = assertLimit(spreadLimit, "spreadLimit", 8, EXECUTION_MONITOR_MAX_TARGETS);
@@ -1756,7 +1771,12 @@ function createStore(database, now) {
         if (Object.hasOwn(seenTools, safeLabel) || Object.keys(seenTools).length < EXECUTION_MONITOR_MAX_TOOLS) {
           seenTools[safeLabel] = Math.min(MAX_CONTEXT_EPOCH, (seenTools[safeLabel] ?? 0) + 1);
         }
-        const rework = { ...(state?.rework ?? {}) };
+        // A suite that ran clears the tally: the rewrites that preceded it were
+        // a red-green cycle closing, not a run circling. This is the only thing
+        // besides the user speaking that forgives rework, and it is deliberately
+        // an action rather than a claim — an agent cannot talk its way out of
+        // the counter, it has to run the tests.
+        const rework = tested ? {} : { ...(state?.rework ?? {}) };
         let reworkCount = 0;
         if (safeTarget !== null) {
           if (Object.hasOwn(rework, safeTarget) || Object.keys(rework).length < EXECUTION_MONITOR_MAX_TARGETS) {
@@ -1774,26 +1794,38 @@ function createStore(database, now) {
         const tripped = reworkCount > safeLimit || spreadCount > safeSpreadLimit;
         const corrections = state?.corrections ?? 0;
         let diagnosis = state?.diagnosis ?? null;
-        // Once two corrections have failed to converge, stop producing a third
-        // verdict and hand the direction to a person instead. A verdict that is
-        // ready but not yet delivered still gets handed over: it was earned
-        // before the limit was reached, and withholding it would waste the
-        // diagnosis and tell the agent nothing about what to narrow.
-        const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS;
+        // This call is itself a block when the counters have tripped, so it is
+        // counted before the escalation test — otherwise the first block would
+        // be judged against a count that does not yet include it.
+        const blocking = tripped && mutating;
+        const blocks = blocking
+          ? Math.min(MAX_CONTEXT_EPOCH, (state?.blocks ?? 0) + 1)
+          : state?.blocks ?? 0;
+        // A verdict that is ready but not yet delivered still gets handed over:
+        // it was earned before the limit was reached, and withholding it would
+        // waste the diagnosis and tell the agent nothing about what to narrow.
+        // Either route reaches a person: two verdicts that failed to converge,
+        // or enough blocks to show the attribution text is being ignored. The
+        // second is the one that can actually fire today, since nothing
+        // dispatches a verdict.
+        const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS
+          || blocks > EXECUTION_MAX_GUARDED_BLOCKS;
         let outcome = null;
-        if (tripped && mutating) {
+        if (blocking) {
+          // Only a verdict that is already in hand is used. Nothing in this
+          // package dispatches one: `recordExecutionDiagnosis` has no caller in
+          // src, so a "pending" diagnosis was never going to be answered. The
+          // hook used to say a review had been started and to retry for its
+          // verdict, which replaced the attribution instruction with an
+          // instruction to wait for something that never arrives — measured
+          // pending for 75s with no reviewer job ever enqueued. Blocking with
+          // the attribution text is what was verified end to end, so that is
+          // what every environment gets.
           if (diagnosis?.state === "ready") outcome = "correct";
           else if (exhausted) outcome = "human";
-          else if (diagnosis?.state === "pending") outcome = "await";
-          else outcome = "dispatch";
         }
-        if (outcome === "dispatch") {
-          diagnosis = { state: "pending", requestedAt: nowIso(now), verdict: null };
-        }
-        // A verdict is handed over once. Clearing it here means the next time
-        // this run trips, it dispatches a fresh diagnosis of where it has got
-        // to — rather than being handed the same answer again, which it has
-        // already acted on.
+        // A verdict is handed over once, then cleared: repeating an answer the
+        // run has already acted on tells it nothing new.
         const delivered = outcome === "correct" ? diagnosis?.verdict ?? null : null;
         if (outcome === "correct") diagnosis = null;
         const next = {
@@ -1801,9 +1833,24 @@ function createStore(database, now) {
           cli: safeCli,
           count,
           seenTools,
-          rework,
-          overLimit: tripped,
+          // Narrowing means editing the artifact the block was about, so a block
+          // that leaves the counters tripped forbids the one action it just
+          // demanded: the corrective write is refused for the same reason as the
+          // circling it was meant to end, and the run can only hand back to the
+          // user. Observed exactly that — an agent named the over-reach, gave a
+          // minimal scope, then stopped, because rewriting the plan it had just
+          // agreed to shrink was still blocked.
+          //
+          // So delivering the attribution text also grants a fresh budget. The
+          // block is the interruption, not a lock: each one costs a full
+          // stop-and-attribute, and a run that keeps circling pays it again and
+          // ends up at a person. Escalation is deliberately excluded — that text
+          // says do not retry the write, so granting a budget alongside it would
+          // contradict the instruction being given.
+          rework: blocking && outcome !== "human" ? {} : rework,
+          overLimit: blocking && outcome !== "human" ? false : tripped,
           corrections,
+          blocks,
           diagnosis
         };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
@@ -1822,6 +1869,11 @@ function createStore(database, now) {
         const shape = reworkCount > safeLimit ? "rework" : spreadCount > safeSpreadLimit ? "spread" : null;
         return {
           ...next,
+          // What this call did, which is not what was stored: a granted block
+          // stores fresh counters for the corrective write that follows, while
+          // the caller still has to be told this call was refused.
+          rework,
+          overLimit: tripped,
           reworkCount,
           spreadCount,
           shape,
@@ -1830,7 +1882,7 @@ function createStore(database, now) {
           // correcting and ask a person.
           outcome,
           verdict: delivered,
-          stop: next.overLimit && mutating
+          stop: blocking
         };
       });
     },
@@ -1896,6 +1948,10 @@ function createStore(database, now) {
           rework: {},
           overLimit: false,
           corrections: state.corrections,
+          // Blocks do clear. They count how far the run got without a person
+          // looking, and escalation exists to fetch a person — one just spoke,
+          // so the tally that was accumulating toward asking them starts over.
+          blocks: 0,
           diagnosis: null
         };
         database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(carried), key);
