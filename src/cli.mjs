@@ -11,6 +11,7 @@ import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
 import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
+import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
@@ -826,6 +827,61 @@ export async function main(args, {
       });
       throw error;
     } finally {
+      store.close();
+    }
+    return;
+  }
+  if (command === "direction-review-run") {
+    // Runs detached, so nothing here may throw into a caller that is already
+    // gone. Every failure is recorded as a failed review, which costs the run no
+    // correction and lets ordinary counting resume.
+    const paths = pathsFor(options.home);
+    const store = openControlStore({ paths });
+    const monitorId = optionValue(options.args, "--monitor-id");
+    const providerName = optionValue(options.args, "--cli", "codex");
+    const transcriptPath = optionValue(options.args, "--transcript");
+    const startedAt = Date.now();
+    let outcome = "failed";
+    try {
+      const monitor = store.getExecutionMonitor({ monitorId });
+      if (!monitor) throw new Error("monitor_missing");
+      const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
+      const timeoutMs = Number(optionValue(options.args, "--timeout-ms",
+        process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000));
+      const context = buildDirectionContext({
+        cli: providerName,
+        shape: monitor.overLimit && Object.keys(monitor.rework).length > 1 ? "spread" : "rework",
+        reworkCount: Math.max(0, ...Object.values(monitor.rework), 0),
+        spreadCount: Object.keys(monitor.rework).length,
+        toolCounts: monitor.seenTools,
+        transcriptTail: await readTranscriptTail(transcriptPath)
+      });
+      const result = await runReviewerProvider({
+        cli: providerName,
+        executable,
+        context,
+        resultKind: "convergence_probe",
+        policyFile: paths.geminiReviewerPolicy,
+        geminiSettingsFile: paths.geminiReviewerSettings,
+        timeoutMs,
+        env: process.env
+      });
+      // The probe's own vocabulary is the verdict: what scope is unnecessary and
+      // what the smallest next step is. Bounded, because it is stored.
+      const verdict = [
+        result?.assessment ? `Assessment: ${result.assessment}.` : "",
+        Array.isArray(result?.unnecessary_scope) && result.unnecessary_scope.length
+          ? `Withdraw: ${result.unnecessary_scope.join("; ")}.` : "",
+        result?.minimal_next_step ? `Smallest next step: ${result.minimal_next_step}.` : "",
+        result?.wrong_assumption ? `Wrong assumption: ${result.wrong_assumption}.` : ""
+      ].filter(Boolean).join(" ").slice(0, 4096);
+      if (!verdict) throw new Error("empty_verdict");
+      store.recordExecutionDiagnosis({ monitorId, verdict });
+      outcome = "recorded";
+    } catch {
+      try { store.recordExecutionDiagnosis({ monitorId, failed: true }); } catch {}
+    } finally {
+      reviewerTerminalLog({ outcome, job: monitorId, durationMs: Date.now() - startedAt });
       store.close();
     }
     return;

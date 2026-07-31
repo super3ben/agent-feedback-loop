@@ -106,6 +106,68 @@ export function launchDetachedReviewer({
   }
 }
 
+/**
+ * Launches a direction review for a blocked execution monitor. Same detached,
+ * scrubbed, unref'd shape as the feedback reviewer — the guard is a short-lived
+ * process and must not wait for a review that takes 29-90s.
+ *
+ * The monitor id stands in for the job id: an execution-time block has no
+ * prompt-time capture identity, and the id is already a bounded hex digest.
+ */
+export function launchDetachedDirectionReview({
+  platform,
+  nodeExecutable,
+  cliFile,
+  home,
+  monitorId,
+  cli,
+  transcriptPath = null,
+  spawnImpl = spawn,
+  env = process.env
+} = {}) {
+  if (!SUPPORTED_PLATFORMS.has(platform)) {
+    return { attempted: false, reason: "unsupported_platform" };
+  }
+  if (!validAbsolutePath(nodeExecutable)
+      || !validAbsolutePath(cliFile)
+      || !validAbsolutePath(home)
+      || !validJobId(monitorId)
+      || !boundedString(cli, 64)
+      || (transcriptPath !== null && !validAbsolutePath(transcriptPath))
+      || typeof spawnImpl !== "function") {
+    return { attempted: false, reason: "invalid_input" };
+  }
+
+  try {
+    const argv = [
+      cliFile,
+      "direction-review-run",
+      "--home",
+      home,
+      "--monitor-id",
+      monitorId,
+      "--cli",
+      cli
+    ];
+    if (transcriptPath) argv.push("--transcript", transcriptPath);
+    const child = spawnImpl(nodeExecutable, argv, {
+      cwd: path.dirname(cliFile),
+      detached: true,
+      stdio: "ignore",
+      env: safeEnvironment(env),
+      windowsHide: true
+    });
+    if (!child || typeof child.unref !== "function") {
+      return { attempted: false, reason: "spawn_failed" };
+    }
+    if (typeof child.once === "function") child.once("error", () => {});
+    child.unref();
+    return { attempted: true, reason: "spawn_attempted" };
+  } catch {
+    return { attempted: false, reason: "spawn_failed" };
+  }
+}
+
 export function recoverDueReviewers({ store, launchReviewer, limit = 1 } = {}) {
   const effectiveLimit = Number.isInteger(limit) && limit > 0 ? 1 : 0;
   if (!effectiveLimit || !store || typeof launchReviewer !== "function") {
