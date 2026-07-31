@@ -1910,6 +1910,39 @@ function createStore(database, now) {
         };
       });
     },
+    // Where a finished review writes its answer. Called by the detached process,
+    // never by the guard. The correction is counted on arrival rather than on
+    // dispatch, so a review that dies costs the run nothing: it does not consume
+    // one of the two attempts before a person is asked.
+    recordExecutionDiagnosis({ monitorId, verdict, failed = false }) {
+      const safeMonitorId = executionMonitorId(monitorId);
+      const safeVerdict = failed ? null : assertString(verdict, "verdict", 4096);
+      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
+      return transaction(() => {
+        const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        if (!existingRow) return { recorded: false };
+        let state;
+        try {
+          state = executionMonitorState(JSON.parse(existingRow.value), safeMonitorId);
+        } catch {
+          return { recorded: false };
+        }
+        // Only a review this run actually asked for can be answered, so a verdict
+        // cannot be planted against a session that never dispatched one.
+        if (state.diagnosis?.state !== "pending") return { recorded: false };
+        const next = {
+          ...state,
+          corrections: failed
+            ? state.corrections
+            : Math.min(MAX_CONTEXT_EPOCH, state.corrections + 1),
+          diagnosis: failed
+            ? { state: "failed", requestedAt: state.diagnosis.requestedAt, verdict: null }
+            : { state: "ready", requestedAt: state.diagnosis.requestedAt, verdict: safeVerdict }
+        };
+        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(next), key);
+        return { recorded: true, corrections: next.corrections };
+      });
+    },
     // The user speaking is new evidence, so the rework counters clear. How many
     // times the direction has already been corrected does not: that is a fact
     // about whether self-correction is working, and saying "continue" does not
