@@ -67,13 +67,6 @@ function blockResponse(cli, reason) {
   return { decision: "block", reason };
 }
 
-// The verdict replaces the generic text rather than being appended to it: by
-// this point the agent already knows it is circling, and what it needs is the
-// specific finding.
-const DIAGNOSIS_VERDICT_PREFIX = "Convergence guard: an independent review of this run has returned a verdict on the direction. It was produced outside your session, so adopting it is not self-approval — treat it as a decision already made, not a suggestion to evaluate.";
-
-const DIAGNOSIS_VERDICT_SUFFIX = "Act on this now: state what you are withdrawing or narrowing to, then continue within that narrower scope. If you believe the verdict is wrong, stop and say so with the evidence rather than continuing as planned.";
-
 // Escalation text. It must not claim corrections happened: the reachable route
 // to here is repeated blocks, meaning the attribution instruction was delivered
 // several times and writes kept coming. Telling an agent it "corrected twice"
@@ -127,14 +120,11 @@ export async function handleExecutionHook({
       // The reason names the shape that tripped, because narrowing one artifact
       // and narrowing a widening direction are different instructions.
       const shapeReason = observed.shape === "spread" ? EXECUTION_SPREAD_STOP_REASON : EXECUTION_STOP_REASON;
-      let reason = shapeReason;
-      if (observed.outcome === "correct" && observed.verdict) {
-        // An external verdict is not self-approval, so acting on it directly is
-        // legitimate: the run narrows itself without waiting for a person.
-        reason = `${DIAGNOSIS_VERDICT_PREFIX}\n\n${observed.verdict}\n\n${DIAGNOSIS_VERDICT_SUFFIX}`;
-      } else if (observed.outcome === "human") {
-        reason = `${shapeReason} ${HUMAN_REQUIRED}`;
-      }
+      // Repeated blocks that changed nothing mean the text is not landing, so
+      // the direction goes to a person instead of being asked for a fourth time.
+      const reason = observed.outcome === "human"
+        ? `${shapeReason} ${HUMAN_REQUIRED}`
+        : shapeReason;
       response = blockResponse(cli, reason);
     }
   } catch {

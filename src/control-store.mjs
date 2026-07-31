@@ -1801,33 +1801,15 @@ function createStore(database, now) {
         const blocks = blocking
           ? Math.min(MAX_CONTEXT_EPOCH, (state?.blocks ?? 0) + 1)
           : state?.blocks ?? 0;
-        // A verdict that is ready but not yet delivered still gets handed over:
-        // it was earned before the limit was reached, and withholding it would
-        // waste the diagnosis and tell the agent nothing about what to narrow.
-        // Either route reaches a person: two verdicts that failed to converge,
-        // or enough blocks to show the attribution text is being ignored. The
-        // second is the one that can actually fire today, since nothing
-        // dispatches a verdict.
+        // Enough blocks to show the attribution text is being ignored hands the
+        // direction to a person. The corrections term is the older route, kept
+        // because stored records carry the count, but nothing increments it now.
         const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS
           || blocks > EXECUTION_MAX_GUARDED_BLOCKS;
         let outcome = null;
         if (blocking) {
-          // Only a verdict that is already in hand is used. Nothing in this
-          // package dispatches one: `recordExecutionDiagnosis` has no caller in
-          // src, so a "pending" diagnosis was never going to be answered. The
-          // hook used to say a review had been started and to retry for its
-          // verdict, which replaced the attribution instruction with an
-          // instruction to wait for something that never arrives — measured
-          // pending for 75s with no reviewer job ever enqueued. Blocking with
-          // the attribution text is what was verified end to end, so that is
-          // what every environment gets.
-          if (diagnosis?.state === "ready") outcome = "correct";
-          else if (exhausted) outcome = "human";
+          if (exhausted) outcome = "human";
         }
-        // A verdict is handed over once, then cleared: repeating an answer the
-        // run has already acted on tells it nothing new.
-        const delivered = outcome === "correct" ? diagnosis?.verdict ?? null : null;
-        if (outcome === "correct") diagnosis = null;
         const next = {
           monitorId: safeMonitorId,
           cli: safeCli,
@@ -1877,44 +1859,12 @@ function createStore(database, now) {
           reworkCount,
           spreadCount,
           shape,
-          // What the caller should do about this block: dispatch a diagnosis,
-          // wait for one already running, deliver its verdict, or stop
-          // correcting and ask a person.
+          // What the caller should do about this block: null asks the run to
+          // attribute the over-reach, "human" stops correcting and asks a
+          // person. Only these two occur — nothing produces a verdict.
           outcome,
-          verdict: delivered,
           stop: blocking
         };
-      });
-    },
-    // Records the verdict a detached diagnosis produced, so the next blocked
-    // call can hand it to the agent. Counting the correction here — not when it
-    // is dispatched — means a diagnosis that never returns does not consume one
-    // of the two attempts.
-    recordExecutionDiagnosis({ monitorId, verdict, failed = false }) {
-      const safeMonitorId = executionMonitorId(monitorId);
-      const safeVerdict = failed ? null : assertString(verdict, "verdict", 4096);
-      const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
-      return transaction(() => {
-        const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
-        if (!existingRow) return { recorded: false };
-        let state;
-        try {
-          state = executionMonitorState(JSON.parse(existingRow.value), safeMonitorId);
-        } catch {
-          return { recorded: false };
-        }
-        if (state.diagnosis?.state !== "pending") return { recorded: false };
-        const next = {
-          ...state,
-          corrections: failed
-            ? state.corrections
-            : Math.min(MAX_CONTEXT_EPOCH, state.corrections + 1),
-          diagnosis: failed
-            ? { state: "failed", requestedAt: state.diagnosis.requestedAt, verdict: null }
-            : { state: "ready", requestedAt: state.diagnosis.requestedAt, verdict: safeVerdict }
-        };
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(next), key);
-        return { recorded: true, corrections: next.corrections };
       });
     },
     // The user speaking is new evidence, so the rework counters clear. How many
