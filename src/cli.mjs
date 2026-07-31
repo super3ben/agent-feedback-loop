@@ -10,7 +10,7 @@ import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookE
 import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
-import { launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
+import { launchDetachedDirectionReview, launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
@@ -922,7 +922,21 @@ export async function main(args, {
           cli,
           controlStore,
           writeResponse,
-          nativeResponse: { continue: true }
+          nativeResponse: { continue: true },
+          // The link that was missing last time. Passing a real launcher is what
+          // permits the guard to announce a review at all; without it the block
+          // asks the run to attribute the over-reach itself.
+          launchDirectionReview({ monitorId, transcriptPath }) {
+            return launchDetachedDirectionReview({
+              platform: process.platform,
+              nodeExecutable: process.execPath,
+              cliFile: CLI_FILE,
+              home: paths.home,
+              monitorId,
+              cli,
+              transcriptPath
+            });
+          }
         });
         return;
       }

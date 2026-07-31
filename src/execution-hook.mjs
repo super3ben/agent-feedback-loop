@@ -7,6 +7,7 @@ import {
   isMutatingTool,
   runsTests
 } from "./execution-monitor.mjs";
+import { diagnosisExpired } from "./direction-review.mjs";
 
 // The block has to ask for a verdict on the direction, not a status report.
 //
@@ -73,6 +74,20 @@ function blockResponse(cli, reason) {
 // when it did not invites it to argue with the premise instead of stopping.
 const HUMAN_REQUIRED = "This direction has now been blocked several times in the same run and the writes have continued, so automatic correction stops here. Do not start another attempt and do not retry the write. Report to the user: what you were trying to do, what you have already changed, and why you kept going after being asked to narrow — then let them decide the direction.";
 
+// Said only when a review really was launched. The retry instruction is
+// load-bearing: a verdict can only be handed over on a later blocked call, so a
+// run that stops entirely never collects it. Reads stay allowed, so the wait is
+// not idle time.
+const REVIEW_DISPATCHED = "An independent review of this direction has been started. It runs outside your session and takes about a minute. Do not ask the user to intervene yet. Keep reading and gathering evidence, then retry a write to collect its verdict.";
+
+const REVIEW_PENDING = "The independent review of this direction is still running. Keep reading rather than writing, then retry to collect its verdict.";
+
+// The verdict replaces the generic text rather than being appended to it: by this
+// point the run knows it is circling, and what it lacks is the specific finding.
+const VERDICT_PREFIX = "Convergence guard: an independent review of this run has returned a verdict on the direction. It was produced outside your session, so adopting it is not self-approval — treat it as a decision already made, not a suggestion to weigh.";
+
+const VERDICT_SUFFIX = "Act on this now: say what you are withdrawing or narrowing to, then continue within that narrower scope. If you believe the verdict is wrong, stop and say so with evidence rather than continuing as planned.";
+
 /**
  * PreToolUse guard. Counts how often one artifact is rewritten while the user
  * stays silent, and blocks before the tool runs — a post-run hook cannot stop a
@@ -89,7 +104,13 @@ export async function handleExecutionHook({
   writeResponse = async () => null,
   nativeResponse = { continue: true },
   limit = EXECUTION_REWORK_LIMIT,
-  spreadLimit = EXECUTION_SPREAD_LIMIT
+  spreadLimit = EXECUTION_SPREAD_LIMIT,
+  // Launching the review belongs to the caller: the guard must not depend on
+  // being able to spawn. Absent means no review can run, and a block falls back
+  // to asking the run to attribute the over-reach itself — honest, rather than a
+  // promise nothing will keep. The previous attempt defaulted to a stub nobody
+  // replaced and still announced a review, leaving one session waiting 2h20m.
+  launchDirectionReview = null
 } = {}) {
   let response = { ...nativeResponse, continue: true };
   try {
@@ -101,6 +122,11 @@ export async function handleExecutionHook({
     const sessionId = payload.session_id ?? payload.sessionId;
     const toolName = payload.tool_name ?? payload.toolName;
     const toolInput = payload.tool_input ?? payload.toolInput;
+    // The review's only evidence about what the run has been doing. Both hosts
+    // supply it under the same key. The file is read by the detached process,
+    // never here — the guard has a few hundred milliseconds, not enough to read a
+    // transcript that reached 11.6MB in this project's own session.
+    const transcriptPath = payload.transcript_path ?? payload.transcriptPath ?? null;
     const monitorId = deriveExecutionMonitorId({ cli, sessionId });
     const observed = controlStore.recordExecutionToolCall({
       monitorId,
@@ -114,7 +140,12 @@ export async function handleExecutionHook({
       // non-convergence would block the discipline the guard wants.
       tested: runsTests({ toolName, toolInput }),
       limit,
-      spreadLimit
+      spreadLimit,
+      // Only claim a review is possible when something can actually launch one.
+      // The store decides to dispatch on the strength of this, and a block that
+      // announced a review nobody could run is what left a session waiting.
+      canReview: typeof launchDirectionReview === "function",
+      diagnosisExpired
     });
     if (observed?.stop) {
       // The reason names the shape that tripped, because narrowing one artifact
@@ -122,9 +153,28 @@ export async function handleExecutionHook({
       const shapeReason = observed.shape === "spread" ? EXECUTION_SPREAD_STOP_REASON : EXECUTION_STOP_REASON;
       // Repeated blocks that changed nothing mean the text is not landing, so
       // the direction goes to a person instead of being asked for a fourth time.
-      const reason = observed.outcome === "human"
-        ? `${shapeReason} ${HUMAN_REQUIRED}`
-        : shapeReason;
+      let reason = shapeReason;
+      if (observed.outcome === "dispatch") {
+        // The block holds while this runs, so there is nothing to wait for here.
+        // A spawn that fails is not fatal: the block still stands, and the run is
+        // told to attribute the over-reach itself rather than to wait for an
+        // answer that is not coming.
+        let launched = false;
+        try {
+          launched = launchDirectionReview({ monitorId, transcriptPath, cli })?.attempted === true;
+        } catch {}
+        if (launched) reason = `${shapeReason} ${REVIEW_DISPATCHED}`;
+      } else if (observed.outcome === "await") {
+        reason = `${shapeReason} ${REVIEW_PENDING}`;
+      } else if (observed.outcome === "correct" && observed.verdict) {
+        // A verdict produced outside the session is not self-approval, so the run
+        // can act on it and narrow without waiting for a person.
+        reason = `${VERDICT_PREFIX}\n\n${observed.verdict}\n\n${VERDICT_SUFFIX}`;
+      } else if (observed.outcome === "human") {
+        // Repeated blocks that changed nothing mean the text is not landing, so
+        // the direction goes to a person rather than being asked for again.
+        reason = `${shapeReason} ${HUMAN_REQUIRED}`;
+      }
       response = blockResponse(cli, reason);
     }
   } catch {
