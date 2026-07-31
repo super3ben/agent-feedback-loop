@@ -68,9 +68,40 @@ Enforcement is limited by the adapter's real seam:
 - Approved OpenSpec and Comet revisions provide a `checkpoint_gate` between tasks.
 - Generic prompt observations are `audit_only` with warning as their maximum.
 
-None of these claims generic real-time blocking of arbitrary tools. There is no
-Stop/AfterAgent convergence hook, user-visible grant or receipt, resident service,
-scheduler, database lesson body, or learning/RAG reader.
+None of these claims generic real-time blocking of arbitrary tools; that is the
+separate execution guard described below. There is no Stop/AfterAgent convergence
+hook, user-visible grant or receipt, resident service, scheduler, database lesson
+body, or learning/RAG reader.
+
+## Execution guard
+
+A `PreToolUse` hook counts how often one artifact is rewritten while the user stays
+silent, and refuses the write before it runs. It is separate from both the reviewer
+and the Probe: it needs no identity, no evidence envelope, and no network, and it
+decides from the session's own tool calls alone. Codex and Claude Code are guarded;
+Gemini is not, having no evidence behind it.
+
+Two shapes count as non-convergence. One artifact returning repeatedly is circling
+in place; many artifacts each rewritten once or twice is a direction that keeps
+widening. Each is named separately in the refusal, because narrowing one file and
+narrowing a whole direction are different instructions.
+
+The refusal asks the run to decide between two causes and act: scope growth, where a
+narrow fix was extended into a general mechanism nobody asked for, or a genuine
+contradiction with the existing design or tests. It also grants the write that
+follows it — narrowing means editing the artifact the block was about, so a refusal
+that stayed in force would forbid the one action it just demanded. A run that keeps
+circling therefore pays a full stop-and-attribute each time, and after several such
+refusals the direction goes to the user instead of being asked for again.
+
+Reads always proceed, so a blocked run can still inspect and hand back. Appending is
+not rework: a file that accumulates is not a task circling. Running a real test
+suite clears the tally, because red-green-refactor rewrites one file repeatedly and
+is the discipline the guard must not punish — the signal is an executed test
+command, not the word "test" appearing in a document.
+
+A new prompt clears the counters. The counter means "tool calls since the user last
+intervened", so the user speaking is exactly the reset condition.
 
 Independent convergence-effectiveness to Markdown publication is deferred. It
 requires a named workflow producer, a bounded evidence envelope, and an independently
@@ -99,9 +130,10 @@ rm -rf "$tmp_home"
 ```
 
 Installation copies package assets, selects the runtime, migrates the selected
-control schema, and configures only the existing prompt hooks. It does not register
-Stop/AfterAgent hooks, import Guard state, activate Guard authority, cut over a
-repository, start a service, or create a learning reader.
+control schema, and configures the prompt hooks plus the `PreToolUse` execution
+guard for the CLIs that support it. It does not register Stop/AfterAgent hooks,
+import Guard state, activate Guard authority, cut over a repository, start a
+service, or create a learning reader.
 
 `doctor` returns `{ version, status }`. `status.ready` remains the prompt/Markdown
 pipeline gate. `status.convergence` separately reports:
