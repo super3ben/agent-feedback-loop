@@ -33,9 +33,30 @@ export const EXECUTION_SPREAD_LIMIT = 8;
 // This default-deny shape is deliberate. A probe that allowed unknown tools
 // enumerated only Write/Bash/Edit and let `apply_patch` through, which wrote 20
 // files while the guard reported itself active. Unknown tools must fail closed.
+// Getting this list wrong in the safe direction still has a cost: `Read` carries
+// a `file_path`, so while it was treated as mutating it also produced a rework
+// target, and reading one file three times was enough to be refused. A guard
+// that blocks reading is worse than useless — the refusal tells the run to go
+// gather evidence, which is exactly what reading is for.
 const READ_ONLY_TOOLS = new Set([
+  // Codex.
   "update_plan",
-  "view_image"
+  "view_image",
+  "get_goal",
+  "collaborationlist_agents",
+  // Claude Code.
+  "Read",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
+  "BashOutput",
+  "TodoWrite",
+  "AskUserQuestion",
+  "ExitPlanMode",
+  "TaskList",
+  "TaskGet",
+  "TaskOutput"
 ]);
 
 const MAX_TARGET_LABEL = 200;
