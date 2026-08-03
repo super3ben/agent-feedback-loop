@@ -13,6 +13,7 @@ import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-sign
 import { launchDetachedDirectionReview, launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./status-report.mjs";
+import { resolveLanguage, padLabel, strings } from "./language.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
@@ -619,7 +620,7 @@ Usage:
   agent-feedback-loop uninstall [--home <path>] [--dry-run] [--remove-files]
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
-  agent-feedback-loop status [--home <path>]
+  agent-feedback-loop status [--home <path>] [--lang en|zh]
   agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
   agent-feedback-loop lineage-init --repo-root <path> --apply
   agent-feedback-loop paths [--home <path>]
@@ -726,12 +727,22 @@ export async function main(args, {
   }
   if (command === "install") {
     const result = await install(options);
-    printActions(result, result.dryRun ? "agent-feedback-loop install dry-run" : "agent-feedback-loop installed");
+    // Only the heading is prose. Each action line is `verb -> path`, and the
+    // paths are what a reader has to check or type, so they stay verbatim.
+    const text = strings(await resolveLanguage({
+      explicit: optionValue(options.args, "--lang"),
+      reflectionsDir: path.join(options.cwd || process.cwd(), ".agent", "reflections")
+    }));
+    printActions(result, result.dryRun ? text.installDryRun : text.installed);
     return;
   }
   if (command === "uninstall") {
     const result = await uninstall(options);
-    printActions(result, result.dryRun ? "agent-feedback-loop uninstall dry-run" : "agent-feedback-loop uninstalled");
+    const text = strings(await resolveLanguage({
+      explicit: optionValue(options.args, "--lang"),
+      reflectionsDir: path.join(options.cwd || process.cwd(), ".agent", "reflections")
+    }));
+    printActions(result, result.dryRun ? text.uninstallDryRun : text.uninstalled);
     return;
   }
   if (command === "doctor") {
@@ -840,55 +851,56 @@ export async function main(args, {
       const guard = summarizeGuard(store.listExecutionMonitors());
       const reviews = summarizeReviews(store.listRecentReviewJobs({ limit: 64 }));
       const reflectionsDir = path.join(options.cwd || process.cwd(), ".agent", "reflections");
+      const language = await resolveLanguage({
+        explicit: optionValue(options.args, "--lang"),
+        reflectionsDir
+      });
+      const text = strings(language);
       const lessons = await listLessons(reflectionsDir);
 
-      console.log("agent-feedback-loop status\n");
+      console.log(`${text.statusTitle}\n`);
 
       const cliBreakdown = Object.entries(guard.byCli)
         .map(([name, count]) => `${name} ${count}`).join(", ");
-      console.log(`Guard — ${guard.sessions} sessions observed${cliBreakdown ? ` (${cliBreakdown})` : ""}`);
-      console.log(`  blocked at least once   ${guard.blocked}`);
-      console.log(`  review dispatched       ${guard.dispatched}`);
-      console.log(`  direction corrected     ${guard.corrected}`);
-      console.log(`  escalated to a person   ${guard.escalated}`);
+      console.log(`${text.guardHeading(guard.sessions)}${cliBreakdown ? ` (${cliBreakdown})` : ""}`);
+      console.log(`  ${padLabel(text.guardBlocked, 24)} ${guard.blocked}`);
+      console.log(`  ${padLabel(text.guardDispatched, 24)} ${guard.dispatched}`);
+      console.log(`  ${padLabel(text.guardCorrected, 24)} ${guard.corrected}`);
+      console.log(`  ${padLabel(text.guardEscalated, 24)} ${guard.escalated}`);
 
       if (guard.recent.length) {
         // Ordering only. These records carry no timestamp, so presenting them
         // under a date would be inventing one.
-        console.log("\n  Most recent blocks (newest first, no timestamps recorded):");
+        console.log(`\n  ${text.guardRecent}`);
         for (const entry of guard.recent) {
-          const parts = [
-            `${entry.cli}`,
-            `${entry.calls} calls`,
-            `${entry.blocks} block${entry.blocks === 1 ? "" : "s"}`,
-            `${entry.artifacts} artifact${entry.artifacts === 1 ? "" : "s"}`
-          ];
-          if (entry.corrections) parts.push(`${entry.corrections} corrected`);
-          if (entry.diagnosis) parts.push(`review ${entry.diagnosis}`);
+          const parts = [entry.cli, text.calls(entry.calls), text.blocks(entry.blocks),
+            text.artifacts(entry.artifacts)];
+          if (entry.corrections) parts.push(text.corrected(entry.corrections));
+          if (entry.diagnosis) parts.push(text.review(entry.diagnosis));
           console.log(`    - ${parts.join(", ")}`);
-          if (entry.verdict) console.log(`      verdict: ${entry.verdict.slice(0, 150)}`);
+          if (entry.verdict) console.log(`      ${text.verdictLabel}: ${entry.verdict.slice(0, 150)}`);
         }
       }
 
       const stateBreakdown = Object.entries(reviews.byState)
         .map(([name, count]) => `${name} ${count}`).join(", ");
-      console.log(`\nReviews — ${reviews.total} jobs${stateBreakdown ? ` (${stateBreakdown})` : ""}`);
+      console.log(`\n${text.reviewsHeading(reviews.total)}${stateBreakdown ? ` (${stateBreakdown})` : ""}`);
       if (reviews.recent.length) {
-        console.log("  Most recent:");
+        console.log(`  ${text.reviewsRecent}`);
         for (const entry of reviews.recent.slice(0, 5)) {
           const when = entry.createdAt ? entry.createdAt.slice(0, 16).replace("T", " ") : "unknown";
           console.log(`    - ${when}  ${entry.state}`);
         }
       }
 
-      console.log(`\nLessons — ${lessons.total} published in ${reflectionsDir}`);
+      console.log(`\n${text.lessonsHeading(lessons.total, reflectionsDir)}`);
       for (const lesson of lessons.recent) {
         console.log(`    - ${lesson.modifiedAt.slice(0, 10)}  ${lesson.title}`);
         const gist = await lessonGist(reflectionsDir, lesson.fileName);
         if (gist) console.log(`      ${gist}`);
       }
       if (!lessons.total) {
-        console.log("    (none here — lessons are written per project, so run this from a project directory)");
+        console.log(`    ${text.lessonsNone}`);
       }
     } finally {
       store.close();
