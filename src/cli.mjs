@@ -12,6 +12,7 @@ import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
 import { launchDetachedDirectionReview, launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
+import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./status-report.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
@@ -618,6 +619,7 @@ Usage:
   agent-feedback-loop uninstall [--home <path>] [--dry-run] [--remove-files]
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
+  agent-feedback-loop status [--home <path>]
   agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
   agent-feedback-loop lineage-init --repo-root <path> --apply
   agent-feedback-loop paths [--home <path>]
@@ -826,6 +828,68 @@ export async function main(args, {
         durationMs: Date.now() - startedAt
       });
       throw error;
+    } finally {
+      store.close();
+    }
+    return;
+  }
+  if (command === "status") {
+    const paths = pathsFor(options.home);
+    const store = openControlStore({ paths });
+    try {
+      const guard = summarizeGuard(store.listExecutionMonitors());
+      const reviews = summarizeReviews(store.listRecentReviewJobs({ limit: 64 }));
+      const reflectionsDir = path.join(options.cwd || process.cwd(), ".agent", "reflections");
+      const lessons = await listLessons(reflectionsDir);
+
+      console.log("agent-feedback-loop status\n");
+
+      const cliBreakdown = Object.entries(guard.byCli)
+        .map(([name, count]) => `${name} ${count}`).join(", ");
+      console.log(`Guard — ${guard.sessions} sessions observed${cliBreakdown ? ` (${cliBreakdown})` : ""}`);
+      console.log(`  blocked at least once   ${guard.blocked}`);
+      console.log(`  review dispatched       ${guard.dispatched}`);
+      console.log(`  direction corrected     ${guard.corrected}`);
+      console.log(`  escalated to a person   ${guard.escalated}`);
+
+      if (guard.recent.length) {
+        // Ordering only. These records carry no timestamp, so presenting them
+        // under a date would be inventing one.
+        console.log("\n  Most recent blocks (newest first, no timestamps recorded):");
+        for (const entry of guard.recent) {
+          const parts = [
+            `${entry.cli}`,
+            `${entry.calls} calls`,
+            `${entry.blocks} block${entry.blocks === 1 ? "" : "s"}`,
+            `${entry.artifacts} artifact${entry.artifacts === 1 ? "" : "s"}`
+          ];
+          if (entry.corrections) parts.push(`${entry.corrections} corrected`);
+          if (entry.diagnosis) parts.push(`review ${entry.diagnosis}`);
+          console.log(`    - ${parts.join(", ")}`);
+          if (entry.verdict) console.log(`      verdict: ${entry.verdict.slice(0, 150)}`);
+        }
+      }
+
+      const stateBreakdown = Object.entries(reviews.byState)
+        .map(([name, count]) => `${name} ${count}`).join(", ");
+      console.log(`\nReviews — ${reviews.total} jobs${stateBreakdown ? ` (${stateBreakdown})` : ""}`);
+      if (reviews.recent.length) {
+        console.log("  Most recent:");
+        for (const entry of reviews.recent.slice(0, 5)) {
+          const when = entry.createdAt ? entry.createdAt.slice(0, 16).replace("T", " ") : "unknown";
+          console.log(`    - ${when}  ${entry.state}`);
+        }
+      }
+
+      console.log(`\nLessons — ${lessons.total} published in ${reflectionsDir}`);
+      for (const lesson of lessons.recent) {
+        console.log(`    - ${lesson.modifiedAt.slice(0, 10)}  ${lesson.title}`);
+        const gist = await lessonGist(reflectionsDir, lesson.fileName);
+        if (gist) console.log(`      ${gist}`);
+      }
+      if (!lessons.total) {
+        console.log("    (none here — lessons are written per project, so run this from a project directory)");
+      }
     } finally {
       store.close();
     }

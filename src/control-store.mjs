@@ -1330,6 +1330,13 @@ function createStore(database, now) {
         return { released: true };
       });
     },
+    // Recent reviewer jobs, newest first. Unlike monitor records these carry real
+    // timestamps, so a report built on them can say when something happened.
+    listRecentReviewJobs({ limit = 64 } = {}) {
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 512) : 64;
+      return database.prepare(`SELECT job_id, state, created_at, completed_at, published_path
+        FROM reviewer_jobs ORDER BY created_at DESC LIMIT ?`).all(safeLimit);
+    },
     listRecoverableReviewJobs({ limit = MAX_RECOVERABLE_REVIEW_JOBS, now: at } = {}) {
       const safeLimit = assertLimit(limit, "limit", MAX_RECOVERABLE_REVIEW_JOBS, MAX_RECOVERABLE_REVIEW_JOBS);
       if (safeLimit === 0) return [];
@@ -1727,6 +1734,27 @@ function createStore(database, now) {
         throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
       }
       return executionMonitorState(parsed, safeMonitorId);
+    },
+    // Every monitor record, newest first. Rows carry no timestamp — store_meta is
+    // key/value only — so insertion order is the only chronology available, and
+    // callers must not present it as a time. A record whose JSON no longer parses
+    // is skipped rather than thrown on: a summary that dies on one bad row is
+    // worse than one that reports the rest.
+    listExecutionMonitors({ limit = EXECUTION_MONITOR_MAX_STORED } = {}) {
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0
+        ? Math.min(limit, EXECUTION_MONITOR_MAX_STORED)
+        : EXECUTION_MONITOR_MAX_STORED;
+      const rows = database.prepare(
+        "SELECT key, value FROM store_meta WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?"
+      ).all(`${EXECUTION_MONITOR_META_PREFIX}%`, safeLimit);
+      const monitors = [];
+      for (const row of rows) {
+        const monitorId = row.key.slice(EXECUTION_MONITOR_META_PREFIX.length);
+        try {
+          monitors.push(executionMonitorState(JSON.parse(row.value), monitorId));
+        } catch {}
+      }
+      return monitors;
     },
     // Counts one tool call for a session and reports whether the run has passed
     // the point where the user should be handed control back. The count is
