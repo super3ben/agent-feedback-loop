@@ -122,7 +122,10 @@ export function validateReviewerResult(value, {
 } = {}) {
   if (!isRecord(value)) fail("reviewer result must be an object");
   if (value.outcome === "no_lesson") {
-    exactKeys(value, new Set(["outcome", "reason_code", "family_key"]));
+    exactKeys(value, new Set([
+      "outcome", "reason_code", "family_key",
+      "incident_summary", "why_not_a_lesson", "would_qualify_if"
+    ]));
     const reasonCode = normalizedString(value.reason_code, {
       name: "reason_code", maxLength: 64, canonical: true
     });
@@ -133,7 +136,26 @@ export function validateReviewerResult(value, {
     const familyKey = normalizedString(value.family_key, {
       name: "family_key", maxLength: 128, canonical: true, pattern: FAMILY_KEY_PATTERN
     });
-    return { outcome: "no_lesson", reason_code: reasonCode, family_key: familyKey };
+    // Why the review declined. A reason code alone is a black box: it says a
+    // review said no, not what it looked at or what would change its mind, so
+    // nobody can tell a correct decline from a threshold set too high.
+    const incidentSummary = normalizedString(value.incident_summary, {
+      name: "incident_summary", maxLength: 600
+    });
+    const whyNotALesson = normalizedString(value.why_not_a_lesson, {
+      name: "why_not_a_lesson", maxLength: 600
+    });
+    const wouldQualifyIf = normalizedString(value.would_qualify_if, {
+      name: "would_qualify_if", maxLength: 400
+    });
+    return {
+      outcome: "no_lesson",
+      reason_code: reasonCode,
+      family_key: familyKey,
+      incident_summary: incidentSummary,
+      why_not_a_lesson: whyNotALesson,
+      would_qualify_if: wouldQualifyIf
+    };
   }
   if (value.outcome !== "lesson") fail("reviewer result has an unsupported outcome");
   exactKeys(value, LESSON_KEYS);

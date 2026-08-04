@@ -66,6 +66,13 @@ const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
 const FAMILY_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
+// Why a review declined to publish. Kept in store_meta rather than a new column
+// on review_job_events: the row is one record per job, read only by the status
+// report, and adding it here avoids a schema migration for a reporting field.
+// Bounded and capped, because these accumulate one per declined review.
+const REVIEW_DECLINE_META_PREFIX = "review_decline:v1:";
+const REVIEW_DECLINE_MAX_STORED = 256;
+const REVIEW_DECLINE_MAX_TEXT = 600;
 const EXECUTION_MONITOR_MAX_STORED = 128;
 const EXECUTION_MONITOR_MAX_TOOLS = 64;
 const EXECUTION_MONITOR_MAX_TARGETS = 64;
@@ -1330,6 +1337,61 @@ function createStore(database, now) {
         return { released: true };
       });
     },
+    // Why recent reviews declined to publish, newest first. Keyed by job id, so a
+    // caller can join these onto the job list. Reviews recorded before declines
+    // were kept simply have no entry.
+    listReviewDeclines({ limit = 64 } = {}) {
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0
+        ? Math.min(limit, REVIEW_DECLINE_MAX_STORED)
+        : 64;
+      const rows = database.prepare(
+        "SELECT value FROM store_meta WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?"
+      ).all(`${REVIEW_DECLINE_META_PREFIX}%`, safeLimit);
+      const declines = [];
+      for (const row of rows) {
+        try {
+          declines.push(JSON.parse(row.value));
+        } catch {}
+      }
+      return declines;
+    },
+    // The most recent decline for each family in this project. What a review
+    // declined and the condition it set for changing its mind have to reach the
+    // NEXT review of the same family, or every review is the first one: five
+    // stored declines each said "would qualify if the family recurs", the family
+    // recurred, and the next review — never shown that promise — declined again.
+    // Keyed per family and per project, so it generalises to every family rather
+    // than the one that exposed the gap.
+    listLatestDeclinesByFamily({ projectId, limit = 32 } = {}) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 128) : 32;
+      const rows = database.prepare(
+        "SELECT value FROM store_meta WHERE key LIKE ? ORDER BY rowid DESC"
+      ).all(`${REVIEW_DECLINE_META_PREFIX}%`);
+      const byFamily = new Map();
+      for (const row of rows) {
+        let decline;
+        try {
+          decline = JSON.parse(row.value);
+        } catch {
+          continue;
+        }
+        if (!decline?.familyKey || byFamily.has(decline.familyKey)) continue;
+        // Declines are stored globally but promises are per project: a condition
+        // set while reviewing one project must not bind another.
+        const job = getReviewJob(String(decline.jobId ?? ""));
+        if (!job || job.project_id !== safeProjectId) continue;
+        byFamily.set(decline.familyKey, {
+          familyKey: decline.familyKey,
+          reasonCode: decline.reasonCode ?? null,
+          declinedAt: decline.declinedAt ?? null,
+          incidentSummary: decline.incidentSummary ?? null,
+          wouldQualifyIf: decline.wouldQualifyIf ?? null
+        });
+        if (byFamily.size >= safeLimit) break;
+      }
+      return [...byFamily.values()];
+    },
     // Recent reviewer jobs, newest first. Unlike monitor records these carry real
     // timestamps, so a report built on them can say when something happened.
     listRecentReviewJobs({ limit = 64 } = {}) {
@@ -1433,7 +1495,8 @@ function createStore(database, now) {
         return { ...renewed, leaseEpoch: safeLeaseEpoch };
       });
     },
-    completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode, familyKey }) {
+    completeReviewNoLesson({ jobId, ownerId, leaseEpoch, reasonCode, familyKey,
+      incidentSummary = null, whyNotALesson = null, wouldQualifyIf = null }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
@@ -1462,6 +1525,34 @@ function createStore(database, now) {
           leaseEpoch: safeLeaseEpoch,
           timestamp
         });
+        // A reason code alone is a black box: it says a review declined, not what
+        // it declined or why, so a person cannot tell a correct decline from a
+        // threshold set too high. Written only when the reviewer supplied the
+        // prose, so reviews recorded before this existed stay readable and
+        // readers must handle a missing record.
+        if (incidentSummary || whyNotALesson || wouldQualifyIf) {
+          const decline = {
+            jobId: safeJobId,
+            reasonCode: safeReasonCode,
+            familyKey: safeFamilyKey,
+            declinedAt: timestamp,
+            incidentSummary: assertOptionalString(incidentSummary, "incidentSummary", REVIEW_DECLINE_MAX_TEXT),
+            whyNotALesson: assertOptionalString(whyNotALesson, "whyNotALesson", REVIEW_DECLINE_MAX_TEXT),
+            wouldQualifyIf: assertOptionalString(wouldQualifyIf, "wouldQualifyIf", REVIEW_DECLINE_MAX_TEXT)
+          };
+          database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+            .run(`${REVIEW_DECLINE_META_PREFIX}${safeJobId}`, JSON.stringify(decline));
+          const retained = database.prepare(
+            "SELECT key FROM store_meta WHERE key LIKE ? ORDER BY rowid"
+          ).all(`${REVIEW_DECLINE_META_PREFIX}%`);
+          if (retained.length > REVIEW_DECLINE_MAX_STORED) {
+            const remove = database.prepare("DELETE FROM store_meta WHERE key=?");
+            for (const stale of retained.slice(0, retained.length - REVIEW_DECLINE_MAX_STORED)) {
+              remove.run(stale.key);
+            }
+          }
+        }
         return { ...completed };
       });
     },

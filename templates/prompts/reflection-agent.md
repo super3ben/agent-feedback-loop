@@ -12,12 +12,26 @@ First audit the incident in this exact order:
 4. the unmet acceptance item.
 
 Then classify responsibility. Return
-`{"outcome":"no_lesson","reason_code":"...","family_key":"..."}` unless the
-bounded evidence proves a reusable Major, Critical, or Blocker lesson caused by
-`agent_fault`. `reason_code` must be exactly one of `insufficient_evidence`,
-`external_limit`, `user_misunderstanding`, `shared_ambiguity`, `minor_issue`, or
-`not_agent_fault`. Prospective requests, user misunderstanding, shared ambiguity,
-external limits, incomplete evidence, and Minor issues are not lessons.
+`{"outcome":"no_lesson","reason_code":"...","family_key":"...","incident_summary":"...","why_not_a_lesson":"...","would_qualify_if":"..."}`
+unless the bounded evidence proves a reusable Major, Critical, or Blocker lesson
+caused by `agent_fault`. `reason_code` must be exactly one of
+`insufficient_evidence`, `external_limit`, `user_misunderstanding`,
+`shared_ambiguity`, `minor_issue`, or `not_agent_fault`. Prospective requests,
+user misunderstanding, shared ambiguity, external limits, incomplete evidence,
+and Minor issues are not lessons.
+
+A declined review is read by a person deciding whether the threshold is right, so
+the three prose fields carry that decision rather than restating the code:
+
+- `incident_summary`: what the user asked for and what the agent actually did,
+  concretely enough to recognise the incident without opening the transcript.
+- `why_not_a_lesson`: the specific reason this evidence does not prove a reusable
+  agent fault. "Insufficient evidence" is the code, not the reason — say what was
+  missing, or what the agent got right.
+- `would_qualify_if`: what would have to be true for the same incident to become
+  a lesson, so a reader can tell a correct decline from a threshold set too high.
+
+Write all three in the language the incident itself is in.
 
 Always name the family this incident belongs to, including when it is not a
 lesson. `recurrence.known_families` lists the family keys this project has
@@ -36,6 +50,17 @@ a new Major lesson even when `reflectionCatalog` is empty. Do not use
 `external_limit` merely because the agent failed to retain information already
 provided: that is not a first-occurrence external limit when recurrence evidence
 proves the pattern.
+
+`recurrence.prior_declines` holds, per family, what the previous review of that
+family declined and the exact condition it set for changing its mind. That
+condition is a commitment, not a note. If this incident matches a prior
+decline's `would_qualify_if`, you may not decline again with the same
+`reason_code`: either publish the lesson, or state in `why_not_a_lesson`
+specifically why the previous review's own condition is not met — quoting the
+condition. Declining the same family repeatedly while each decline promises the
+next occurrence will qualify is how a lesson the user has hit three times was
+never written; the user was asked for the same credential in three separate
+sessions because each review deferred to a next time that never counted.
 
 For a proven lesson, identify a controlled reusable `method_class`, determine
 whether an existing family in `reflectionCatalog` applies, and return exactly the

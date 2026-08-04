@@ -5,7 +5,9 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "outcome": { "const": "no_lesson" },
+        "outcome": {
+          "const": "no_lesson"
+        },
         "reason_code": {
           "enum": [
             "insufficient_evidence",
@@ -21,17 +23,49 @@
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "incident_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        },
+        "why_not_a_lesson": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        },
+        "would_qualify_if": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
         }
       },
-      "required": ["outcome", "reason_code", "family_key"]
+      "required": [
+        "outcome",
+        "reason_code",
+        "family_key",
+        "incident_summary",
+        "why_not_a_lesson",
+        "would_qualify_if"
+      ]
     },
     {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "outcome": { "const": "lesson" },
-        "final_severity": { "enum": ["Major", "Critical", "Blocker"] },
-        "responsibility": { "const": "agent_fault" },
+        "outcome": {
+          "const": "lesson"
+        },
+        "final_severity": {
+          "enum": [
+            "Major",
+            "Critical",
+            "Blocker"
+          ]
+        },
+        "responsibility": {
+          "const": "agent_fault"
+        },
         "method_class": {
           "type": "string",
           "minLength": 1,
@@ -39,13 +73,19 @@
           "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
         },
         "family_id": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
         },
         "proposed_family_key": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
@@ -150,15 +190,25 @@
           "oneOf": [
             {
               "properties": {
-                "family_id": { "type": "null" },
-                "proposed_family_key": { "type": "string" },
-                "recurrence_of": { "maxItems": 0 }
+                "family_id": {
+                  "type": "null"
+                },
+                "proposed_family_key": {
+                  "type": "string"
+                },
+                "recurrence_of": {
+                  "maxItems": 0
+                }
               }
             },
             {
               "properties": {
-                "family_id": { "type": "string" },
-                "proposed_family_key": { "type": "null" }
+                "family_id": {
+                  "type": "string"
+                },
+                "proposed_family_key": {
+                  "type": "null"
+                }
               }
             }
           ]

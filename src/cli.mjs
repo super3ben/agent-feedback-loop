@@ -893,6 +893,20 @@ export async function main(args, {
         }
       }
 
+      // A declined review used to be a bare reason code, which cannot tell a
+      // correct decline from a threshold set too high. These carry the reasoning.
+      const declines = store.listReviewDeclines({ limit: 5 });
+      if (declines.length) {
+        console.log(`\n  ${text.declinesHeading}`);
+        for (const decline of declines) {
+          const when = decline.declinedAt ? decline.declinedAt.slice(0, 16).replace("T", " ") : "";
+          console.log(`    - ${when}  ${decline.reasonCode}  [${decline.familyKey}]`);
+          if (decline.incidentSummary) console.log(`      ${decline.incidentSummary}`);
+          if (decline.whyNotALesson) console.log(`      ${text.declineWhy}: ${decline.whyNotALesson}`);
+          if (decline.wouldQualifyIf) console.log(`      ${text.declineQualify}: ${decline.wouldQualifyIf}`);
+        }
+      }
+
       console.log(`\n${text.lessonsHeading(lessons.total, reflectionsDir)}`);
       for (const lesson of lessons.recent) {
         console.log(`    - ${lesson.modifiedAt.slice(0, 10)}  ${lesson.title}`);

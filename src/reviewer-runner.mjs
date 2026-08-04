@@ -98,10 +98,28 @@ function recurrenceSummary({ store, jobId }) {
   // key from this list instead of minting a new one for the same problem, which
   // is what makes a repeat countable at all.
   const knownFamilies = store.listReviewFamilyKeys({ jobId, limit: 32 });
+  // Each family's most recent decline, including the condition that review set
+  // for changing its mind. Without this every review is effectively the first:
+  // it writes "would qualify if the family recurs", the family recurs, and the
+  // next review — never shown the promise — declines the same way again.
+  let priorDeclines = [];
+  try {
+    const projectId = store.getReviewJob(jobId)?.project_id;
+    if (projectId && typeof store.listLatestDeclinesByFamily === "function") {
+      priorDeclines = store.listLatestDeclinesByFamily({ projectId, limit: 32 });
+    }
+  } catch {}
   return {
     known_families: knownFamilies.map((entry) => ({
       family_key: entry.familyKey,
       occurrences: entry.occurrences
+    })),
+    prior_declines: priorDeclines.map((entry) => ({
+      family_key: entry.familyKey,
+      reason_code: entry.reasonCode,
+      declined_at: entry.declinedAt,
+      incident_summary: entry.incidentSummary,
+      would_qualify_if: entry.wouldQualifyIf
     }))
   };
 }
@@ -264,7 +282,12 @@ export async function runReviewJob({
         ownerId,
         leaseEpoch,
         reasonCode: result.reason_code,
-        familyKey: result.family_key
+        familyKey: result.family_key,
+        // Why this review declined. Without it a decline is a bare code, and
+        // nobody can tell a correct one from a threshold set too high.
+        incidentSummary: result.incident_summary,
+        whyNotALesson: result.why_not_a_lesson,
+        wouldQualifyIf: result.would_qualify_if
       });
       return { outcome: "reviewed_no_lesson", documentPath: null };
     } catch (error) {
