@@ -139,14 +139,20 @@ export function validateReviewerResult(value, {
     // Why the review declined. A reason code alone is a black box: it says a
     // review said no, not what it looked at or what would change its mind, so
     // nobody can tell a correct decline from a threshold set too high.
+    //
+    // Scanned like published prose. The reviewer writes these fields while
+    // reading untrusted transcript evidence, they are stored, and they flow back
+    // into later reviews as prior_declines — an unscanned field here would be a
+    // durable channel for credentials or planted control markers that the
+    // publication path already refuses.
     const incidentSummary = normalizedString(value.incident_summary, {
-      name: "incident_summary", maxLength: 600
+      name: "incident_summary", maxLength: 600, scan: true
     });
     const whyNotALesson = normalizedString(value.why_not_a_lesson, {
-      name: "why_not_a_lesson", maxLength: 600
+      name: "why_not_a_lesson", maxLength: 600, scan: true
     });
     const wouldQualifyIf = normalizedString(value.would_qualify_if, {
-      name: "would_qualify_if", maxLength: 400
+      name: "would_qualify_if", maxLength: 400, scan: true
     });
     return {
       outcome: "no_lesson",

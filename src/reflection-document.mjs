@@ -215,6 +215,22 @@ function sectionsFrom(markdown) {
     const end = index + 1 < headings.length ? headings[index + 1].index : markdown.length;
     sections.set(kind, markdown.slice(start, end).trim());
   }
+  if (sections.size > 0) return sections;
+  // The house's earlier reviewers wrote sections as top-level list entries
+  // ("- class of mistake:" with indented children) instead of "##" headings.
+  // 43 of the 61 documents in one real project use this shape, including two
+  // Major lessons about the exact credential mistake the user kept hitting —
+  // all invisible to the selector until this fallback. Underscored variants
+  // ("root_cause") appear too, so underscores normalise to spaces.
+  const listMarkers = [...markdown.matchAll(/^-\s+([a-z][a-z0-9 _/]*?)\s*:\s*$/gimu)];
+  for (let index = 0; index < listMarkers.length; index += 1) {
+    const name = listMarkers[index][1].replace(/_/gu, " ");
+    const kind = HEADING_ALIASES.get(normalizeHeading(name));
+    if (!kind || sections.has(kind)) continue;
+    const start = listMarkers[index].index + listMarkers[index][0].length;
+    const end = index + 1 < listMarkers.length ? listMarkers[index + 1].index : markdown.length;
+    sections.set(kind, listMarkers[index + 1] ? markdown.slice(start, end).trim() : markdown.slice(start).trim());
+  }
   return sections;
 }
 
@@ -345,6 +361,18 @@ export function parseReflectionMarkdown(markdown, { path: filePath }) {
     return ineligible(filePath, "legacy_incomplete");
   }
   const methodClass = `legacy-method-${sha256(classOfMistake).slice(0, 20)}`;
+  // Legacy documents never carried applies_when, and the selector weights that
+  // field 4x — so a rescued Major lesson about the exact mistake being repeated
+  // scored 2 while unrelated documents scored 7, and the user was re-asked for
+  // a credential three lessons already covered. The complaint and the repeated
+  // pattern lines are the closest thing these documents have to the canonical
+  // field's definition — trigger conditions in the user's own words — so they
+  // stand in for it. Canonical documents are untouched.
+  const complaintText = normalizedSectionText(sections.get("complaint") ?? "");
+  const legacyAppliesWhen = [
+    ...(complaintText ? [complaintText] : []),
+    ...listItems(sections.get("repeatedPattern"))
+  ].slice(0, 8);
   return {
     eligible: true,
     canonical: false,
@@ -357,7 +385,7 @@ export function parseReflectionMarkdown(markdown, { path: filePath }) {
     responsibility: "agent_fault",
     methodClass,
     familyId: `legacy-family-${sha256(`${classOfMistake}\n${methodClass}`).slice(0, 20)}`,
-    appliesWhen: [],
+    appliesWhen: legacyAppliesWhen,
     effectiveness: "unknown",
     sourceIdentityHash: null,
     facts: listItems(sections.get("facts")),
