@@ -16,9 +16,23 @@ const SECRET_PATTERNS = [
   { name: "password", pattern: /(password|passwd)\s*[=:]\s*([^\s,;]+)/gi },
   { name: "credential", pattern: /(password|passwd|passcode|api[_ -]?key|token|secret)\s+(?:is|was)\s+(?!(?:already|previously|shared|provided|given|sent)\b)([^\s,;]+)/gi },
   { name: "credential", pattern: /(密码|口令|密钥)\s*(?:是|为|：|:)\s*([^\s,，;；。]+)/g },
-  { name: "bearer", pattern: /Bearer\s+[A-Za-z0-9._~+/=-]+/gi }
+  { name: "bearer", pattern: /Bearer\s+[A-Za-z0-9._~+/=-]+/gi },
+  // `admin/Hik@1245` names no field, so no label-based rule above fires and no
+  // context word appears on the line either. The username is kept because it is
+  // what makes the trace readable as evidence; only the secret half is removed.
+  // The value side must carry a digit and a symbol that paths do not use. Dot,
+  // hyphen and underscore are deliberately excluded from that symbol class:
+  // counting them made `docs/2026-08-06-notes.md` read as a credential, which
+  // would redact ordinary filenames out of the evidence.
+  {
+    name: "credential_pair",
+    pattern: /\b([A-Za-z][\w.-]{2,31})\/(?=[^\s/]{6,64}(?:\s|$))(?=[^\s/]*\d)(?=[^\s/]*[^\w\s/.-])([^\s/]+)/g
+  }
 ];
-const CREDENTIAL_CONTEXT_PATTERN = /\b(?:password|passwd|passcode|credential|api[_ -]?key|token|secret)\b|密码|口令|密钥/i;
+// An account word is enough context on its own. Real login lines say
+// "账号root <secret>" or "account root <secret>" and never repeat the word
+// password, so requiring a password label is what let 32% of the corpus leak.
+const CREDENTIAL_CONTEXT_PATTERN = /\b(?:password|passwd|passcode|credential|api[_ -]?key|token|secret|account|username|login)\b|密码|口令|密钥|账号|账户|用户名/i;
 const CONTEXT_TOKEN_PATTERN = /[^\s,，;；。!?！？"'`<>]+/g;
 
 function hasArrayValues(value) {
@@ -57,23 +71,43 @@ export function redactText(input, { blockedTokenHashes = [] } = {}) {
   const credentialContext = CREDENTIAL_CONTEXT_PATTERN.test(text);
   const blocked = new Set(blockedTokenHashes);
   const manifest = [];
+  // Values proven secret by a labelled rule on this text. Handing these to the
+  // next call lets an unlabelled reuse of the same value be scrubbed without a
+  // rule for its phrasing.
+  const learned = new Set();
   for (const { name, pattern } of SECRET_PATTERNS) {
-    text = text.replace(pattern, (match, label) => {
+    text = text.replace(pattern, (match, label, value) => {
       manifest.push({ type: name, label: label || name });
+      if (value) learned.add(createHash("sha256").update(value).digest("hex"));
       return label ? `${label}=[REDACTED]` : "Bearer [REDACTED]";
     });
   }
   if (credentialContext || blocked.size > 0) {
     text = text.replace(CONTEXT_TOKEN_PATTERN, (token) => {
+      // The token pattern does not split on brackets or trailing punctuation, so
+      // `{secret};` arrives as one token and would miss the hash learned for the
+      // bare value. Compare on the unwrapped core and put the wrapper back, so a
+      // delimiter is not a way around redaction.
+      const [, open = "", core = token, close = ""] = /^([[({<'"]*)(.*?)([\])}>'";:,.]*)$/s.exec(token) ?? [];
       const tokenHash = createHash("sha256").update(token).digest("hex");
+      const coreHash = createHash("sha256").update(core).digest("hex");
+      if (core !== token && (blocked.has(coreHash)
+          || (credentialContext && looksLikeCredentialToken(core)))) {
+        manifest.push({ type: "credential_context", label: "contextual_token" });
+        learned.add(coreHash);
+        return `${open}[REDACTED]${close}`;
+      }
       if (!(credentialContext && looksLikeCredentialToken(token)) && !blocked.has(tokenHash)) return token;
       manifest.push({ type: "credential_context", label: "contextual_token" });
+      learned.add(tokenHash);
       return "[REDACTED]";
     });
   }
   return {
     text,
     manifest,
+    // Hashes only: the caller can match a repeat without ever holding the value.
+    learnedTokenHashes: [...learned],
     contentHash: createHash("sha256").update(text).digest("hex")
   };
 }
