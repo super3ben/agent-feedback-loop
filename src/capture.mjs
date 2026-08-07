@@ -214,7 +214,11 @@ export function extractTranscriptExcerpt(transcriptText, { maxChars = 12 * 1024 
   return fragments.join("\n").slice(-maxChars);
 }
 
-export function normalizeHookEvent({ cli, payload, installationId = "unknown", timeout, timeoutUnit, capturePolicyRevision = 1 }) {
+// blockedTokenHashes carries what an earlier event in this same turn already
+// proved secret. Redaction runs once per event, so `password: X` is scrubbed
+// where it is labelled and a later bare `X` would ship in the clear; on 126
+// lines of real capture text that was 33 of the leaks.
+export function normalizeHookEvent({ cli, payload, installationId = "unknown", timeout, timeoutUnit, capturePolicyRevision = 1, blockedTokenHashes = [] }) {
   const input = typeof payload === "string" ? { prompt: payload } : (payload || {});
   const toolRefs = Array.isArray(input.tool_refs) ? input.tool_refs : [];
   const stableSessionId = String(input.session_id || input.sessionId || "").trim();
@@ -222,7 +226,7 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
   const explicitEventId = input.event_id || input.eventId || input.prompt_id || input.promptId || null;
   const nativeTurnId = input.native_turn || input.turn_id || input.turnId || null;
   const stableTurnId = nativeTurnId === null ? "" : String(nativeTurnId).trim();
-  const redacted = redactText(input.prompt || input.text || "");
+  const redacted = redactText(input.prompt || input.text || "", { blockedTokenHashes });
   const transcriptPath = String(input.transcript_path || input.transcriptPath || "");
   const derivedSourceId = `derived:${lengthPrefixedUtf8Sha256([
     cli,
@@ -261,6 +265,11 @@ export function normalizeHookEvent({ cli, payload, installationId = "unknown", t
     redacted_text: redacted.text,
     content_hash: redacted.contentHash,
     redaction_manifest: redacted.manifest,
+    // Read by the caller to carry into the referent event, which is redacted
+    // afterwards. Hashes only, so passing this around never moves the secret.
+    // prepareCapture keeps only the fields it names, so this never reaches the
+    // store.
+    learned_token_hashes: redacted.learnedTokenHashes,
     capture_policy_revision: capturePolicyRevision,
     data_class: input.data_class || "normal",
     capture_source: "prompt_hook",
@@ -283,7 +292,11 @@ export function normalizeAssistantReferentEvent({
   event,
   referent,
   installationId = "unknown",
-  capturePolicyRevision = 1
+  capturePolicyRevision = 1,
+  // What the user's own text already proved secret this turn. The assistant
+  // reply often echoes a value the user labelled ("retry with <the password>"),
+  // and without these hashes that echo has no label to match on.
+  blockedTokenHashes = []
 }) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     throw new TypeError("event must be an object");
@@ -301,7 +314,7 @@ export function normalizeAssistantReferentEvent({
     referent.turnId,
     referent.timestamp
   ]);
-  const redacted = redactText(referentText);
+  const redacted = redactText(referentText, { blockedTokenHashes });
   const sourceEventId = `assistant:${referentIdentity}`;
   return {
     cli,
