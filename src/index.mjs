@@ -482,7 +482,13 @@ async function installJsonHooks(paths, cli, dryRun, actions) {
   for (const [event, kind] of events) {
     settings.hooks[event] = settings.hooks[event] || [];
     settings.hooks[event].push({
-      matcher: "",
+      // Execution events match on tool name, so the matcher has to name the
+      // tools. An empty string was installed for both events at first, which is
+      // harmless for UserPromptSubmit — it carries no tool — but on PreToolUse
+      // it silently matched nothing: a live session recorded seenTools
+      // {"Bash":6} and not one of the dozen Edit calls made in the same run, so
+      // the guard counted almost nothing while appearing to be installed.
+      matcher: kind === "execution" ? "*" : "",
       hooks: [{ type: "command", command: hookCommand(paths, cli, kind), timeout: cli.hookTimeout }]
     });
   }
