@@ -2095,45 +2095,20 @@ function createStore(database, now) {
         return { recorded: true, corrections: next.corrections };
       });
     },
-    // The user speaking is new evidence, so the rework counters clear. How many
-    // times the direction has already been corrected does not: that is a fact
-    // about whether self-correction is working, and saying "continue" does not
-    // make two failed corrections un-happen. Clearing it here would let the run
-    // cycle forever — correct twice, user speaks, correct twice again — and
-    // never reach the point where a person is asked to look.
+    // The user speaking is new evidence, so the monitor starts over. Nothing is
+    // carried, including the correction count. That count exists to decide when
+    // a run needs a person, and a person just spoke; carrying it left monitors
+    // sitting at the limit with no review ever dispatched, so `exhausted` was
+    // true before `canReview` was reached and every later block went straight to
+    // "ask a person" while the independent review never ran.
     resetExecutionMonitor({ monitorId }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const key = `${EXECUTION_MONITOR_META_PREFIX}${safeMonitorId}`;
       return transaction(() => {
         const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
         if (!existingRow) return { reset: false };
-        let state = null;
-        try {
-          state = executionMonitorState(JSON.parse(existingRow.value), safeMonitorId);
-        } catch {
-          database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
-          return { reset: true };
-        }
-        if (!state.corrections) {
-          database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
-          return { reset: true };
-        }
-        const carried = {
-          monitorId: safeMonitorId,
-          cli: state.cli,
-          count: 0,
-          seenTools: {},
-          rework: {},
-          overLimit: false,
-          corrections: state.corrections,
-          // Blocks do clear. They count how far the run got without a person
-          // looking, and escalation exists to fetch a person — one just spoke,
-          // so the tally that was accumulating toward asking them starts over.
-          blocks: 0,
-          diagnosis: null
-        };
-        database.prepare("UPDATE store_meta SET value=? WHERE key=?").run(JSON.stringify(carried), key);
-        return { reset: true, corrections: state.corrections };
+        database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+        return { reset: true, corrections: 0 };
       });
     },
     recordCaptureFailOpen({ eventType, reasonCode, sourceProvider = null, sessionUid = null, eventUid = null, createdAt }) {
