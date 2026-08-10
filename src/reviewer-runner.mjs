@@ -8,6 +8,7 @@ import {
   validateReflectionModel
 } from "./reflection-document.mjs";
 import { validateReviewerResult } from "./reviewer-result.mjs";
+import { maybeUpdateRulesTier } from "./update-rules-tier.mjs";
 
 const DEFAULT_LEASE_MS = 185_000;
 const PUBLICATION_LEASE_MS = 30_000;
@@ -347,8 +348,24 @@ export async function runReviewJob({
       sha256: published.sha256,
       // A new family proposes its key; an existing one already has recurrence
       // recorded against the key its earlier reviews used.
-      familyKey: result.proposed_family_key ?? null
+      familyKey: result.proposed_family_key ?? null,
+      // Severity drives the rules-tier gate: Major + 3 → .agent/rules/,
+      // Critical + 2, Blocker + 1.
+      severity: result.final_severity ?? null
     });
+    // A lesson that keeps recurring has already proved that advisory injection
+    // is not enough, so it is compiled into the rules file the host reads every
+    // turn. Failure here must not undo a published lesson: the document is the
+    // durable record, the rules file is a projection of it.
+    try {
+      await maybeUpdateRulesTier({
+        store,
+        // A job is rejected earlier unless its project_id equals projectDir, so
+        // the directory is the project identity here.
+        projectId: projectDir,
+        projectDir
+      });
+    } catch {}
     return { outcome: "published", documentPath: published.path };
   } catch (error) {
     const failure = new ReviewJobError(publicationFailure(error), error);

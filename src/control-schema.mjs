@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const REVIEW_JOB_STATES = Object.freeze([
   "pending", "running", "retryable", "reviewed_no_lesson", "published", "failed"
@@ -24,7 +24,12 @@ CREATE TABLE IF NOT EXISTS continuation_grants(grant_id TEXT PRIMARY KEY, token_
 `;
 
 export const REVIEWER_FAMILY_KEY_SQL = "ALTER TABLE reviewer_jobs ADD COLUMN family_key TEXT;\n";
-export const SCHEMA_SQL = `${V1_SCHEMA_SQL}${CONVERGENCE_SCHEMA_SQL}${REVIEWER_FAMILY_KEY_SQL}`;
+// Severity is needed by the rules-tier gate: a family with 3+ occurrences is only
+// written to project rules if the lesson is Major or worse. Stored on the job
+// because the severity is what the reviewer judged about this specific complaint,
+// not the family's lifetime worst.
+export const REVIEWER_SEVERITY_SQL = "ALTER TABLE reviewer_jobs ADD COLUMN final_severity TEXT;\n";
+export const SCHEMA_SQL = `${V1_SCHEMA_SQL}${CONVERGENCE_SCHEMA_SQL}${REVIEWER_FAMILY_KEY_SQL}${REVIEWER_SEVERITY_SQL}`;
 
 function sqlSignature(sqlText) {
   const statements = sqlText.split("\n").map((statement) => statement.trim());
@@ -257,7 +262,8 @@ export const CONTROL_SCHEMA_SIGNATURE = Object.freeze({
       ["error_code", "TEXT", 0, null, 0],
       ["published_path", "TEXT", 0, null, 0],
       ["published_sha256", "TEXT", 0, null, 0],
-      ["family_key", "TEXT", 0, null, 0]
+      ["family_key", "TEXT", 0, null, 0],
+      ["final_severity", "TEXT", 0, null, 0]
     ),
     indexes: [
       canonicalUniqueIndex("pk", [[0, "job_id"]]),
@@ -329,7 +335,7 @@ const CONVERGENCE_TABLES = new Set([
 
 // v1 is a historical shape: it predates both the convergence tables and the
 // reviewer family key, so columns added since must not leak into its signature.
-const V1_ADDED_COLUMNS = Object.freeze({ reviewer_jobs: new Set(["family_key"]) });
+const V1_ADDED_COLUMNS = Object.freeze({ reviewer_jobs: new Set(["family_key", "final_severity"]) });
 
 export const CONTROL_SCHEMA_V1_SIGNATURE = Object.freeze(Object.fromEntries(
   Object.entries(CONTROL_SCHEMA_SIGNATURE)

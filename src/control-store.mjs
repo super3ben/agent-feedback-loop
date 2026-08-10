@@ -24,6 +24,7 @@ import { NO_LESSON_REASON_CODES } from "./reviewer-result.mjs";
 import {
   CONVERGENCE_SCHEMA_SQL,
   REVIEWER_FAMILY_KEY_SQL,
+  REVIEWER_SEVERITY_SQL,
   CONTROL_SCHEMA_SIGNATURE,
   CONTROL_SCHEMA_SQL_SIGNATURE,
   CONTROL_SCHEMA_V1_SIGNATURE,
@@ -1362,9 +1363,19 @@ function createStore(database, now) {
     // recurred, and the next review — never shown that promise — declined again.
     // Keyed per family and per project, so it generalises to every family rather
     // than the one that exposed the gap.
-    listLatestDeclinesByFamily({ projectId, limit = 32 } = {}) {
+    // A family's declines are returned as a list, newest first, not just the
+    // newest one. Four declines for stored-credential-lookup each read as an
+    // isolated question about Keychain permissions; side by side they show one
+    // root cause — the user says a password works, the agent keeps diverting to
+    // credential management. A reviewer shown one of them cannot see the pattern
+    // it is being asked to prove, which is why every review declined for
+    // insufficient evidence while the evidence sat in the store.
+    listLatestDeclinesByFamily({ projectId, limit = 32, perFamily = 6 } = {}) {
       const safeProjectId = assertString(projectId, "projectId", 4096);
       const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 128) : 32;
+      const safePerFamily = Number.isSafeInteger(perFamily) && perFamily > 0
+        ? Math.min(perFamily, 16)
+        : 6;
       const rows = database.prepare(
         "SELECT value FROM store_meta WHERE key LIKE ? ORDER BY rowid DESC"
       ).all(`${REVIEW_DECLINE_META_PREFIX}%`);
@@ -1376,24 +1387,41 @@ function createStore(database, now) {
         } catch {
           continue;
         }
-        if (!decline?.familyKey || byFamily.has(decline.familyKey)) continue;
+        if (!decline?.familyKey) continue;
+        const collected = byFamily.get(decline.familyKey);
+        if (collected && collected.length >= safePerFamily) continue;
+        if (!collected && byFamily.size >= safeLimit) continue;
         // Declines are stored globally but promises are per project: a condition
         // set while reviewing one project must not bind another.
         const job = getReviewJob(String(decline.jobId ?? ""));
         if (!job || job.project_id !== safeProjectId) continue;
-        byFamily.set(decline.familyKey, {
+        const entry = {
           familyKey: decline.familyKey,
           reasonCode: decline.reasonCode ?? null,
           declinedAt: decline.declinedAt ?? null,
           incidentSummary: decline.incidentSummary ?? null,
           wouldQualifyIf: decline.wouldQualifyIf ?? null
-        });
-        if (byFamily.size >= safeLimit) break;
+        };
+        if (collected) collected.push(entry);
+        else byFamily.set(decline.familyKey, [entry]);
       }
-      return [...byFamily.values()];
+      return [...byFamily.values()].flat();
     },
     // Recent reviewer jobs, newest first. Unlike monitor records these carry real
     // timestamps, so a report built on them can say when something happened.
+    // The rules tier needs the severity a family was last published at, and the
+    // document that carries its method changes. Recurrence is counted elsewhere;
+    // this only answers "what did the newest published lesson for this family
+    // decide", which is what the tier gate reads.
+    getLatestPublishedJobForFamily({ projectId, familyKey }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) return null;
+      return database.prepare(`SELECT job_id, family_key, final_severity, published_path, completed_at
+        FROM reviewer_jobs
+        WHERE project_id=? AND family_key=? AND state='published' AND published_path IS NOT NULL
+        ORDER BY completed_at DESC LIMIT 1`).get(safeProjectId, safeFamilyKey) ?? null;
+    },
     listRecentReviewJobs({ limit = 64 } = {}) {
       const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 512) : 64;
       return database.prepare(`SELECT job_id, state, created_at, completed_at, published_path
@@ -1615,7 +1643,7 @@ function createStore(database, now) {
         .all(currentJob.project_id, safeJobId, safeLimit)
         .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
     },
-    completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256, familyKey = null }) {
+    completeReviewPublished({ jobId, ownerId, leaseEpoch, path: publishedPath, sha256, familyKey = null, severity = null }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
@@ -1627,17 +1655,22 @@ function createStore(database, now) {
       if (safeFamilyKey !== null && !FAMILY_KEY_PATTERN.test(safeFamilyKey)) {
         throw new TypeError("familyKey is not a controlled key");
       }
+      const safeSeverity = severity === null ? null : assertString(severity, "severity", 16);
+      if (safeSeverity !== null && !["Major", "Critical", "Blocker"].includes(safeSeverity)) {
+        throw new TypeError("severity is not a valid value");
+      }
       if (!/^[a-f0-9]{64}$/.test(safeSha256)) throw new TypeError("sha256 must be lowercase hexadecimal");
       const timestamp = nowIso(now);
       return transaction(() => {
         const completed = database.prepare(`UPDATE reviewer_jobs
           SET state='published', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
               completed_at=?, result_code='published', error_code=NULL,
-              published_path=?, published_sha256=?, family_key=COALESCE(?, family_key)
+              published_path=?, published_sha256=?, family_key=COALESCE(?, family_key),
+              final_severity=COALESCE(?, final_severity)
           WHERE job_id=? AND state='running' AND owner_id=? AND lease_epoch=?
             AND lease_until IS NOT NULL AND lease_until>?
           RETURNING *`).get(
-          timestamp, safePublishedPath, safeSha256, safeFamilyKey,
+          timestamp, safePublishedPath, safeSha256, safeFamilyKey, safeSeverity,
           safeJobId, safeOwnerId, safeLeaseEpoch, timestamp
         );
         if (!completed) throw reviewLeaseLost();
@@ -2217,9 +2250,21 @@ function configureConnection(database, busyTimeoutMs = SQLITE_BUSY_TIMEOUT_MS) {
   database.exec(`PRAGMA busy_timeout = ${timeoutMs}; PRAGMA foreign_keys = ON;`);
 }
 
-// Recurrence is counted per family key, so an existing database needs the
-// column before a no_lesson review can record which family it looked at.
-
+// Severity is needed by the rules-tier gate: Major + 3, Critical + 2, Blocker + 1.
+export function migrateControlSchemaV3ToV4(database, now = () => new Date()) {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(REVIEWER_SEVERITY_SQL);
+    database.prepare("DELETE FROM schema_migrations").run();
+    database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+      .run(SCHEMA_VERSION, nowIso(now));
+    verifyControlSchema(database, SCHEMA_VERSION);
+    database.exec("COMMIT");
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+}
 
 export function migrateControlSchemaV2ToV3(database, now = () => new Date()) {
   database.exec("BEGIN IMMEDIATE");
@@ -2227,8 +2272,7 @@ export function migrateControlSchemaV2ToV3(database, now = () => new Date()) {
     database.exec(REVIEWER_FAMILY_KEY_SQL);
     database.prepare("DELETE FROM schema_migrations").run();
     database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-      .run(SCHEMA_VERSION, nowIso(now));
-    verifyControlSchema(database, SCHEMA_VERSION);
+      .run(3, nowIso(now));
     database.exec("COMMIT");
   } catch (error) {
     try { database.exec("ROLLBACK"); } catch {}
@@ -2241,11 +2285,9 @@ export function migrateControlSchemaV1ToV2(database, now = () => new Date()) {
   try {
     verifyControlSchema(database, 1, CONTROL_SCHEMA_V1_SIGNATURE, CONTROL_SCHEMA_V1_SQL_SIGNATURE);
     database.exec(CONVERGENCE_SCHEMA_SQL);
-    database.exec(REVIEWER_FAMILY_KEY_SQL);
     database.prepare("DELETE FROM schema_migrations").run();
     database.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-      .run(SCHEMA_VERSION, nowIso(now));
-    verifyControlSchema(database, SCHEMA_VERSION);
+      .run(2, nowIso(now));
     database.exec("COMMIT");
   } catch (error) {
     try { database.exec("ROLLBACK"); } catch {}
@@ -2277,15 +2319,21 @@ function initializeOrMigrateSchema(database, now) {
     verifyControlSchema(database, SCHEMA_VERSION);
     return;
   }
+  if (versions.length === 1 && versions[0] === 3) {
+    migrateControlSchemaV3ToV4(database, now);
+    verifyControlSchema(database, SCHEMA_VERSION);
+    return;
+  }
   if (versions.length === 1 && versions[0] === 2) {
     migrateControlSchemaV2ToV3(database, now);
-    return;
+    return initializeOrMigrateSchema(database, now);
   }
   if (versions.length !== 1 || versions[0] !== 1) {
     throw new ControlStoreError(CONTROL_SCHEMA_MISMATCH, CONTROL_SCHEMA_MISMATCH);
   }
 
   migrateControlSchemaV1ToV2(database, now);
+  initializeOrMigrateSchema(database, now);
 }
 
 export function initializeControlStore({ paths, now = () => new Date() }) {
