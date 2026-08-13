@@ -10,11 +10,12 @@ import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookE
 import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
-import { launchDetachedDirectionReview, launchDetachedReviewer, recoverDueReviewers } from "./reviewer-launcher.mjs";
+import { launchDetachedDirectionReview, launchDetachedLLMClassifier, launchDetachedReviewer, recoverDueClassifiers, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./status-report.mjs";
 import { resolveLanguage, padLabel, strings } from "./language.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
+import { runLLMClassifier } from "./llm-classifier.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
 import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { deriveReviewerFamilyId } from "./reviewer-result.mjs";
@@ -290,6 +291,7 @@ export async function handlePromptHook({
   controlStore,
   blobs,
   launchReviewer = () => {},
+  launchLLMClassifier = () => {},
   recoverReviewers = () => ({ scanned: 0, attempted: 0 }),
   writeResponse = async () => null,
   nativeResponse = { continue: true },
@@ -343,11 +345,22 @@ export async function handlePromptHook({
     promptLog("feedback_signal_evaluated", { reason: "detector_failed" });
   }
 
+  // The wordlist rejected the message but an assistant referent exists, so the
+  // message is a human turn addressed at prior work. The detached classifier —
+  // not a wordlist — judges whether it is dissatisfaction. Yes admits the job
+  // to the reviewer; no discards it. Forwarding every referent-backed prompt
+  // is deliberate: the reported misses ("还是这样", "每次都问") yield zero
+  // support signals, so a soft gate would starve exactly the real complaints.
+  // Noise is bounded downstream: the reviewer rejects non-dissatisfaction.
+  const llmPath = Boolean(event)
+    && !signal?.candidate
+    && Boolean(signal?.referent);
+
   if (signal?.candidate && event?.identity_unstable) {
     result.candidate = false;
     result.reason = "identity_unstable";
     promptLog("feedback_signal_evaluated", { reason: "identity_unstable" });
-  } else if (signal?.candidate && event) {
+  } else if ((signal?.candidate || llmPath) && event) {
     let sourceCapture = null;
     let referentCapture = null;
     try {
@@ -397,25 +410,60 @@ export async function handlePromptHook({
             referentEventUid: referentEventUid ?? "none"
           }),
           projectId: event.project_id,
-          // Preserve the detector source as bounded candidate evidence; every
-          // admitted candidate is evaluated by the detached full reviewer.
-          reasonCode: signal?.source === "expanded" ? "expanded_feedback" : "explicit_feedback"
+          // Wordlist hits stay pending; LLM-fallback candidates start llm_pending
+          // and are not launchable until the classifier flips them.
+          reasonCode: llmPath
+            ? "llm_fallback"
+            : (signal?.source === "expanded" ? "expanded_feedback" : "explicit_feedback"),
+          initialState: llmPath ? "llm_pending" : "pending"
         });
         result.jobId = candidate.jobId;
-        promptLog(candidate.created ? "review_job_created" : "review_job_reused", {
+        promptLog(llmPath ? "llm_fallback_job_created" : "review_job_created", {
           job: candidate.jobId,
           result: candidate.created ? "created" : "reused"
         });
-        reservation = controlStore.reserveReviewLaunch({
-          jobId: candidate.jobId,
-          cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
-        });
+        // The reviewer launch is reserved only for wordlist-confirmed jobs. An
+        // llm_pending job is claimed by the detached classifier itself.
+        reservation = llmPath
+          ? null
+          : controlStore.reserveReviewLaunch({
+              jobId: candidate.jobId,
+              cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
+            });
       } catch (error) {
         result.reason = "store_failed";
-        promptLog("review_job_created", { reason: "store_failed", job: candidate?.jobId });
+        promptLog(llmPath ? "llm_fallback_job_created" : "review_job_created", {
+          reason: "store_failed",
+          job: candidate?.jobId
+        });
       }
 
-      if (candidate && reservation?.launch) {
+      // The classifier launches directly: its claim is the reservation. The
+      // launch epoch is only for failure attribution; the classifier mints its
+      // own lease when it claims the job.
+      if (candidate && llmPath) {
+        try {
+          const launch = launchLLMClassifier(candidate.jobId, 1);
+          if (launch?.attempted !== false) {
+            result.launchRequested = true;
+            result.reason = "llm_classifier_spawned";
+            promptLog("llm_classifier_spawn_attempted", {
+              job: candidate.jobId,
+              result: "attempted"
+            });
+          } else {
+            result.reason = launchFailureReason(launch?.reason);
+            promptLog("llm_classifier_spawn_attempted", {
+              job: candidate.jobId,
+              result: "failed",
+              reason: result.reason
+            });
+          }
+        } catch (error) {
+          result.reason = "spawn_failed";
+          promptLog("llm_classifier_spawn_attempted", { job: candidate.jobId, result: "failed", reason: "spawn_failed" });
+        }
+      } else if (candidate && reservation?.launch) {
         try {
           const launch = launchReviewer(candidate.jobId, reservation.launchEpoch);
           if (launch?.attempted !== false) {
@@ -844,6 +892,41 @@ export async function main(args, {
     }
     return;
   }
+  if (command === "classify-feedback") {
+    const paths = pathsFor(options.home);
+    const store = openControlStore({ paths });
+    const blobs = new EncryptedBlobStore({
+      root: paths.blobRoot,
+      keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+    });
+    const jobId = optionValue(options.args, "--job-id");
+    const ownerId = `classifier-${process.pid}`;
+    const startedAt = Date.now();
+    try {
+      const verdict = await runLLMClassifier({
+        store,
+        blobs,
+        jobId,
+        ownerId,
+        env: process.env
+      });
+      reviewerTerminalLog({
+        outcome: verdict.admission ? "admitted" : "discarded",
+        job: jobId,
+        reason: verdict.reasonCode,
+        durationMs: Date.now() - startedAt
+      });
+    } catch (error) {
+      reviewerTerminalLog({
+        job: jobId,
+        reason: boundedReason(error, "classifier_failed"),
+        durationMs: Date.now() - startedAt
+      });
+    } finally {
+      store.close();
+    }
+    return;
+  }
   if (command === "status") {
     const paths = pathsFor(options.home);
     const store = openControlStore({ paths });
@@ -1053,8 +1136,19 @@ export async function main(args, {
             env: process.env
           });
         },
+        launchLLMClassifier(jobId) {
+          return launchDetachedLLMClassifier({
+            platform: process.platform,
+            nodeExecutable: process.execPath,
+            cliFile: CLI_FILE,
+            home: paths.home,
+            jobId,
+            launchEpoch: 1,
+            env: process.env
+          });
+        },
         recoverReviewers() {
-          return recoverDueReviewers({
+          const reviewers = recoverDueReviewers({
             store: controlStore,
             limit: 1,
             launchReviewer(jobId, launchEpoch) {
@@ -1069,6 +1163,24 @@ export async function main(args, {
               });
             }
           });
+          // A stray llm_pending job (classifier spawn lost its process) is
+          // picked back up here, not left stuck next to the reviewer recovery.
+          recoverDueClassifiers({
+            store: controlStore,
+            limit: 1,
+            launchClassifier(jobId) {
+              return launchDetachedLLMClassifier({
+                platform: process.platform,
+                nodeExecutable: process.execPath,
+                cliFile: CLI_FILE,
+                home: paths.home,
+                jobId,
+                launchEpoch: 1,
+                env: process.env
+              });
+            }
+          });
+          return reviewers;
         },
         writeResponse,
         nativeResponse,

@@ -114,6 +114,62 @@ export function launchDetachedReviewer({
  * The monitor id stands in for the job id: an execution-time block has no
  * prompt-time capture identity, and the id is already a bounded hex digest.
  */
+/**
+ * Launches the detached LLM classifier for a job admitted by the fallback path
+ * (wordlist missed, a LLM must judge whether the message is dissatisfaction).
+ * Same detached, scrubbed, unref'd shape as the feedback reviewer: the prompt
+ * hook can only budget a few milliseconds, while the classifier's LLM call
+ * takes the same 29-90s the reviewer does.
+ */
+export function launchDetachedLLMClassifier({
+  platform,
+  nodeExecutable,
+  cliFile,
+  home,
+  jobId,
+  launchEpoch,
+  spawnImpl = spawn,
+  env = process.env
+} = {}) {
+  if (!SUPPORTED_PLATFORMS.has(platform)) {
+    return { attempted: false, reason: "unsupported_platform" };
+  }
+  if (!validAbsolutePath(nodeExecutable)
+      || !validAbsolutePath(cliFile)
+      || !validAbsolutePath(home)
+      || !validJobId(jobId)
+      || !Number.isSafeInteger(launchEpoch)
+      || launchEpoch < 1
+      || typeof spawnImpl !== "function") {
+    return { attempted: false, reason: "invalid_input" };
+  }
+
+  try {
+    const child = spawnImpl(nodeExecutable, [
+      cliFile,
+      "classify-feedback",
+      "--home",
+      home,
+      "--job-id",
+      jobId
+    ], {
+      cwd: path.dirname(cliFile),
+      detached: true,
+      stdio: "ignore",
+      env: safeEnvironment(env),
+      windowsHide: true
+    });
+    if (!child || typeof child.unref !== "function") {
+      return { attempted: false, reason: "spawn_failed" };
+    }
+    if (typeof child.once === "function") child.once("error", () => {});
+    child.unref();
+    return { attempted: true, reason: "spawn_attempted" };
+  } catch {
+    return { attempted: false, reason: "spawn_failed" };
+  }
+}
+
 export function launchDetachedDirectionReview({
   platform,
   nodeExecutable,
@@ -211,4 +267,31 @@ export function recoverDueReviewers({ store, launchReviewer, limit = 1 } = {}) {
     } catch {}
   }
   return { scanned: 1, attempted: 1 };
+}
+
+export function recoverDueClassifiers({ store, launchClassifier, limit = 1 } = {}) {
+  const effectiveLimit = Number.isInteger(limit) && limit > 0 ? 1 : 0;
+  if (!effectiveLimit || !store || typeof launchClassifier !== "function") {
+    return { scanned: 0, attempted: 0 };
+  }
+
+  let due;
+  try {
+    due = store.listDueLLMClassifications({ limit: effectiveLimit });
+  } catch {
+    return { scanned: 0, attempted: 0 };
+  }
+  const job = Array.isArray(due) ? due[0] : null;
+  if (!job) return { scanned: 0, attempted: 0 };
+
+  let failureReason = null;
+  try {
+    const result = launchClassifier(job.job_id, 1);
+    if (result?.attempted === false) failureReason = safeReason(result.reason);
+  } catch {
+    failureReason = "spawn_failed";
+  }
+  // A classifier claim protects against double-processing; the recovery spawn is
+  // best-effort and leaves the job in llm_pending for the next recovery pass.
+  return { scanned: 1, attempted: failureReason ? 0 : 1 };
 }

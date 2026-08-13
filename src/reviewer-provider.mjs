@@ -37,7 +37,7 @@ function providerError(code, cause) {
   return error;
 }
 
-function reviewerEnvironment(source) {
+export function reviewerEnvironment(source) {
   const allowed = new Set(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
   for (const name of String(source?.AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST || "")
     .split(",").map((item) => item.trim()).filter((item) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(item))) {

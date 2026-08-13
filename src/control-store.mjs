@@ -1211,7 +1211,7 @@ function createStore(database, now) {
       const row = getReviewJob(jobId);
       return row ? { ...row } : null;
     },
-    createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null, reasonCode = "explicit_feedback" }) {
+    createReviewCandidate({ sourceEventUid, referentEventUid = null, sourceIdentity, projectId = null, reasonCode = "explicit_feedback", initialState = "pending", userText = null, referentText = null }) {
       const safeSourceEventUid = assertString(sourceEventUid, "sourceEventUid", 512);
       const safeReferentEventUid = assertOptionalString(referentEventUid, "referentEventUid", 512);
       const safeSourceIdentity = assertString(sourceIdentity, "sourceIdentity", 2048);
@@ -1232,8 +1232,8 @@ function createStore(database, now) {
         const jobId = randomUUID();
         database.prepare(`INSERT INTO reviewer_jobs
           (job_id, source_identity, source_event_uid, referent_event_uid, project_id, state, created_at)
-          VALUES (?, ?, ?, ?, ?, 'pending', ?)`).run(
-          jobId, safeSourceIdentity, safeSourceEventUid, safeReferentEventUid, safeProjectId, timestamp
+          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+          jobId, safeSourceIdentity, safeSourceEventUid, safeReferentEventUid, safeProjectId, initialState, timestamp
         );
         insertReviewJobEvent({
           jobId,
@@ -1250,6 +1250,108 @@ function createStore(database, now) {
         WHERE job_id=? AND event_type='candidate_created'
         ORDER BY id LIMIT 1`).all(safeJobId);
       return rows.length === 1 ? { ...rows[0] } : null;
+    },
+    // A candidate admitted by the LLM fallback path, waiting on the classifier.
+    // The classifier claims it like a reviewer would, reads the source text,
+    // and flips it to 'pending' (admit) or 'discarded' (drop).
+    listPendingLLMClassifications({ limit = MAX_RECOVERABLE_REVIEW_JOBS, now: at } = {}) {
+      const safeLimit = assertLimit(limit, "limit", MAX_RECOVERABLE_REVIEW_JOBS, MAX_RECOVERABLE_REVIEW_JOBS);
+      if (safeLimit === 0) return [];
+      return database.prepare(`SELECT * FROM reviewer_jobs
+        WHERE state='llm_pending'
+        ORDER BY created_at, job_id LIMIT ?`).all(safeLimit).map((row) => ({ ...row }));
+    },
+    // llm_pending jobs a classifier may retry: never claimed, released (lease
+    // cleared after a failed call), or the previous claim's lease lapsed.
+    // A released job honors the backoff its release scheduled, so a failed
+    // classifier is not re-fired on every subsequent hook.
+    listDueLLMClassifications({ limit = MAX_RECOVERABLE_REVIEW_JOBS, now: at } = {}) {
+      const safeLimit = assertLimit(limit, "limit", MAX_RECOVERABLE_REVIEW_JOBS, MAX_RECOVERABLE_REVIEW_JOBS);
+      if (safeLimit === 0) return [];
+      const timestamp = reviewTimestamp(at).toISOString();
+      return database.prepare(`SELECT * FROM reviewer_jobs
+        WHERE state='llm_pending'
+          AND (next_launch_at IS NULL OR next_launch_at<=?)
+          AND (lease_until IS NULL OR lease_until<=?)
+        ORDER BY created_at, job_id LIMIT ?`).all(timestamp, timestamp, safeLimit).map((row) => ({ ...row }));
+    },
+    claimLLMClassification({ jobId, ownerId, leaseMs = DEFAULT_REVIEW_LEASE_MS }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseMs = assertMilliseconds(leaseMs, "leaseMs");
+      const current = reviewTimestamp();
+      const timestamp = current.toISOString();
+      const leaseUntil = new Date(current.getTime() + safeLeaseMs).toISOString();
+      return transaction(() => {
+        const claimed = database.prepare(`UPDATE reviewer_jobs
+          SET state='llm_pending', owner_id=?, lease_epoch=lease_epoch+1, lease_until=?,
+              claimed_at=?, next_attempt_at=NULL
+          WHERE job_id=? AND state='llm_pending' AND claimed_at IS NULL
+          RETURNING *`).get(safeOwnerId, leaseUntil, timestamp, safeJobId);
+        if (!claimed) return null;
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "llm_claimed",
+          leaseEpoch: Number(claimed.lease_epoch),
+          timestamp
+        });
+        return { job: { ...claimed }, leaseEpoch: Number(claimed.lease_epoch) };
+      });
+    },
+    releaseLLMClassification({ jobId, ownerId, leaseEpoch, backoffMs = 0 }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safeBackoffMs = assertMilliseconds(backoffMs, "backoffMs");
+      const timestamp = nowIso(now);
+      const current = reviewTimestamp();
+      const nextLaunchAt = new Date(current.getTime() + safeBackoffMs).toISOString();
+      return transaction(() => {
+        const released = database.prepare(`UPDATE reviewer_jobs
+          SET owner_id=NULL, lease_until=NULL, next_launch_at=?
+          WHERE job_id=? AND state='llm_pending' AND owner_id=? AND lease_epoch=?
+          RETURNING job_id`).get(nextLaunchAt, safeJobId, safeOwnerId, safeLeaseEpoch);
+        if (!released) return { released: false };
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "llm_released",
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { released: true };
+      });
+    },
+    // The classifier's verdict. admission=true flips the job to 'pending' so the
+    // reviewer can claim it; admission=false drops it to 'discarded' and clears
+    // the lease. Only the owner who claimed the classification may resolve it.
+    resolveLLMAdmission({ jobId, ownerId, leaseEpoch, admission, reasonCode }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeOwnerId = assertString(ownerId, "ownerId", 512);
+      const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
+      const safeAdmission = Boolean(admission);
+      const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        const target = safeAdmission ? "pending" : "discarded";
+        const resolved = database.prepare(`UPDATE reviewer_jobs
+          SET state=?, owner_id=NULL, lease_until=NULL, next_attempt_at=NULL, completed_at=?,
+              result_code=?
+          WHERE job_id=? AND state='llm_pending' AND owner_id=? AND lease_epoch=?
+          RETURNING *`).get(
+          target, timestamp, safeReasonCode, safeJobId, safeOwnerId, safeLeaseEpoch
+        );
+        if (!resolved) {
+          throw new Error(String(reasonCode ?? "llm_release_lost"));
+        }
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: safeAdmission ? "llm_admitted" : "llm_discarded",
+          reasonCode: safeReasonCode,
+          leaseEpoch: safeLeaseEpoch,
+          timestamp
+        });
+        return { ...resolved };
+      });
     },
     reserveReviewLaunch({ jobId, cooldownMs }) {
       const safeJobId = assertString(jobId, "jobId", 512);

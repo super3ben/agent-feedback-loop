@@ -1,7 +1,13 @@
 export const SCHEMA_VERSION = 4;
 
 export const REVIEW_JOB_STATES = Object.freeze([
-  "pending", "running", "retryable", "reviewed_no_lesson", "published", "failed"
+  "pending", "running", "retryable", "reviewed_no_lesson", "published", "failed",
+  // LLM classifier is judging whether a candidate warrants a review. Not
+  // launchable until the classifier writes its verdict.
+  "llm_pending",
+  // The LLM classifier judged the candidate not to be dissatisfaction; the
+  // event stays captured but no reviewer is dispatched.
+  "discarded"
 ]);
 
 export const V1_SCHEMA_SQL = `

@@ -418,11 +418,15 @@ export function classifyRetrospectiveEvidence({ userText, hasReferent }) {
       || reasons.has("recurrence_complaint")
       || reasons.has("rhetorical_accountability")
     );
+  // supportCount is the number of context signals. Handler uses it to decide
+  // whether to invoke LLM fallback when negative_evaluation is missing.
+  const supportCount = supporting.length;
   const source = explicit ? "explicit" : (expanded ? "expanded" : null);
   return {
     candidate: explicit || expanded,
     source,
     reasonCodes,
+    supportCount,
     score: explicit ? 40 + supporting.length * 20 : 40 + reasonCodes.length * 10
   };
 }
