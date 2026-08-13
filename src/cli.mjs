@@ -9,7 +9,7 @@ import { doctor, install, pathsFor, uninstall } from "./index.mjs";
 import { captureObservedSession, normalizeAssistantReferentEvent, normalizeHookEvent } from "./capture.mjs";
 import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
-import { detectFeedbackCandidate, feedbackSourceIdentity } from "./feedback-signal.mjs";
+import { detectFeedbackCandidate, feedbackSourceIdentity, isNeutralOperationPrompt } from "./feedback-signal.mjs";
 import { launchDetachedDirectionReview, launchDetachedLLMClassifier, launchDetachedReviewer, recoverDueClassifiers, recoverDueReviewers } from "./reviewer-launcher.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./status-report.mjs";
@@ -352,9 +352,13 @@ export async function handlePromptHook({
   // is deliberate: the reported misses ("还是这样", "每次都问") yield zero
   // support signals, so a soft gate would starve exactly the real complaints.
   // Noise is bounded downstream: the reviewer rejects non-dissatisfaction.
+  // Unambiguous operation/affirmation prompts ("继续", "好的", "等等") skip the
+  // call outright — they cannot be dissatisfaction, so a full LLM round is a
+  // waste.
   const llmPath = Boolean(event)
     && !signal?.candidate
-    && Boolean(signal?.referent);
+    && Boolean(signal?.referent)
+    && !isNeutralOperationPrompt(userText);
 
   if (signal?.candidate && event?.identity_unstable) {
     result.candidate = false;

@@ -431,6 +431,30 @@ export function classifyRetrospectiveEvidence({ userText, hasReferent }) {
   };
 }
 
+// A prompt that is unambiguously neutral operation or brief affirmation.
+// The FULL message must match one of these — no trailing complaint, no
+// embedded dissatisfaction cue. These can never be dissatisfaction, so the
+// LLM fallback gate skips them and saves a detached classifier call per
+// ordinary turn. Kept deliberately narrow: when unsure, a message is NOT
+// neutral and still goes to the classifier.
+const NEUTRAL_OPERATION = Object.freeze([
+  // Pure continuation requests. "继续做这个" "接着改" "往下做" "继续一下吧" "go on".
+  /^(?:继续|接着|接着做|往下|往下做|继续做|继续改|继续弄)(?:吧|呀|啊|一下|一下(?:吧|呀|啊)|这个|这个事)?[。.]?$/u,
+  /^(?:go on|continue|keep going)(?:[ .,]*(?:with |doing |the )?[a-z0-9 ]*)?$/iu,
+  // Brief affirmative confirmations. Exact whole-message match only.
+  /^(?:好|好的|嗯|嗯嗯|可以|行|中|没问题|没有问题|收到|知道了|明白|了解了|是的|对|对的|ok|okay|sure|fine|alright|right|yep|y|yes)[.!？?。]?$/iu,
+  // Pauses / parenthetical requests.
+  /^(?:等等|等一下|稍等|等我(?:看|看看|查|查查|想|想想)|让我(?:看|看看|查|查查|想|想想))[。.!！?？]?$/u,
+  // Pure sequencing with no evaluation ("先…再…").
+  /^先[^。！？?\n]{0,16}(?:再|然后)[^。！？?\n]{0,16}$/u
+]);
+
+export function isNeutralOperationPrompt(userText) {
+  const text = String(userText ?? "").trim();
+  if (!text) return true;
+  return NEUTRAL_OPERATION.some((pattern) => pattern.test(text));
+}
+
 function isSyntheticAflControl(payload, userText) {
   if (payload?.hook_run_id || payload?.hookRunId || payload?.hook_prompt || payload?.hookPrompt) return true;
   const text = String(userText ?? "");
