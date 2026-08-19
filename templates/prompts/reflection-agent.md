@@ -17,8 +17,26 @@ unless the bounded evidence proves a reusable Major, Critical, or Blocker lesson
 caused by `agent_fault`. `reason_code` must be exactly one of
 `insufficient_evidence`, `external_limit`, `user_misunderstanding`,
 `shared_ambiguity`, `minor_issue`, or `not_agent_fault`. Prospective requests,
-user misunderstanding, shared ambiguity, external limits, incomplete evidence,
+user misunderstanding, external limits, incomplete evidence,
 and Minor issues are not lessons.
+
+**Shared ambiguity is not an automatic excuse.** When the user's wording is
+ambiguous, evaluate the **agent's response to the ambiguity**:
+- If the agent resolved ambiguity by executing the most destructive
+  interpretation **without first clarifying or evaluating consequences**, that
+  is an agent fault: the agent should have asked, scoped, or at minimum
+  assessed before acting.
+- If the agent asked for clarification, the user confirmed, and the agent
+  then acted on the confirmed understanding, that is genuine shared ambiguity.
+- Destructive actions (deleting files, removing worktrees, dropping data,
+  overwriting state) always require the agent to evaluate before executing,
+  regardless of how certain the user's wording sounds. The more destructive
+  the action, the higher the burden on the agent to verify intent.
+
+In short: **the ambiguity being shared does not excuse the agent from
+evaluating consequences.** A lesson may be warranted even when the user's
+wording was imprecise, if the agent's handling of that imprecision —
+particularly when it led to destructive execution — was the core failure.
 
 A declined review is read by a person deciding whether the threshold is right, so
 the three prose fields carry that decision rather than restating the code:
