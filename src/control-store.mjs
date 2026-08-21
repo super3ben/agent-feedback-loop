@@ -92,6 +92,7 @@ const EXECUTION_MAX_SELF_CORRECTIONS = 2;
 // the same text a fourth time is not going to work either.
 const EXECUTION_MAX_GUARDED_BLOCKS = 3;
 const EXECUTION_MONITOR_CLIS = new Set(["codex", "claude", "gemini"]);
+const DESIGN_PERMIT_META_PREFIX = "design_permit:";
 const READ_ONLY_SOURCE_SUFFIXES = Object.freeze(["", "-wal", "-shm", "-journal"]);
 const MAX_READ_ONLY_SNAPSHOT_BYTES = 512 * 1024 * 1024;
 const READ_ONLY_COPY_CHUNK_BYTES = 64 * 1024;
@@ -489,6 +490,16 @@ function executionMonitorId(value) {
   return monitorId;
 }
 
+const VALID_DESIGN_PERMIT_SOURCES = new Set(["comet", "openspec", "convention"]);
+
+function validateDesignPermit(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return null;
+  if (typeof value.phase !== "string" || !value.phase) return null;
+  if (!VALID_DESIGN_PERMIT_SOURCES.has(value.source)) return null;
+  return { phase: value.phase, source: value.source };
+}
+
 function executionMonitorState(value, monitorId) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.monitorId !== monitorId
@@ -541,6 +552,13 @@ function executionMonitorState(value, monitorId) {
       verdict: assertOptionalString(source.verdict, "verdict", 4096)
     };
   }
+  // Soft-signal advisories count. Defaults to 0 for older records.
+  const advisories = value.advisories ?? 0;
+  if (!Number.isSafeInteger(advisories) || advisories < 0 || advisories > MAX_CONTEXT_EPOCH) {
+    throw new ControlStoreError("execution_monitor_state_invalid", "execution monitor state invalid");
+  }
+  // When a verdict was delivered, the next trip should escalate to a hard block.
+  const verdictFreePass = value.verdictFreePass === true;
   return {
     monitorId,
     cli: value.cli,
@@ -550,6 +568,8 @@ function executionMonitorState(value, monitorId) {
     rework,
     corrections,
     blocks,
+    advisories,
+    verdictFreePass,
     diagnosis
   };
 }
@@ -1283,11 +1303,16 @@ function createStore(database, now) {
       const timestamp = current.toISOString();
       const leaseUntil = new Date(current.getTime() + safeLeaseMs).toISOString();
       return transaction(() => {
+        // A job is claimable when it is llm_pending AND either never claimed
+        // (first attempt) or released/expired (owner_id IS NULL and lease
+        // expired or not set). The lease is the concurrency guard; claimed_at
+        // is only an audit field and must not block recovery re-claims.
         const claimed = database.prepare(`UPDATE reviewer_jobs
           SET state='llm_pending', owner_id=?, lease_epoch=lease_epoch+1, lease_until=?,
               claimed_at=?, next_attempt_at=NULL
-          WHERE job_id=? AND state='llm_pending' AND claimed_at IS NULL
-          RETURNING *`).get(safeOwnerId, leaseUntil, timestamp, safeJobId);
+          WHERE job_id=? AND state='llm_pending'
+            AND (owner_id IS NULL AND (lease_until IS NULL OR lease_until<=?))
+          RETURNING *`).get(safeOwnerId, leaseUntil, timestamp, safeJobId, timestamp);
         if (!claimed) return null;
         insertReviewJobEvent({
           jobId: safeJobId,
@@ -1990,7 +2015,8 @@ function createStore(database, now) {
     // tools and finishes is healthy, while one that rewrites the same file over
     // and over without new input is circling.
     recordExecutionToolCall({ monitorId, cli, mutating, toolLabel, target = null, tested = false,
-      limit, spreadLimit, canReview = false, diagnosisExpired = () => false }) {
+      limit, spreadLimit, canReview = false, diagnosisExpired = () => false,
+      designPermit = null }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const safeCli = assertString(cli, "cli", 64);
       if (!EXECUTION_MONITOR_CLIS.has(safeCli)) throw new TypeError("cli is unsupported");
@@ -2003,6 +2029,7 @@ function createStore(database, now) {
       if (typeof tested !== "boolean") throw new TypeError("tested must be boolean");
       if (typeof canReview !== "boolean") throw new TypeError("canReview must be boolean");
       if (typeof diagnosisExpired !== "function") throw new TypeError("diagnosisExpired must be a function");
+      const safeDesignPermit = validateDesignPermit(designPermit);
       const safeLimit = assertLimit(limit, "limit", 2, 4096);
       if (safeLimit < 1) throw new TypeError("limit must be positive");
       const safeSpreadLimit = assertLimit(spreadLimit, "spreadLimit", 8, EXECUTION_MONITOR_MAX_TARGETS);
@@ -2059,7 +2086,14 @@ function createStore(database, now) {
         if (diagnosis?.state === "pending" && diagnosisExpired(diagnosis)) {
           diagnosis = { state: "failed", requestedAt: diagnosis.requestedAt, verdict: null };
         }
-        const blocking = tripped && mutating;
+        const intervention = tripped && mutating && !safeDesignPermit;
+        let verdictFreePass = state?.verdictFreePass ?? false;
+        // First trip: warn only (soft signal), let the agent continue while
+        // the review runs in the background.  Only escalate to a hard block
+        // after the verdict has been delivered and the agent still circles —
+        // or when no review is available to produce a verdict at all.
+        const warned = intervention && canReview && !verdictFreePass;
+        const blocking = intervention && !warned;
         const waiting = blocking && diagnosis?.state === "pending";
         // This call is itself a block when the counters have tripped, so it is
         // counted before the escalation test — otherwise the first block would
@@ -2069,23 +2103,29 @@ function createStore(database, now) {
         const blocks = blocking && !waiting
           ? Math.min(MAX_CONTEXT_EPOCH, (state?.blocks ?? 0) + 1)
           : state?.blocks ?? 0;
+        const advisories = warned
+          ? Math.min(MAX_CONTEXT_EPOCH, (state?.advisories ?? 0) + 1)
+          : state?.advisories ?? 0;
         // Two routes reach a person: corrections that did not converge, or
         // enough blocks to show the attribution text is being ignored.
         const exhausted = corrections >= EXECUTION_MAX_SELF_CORRECTIONS
           || blocks > EXECUTION_MAX_GUARDED_BLOCKS;
         let outcome = null;
-        if (blocking) {
+        if (warned || blocking) {
           // Order matters. A verdict in hand is delivered even at the limit: it
           // was earned before the limit was reached, and withholding it would
           // waste the review and tell the run nothing about what to narrow.
           if (diagnosis?.state === "ready" && diagnosis.verdict) outcome = "correct";
-          else if (exhausted) outcome = "human";
-          else if (waiting) outcome = "await";
+          else if (blocking && exhausted) outcome = "human";
+          else if (diagnosis?.state === "pending") outcome = "await";
           else if (canReview) outcome = "dispatch";
         }
         if (outcome === "dispatch") {
           diagnosis = { state: "pending", requestedAt: nowIso(now), verdict: null };
         }
+        // After delivering a verdict, arm the free pass so the next trip
+        // escalates to a hard block — the agent has been told what to narrow.
+        if (outcome === "correct") verdictFreePass = true;
         // Handed over once, then cleared, so the next block reviews where the run
         // got to rather than repeating an answer it has already acted on.
         const delivered = outcome === "correct" ? diagnosis.verdict : null;
@@ -2124,10 +2164,12 @@ function createStore(database, now) {
           // block, so the run would sail through the whole wait unguarded and no
           // later block would ever collect the verdict. Measured: the call after
           // a dispatch came back allowed instead of waiting.
-          rework: blocking && (outcome === null || outcome === "correct") ? {} : rework,
+          rework: (blocking || warned) && (outcome === null || outcome === "correct") ? {} : rework,
           overLimit: blocking && (outcome === null || outcome === "correct") ? false : tripped,
           corrections,
           blocks,
+          advisories,
+          verdictFreePass,
           diagnosis
         };
         database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
@@ -2154,6 +2196,10 @@ function createStore(database, now) {
           reworkCount,
           spreadCount,
           shape,
+          // warned = soft signal (let agent continue), stop = hard block.
+          // warned is true on the first trip while a review is pending;
+          // stop becomes true after the verdict free pass is consumed.
+          warned,
           // What the caller should do about this block: "dispatch" launches a
           // review and says so, "await" reports one already running, "correct"
           // hands over the verdict below, "human" stops correcting and asks a
@@ -2209,6 +2255,8 @@ function createStore(database, now) {
       return transaction(() => {
         const existingRow = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
         if (!existingRow) return { reset: false };
+        // Soft-signal state must reset when the user speaks: a new prompt is
+        // fresh evidence, so the warn→block cycle starts over.
         database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
         return { reset: true, corrections: 0 };
       });
@@ -2252,6 +2300,30 @@ function createStore(database, now) {
         return [];
       }
     },
+    designPermitCache: {
+      get(key) {
+        const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+        return row ? row.value : undefined;
+      },
+      set(key, value) {
+        database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(key, value);
+      },
+      delete(key) {
+        database.prepare("DELETE FROM store_meta WHERE key=?").run(key);
+      },
+      countPrefix(prefix) {
+        const rows = database.prepare("SELECT COUNT(*) as cnt FROM store_meta WHERE key LIKE ?")
+          .get(`${prefix}%`);
+        return rows ? rows.cnt : 0;
+      },
+      oldestKey(prefix) {
+        const row = database.prepare("SELECT key FROM store_meta WHERE key LIKE ? ORDER BY rowid ASC LIMIT 1")
+          .get(`${prefix}%`);
+        return row ? row.key : undefined;
+      }
+    },
+
     close() {
       database.close();
     }
