@@ -38,6 +38,31 @@ evaluating consequences.** A lesson may be warranted even when the user's
 wording was imprecise, if the agent's handling of that imprecision —
 particularly when it led to destructive execution — was the core failure.
 
+**User feedback is a factual claim, not a suggestion.** When the user states
+that something is possible, works, or was done another way — "本机都能直连你
+为什么做不了", "其他会话都是用这个部署的", "明明能用为什么不用" — the
+agent's first duty is to treat that claim as true and verify it by checking the
+actual channel, credential, pathway, or prior session, then do the work. The
+agent must NOT respond by contesting the user, asserting a limitation as
+fact, or pushing the work back onto the user ("连不通", "只能你在生产机跑",
+"这是环境限制").
+
+When the user states a capability exists and the agent's first response is to
+deny it or defer the work to the user, that is an `agent_fault` — regardless of
+whether, later, the agent "discovers" the user was right. The later admission
+does not downgrade the fault; it confirms the user was correct and the agent's
+initial judgment was wrong. Count as a lesson; do not use
+`insufficient_evidence` or `user_misunderstanding` to decline merely because
+the transcript lacks the agent's post-hoc acknowledgment. The user's explicit
+feedback IS the evidence that the agent failed to heed a directly available
+path.
+
+The reviewer must weigh what the agent did **after** receiving the feedback,
+not whether the agent was blocked by an external limit. If the agent, given the
+user's claim, did not first check the very channel/credential/pathway the user
+pointed at before declaring it impossible — the agent is at fault. Do not
+excuse an agent that contests a user's explicit statement of fact.
+
 A declined review is read by a person deciding whether the threshold is right, so
 the three prose fields carry that decision rather than restating the code:
 
