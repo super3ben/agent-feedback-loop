@@ -9,6 +9,7 @@ import {
 } from "./reflection-document.mjs";
 import { validateReviewerResult } from "./reviewer-result.mjs";
 import { maybeUpdateRulesTier } from "./update-rules-tier.mjs";
+import { escalateDeclinedFamily } from "./reviewer-escalate.mjs";
 
 const DEFAULT_LEASE_MS = 185_000;
 const PUBLICATION_LEASE_MS = 30_000;
@@ -277,6 +278,59 @@ export async function runReviewJob({
   }
 
   if (result.outcome === "no_lesson") {
+    // The LLM declined. Before accepting the decline, check whether this family
+    // has already been declined repeatedly in the window — if so, the loop of
+    // "decline, recur, decline again" has proven the promise was met, and a
+    // deterministic escalation publishes a lesson instead of letting a third
+    // excuse win. This does not rely on the model honoring its own
+    // would_qualify_if.
+    const escalated = escalateDeclinedFamily({
+      verdict: result,
+      declines: context.recurrence?.prior_declines ?? [],
+      job: context.job
+    });
+    if (escalated) {
+      let escalatedModel;
+      try {
+        escalatedModel = validateReflectionModel(escalated, {
+          sourceIdentity: context.job.source_identity,
+          createdAt: context.source.sourceTimestamp ?? context.source.createdAt,
+          publishedAt: context.job.created_at
+        });
+      } catch (error) {
+        const failure = new ReviewJobError("provider_invalid", error);
+        recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+        throw failure;
+      }
+      try {
+        store.renewReviewLease({ jobId, ownerId, leaseEpoch, leaseMs: PUBLICATION_LEASE_MS });
+        store.assertReviewLease({ jobId, ownerId, leaseEpoch });
+        const published = await publishReflectionDocument({
+          projectDir,
+          model: escalatedModel,
+          beforeRename: () => store.renewReviewLease({
+            jobId,
+            ownerId,
+            leaseEpoch,
+            leaseMs: PUBLICATION_LEASE_MS
+          })
+        });
+        store.completeReviewPublished({
+          jobId,
+          ownerId,
+          leaseEpoch,
+          path: published.path,
+          sha256: published.sha256,
+          familyKey: escalated.proposed_family_key ?? null,
+          severity: escalated.final_severity ?? null
+        });
+        return { outcome: "lesson", documentPath: published.path, escalated: true };
+      } catch (error) {
+        const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
+        recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+        throw failure;
+      }
+    }
     try {
       store.completeReviewNoLesson({
         jobId,
