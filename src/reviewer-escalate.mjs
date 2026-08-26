@@ -118,7 +118,7 @@ export function escalateDeclinedFamily({ verdict, declines = [], job }) {
     root_cause: rootCause,
     class_of_mistake: classOfMistake,
     method_changes: methodChanges,
-    repeated_pattern_evidence: inWindow.map((entry, index) =>
+    repeated_pattern_evidence: inWindow.slice(0, 8).map((entry, index) =>
       bounded(`第 ${index + 1} 次拒绝：${entry.incidentSummary || entry.reasonCode || "无摘要"}`, 512)
     ),
     recurrence_of: []
