@@ -83,18 +83,35 @@ async function sourceEventText({ store, blobs, jobId }) {
 
 function classifyPrompt({ userText, referentText }) {
   const lines = [
-    "You are a simple classifier. Determine whether a user message expresses",
-    "dissatisfaction about an AI assistant's work.",
+    "判断用户是否表达不满、质疑或抱怨，然后以 JSON 收尾：",
+    '{ "dissatisfied": true } 或 { "dissatisfied": false }。',
     "",
-    "Reply with ONLY \"yes\" or \"no\", nothing else.",
+    "先给一句简短理由，再输出 JSON。只输出理由和 JSON，不要别的。",
     "",
-    "User message:",
+    "判定原则：",
+    "- 看用户说出口的话本身。反问、质疑、指责、抱怨就是不满，",
+    "  即使助手觉得自己有道理。",
+    "- 助手的辩解或解释不能作为用户没有不满的理由。",
+    "",
+    "【不满 / 质疑 / 抱怨】",
+    "- 反问或质问：为什么还这样？本机都直连了还不能做？其他会话都部署过了你还不能做？",
+    "  怎么又不行？你根本没改对吧？",
+    "- 明确说助手错了 / 没用 / 没做到：不是这样，没用，你又说错，这不是我想要的",
+    "- 抱怨反复 / 又来了：每次都要问，又来了，之前不是说过吗，还是这样",
+    "- 预期没达到：不是让你直接做吗？明明能用为什么不用？你绕了半天",
+    "- 助手把活推回、用户反对：还要我自己做？你直接做啊",
+    "",
+    "【中性，判 false】",
+    "- 纯信息性提问、无情绪：这个怎么配置？这条命令是干嘛的？",
+    "- 继续或确认：继续，好的，可以，明白，下一步，收到",
+    "",
+    "用户消息：",
     userText
   ];
   if (referentText) {
     lines.push(
       "",
-      "The assistant's preceding response (for context only):",
+      "助手此前的回应（仅作背景，不能作为用户没有不满的理由）：",
       referentText
     );
   }
@@ -102,10 +119,15 @@ function classifyPrompt({ userText, referentText }) {
 }
 
 function parseVerdict(stdout) {
-  const trimmed = String(stdout ?? "").trim().toLowerCase();
-  if (/\byes\b/u.test(trimmed)) return { admission: true, reasonCode: "llm_confirmed" };
-  if (/\bno\b/u.test(trimmed)) return { admission: false, reasonCode: "llm_rejected" };
-  return null;
+  const text = String(stdout ?? "");
+  // The model emits a reason then a JSON verdict. Match the last
+  // {"dissatisfied": true|false} so a reason mentioning "不满" or "true"
+  // earlier cannot flip the result.
+  const json = /[{\[]\s*"dissatisfied"\s*:\s*(true|false)\s*[}\]]/u.exec(text);
+  if (!json) return null;
+  return json[1] === "true"
+    ? { admission: true, reasonCode: "llm_confirmed" }
+    : { admission: false, reasonCode: "llm_rejected" };
 }
 
 // A lean yes/no call, not the full evidence/schema contract the reviewer uses.
