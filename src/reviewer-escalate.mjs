@@ -48,9 +48,21 @@ export function escalateDeclinedFamily({ verdict, declines = [], job }) {
   if (!familyKey) return null;
   if (!job?.source_identity) return null;
 
+  // Declines arrive in two shapes: the store returns camelCase
+  // (familyKey/incidentSummary), but the review context's prior_declines are
+  // serialized snake_case (family_key/incident_summary). Read both — matching
+  // only one shape silently makes every family look first-time.
+  const normalized = (declines || []).map((entry) => ({
+    familyKey: entry.familyKey ?? entry.family_key ?? null,
+    reasonCode: entry.reasonCode ?? entry.reason_code ?? null,
+    declinedAt: entry.declinedAt ?? entry.declined_at ?? null,
+    incidentSummary: entry.incidentSummary ?? entry.incident_summary ?? null,
+    wouldQualifyIf: entry.wouldQualifyIf ?? entry.would_qualify_if ?? null
+  }));
+
   // Only the same family's own history counts; a different family that also
   // recurs is not this family's promise.
-  const familyDeclines = (declines || []).filter((entry) => entry.familyKey === familyKey);
+  const familyDeclines = normalized.filter((entry) => entry.familyKey === familyKey);
   // Count declines in the window. declinedAt may be null on backfilled rows;
   // treat a missing timestamp as recent so old rows without a stamp still
   // count rather than silently making the family look fresh.
