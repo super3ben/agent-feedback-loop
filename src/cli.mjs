@@ -25,6 +25,7 @@ import { ConvergenceProbeContextStore } from "./convergence-probe-context.mjs";
 import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 import { ensureRepositoryLineage } from "./convergence-identity.mjs";
 import { handleExecutionHook, resetExecutionMonitorForPrompt } from "./execution-hook.mjs";
+import { resolveDesignPermit } from "./design-permit.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
@@ -181,6 +182,7 @@ const LOG_EVENTS = new Set([
   "review_job_recovered",
   "review_failed",
   "review_completed_no_lesson",
+  "llm_classified",
   "reflection_published",
   "reflection_parse_omitted",
   "reflection_selected",
@@ -196,7 +198,7 @@ const LOG_REASONS = new Set([
   "not_due", "unsupported_platform", "provider_unavailable", "provider_timeout", "provider_invalid", "context_invalid",
   "lease_lost", "publication_failed", "publication_collision", "reviewer_failed"
 ]);
-const LOG_RESULTS = new Set(["attempted", "reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted"]);
+const LOG_RESULTS = new Set(["attempted", "reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted", "admitted", "discarded"]);
 const LOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const LOG_HASH = /^[a-f0-9]{64}$/u;
 const LOG_MAX_INTEGER = 2_147_483_647;
@@ -694,6 +696,9 @@ export function reviewerTerminalLog({ outcome, job, reason = "reviewer_failed", 
   if (outcome === "reviewed_no_lesson") {
     return structuredLog("review_completed_no_lesson", { ...fields, result: "reviewed_no_lesson" }, writer);
   }
+  if (outcome === "admitted" || outcome === "discarded") {
+    return structuredLog("llm_classified", { ...fields, result: outcome }, writer);
+  }
   return structuredLog("review_failed", { ...fields, result: "failed", reason }, writer);
 }
 
@@ -1094,27 +1099,51 @@ export async function main(args, {
     try {
       controlStore = openControlStore({ paths, busyTimeoutMs: 250 });
       if (EXECUTION_HOOK_EVENTS.has(nativeHookEventName)) {
-        await handleExecutionHook({
-          payload,
-          cli,
-          controlStore,
-          writeResponse,
-          nativeResponse: { continue: true },
-          // The link that was missing last time. Passing a real launcher is what
-          // permits the guard to announce a review at all; without it the block
-          // asks the run to attribute the over-reach itself.
-          launchDirectionReview({ monitorId, transcriptPath }) {
-            return launchDetachedDirectionReview({
-              platform: process.platform,
-              nodeExecutable: process.execPath,
-              cliFile: CLI_FILE,
-              home: paths.home,
-              monitorId,
-              cli,
-              transcriptPath
-            });
-          }
-        });
+        // The execution guard is retired (2026-08-31). It was built for
+        // GPT-era overthinking — Codex review-then-improve loops that never
+        // failed a single call — and current Claude runs do not circle that
+        // way: measured on live sessions the guard's false blocks cost more
+        // than the circling it caught. The PreToolUse hooks are uninstalled
+        // from both hosts (backups: ~/.claude/settings.json.bak-guard-off,
+        // ~/.codex/config.toml.bak-guard-off), and this dispatch is commented
+        // out so a hook that gets reinstalled fails open instead of silently
+        // reviving the guard. To revive: restore the block below and
+        // reinstall the hooks. The store, hook logic and their tests are
+        // kept intact.
+        //
+        // let designPermit = null;
+        // try {
+        //   const toolInput = payload?.tool_input ?? payload?.toolInput;
+        //   if (toolInput && typeof toolInput === "object" && !Array.isArray(toolInput)) {
+        //     for (const field of ["file_path", "filePath", "path", "notebook_path"]) {
+        //       const value = toolInput[field];
+        //       if (typeof value === "string" && value.trim()) {
+        //         designPermit = await resolveDesignPermit(value.trim(), null, controlStore.designPermitCache);
+        //         break;
+        //       }
+        //     }
+        //   }
+        // } catch {}
+        // await handleExecutionHook({
+        //   payload,
+        //   cli,
+        //   controlStore,
+        //   designPermit,
+        //   writeResponse,
+        //   nativeResponse: { continue: true },
+        //   launchDirectionReview({ monitorId, transcriptPath }) {
+        //     return launchDetachedDirectionReview({
+        //       platform: process.platform,
+        //       nodeExecutable: process.execPath,
+        //       cliFile: CLI_FILE,
+        //       home: paths.home,
+        //       monitorId,
+        //       cli,
+        //       transcriptPath
+        //     });
+        //   }
+        // });
+        await writeResponse();
         return;
       }
       // The user submitting a prompt is the intervention the execution counter
