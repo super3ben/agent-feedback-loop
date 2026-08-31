@@ -9,6 +9,7 @@
 import path from "node:path";
 
 import {
+  codexProviderRouting,
   resolveReviewerExecutable,
   reviewerEnvironment,
   runProcessWithInput
@@ -132,7 +133,7 @@ function parseVerdict(stdout) {
 
 // A lean yes/no call, not the full evidence/schema contract the reviewer uses.
 // The prompt goes on stdin; the CLI's plain-text output is the verdict.
-function classifierInvocation({ cli, executable }) {
+function classifierInvocation({ cli, executable, codexRouting = [] }) {
   if (cli === "claude") {
     return {
       command: executable,
@@ -157,6 +158,11 @@ function classifierInvocation({ cli, executable }) {
         "--skip-git-repo-check",
         "--sandbox", "read-only",
         "--color", "never",
+        // --ignore-user-config drops the user's model_provider gateway routing
+        // (base_url etc.). Without re-injecting it the isolated codex call
+        // cannot reach the gateway and reconnect-loops until the timeout —
+        // exactly what wedged every codex classification in llm_pending.
+        ...codexRouting,
         "-"
       ]
     };
@@ -194,11 +200,22 @@ export async function runLLMClassifier({
     store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
     throw new LLMClassifyError("provider_unavailable");
   }
+  // Same gateway routing the full reviewer injects for codex: without it the
+  // isolated call cannot reach the user's model provider.
+  let codexRouting = [];
+  if (evidence.sourceProvider === "codex" && typeof env?.HOME === "string" && env.HOME) {
+    try {
+      codexRouting = await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") });
+    } catch {
+      codexRouting = [];
+    }
+  }
   // The provider shell-outs bind the schema to their own transport. The
   // classifier has no schema; it reads plain yes/no, so use the claude shorthand.
   const invocation = classifierInvocation({
     cli: evidence.sourceProvider,
-    executable
+    executable,
+    codexRouting
   });
   const input = classifyPrompt({ userText: evidence.userText, referentText: evidence.referentText });
   let output;
