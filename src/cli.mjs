@@ -1,6 +1,6 @@
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -183,6 +183,7 @@ const LOG_EVENTS = new Set([
   "review_failed",
   "review_completed_no_lesson",
   "llm_classified",
+  "rules_block_injected",
   "reflection_published",
   "reflection_parse_omitted",
   "reflection_selected",
@@ -285,6 +286,34 @@ export async function writePromptResponse({ cli, response, writer }) {
   }
   if (typeof writer !== "function") throw new TypeError("writer must be a function");
   await writer(response);
+}
+
+// The managed rules block in the project's rules file, bounded for injection.
+// Only the afl-managed block is injected — hand-written project rules stay in
+// the file where the project's own docs reference them.
+const RULES_BLOCK_MAX_BYTES = 6 * 1_024;
+
+async function readProjectRulesBlock(projectDir) {
+  if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) return null;
+  const file = path.join(projectDir, ".agent", "rules", "feedback-loop.md");
+  let text;
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+  const start = text.indexOf("<!-- afl:rules:start -->");
+  const end = text.indexOf("<!-- afl:rules:end -->");
+  if (start < 0 || end <= start) return null;
+  const body = text.slice(start + "<!-- afl:rules:start -->".length, end).trim();
+  if (!body) return null;
+  const bounded = Buffer.byteLength(body, "utf8") > RULES_BLOCK_MAX_BYTES
+    ? Buffer.from(body, "utf8").subarray(0, RULES_BLOCK_MAX_BYTES).toString("utf8")
+    : body;
+  return [
+    "【复发教训规则 — 以下每条都对应本项目已发生 ≥3 次的同类错误，本轮必须遵守】",
+    bounded
+  ].join("\n");
 }
 
 export async function handlePromptHook({
@@ -631,6 +660,21 @@ export async function handlePromptHook({
     promptLog("reflection_parse_omitted", { reason: "selection_failed" });
     result.guidance = "";
     result.selection = { selectedCount: 0, omissionCount: 0, tokenEstimate: 0 };
+  }
+
+  // The rules tier compiles recurring lessons into the project rules file, but
+  // a file the model is merely told to read is advisory. Injecting the managed
+  // block into every prompt's context makes the recurrence guarantee
+  // mechanical: a rule that reached ≥3 occurrences is seen each turn without
+  // depending on the model choosing to open the file.
+  try {
+    const rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir);
+    if (rulesBlock) {
+      result.guidance = rulesBlock + (result.guidance ? `\n\n${result.guidance}` : "");
+      promptLog("rules_block_injected", { bytes: Buffer.byteLength(rulesBlock, "utf8") });
+    }
+  } catch (error) {
+    promptLog("rules_block_injected", { reason: "selection_failed" });
   }
 
   const hookEventName = opaqueLogValue(
