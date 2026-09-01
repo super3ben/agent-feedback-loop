@@ -909,24 +909,30 @@ export async function main(args, {
       providerName = storedContext?.source?.source_provider ?? "unknown";
       const projectDir = storedContext?.job?.project_id ?? null;
       const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
-      const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000));
+      // A big-evidence review legitimately runs 3-5 minutes; 180s cut those
+      // off mid-generation. The claim lease scales from this (see runReviewJob).
+      const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 300_000));
+      // Attach the timeout so runReviewJob can size the claim lease to outlive
+      // the provider call instead of the fixed default.
+      const provider = (context) => runReviewerProvider({
+        cli: providerName,
+        executable,
+        context,
+        promptFile: paths.promptFile,
+        schemaFile: paths.reviewerSchema,
+        policyFile: paths.geminiReviewerPolicy,
+        geminiSettingsFile: paths.geminiReviewerSettings,
+        timeoutMs,
+        env: process.env
+      });
+      provider.timeoutMs = timeoutMs;
       const result = await runReviewJob({
         jobId,
         ownerId,
         store,
         blobs,
         projectDir,
-        provider: (context) => runReviewerProvider({
-          cli: providerName,
-          executable,
-          context,
-          promptFile: paths.promptFile,
-          schemaFile: paths.reviewerSchema,
-          policyFile: paths.geminiReviewerPolicy,
-          geminiSettingsFile: paths.geminiReviewerSettings,
-          timeoutMs,
-          env: process.env
-        }),
+        provider
       });
       reviewerTerminalLog({
         outcome: result.outcome,

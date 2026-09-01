@@ -238,12 +238,22 @@ export async function runReviewJob({
   blobs,
   provider,
   projectDir,
-  leaseMs = DEFAULT_LEASE_MS
+  leaseMs = null
 }) {
   if (!store || !blobs || typeof provider !== "function") {
     throw new ReviewJobError("context_invalid");
   }
-  const claimed = store.claimReviewJob({ jobId, ownerId, leaseMs });
+  // The claim lease must outlive the provider call. A provider timeout longer
+  // than the default lease (observed: big-evidence reviews run 3-5 minutes)
+  // expired the lease mid-review, so the verdict was thrown away as
+  // lease_lost even when the provider answered. When the caller passes no
+  // explicit lease, scale it from the provider timeout plus a buffer.
+  const safeLeaseMs = Number.isSafeInteger(leaseMs) && leaseMs > 0
+    ? leaseMs
+    : Number.isSafeInteger(provider.timeoutMs) && provider.timeoutMs > 0
+      ? provider.timeoutMs + 15_000
+      : DEFAULT_LEASE_MS;
+  const claimed = store.claimReviewJob({ jobId, ownerId, leaseMs: safeLeaseMs });
   if (!claimed?.job) throw new ReviewJobError("lease_lost");
   const leaseEpoch = claimed.leaseEpoch;
   let context;
