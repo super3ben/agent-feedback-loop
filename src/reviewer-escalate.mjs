@@ -42,11 +42,16 @@ function joinSummaries(declines, max = 600) {
  * @param {Array<{incidentSummary, reasonCode, wouldQualifyIf, declinedAt}>}
  *   params.declines - the family's decline history, newest first.
  * @param {object} params.job - the current review job row (for source identity).
+ * @param {boolean} [params.hasPublishedLesson] - the family already has a
+ *   published lesson. Escalation exists to break a never-published family out
+ *   of a decline loop; once published, normal recurrence machinery owns the
+ *   family and escalating again would pile up duplicate meta-lessons.
  */
-export function escalateDeclinedFamily({ verdict, declines = [], job }) {
+export function escalateDeclinedFamily({ verdict, declines = [], job, hasPublishedLesson = false }) {
   const familyKey = String(verdict?.family_key ?? "").trim();
   if (!familyKey) return null;
   if (!job?.source_identity) return null;
+  if (hasPublishedLesson) return null;
 
   // Declines arrive in two shapes: the store returns camelCase
   // (familyKey/incidentSummary), but the review context's prior_declines are
@@ -106,10 +111,18 @@ export function escalateDeclinedFamily({ verdict, declines = [], job }) {
     "当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。"
   ].slice(0, 8);
 
+  // Selection matches a future session's OPENING request by literal word
+  // overlap. A condition phrased as the complaint ("当用户表达不满时") can
+  // only match after the mistake repeats, so echo the incident's concrete
+  // nouns (群/日志/意图识别/…) as the matching surface, alongside the
+  // generic trigger.
+  const incidentEcho = bounded(verdict?.incident_summary || "", 100);
   const appliesWhen = [
+    bounded(`当要处理「${incidentEcho}」同类问题、或按群类型/项目归属/现场归属/日志时间窗下判断之前`, 160),
+    bounded(`when handling the same class of problem as 「${incidentEcho}」, or before judging a group type, project or site attribution, or a log window`, 160),
     "当用户对 agent 的工作表达明确不满、指出其理解错或范围做过头时",
     "when the user explicitly expresses dissatisfaction or points out that the agent misunderstood the scope"
-  ].slice(0, 16);
+  ].filter(Boolean).slice(0, 16);
 
   const proposedFamilyKey = familyKey;
   // The family has never been published (it was only ever declined), so this is

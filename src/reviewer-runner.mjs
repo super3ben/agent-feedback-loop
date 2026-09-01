@@ -287,7 +287,15 @@ export async function runReviewJob({
     const escalated = escalateDeclinedFamily({
       verdict: result,
       declines: context.recurrence?.prior_declines ?? [],
-      job: context.job
+      job: context.job,
+      hasPublishedLesson: Boolean(
+        context.job.project_id
+        && typeof store.getLatestPublishedJobForFamily === "function"
+        && store.getLatestPublishedJobForFamily({
+          projectId: context.job.project_id,
+          familyKey: result.family_key
+        })
+      )
     });
     if (escalated) {
       let escalatedModel;
@@ -324,6 +332,16 @@ export async function runReviewJob({
           familyKey: escalated.proposed_family_key ?? null,
           severity: escalated.final_severity ?? null
         });
+        // Same projection the normal publish path runs: an escalated family has
+        // by definition recurred enough for the rules tier, and the rules file
+        // is the channel that reaches every later turn. Publishing without this
+        // step leaves the lesson stored but never enforced.
+        try {
+          await maybeUpdateRulesTier({ store, projectId: context.job.project_id, projectDir });
+        } catch {
+          // The document is the durable record; a failed rules projection is
+          // retried on the next publication.
+        }
         return { outcome: "lesson", documentPath: published.path, escalated: true };
       } catch (error) {
         const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
