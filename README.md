@@ -22,12 +22,42 @@ state, not lesson bodies. This is direct Markdown selection, not RAG.
 ### Natural-language dissatisfaction coverage
 
 Recognizing dissatisfaction no longer requires a fixed negative keyword such as
-"做错了" or "不合理". Natural-language complaints — being asked to restate
-already-known information, frustration about a recurring problem, and rhetorical
-accountability ("how is this unknown again?") — are admitted for the detached full
-reviewer, while the prompt hook remains fast and silent. The reviewer compares only
-bounded, same-project prior candidate evidence and may use corroborated recurrence
-to form a Major lesson.
+"做错了" or "不合理". Three layers cover the gap between wordlists and judgment:
+
+1. **Expanded wordlist routes.** Natural-language complaints — being asked to
+   restate already-known information, frustration about a recurring problem, and
+   rhetorical accountability ("how is this unknown again?") — are admitted for the
+   detached full reviewer directly.
+2. **LLM fallback classifier.** A message the wordlist misses but that carries an
+   assistant referent goes to a detached binary classifier (`classify-feedback`),
+   which answers reason-first and then `{"dissatisfied": true/false}`. Yes admits
+   the job to the reviewer; no discards it. The classifier is told the agent's own
+   excuse must not count as evidence the user is satisfied — a deflection ("连
+   不通") cannot sway the verdict. Pure operation turns ("继续", "好的", "等等")
+   skip the call entirely. Because the classifier runs per referent-backed
+   prompt, codex invocations inject the same gateway routing the reviewer uses;
+   without it every codex classification wedged until timeout.
+3. **Deterministic escalation.** A reviewer that keeps declining the same
+   recurring family — each time with a fresh excuse (post-hoc correction, "not
+   deployed yet", prospective request) — no longer gets the last word: once a
+   family has been declined 3+ times inside a 14-day window, the next decline is
+   replaced by a synthesized Major lesson built from the accumulated decline
+   summaries and published directly. A family that already has a published
+   lesson is left to normal recurrence machinery instead of piling up duplicate
+   meta-lessons.
+
+### From published lesson to later session
+
+Publication is not delivery. Three channels carry a lesson forward:
+
+- The reviewer contract treats the user's explicit statement of fact as a
+  factual claim the agent must verify before contesting, and treats scope
+  overreach as agent fault even when the agent later corrects it.
+- Families that reach `Major+3` / `Critical+2` / `Blocker+1` occurrences are
+  compiled into the managed block of `.agent/rules/feedback-loop.md`.
+- The prompt hook injects that managed block into every prompt's context
+  (bounded to 6 KB), so a rule that has recurred enough is seen each turn
+  mechanically rather than depending on the model choosing to open the file.
 
 ### Reviewer provider environment
 
@@ -43,7 +73,9 @@ stored in the CLI's own config — needs those names passed through
 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` (a comma-separated allowlist whose value
 must also list `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` and
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` themselves so they survive into the detached
-process). The per-review timeout defaults to 180000 ms; raise it with
+process). The per-review timeout defaults to 300000 ms and the claim lease scales
+from it, so a big-evidence review that legitimately runs minutes is not cut off
+mid-generation or discarded as lease-lost; raise it further with
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` when a real provider needs longer.
 
 ## Convergence control
@@ -93,6 +125,15 @@ follows it — narrowing means editing the artifact the block was about, so a re
 that stayed in force would forbid the one action it just demanded. A run that keeps
 circling therefore pays a full stop-and-attribute each time, and after several such
 refusals the direction goes to the user instead of being asked for again.
+
+The first trip warns instead of blocking: the tool runs, an advisory names the
+circling shape, and an independent direction review is dispatched in the
+background. A hard block follows only after that verdict has been delivered and
+the run still circles — and the verdict buys exactly one free pass, spent on its
+first block, so a run cannot be told the verdict once and then refused forever
+with nothing new to act on. A filesystem-attested design-phase permit (resolved
+from workflow state files, invisible to the agent) suppresses blocking while the
+counters keep ticking.
 
 Reads always proceed, so a blocked run can still inspect and hand back. Appending is
 not rework: a file that accumulates is not a task circling. Running a real test

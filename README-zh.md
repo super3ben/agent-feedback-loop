@@ -17,10 +17,33 @@
 
 ### 自然语言不满覆盖
 
-识别不满不再依赖固定的负面关键词（如"做错了""不合理"）。自然语言表达的抱怨——被
-要求重复已知信息、对反复出现的问题不耐烦、以及质问式追责（"怎么又不知道了"）——都会
-进入 detached full reviewer；prompt hook 仍保持快速、静默。reviewer 只比较同项目、
-有界的历史候选证据，并可用经佐证的复发模式形成 Major 经验。
+识别不满不再依赖固定的负面关键词（如"做错了""不合理"）。三层机制覆盖词表与判断
+之间的空隙：
+
+1. **扩展词表路由。** 自然语言表达的抱怨——被要求重复已知信息、对反复出现的
+   问题不耐烦、以及质问式追责（"怎么又不知道了"）——直接进入 detached full
+   reviewer。
+2. **LLM 回退分类器。** 词表未命中但带助手 referent 的消息交给 detached 二元
+   分类器（`classify-feedback`），先给理由再输出 `{"dissatisfied": true/false}`。
+   Yes 放行给 reviewer，No 丢弃。分类器被明确告知：助手的辩解不能作为用户没有
+   不满的理由——一句"连不通"糊弄不了判定。纯操作对话（"继续""好的""等等"）
+   整句命中即跳过，不发调用。由于分类器按每条带 referent 的消息触发，codex
+   调用会注入与 reviewer 相同的网关路由；缺了它所有 codex 分类都会挂到超时。
+3. **确定性升级。** reviewer 反复用新借口（事后纠正、"还没部署"、前瞻建议）
+   拒绝沉淀同一家族时，不再由它说了算：同族在 14 天窗口内被拒 ≥3 次后，下一次
+   拒绝会被替换为用累计拒绝记录合成的 Major 经验并直接发布。已有已发布教训的
+   家族交给正常复发机制，不堆积重复的 meta-lesson。
+
+### 从发布到下次会话生效
+
+发布不等于送达。三条通道把教训带给后续会话：
+
+- reviewer 合同把用户的明确事实陈述当作必须先核查再反驳的主张，把超出用户
+  明确范围的扩大执行（即使事后纠正）判定为 agent 责任。
+- 达到 `Major+3` / `Critical+2` / `Blocker+1` 复发次数的家族会被编译进
+  `.agent/rules/feedback-loop.md` 的托管区块。
+- prompt hook 每轮把该托管区块注入上下文（上限 6KB），复发足够多的规则每一轮
+  都被看到——机械保证，不依赖模型自觉打开文件。
 
 ### Reviewer provider 环境
 
@@ -34,8 +57,9 @@ shell 环境变量认证时——例如把 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_
 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST`（逗号分隔的白名单）放行这些变量名；
 其值还必须列出 `AGENT_FEEDBACK_LOOP_REVIEWER_ENV_ALLOWLIST` 和
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 本身，才能传入 detached 进程。单次审查
-超时默认 180000 ms；真实 provider 需要更长时间时用
-`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 调高。
+超时默认 300000 ms，claim lease 跟随超时伸缩，大证据量的审查跑几分钟也不会被
+中途掐断或以 lease 丢失作废；真实 provider 需要更长时间时用
+`AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 再调高。
 
 ## 收敛控制
 
@@ -49,6 +73,13 @@ Breaker 根据已验证的外部事实判断，例如：决策依据未变却重
 正式 review 重复失败。`routine` 在第一次已验证的无证据扩张时暂停；`important`
 至多获得一次可证伪探索预算；`critical` 每一代都必须增加与风险直接相关的新验证
 证据，并不享有无限探索。
+
+Codex 与 Claude Code 的执行守卫采用 warn-first：首次触发只警告（工具继续执行，
+附加指示性文案），同时在后台派发独立方向评审；只有当评审结论已交付而运行仍在
+绕圈时才硬阻断——且评审结论只能抵一次阻断，用掉即失效，避免"听过一次结论就
+被永久拒绝、再无新输入可执行"的单向闩锁。设计阶段许可（由工作流状态文件证明、
+对 agent 不可见）可在抑制阻断的同时保持计数。读取类调用永远放行；真实测试命令
+清零计数，使 red-green-refactor 不被惩罚；新用户消息同样清零计数。
 
 执行强度受适配器真实边界限制：
 
