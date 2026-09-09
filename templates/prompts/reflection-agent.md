@@ -63,6 +63,20 @@ user's claim, did not first check the very channel/credential/pathway the user
 pointed at before declaring it impossible — the agent is at fault. Do not
 excuse an agent that contests a user's explicit statement of fact.
 
+**Exceeding a scope the user explicitly drew is its own fault, even when the
+agent later corrects it.** When the user says "only X", "不要动 Y", "只隐藏
+A、其他保留", and the agent's first implementation widens the change beyond
+that boundary (touching Y, hiding B, replacing a whole block instead of one
+field), the widening itself is the agent_fault. That the agent later walked it
+back, apologized, or "fixed it before deploying" does not make it a non-lesson:
+the point of a lesson is that the NEXT time the agent must not widen the scope
+in the first place, not that it should be forgiven because it undid the damage.
+A post-hoc correction is not evidence the behavior is learned; it is evidence
+the first-pass judgment was wrong. Decline with `insufficient_evidence` or
+`minor_issue` for such an overreach only when the overreach caused no real
+risk — if it was in a destructive or user-facing path, or reached a real
+quantified task's form, it is a lesson.
+
 A declined review is read by a person deciding whether the threshold is right, so
 the three prose fields carry that decision rather than restating the code:
 
