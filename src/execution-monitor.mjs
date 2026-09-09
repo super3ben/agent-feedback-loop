@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 // How many times one artifact may be rewritten while the user stays silent.
-// Creating a file is free; only edits to existing content count. At 2 the third
+// Creating a file is free; only edits to existing content count. At 4 the fifth
 // rewrite is stopped, which is where refining an artifact nobody asked to
 // refine starts to look like circling rather than converging.
 //
@@ -10,8 +10,14 @@ import { createHash } from "node:crypto";
 // input is circling. Advanced models reach this state by review-then-improve
 // loops that never fail — each pass looks reasonable, and nothing ever errors.
 //
+// Raised from 2 to 4 after measured use: at 2 the guard fired on ordinary
+// iteration — write, run the tests, fix what they caught, fix the next thing —
+// which is convergence, not circling. Every false block costs a full
+// stop-and-attribute cycle, so the limit is set where a run has had enough
+// passes to be visibly stuck rather than merely busy.
+//
 // The user speaking resets it, because a new instruction is new evidence.
-export const EXECUTION_REWORK_LIMIT = 2;
+export const EXECUTION_REWORK_LIMIT = 4;
 
 // How many distinct artifacts may be rewritten in one session before the
 // direction itself is stopped, rather than any single file.
@@ -23,9 +29,10 @@ export const EXECUTION_REWORK_LIMIT = 2;
 // in place and spreading sideways are both non-convergence; only the second one
 // keeps every individual counter low.
 //
-// 8 is set from observed sessions: the spreading run reached 20 distinct
-// rewritten artifacts, while a healthy 160-call run touched 3.
-export const EXECUTION_SPREAD_LIMIT = 8;
+// Raised from 8 to 15. 8 was read off one spreading run that reached 20 and one
+// healthy run that touched 3, but a legitimate refactor crosses 8 files without
+// widening its direction at all. 15 still sits well below the observed 20.
+export const EXECUTION_SPREAD_LIMIT = 15;
 
 // Tool calls that cannot change anything. Everything else — including every
 // tool this list has never heard of — counts as mutating.

@@ -35,6 +35,10 @@ const STOP_VERDICT = [
 
 export const EXECUTION_STOP_REASON = `${STOP_PREAMBLE} One artifact has been rewritten repeatedly with no new input from the user, so further passes are refining rather than converging. ${STOP_VERDICT}`;
 
+// Warned variant: let the agent continue while the review runs.
+export const EXECUTION_WARN_REASON = "Convergence guard: this run is rewriting the same artifact repeatedly without new input from the user. An independent review has been started. You may continue for now, but the next verdict will tell you exactly what to narrow. If you keep circling after that, a hard block follows.";
+export const EXECUTION_SPREAD_WARN_REASON = "Convergence guard: this run is widening its direction across many artifacts without the user stepping in. An independent review has been started. You may continue for now, but the next verdict will tell you exactly what to narrow. If you keep circling after that, a hard block follows.";
+
 // Spreading sideways needs its own text: every per-file counter stayed low, so
 // telling the agent "this file was rewritten repeatedly" would not match what it
 // just did and would point it at the wrong thing to narrow.
@@ -66,6 +70,22 @@ function blockResponse(cli, reason) {
     };
   }
   return { decision: "block", reason };
+}
+
+// Warn response: lets the tool run but attaches advisory text. The agent
+// receives the message alongside a successful tool result, so it knows
+// the guard noticed the circling without being forced to stop.
+function warnResponse(cli, reason) {
+  if (cli === "claude") {
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason: reason
+      }
+    };
+  }
+  return { continue: true, reason };
 }
 
 // Escalation text. It must not claim corrections happened: the reachable route
@@ -101,6 +121,7 @@ export async function handleExecutionHook({
   payload,
   cli,
   controlStore,
+  designPermit = null,
   writeResponse = async () => null,
   nativeResponse = { continue: true },
   limit = EXECUTION_REWORK_LIMIT,
@@ -145,20 +166,37 @@ export async function handleExecutionHook({
       // The store decides to dispatch on the strength of this, and a block that
       // announced a review nobody could run is what left a session waiting.
       canReview: typeof launchDirectionReview === "function",
-      diagnosisExpired
+      diagnosisExpired,
+      // Design-phase permit: when the agent is in an attested design phase,
+      // suppress blocking while keeping counters ticking.
+      designPermit: designPermit ?? null
     });
-    if (observed?.stop) {
-      // The reason names the shape that tripped, because narrowing one artifact
-      // and narrowing a widening direction are different instructions.
+    if (observed?.warned) {
+      // Soft signal: let the agent continue while the review runs.
+      const shapeWarn = observed.shape === "spread" ? EXECUTION_SPREAD_WARN_REASON : EXECUTION_WARN_REASON;
+      let reason = shapeWarn;
+      if (observed.outcome === "dispatch") {
+        let launched = false;
+        try {
+          launched = launchDirectionReview({ monitorId, transcriptPath, cli })?.attempted === true;
+        } catch {}
+        if (launched) reason = `${shapeWarn} Review dispatched — keep reading and gathering evidence.`;
+      } else if (observed.outcome === "await") {
+        reason = `${shapeWarn} Review still running — keep reading rather than writing.`;
+      } else if (observed.outcome === "correct" && observed.verdict) {
+        reason = `${VERDICT_PREFIX}\n\n${observed.verdict}\n\n${VERDICT_SUFFIX}`;
+      }
+      response = warnResponse(cli, reason);
+    } else if (observed?.stop) {
+      // Hard block. It still has to carry the state of the direction review:
+      // the store marks a diagnosis pending on "dispatch", but only this hook
+      // can spawn the process. Handling "dispatch" in the warn branch alone
+      // meant a blocked call recorded a review nobody launched, which then
+      // expired at the deadline and dispatched again — a run sat at 108 calls
+      // with a failed diagnosis, refused every time and never told why.
       const shapeReason = observed.shape === "spread" ? EXECUTION_SPREAD_STOP_REASON : EXECUTION_STOP_REASON;
-      // Repeated blocks that changed nothing mean the text is not landing, so
-      // the direction goes to a person instead of being asked for a fourth time.
       let reason = shapeReason;
       if (observed.outcome === "dispatch") {
-        // The block holds while this runs, so there is nothing to wait for here.
-        // A spawn that fails is not fatal: the block still stands, and the run is
-        // told to attribute the over-reach itself rather than to wait for an
-        // answer that is not coming.
         let launched = false;
         try {
           launched = launchDirectionReview({ monitorId, transcriptPath, cli })?.attempted === true;
@@ -167,12 +205,8 @@ export async function handleExecutionHook({
       } else if (observed.outcome === "await") {
         reason = `${shapeReason} ${REVIEW_PENDING}`;
       } else if (observed.outcome === "correct" && observed.verdict) {
-        // A verdict produced outside the session is not self-approval, so the run
-        // can act on it and narrow without waiting for a person.
         reason = `${VERDICT_PREFIX}\n\n${observed.verdict}\n\n${VERDICT_SUFFIX}`;
       } else if (observed.outcome === "human") {
-        // Repeated blocks that changed nothing mean the text is not landing, so
-        // the direction goes to a person rather than being asked for again.
         reason = `${shapeReason} ${HUMAN_REQUIRED}`;
       }
       response = blockResponse(cli, reason);

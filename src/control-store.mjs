@@ -2087,13 +2087,21 @@ function createStore(database, now) {
           diagnosis = { state: "failed", requestedAt: diagnosis.requestedAt, verdict: null };
         }
         const intervention = tripped && mutating && !safeDesignPermit;
-        let verdictFreePass = state?.verdictFreePass ?? false;
+        // Armed by the verdict that was already handed over. It buys exactly
+        // one escalation block and is then spent, because leaving it set made
+        // the latch one-way: `warned` stayed false for the rest of the session,
+        // so every later trip hard-blocked. Observed live at count=108 with
+        // advisories=3 and verdictFreePass still true — the run had been told
+        // nothing new for a hundred calls and could only keep being refused.
+        const armed = state?.verdictFreePass ?? false;
+        let verdictFreePass = armed;
         // First trip: warn only (soft signal), let the agent continue while
         // the review runs in the background.  Only escalate to a hard block
         // after the verdict has been delivered and the agent still circles —
         // or when no review is available to produce a verdict at all.
-        const warned = intervention && canReview && !verdictFreePass;
+        const warned = intervention && canReview && !armed;
         const blocking = intervention && !warned;
+        if (blocking && armed) verdictFreePass = false;
         const waiting = blocking && diagnosis?.state === "pending";
         // This call is itself a block when the counters have tripped, so it is
         // counted before the escalation test — otherwise the first block would
