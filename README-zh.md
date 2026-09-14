@@ -34,6 +34,13 @@
    拒绝会被替换为用累计拒绝记录合成的 Major 经验并直接发布。已有已发布教训的
    家族交给正常复发机制，不堆积重复的 meta-lesson。
 
+   **DeepSeek Harness（`dsh`）覆盖：** 挂载官方桥接包
+   `@deepseek-ai/dsh-hooks-claude-code`，`configPath` 指向一份调用
+   `core-hook.sh --event UserPromptSubmit` 的 Claude 方言 hooks 文件即可。桥接
+   的 payload 永远不带 transcript，因此无法携带 transcript 的方言，其 prompt
+   也会送分类器而不是被静默丢弃；能带 transcript 的会话在尚无 referent 时
+   （首轮）仍保持跳过。
+
 ### 从发布到下次会话生效
 
 发布不等于送达。三条通道把教训带给后续会话：

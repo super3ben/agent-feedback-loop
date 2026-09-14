@@ -386,9 +386,17 @@ export async function handlePromptHook({
   // Unambiguous operation/affirmation prompts ("继续", "好的", "等等") skip the
   // call outright — they cannot be dissatisfaction, so a full LLM round is a
   // waste.
+  //
+  // The dsh bridge (dsh-hooks-claude-code) emits Claude-dialect payloads with
+  // transcript_path:'' and no prior-message field, so referent resolution
+  // always fails there. A dialect that cannot carry a referent must not be
+  // silently dropped — its non-neutral prompts go to the classifier too.
+  const referentUnavailable = Boolean(event)
+    && !input.transcript_path
+    && !input.previous_assistant_message;
   const llmPath = Boolean(event)
     && !signal?.candidate
-    && Boolean(signal?.referent)
+    && (Boolean(signal?.referent) || referentUnavailable)
     && !isNeutralOperationPrompt(userText);
 
   if (signal?.candidate && event?.identity_unstable) {

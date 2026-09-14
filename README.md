@@ -46,6 +46,13 @@ Recognizing dissatisfaction no longer requires a fixed negative keyword such as
    lesson is left to normal recurrence machinery instead of piling up duplicate
    meta-lessons.
 
+   **DeepSeek Harness (`dsh`) coverage:** mount the official
+   `@deepseek-ai/dsh-hooks-claude-code` bridge and point it at a Claude-dialect
+   hooks file calling `core-hook.sh --event UserPromptSubmit`. The bridge never
+   carries a transcript, so prompts from a dialect that cannot supply one go to
+   the classifier instead of being silently dropped; prompts in sessions that
+   can carry a transcript but have no referent yet (first turn) stay skipped.
+
 ### From published lesson to later session
 
 Publication is not delivery. Three channels carry a lesson forward:
