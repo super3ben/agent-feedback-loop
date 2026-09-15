@@ -34,12 +34,14 @@
    拒绝会被替换为用累计拒绝记录合成的 Major 经验并直接发布。已有已发布教训的
    家族交给正常复发机制，不堆积重复的 meta-lesson。
 
-   **DeepSeek Harness（`dsh`）覆盖：** 挂载官方桥接包
-   `@deepseek-ai/dsh-hooks-claude-code`，`configPath` 指向一份调用
-   `core-hook.sh --event UserPromptSubmit` 的 Claude 方言 hooks 文件即可。桥接
-   的 payload 永远不带 transcript，因此无法携带 transcript 的方言，其 prompt
-   也会送分类器而不是被静默丢弃；能带 transcript 的会话在尚无 referent 时
-   （首轮）仍保持跳过。
+   **DeepSeek Harness（`dsh`）覆盖：** `install` 自带一个独立的 dsh 原生插件
+   （`dsh-plugin/`），并自动接线到 `~/.dsh/profiles/` 下的每个 profile
+   （symlink、`link:` 依赖、托管 patch 行）——不依赖任何桥接包。插件把每条
+   prompt 喂给 `core-hook.sh`，并把编译好的规则区块注入回 harness。harness 不
+   暴露 transcript，因此无法携带 transcript 的方言，其 prompt 也会送分类器
+   而不是被静默丢弃；能带 transcript 的会话在尚无 referent 时（首轮）仍保持
+   跳过。dsh 来源的评审/分类子进程运行在宿主 CLI 上（claude，其次 codex、
+   gemini）。
 
 ### 从发布到下次会话生效
 
@@ -81,12 +83,10 @@ Breaker 根据已验证的外部事实判断，例如：决策依据未变却重
 至多获得一次可证伪探索预算；`critical` 每一代都必须增加与风险直接相关的新验证
 证据，并不享有无限探索。
 
-Codex 与 Claude Code 的执行守卫采用 warn-first：首次触发只警告（工具继续执行，
-附加指示性文案），同时在后台派发独立方向评审；只有当评审结论已交付而运行仍在
-绕圈时才硬阻断——且评审结论只能抵一次阻断，用掉即失效，避免"听过一次结论就
-被永久拒绝、再无新输入可执行"的单向闩锁。设计阶段许可（由工作流状态文件证明、
-对 agent 不可见）可在抑制阻断的同时保持计数。读取类调用永远放行；真实测试命令
-清零计数，使 red-green-refactor 不被惩罚；新用户消息同样清零计数。
+执行守卫已退役（2026-08-31）。它为 GPT 时代在 review-then-improve 循环里绕圈的运行
+设计；实测当前会话中误拦截的代价高于它抓到的真复发。两端的 `PreToolUse` hook 均已
+卸载，运行时调度也已在 `src/cli.mjs` 中注释——即使 hook 被重装，所有调用都会直接
+放行。store、hook 逻辑与测试保留在代码库中；恢复需要还原该调度并重装 hook。
 
 执行强度受适配器真实边界限制：
 

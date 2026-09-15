@@ -46,12 +46,16 @@ Recognizing dissatisfaction no longer requires a fixed negative keyword such as
    lesson is left to normal recurrence machinery instead of piling up duplicate
    meta-lessons.
 
-   **DeepSeek Harness (`dsh`) coverage:** mount the official
-   `@deepseek-ai/dsh-hooks-claude-code` bridge and point it at a Claude-dialect
-   hooks file calling `core-hook.sh --event UserPromptSubmit`. The bridge never
-   carries a transcript, so prompts from a dialect that cannot supply one go to
-   the classifier instead of being silently dropped; prompts in sessions that
-   can carry a transcript but have no referent yet (first turn) stay skipped.
+   **DeepSeek Harness (`dsh`) coverage:** `install` ships a standalone native
+   harness plugin (`dsh-plugin/`) and wires it into every profile under
+   `~/.dsh/profiles/` (symlink, `link:` dependency, managed patch row) — no
+   bridge package involved. The plugin feeds every prompt into `core-hook.sh`
+   and injects the compiled rules context back into the harness. The harness
+   exposes no transcript, so prompts from a dialect that cannot supply one go
+   to the classifier instead of being silently dropped; prompts in sessions
+   that can carry a transcript but have no referent yet (first turn) stay
+   skipped. Reviewer and classifier subprocesses for dsh-sourced jobs run on a
+   host CLI (claude, then codex, then gemini).
 
 ### From published lesson to later session
 
@@ -107,54 +111,26 @@ Enforcement is limited by the adapter's real seam:
 - Approved OpenSpec and Comet revisions provide a `checkpoint_gate` between tasks.
 - Generic prompt observations are `audit_only` with warning as their maximum.
 
-None of these claims generic real-time blocking of arbitrary tools; that is the
-separate execution guard described below. There is no Stop/AfterAgent convergence
-hook, user-visible grant or receipt, resident service, scheduler, database lesson
-body, or learning/RAG reader.
-
-## Execution guard
-
-A `PreToolUse` hook counts how often one artifact is rewritten while the user stays
-silent, and refuses the write before it runs. It is separate from both the reviewer
-and the Probe: it needs no identity, no evidence envelope, and no network, and it
-decides from the session's own tool calls alone. Codex and Claude Code are guarded;
-Gemini is not, having no evidence behind it.
-
-Two shapes count as non-convergence. One artifact returning repeatedly is circling
-in place; many artifacts each rewritten once or twice is a direction that keeps
-widening. Each is named separately in the refusal, because narrowing one file and
-narrowing a whole direction are different instructions.
-
-The refusal asks the run to decide between two causes and act: scope growth, where a
-narrow fix was extended into a general mechanism nobody asked for, or a genuine
-contradiction with the existing design or tests. It also grants the write that
-follows it — narrowing means editing the artifact the block was about, so a refusal
-that stayed in force would forbid the one action it just demanded. A run that keeps
-circling therefore pays a full stop-and-attribute each time, and after several such
-refusals the direction goes to the user instead of being asked for again.
-
-The first trip warns instead of blocking: the tool runs, an advisory names the
-circling shape, and an independent direction review is dispatched in the
-background. A hard block follows only after that verdict has been delivered and
-the run still circles — and the verdict buys exactly one free pass, spent on its
-first block, so a run cannot be told the verdict once and then refused forever
-with nothing new to act on. A filesystem-attested design-phase permit (resolved
-from workflow state files, invisible to the agent) suppresses blocking while the
-counters keep ticking.
-
-Reads always proceed, so a blocked run can still inspect and hand back. Appending is
-not rework: a file that accumulates is not a task circling. Running a real test
-suite clears the tally, because red-green-refactor rewrites one file repeatedly and
-is the discipline the guard must not punish — the signal is an executed test
-command, not the word "test" appearing in a document.
-
-A new prompt clears the counters. The counter means "tool calls since the user last
-intervened", so the user speaking is exactly the reset condition.
+None of these claims generic real-time blocking of arbitrary tools; there is no
+tool-level guard. There is no Stop/AfterAgent convergence hook, user-visible grant
+or receipt, resident service, scheduler, database lesson body, or learning/RAG
+reader.
 
 Independent convergence-effectiveness to Markdown publication is deferred. It
 requires a named workflow producer, a bounded evidence envelope, and an independently
 approved learning-job authority and result contract. Today, the real-dissatisfaction
 feedback reviewer remains the only automatic Markdown producer.
+
+## Execution guard (retired)
+
+A `PreToolUse` execution guard — a per-artifact rewrite counter with warn-then-block
+escalation and a background direction review — was retired on 2026-08-31. It was
+built for GPT-era runs that circle in review-then-improve loops; measured on live
+sessions its false blocks cost more than the circling it caught. The `PreToolUse`
+hooks are uninstalled from both hosts and the runtime dispatch is commented out in
+`src/cli.mjs`, so even a reinstalled hook passes every call through. The store, hook
+logic, and their tests remain in the tree; reviving means restoring that dispatch and
+reinstalling the hooks.
 
 ## Install and diagnose
 
@@ -178,8 +154,7 @@ rm -rf "$tmp_home"
 ```
 
 Installation copies package assets, selects the runtime, migrates the selected
-control schema, and configures the prompt hooks plus the `PreToolUse` execution
-guard for the CLIs that support it. It does not register Stop/AfterAgent hooks,
+control schema, and configures the prompt hooks. It does not register Stop/AfterAgent hooks,
 import Guard state, activate Guard authority, cut over a repository, start a
 service, or create a learning reader.
 

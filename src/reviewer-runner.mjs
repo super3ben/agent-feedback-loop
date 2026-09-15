@@ -165,7 +165,11 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
   const stored = store.getReviewContext({ jobId, priorLimit: 6, followingLimit: 2 });
   if (!stored?.job || !stored.source) throw new ReviewJobError("context_invalid");
   if (stored.job.project_id !== projectDir || stored.source.source_provider !== "codex"
-      && stored.source.source_provider !== "claude" && stored.source.source_provider !== "gemini") {
+      && stored.source.source_provider !== "claude" && stored.source.source_provider !== "gemini"
+      // dsh sessions are captured through the native harness plugin and reviewed
+      // by whichever host CLI backs the reviewer (see resolveReviewerExecutable),
+      // so dsh is a valid capture source even though no dsh binary runs here.
+      && stored.source.source_provider !== "dsh") {
     throw new ReviewJobError("context_invalid");
   }
   await assertProjectBoundary(projectDir);

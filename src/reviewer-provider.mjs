@@ -15,6 +15,9 @@ const PROVIDER_OVERRIDES = Object.freeze({
   claude: "AGENT_FEEDBACK_LOOP_CLAUDE_COMMAND",
   gemini: "AGENT_FEEDBACK_LOOP_GEMINI_COMMAND"
 });
+// A dsh-sourced job has no own binary; its reviewer/classifier subprocess runs
+// on whichever host CLI is installed, tried in this order.
+const PROVIDER_FALLBACKS = Object.freeze({ dsh: Object.freeze(["claude", "codex", "gemini"]) });
 const SOURCE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_TEMPLATE_ROOT = path.join(path.dirname(SOURCE_ROOT), "templates");
 const INSTALLED_TEMPLATE_ROOT = path.resolve(SOURCE_ROOT, "../../..");
@@ -69,13 +72,24 @@ async function executableCandidate(command, pathValue) {
 }
 
 export async function resolveReviewerExecutable({ cli, env = process.env } = {}) {
-  const command = PROVIDER_COMMANDS[cli];
-  if (!command) return null;
-  const override = env[PROVIDER_OVERRIDES[cli]];
-  if (override) return executableCandidate(override, env.PATH || "");
-  const fromPath = await executableCandidate(command, env.PATH || "");
-  if (fromPath) return fromPath;
-  if (cli === "codex") return executableCandidate("/Applications/ChatGPT.app/Contents/Resources/codex", "");
+  const resolveFor = async (provider) => {
+    const command = PROVIDER_COMMANDS[provider];
+    if (!command) return null;
+    const override = env[PROVIDER_OVERRIDES[provider]];
+    if (override) return executableCandidate(override, env.PATH || "");
+    const fromPath = await executableCandidate(command, env.PATH || "");
+    if (fromPath) return fromPath;
+    if (provider === "codex") return executableCandidate("/Applications/ChatGPT.app/Contents/Resources/codex", "");
+    return null;
+  };
+  const primary = await resolveFor(cli);
+  if (primary) return primary;
+  // dsh has no own binary: its captured events are reviewed/classified by
+  // whichever host CLI is installed, in a deterministic order.
+  for (const fallback of PROVIDER_FALLBACKS[cli] ?? []) {
+    const candidate = await resolveFor(fallback);
+    if (candidate) return candidate;
+  }
   return null;
 }
 

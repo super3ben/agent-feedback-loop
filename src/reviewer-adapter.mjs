@@ -1,6 +1,6 @@
 import { resolveReviewerExecutable } from "./reviewer-provider.mjs";
 
-const CLI_LABELS = { codex: "Codex", claude: "Claude Code", gemini: "Gemini CLI" };
+const CLI_LABELS = { codex: "Codex", claude: "Claude Code", gemini: "Gemini CLI", dsh: "DeepSeek Harness" };
 
 export async function detectReviewerAdapter({
   cli = "unknown",

@@ -916,14 +916,17 @@ export async function main(args, {
       const storedContext = store.getReviewContext({ jobId, priorLimit: 0, followingLimit: 0 });
       providerName = storedContext?.source?.source_provider ?? "unknown";
       const projectDir = storedContext?.job?.project_id ?? null;
-      const executable = await resolveReviewerExecutable({ cli: providerName, env: process.env });
+      // dsh has no own binary: the review subprocess runs on a host CLI
+      // (resolveReviewerExecutable applies the fallback order for dsh).
+      const invocationCli = providerName === "dsh" ? "claude" : providerName;
+      const executable = await resolveReviewerExecutable({ cli: invocationCli, env: process.env });
       // A big-evidence review legitimately runs 3-5 minutes; 180s cut those
       // off mid-generation. The claim lease scales from this (see runReviewJob).
       const timeoutMs = Number(optionValue(options.args, "--timeout-ms", process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 300_000));
       // Attach the timeout so runReviewJob can size the claim lease to outlive
       // the provider call instead of the fixed default.
       const provider = (context) => runReviewerProvider({
-        cli: providerName,
+        cli: invocationCli,
         executable,
         context,
         promptFile: paths.promptFile,

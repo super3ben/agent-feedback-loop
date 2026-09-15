@@ -1,0 +1,13 @@
+{
+  "name": "agent-feedback-loop-dsh",
+  "version": "0.9.0",
+  "private": true,
+  "description": "Native DeepSeek Harness plugin: feeds every prompt into the local agent-feedback-loop capture pipeline and injects compiled recurrence rules back as context.",
+  "type": "module",
+  "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

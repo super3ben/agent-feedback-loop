@@ -7,10 +7,13 @@ import {
   cp,
   lstat,
   mkdir,
+  readdir,
   readFile,
+  realpath,
   rename,
   rm,
   stat,
+  symlink,
   writeFile
 } from "node:fs/promises";
 import os from "node:os";
@@ -458,8 +461,99 @@ async function writePromptPack(paths, dryRun, actions) {
   await removeLegacyHooks(paths, dryRun, actions);
 }
 
-async function installTomlBlock(paths, cli, dryRun, actions) {
-  const configFile = paths[cli.configKey];
+const DSH_PATCH_MANAGED_BEGIN = "# agent-feedback-loop:dsh:start";
+const DSH_PATCH_MANAGED_END = "# agent-feedback-loop:dsh:end";
+const DSH_PLUGIN_DEP_NAME = "agent-feedback-loop-dsh";
+
+/**
+ * Wires the native dsh plugin into every DeepSeek Harness profile under
+ * <home>/.dsh/profiles. Best-effort: no dsh home means nothing to do, and a
+ * per-profile failure is reported as an action instead of failing the install.
+ * Wiring is three idempotent steps per profile — a node_modules symlink to the
+ * installed plugin, a "link:" dependency so pnpm keeps it, and a managed patch
+ * row so the harness activates the plugin's bundle layer. The dsh home follows
+ * the install home (the real install home IS the user's home), so test homes
+ * stay isolated.
+ */
+async function wireDshPlugin(paths, home, dryRun, actions, options = {}) {
+  const dshHome = options.dshHome || path.join(home, ".dsh");
+  const profilesDir = path.join(dshHome, "profiles");
+  let profiles;
+  try {
+    profiles = (await readdir(profilesDir, { withFileTypes: true }))
+      // Skip dotdirs and pnpm's own node_modules directory inside profiles/.
+      // A real profile holds a cordis.patch.yml; a directory without one is
+      // tooling storage, not a wireable profile.
+      .filter((entry) => entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith("."))
+      .map((entry) => entry.name);
+  } catch {
+    return; // No dsh home: the harness is not installed here.
+  }
+  if (profiles.length === 0) return;
+  const pluginSource = path.join(paths.packRoot, "dsh-plugin");
+  for (const profile of profiles) {
+    const profileDir = path.join(profilesDir, profile);
+    try {
+      const modulesDir = path.join(profileDir, "node_modules");
+      if (!dryRun) await mkdir(modulesDir, { recursive: true });
+      const linkPath = path.join(modulesDir, DSH_PLUGIN_DEP_NAME);
+      let needsLink = true;
+      try {
+        const target = await lstat(linkPath);
+        if (target.isSymbolicLink()) {
+          const real = await realpath(linkPath).catch(() => null);
+          needsLink = real !== pluginSource;
+        }
+      } catch {}
+      if (needsLink) {
+        actions.push(`dsh profile "${profile}": link plugin -> ${pluginSource}`);
+        if (!dryRun) {
+          await rm(linkPath, { force: true });
+          await symlink(pluginSource, linkPath, "dir");
+        }
+      }
+
+      const manifestPath = path.join(profileDir, "package.json");
+      let manifest = {};
+      try {
+        manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      } catch {}
+      manifest.dependencies = manifest.dependencies || {};
+      const wantedDep = `link:${pluginSource}`;
+      if (manifest.dependencies[DSH_PLUGIN_DEP_NAME] !== wantedDep) {
+        manifest.dependencies[DSH_PLUGIN_DEP_NAME] = wantedDep;
+        actions.push(`dsh profile "${profile}": add ${DSH_PLUGIN_DEP_NAME} dependency`);
+        if (!dryRun) {
+          const manifestTemp = `${manifestPath}.${process.pid}.tmp`;
+          await writeFile(manifestTemp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+          await rename(manifestTemp, manifestPath);
+        }
+      }
+
+      const patchPath = path.join(profileDir, "cordis.patch.yml");
+      let patch = "";
+      try {
+        patch = await readFile(patchPath, "utf8");
+      } catch {}
+      if (!patch.includes(DSH_PATCH_MANAGED_BEGIN)) {
+        const block = [
+          `${DSH_PATCH_MANAGED_BEGIN}`,
+          "- insert:",
+          "    - id: agent-feedback-loop",
+          `      name: ${DSH_PLUGIN_DEP_NAME}`,
+          `${DSH_PATCH_MANAGED_END}`,
+          ""
+        ].join("\n");
+        actions.push(`dsh profile "${profile}": add managed patch row`);
+        if (!dryRun) await writeFile(patchPath, `${patch}${patch && !patch.endsWith("\n") ? "\n" : ""}${block}`, "utf8");
+      }
+    } catch (error) {
+      actions.push(`dsh profile "${profile}": wiring skipped (${String(error?.message || error).slice(0, 120)})`);
+    }
+  }
+}
+
+async function installTomlBlock(paths, cli, dryRun, actions) {  const configFile = paths[cli.configKey];
   await backup(configFile, dryRun, actions);
   const current = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
   const cleaned = cleanLegacyCodexHooks(current, paths);
@@ -528,6 +622,7 @@ export async function install(options = {}) {
   }
   await writePromptPack(paths, dryRun, actions);
   await writeRuntimeLauncher(paths, dryRun, actions);
+  await wireDshPlugin(paths, home, dryRun, actions, { dshHome: options.dshHome });
   for (const cli of CLIS) {
     await installCli(paths, cli, dryRun, actions);
   }

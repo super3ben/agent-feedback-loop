@@ -195,7 +195,10 @@ export async function runLLMClassifier({
     throw new LLMClassifyError(code, error);
   }
 
-  const executable = await resolveExecutable({ cli: evidence.sourceProvider, env });
+  // dsh has no own binary: the classifier subprocess runs on a host CLI
+  // (resolveExecutable applies the same fallback order as the reviewer).
+  const invocationCli = evidence.sourceProvider === "dsh" ? "claude" : evidence.sourceProvider;
+  const executable = await resolveExecutable({ cli: invocationCli, env });
   if (!executable) {
     store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
     throw new LLMClassifyError("provider_unavailable");
@@ -203,7 +206,7 @@ export async function runLLMClassifier({
   // Same gateway routing the full reviewer injects for codex: without it the
   // isolated call cannot reach the user's model provider.
   let codexRouting = [];
-  if (evidence.sourceProvider === "codex" && typeof env?.HOME === "string" && env.HOME) {
+  if (invocationCli === "codex" && typeof env?.HOME === "string" && env.HOME) {
     try {
       codexRouting = await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") });
     } catch {
@@ -213,7 +216,7 @@ export async function runLLMClassifier({
   // The provider shell-outs bind the schema to their own transport. The
   // classifier has no schema; it reads plain yes/no, so use the claude shorthand.
   const invocation = classifierInvocation({
-    cli: evidence.sourceProvider,
+    cli: invocationCli,
     executable,
     codexRouting
   });

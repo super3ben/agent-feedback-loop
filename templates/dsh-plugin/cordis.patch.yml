@@ -1,0 +1,5 @@
+# Applied after every bundle layer when this package is listed in a profile's
+# dsh.profile.bundles (or referenced from the profile's own patch layer).
+- insert:
+    - id: agent-feedback-loop
+      name: agent-feedback-loop-dsh
