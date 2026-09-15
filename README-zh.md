@@ -35,8 +35,9 @@
    家族交给正常复发机制，不堆积重复的 meta-lesson。
 
    **DeepSeek Harness（`dsh`）覆盖：** `install` 自带一个独立的 dsh 原生插件
-   （`dsh-plugin/`），并自动接线到 `~/.dsh/profiles/` 下的每个 profile
-   （symlink、`link:` 依赖、托管 patch 行）——不依赖任何桥接包。插件把每条
+   （`dsh-plugin/`），并按 `dsh plugin add` 的同一方式接线到 `~/.dsh/profiles/`
+   下的每个 profile（node_modules symlink、`link:` 依赖、
+   `dsh.profile.bundles` 登记）——不依赖任何桥接包。插件把每条
    prompt 喂给 `core-hook.sh`，并把编译好的规则区块注入回 harness。harness 不
    暴露 transcript，因此无法携带 transcript 的方言，其 prompt 也会送分类器
    而不是被静默丢弃；能带 transcript 的会话在尚无 referent 时（首轮）仍保持
@@ -124,6 +125,20 @@ rm -rf "$tmp_home"
 安装只复制 package assets、选择 runtime、迁移所选 control schema，并配置既有 prompt
 hooks。它不会注册 Stop/AfterAgent hook，不会导入 Guard state、激活 Guard authority、
 切换仓库权威、启动服务或创建 learning reader。
+
+### DeepSeek Harness（`dsh`）
+
+若存在 dsh home（`~/.dsh/profiles/`），`agent-feedback-loop install` 还会把独立
+原生插件接线到每个 harness profile：插件复制到 `<packRoot>/dsh-plugin/`，链入
+profile 的 `node_modules`，添加 `link:` 依赖，并在 `dsh.profile.bundles` 登记
+——与 `dsh plugin add` 的最终状态一致，且重复安装幂等。插件由自带的 bundle
+patch 层激活；`install` 绝不写 profile 的 `cordis.patch.yml`（那里的手动行会与
+bundle 层在 loader entry id 上冲突，harness 将拒绝启动）。bundle 登记机制之前
+的旧安装会被自动迁移：其写入的托管 patch 行会被移除。
+
+安装后需重启 harness，运行中的实例才会加载插件。dsh home 跟随安装 home
+（真实用户即 `~/.dsh`）；用 `--home` 指向一次性目录即可在不触碰真实 profile
+的情况下试接线。
 
 `doctor` 返回 `{ version, status }`。`status.ready` 仍是 prompt/Markdown 路径的门。
 `status.convergence` 分开报告：

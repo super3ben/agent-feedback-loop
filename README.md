@@ -48,8 +48,9 @@ Recognizing dissatisfaction no longer requires a fixed negative keyword such as
 
    **DeepSeek Harness (`dsh`) coverage:** `install` ships a standalone native
    harness plugin (`dsh-plugin/`) and wires it into every profile under
-   `~/.dsh/profiles/` (symlink, `link:` dependency, managed patch row) — no
-   bridge package involved. The plugin feeds every prompt into `core-hook.sh`
+   `~/.dsh/profiles/` the same way `dsh plugin add` does (node_modules symlink,
+   `link:` dependency, `dsh.profile.bundles` registration) — no bridge package
+   involved. The plugin feeds every prompt into `core-hook.sh`
    and injects the compiled rules context back into the harness. The harness
    exposes no transcript, so prompts from a dialect that cannot supply one go
    to the classifier instead of being silently dropped; prompts in sessions
@@ -157,6 +158,24 @@ Installation copies package assets, selects the runtime, migrates the selected
 control schema, and configures the prompt hooks. It does not register Stop/AfterAgent hooks,
 import Guard state, activate Guard authority, cut over a repository, start a
 service, or create a learning reader.
+
+### DeepSeek Harness (`dsh`)
+
+If a dsh home exists (`~/.dsh/profiles/`), `agent-feedback-loop install` also
+wires the standalone native plugin into every harness profile: it copies the
+plugin to `<packRoot>/dsh-plugin/`, links it into the profile's `node_modules`,
+adds a `link:` dependency, and registers it in `dsh.profile.bundles` — the same
+end state as `dsh plugin add`, and idempotent across reinstalls. The plugin is
+activated by its own bundled patch layer; `install` never writes into the
+profile's `cordis.patch.yml` (a manual row there collides with the bundle layer
+on the loader entry id and the harness refuses to boot). Installs from before
+bundle registration are migrated automatically: the managed patch row they
+wrote is removed.
+
+Restart the harness after installing so the running instance picks the plugin
+up. The dsh home follows the install home (`~/.dsh` for the real user); pass
+`--home` with a disposable directory to try the wiring without touching a real
+profile.
 
 `doctor` returns `{ version, status }`. `status.ready` remains the prompt/Markdown
 pipeline gate. `status.convergence` separately reports:
