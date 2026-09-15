@@ -530,22 +530,33 @@ async function wireDshPlugin(paths, home, dryRun, actions, options = {}) {
         }
       }
 
+      const bundles = manifest.dsh?.profile?.bundles;
+      if (Array.isArray(bundles) && !bundles.includes(DSH_PLUGIN_DEP_NAME)) {
+        bundles.push(DSH_PLUGIN_DEP_NAME);
+        actions.push(`dsh profile "${profile}": register ${DSH_PLUGIN_DEP_NAME} bundle`);
+        if (!dryRun) {
+          const manifestTemp = `${manifestPath}.${process.pid}.tmp`;
+          await writeFile(manifestTemp, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+          await rename(manifestTemp, manifestPath);
+        }
+      }
+
+      // Migration: installs before bundle registration wrote a managed row
+      // into the profile patch. It collides with the bundle layer's own row
+      // (duplicate loader entry id) and must come off.
       const patchPath = path.join(profileDir, "cordis.patch.yml");
       let patch = "";
       try {
         patch = await readFile(patchPath, "utf8");
       } catch {}
-      if (!patch.includes(DSH_PATCH_MANAGED_BEGIN)) {
-        const block = [
-          `${DSH_PATCH_MANAGED_BEGIN}`,
-          "- insert:",
-          "    - id: agent-feedback-loop",
-          `      name: ${DSH_PLUGIN_DEP_NAME}`,
-          `${DSH_PATCH_MANAGED_END}`,
-          ""
-        ].join("\n");
-        actions.push(`dsh profile "${profile}": add managed patch row`);
-        if (!dryRun) await writeFile(patchPath, `${patch}${patch && !patch.endsWith("\n") ? "\n" : ""}${block}`, "utf8");
+      if (patch.includes(DSH_PATCH_MANAGED_BEGIN)) {
+        const begin = patch.indexOf(DSH_PATCH_MANAGED_BEGIN);
+        const end = patch.indexOf(DSH_PATCH_MANAGED_END);
+        if (end > begin) {
+          const cleaned = `${patch.slice(0, begin)}${patch.slice(end + DSH_PATCH_MANAGED_END.length)}`.replace(/\n{3,}/gu, "\n\n");
+          actions.push(`dsh profile "${profile}": remove colliding managed patch row`);
+          if (!dryRun) await writeFile(patchPath, cleaned, "utf8");
+        }
       }
     } catch (error) {
       actions.push(`dsh profile "${profile}": wiring skipped (${String(error?.message || error).slice(0, 120)})`);
@@ -553,7 +564,8 @@ async function wireDshPlugin(paths, home, dryRun, actions, options = {}) {
   }
 }
 
-async function installTomlBlock(paths, cli, dryRun, actions) {  const configFile = paths[cli.configKey];
+async function installTomlBlock(paths, cli, dryRun, actions) {
+  const configFile = paths[cli.configKey];
   await backup(configFile, dryRun, actions);
   const current = (await exists(configFile)) ? await readFile(configFile, "utf8") : "";
   const cleaned = cleanLegacyCodexHooks(current, paths);
