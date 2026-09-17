@@ -197,7 +197,8 @@ const LOG_REASONS = new Set([
   "selection_failed", "response_failed", "emission_record_failed", "invalid_input", "hook_failed",
   "candidate", "not_candidate", "launch_reserved", "reserved", "terminal", "not_found", "cooldown",
   "not_due", "unsupported_platform", "provider_unavailable", "provider_timeout", "provider_invalid", "context_invalid",
-  "lease_lost", "publication_failed", "publication_collision", "reviewer_failed"
+  "lease_lost", "publication_failed", "publication_collision", "reviewer_failed",
+  "over_budget", "oversized_section"
 ]);
 const LOG_RESULTS = new Set(["attempted", "reviewed_no_lesson", "published", "failed", "created", "reused", "selected", "emitted", "admitted", "discarded"]);
 const LOG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -291,7 +292,37 @@ export async function writePromptResponse({ cli, response, writer }) {
 // The managed rules block in the project's rules file, bounded for injection.
 // Only the afl-managed block is injected — hand-written project rules stay in
 // the file where the project's own docs reference them.
+//
+// The writer projects the block into this budget (buildRulesBlock), so a
+// conforming file always fits. This cap is a backstop for a file edited by hand
+// or written by an older version, and it cuts on section boundaries rather than
+// mid-byte: the previous byte-slice dropped 44% of a live block, split CJK
+// characters, and never said so.
 const RULES_BLOCK_MAX_BYTES = 6 * 1_024;
+
+/**
+ * Trims whole sections off the end until the text fits, keeping the header.
+ *
+ * Whole sections rather than bytes, because a half-written rule is worse than
+ * an absent one: it reads as a complete instruction while missing its method
+ * changes. Returns the text and how many sections were dropped.
+ */
+function boundBlockOnSectionBoundaries(body, maxBytes) {
+  if (Buffer.byteLength(body, "utf8") <= maxBytes) return { text: body, dropped: 0 };
+  const sections = body.split(/\n(?=### )/u);
+  if (sections.length < 2) {
+    // A single oversized section has no boundary to cut on. Keep it whole and
+    // let the caller log the overflow — a truncated rule would be misleading.
+    return { text: body, dropped: 0, oversized: true };
+  }
+  const kept = [...sections];
+  let dropped = 0;
+  while (kept.length > 1 && Buffer.byteLength(kept.join("\n"), "utf8") > maxBytes) {
+    kept.pop();
+    dropped += 1;
+  }
+  return { text: kept.join("\n"), dropped };
+}
 
 async function readProjectRulesBlock(projectDir) {
   if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) return null;
@@ -307,13 +338,20 @@ async function readProjectRulesBlock(projectDir) {
   if (start < 0 || end <= start) return null;
   const body = text.slice(start + "<!-- afl:rules:start -->".length, end).trim();
   if (!body) return null;
-  const bounded = Buffer.byteLength(body, "utf8") > RULES_BLOCK_MAX_BYTES
-    ? Buffer.from(body, "utf8").subarray(0, RULES_BLOCK_MAX_BYTES).toString("utf8")
-    : body;
-  return [
-    "【复发教训规则 — 以下每条都对应本项目已发生 ≥3 次的同类错误，本轮必须遵守】",
-    bounded
-  ].join("\n");
+  const bounded = boundBlockOnSectionBoundaries(body, RULES_BLOCK_MAX_BYTES);
+  if (bounded.oversized || bounded.dropped > 0) {
+    promptLog("rules_block_injected", {
+      reason: bounded.oversized ? "oversized_section" : "over_budget",
+      count: bounded.dropped
+    });
+  }
+  return {
+    text: [
+      "【复发教训规则 — 以下每条都对应本项目已发生 ≥3 次的同类错误，本轮必须遵守】",
+      bounded.text
+    ].join("\n"),
+    dropped: bounded.dropped
+  };
 }
 
 export async function handlePromptHook({
@@ -678,8 +716,8 @@ export async function handlePromptHook({
   try {
     const rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir);
     if (rulesBlock) {
-      result.guidance = rulesBlock + (result.guidance ? `\n\n${result.guidance}` : "");
-      promptLog("rules_block_injected", { bytes: Buffer.byteLength(rulesBlock, "utf8") });
+      result.guidance = rulesBlock.text + (result.guidance ? `\n\n${result.guidance}` : "");
+      promptLog("rules_block_injected", { bytes: Buffer.byteLength(rulesBlock.text, "utf8") });
     }
   } catch (error) {
     promptLog("rules_block_injected", { reason: "selection_failed" });

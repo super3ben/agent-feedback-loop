@@ -71,6 +71,36 @@ Publication is not delivery. Three channels carry a lesson forward:
   (bounded to 6 KB), so a rule that has recurred enough is seen each turn
   mechanically rather than depending on the model choosing to open the file.
 
+#### The rules block is a projection, not an accumulating log
+
+The managed block is rebuilt from store state on every publication and is held
+under a fixed byte budget, so it cannot grow without bound and nobody has to
+prune it. Three properties make that automatic:
+
+- **Merge.** Families are merged when their rendered bodies are identical. The
+  family id hashes the reviewer's free-text `family_key` alongside its method
+  class, so the same lesson arrives under a new id whenever the reviewer
+  phrases the key differently. One live project carried seven such duplicates,
+  36.6% of its block.
+- **Rank.** Surviving sections are ordered by severity, then occurrence count,
+  then most recent recurrence. Without the third term a family hit 39 times
+  months ago and never since outranks one hit five times this week.
+- **Demote, never drop.** A family that does not fit the budget keeps a
+  heading-only line, naming it and carrying its count. It is never deleted: it
+  stays published, stays counted, and returns to full text automatically the
+  moment it recurs and outranks something else.
+
+The writer guarantees the block fits, which replaces a byte-slice the reader
+used to apply at injection time. That slice cut mid-character and silently
+dropped 44% of a live block — including five families that had qualified. An
+over-budget block now means the file was written by an older version or edited
+by hand; the reader then trims whole sections and logs how many it dropped.
+
+`doctor` reports the block under `status.rulesBlock` with two separate flags:
+`saturated` (the projection reached its ceiling — working as designed) and
+`overBudget` (the file no longer matches what the writer produces). Neither
+asks you to clean anything up.
+
 ### Reviewer provider environment
 
 The detached reviewer runs the host CLI (`codex`, `claude`, or `gemini`) in a

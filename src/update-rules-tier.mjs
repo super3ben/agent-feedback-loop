@@ -11,16 +11,21 @@
 import { readFile } from "node:fs/promises";
 
 import { parseReflectionMarkdown } from "./reflection-document.mjs";
-import { buildRulesBlock, qualifyForRules, writeAflRulesBlock } from "./rules-writer.mjs";
-
-// Blocker outranks Critical outranks Major, then more recurrences first. The
-// order decides what survives if the block is ever capped.
-const SEVERITY_RANK = { Blocker: 0, Critical: 1, Major: 2 };
+import {
+  buildRulesBlock,
+  qualifyForRules,
+  readRulesBlockBudget,
+  rulesBlockIsCurrent,
+  writeAflRulesBlock
+} from "./rules-writer.mjs";
 
 /**
  * Rebuilds the whole managed block from current state rather than appending to
- * it, so a family that stops qualifying disappears and the file cannot drift
- * away from what the store actually holds.
+ * it. Selection happens under a fixed byte budget inside buildRulesBlock, so
+ * the block cannot grow without bound and nobody has to prune it by hand: a
+ * family that stops qualifying leaves, and one that recurs outranks whichever
+ * family it displaces. Demotion is a projection, not a deletion — the lesson
+ * stays published, stays counted, and returns on its next recurrence.
  */
 export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
   if (!store || !projectId || !projectDir) return { updated: false, reason: "missing_input" };
@@ -58,6 +63,11 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
       familyKey,
       severity: job.final_severity,
       occurrences,
+      // The projection ranks on recency as well as count, so a family that was
+      // hit 39 times months ago and has not recurred since yields to one hit
+      // five times this week. A lesson that stopped recurring may have been
+      // learned; one that keeps recurring has not.
+      latestRecurrenceAt: job.completed_at ?? null,
       incidentSummary: document.classOfMistake ?? null,
       methodChanges: document.methodChanges
     });
@@ -65,14 +75,16 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
 
   if (!qualified.length) return { updated: false, reason: "none_qualified" };
 
-  qualified.sort((left, right) => {
-    const bySeverity = SEVERITY_RANK[left.severity] - SEVERITY_RANK[right.severity];
-    return bySeverity !== 0 ? bySeverity : right.occurrences - left.occurrences;
-  });
-
   const block = buildRulesBlock(qualified);
   if (!block) return { updated: false, reason: "empty_block" };
 
+  const budget = readRulesBlockBudget(block);
+  // The projection is deterministic, so an unchanged store produces an
+  // unchanged block and the file's mtime need not move.
+  if (await rulesBlockIsCurrent(projectDir, block)) {
+    return { updated: false, reason: "already_current", familyCount: qualified.length, budget };
+  }
+
   const written = await writeAflRulesBlock(projectDir, block);
-  return { updated: true, path: written.path, familyCount: qualified.length };
+  return { updated: true, path: written.path, familyCount: qualified.length, budget };
 }

@@ -24,6 +24,7 @@ import { createCodexHost } from "./codex-host.mjs";
 import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { SCHEMA_VERSION } from "./control-schema.mjs";
 import { readReflectionCatalog } from "./reflection-document.mjs";
+import { RULES_BLOCK_BUDGET_BYTES, readRulesBlockBudget } from "./rules-writer.mjs";
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
@@ -775,6 +776,50 @@ async function inspectReflectionDirectory(directory) {
   }
 }
 
+/**
+ * How full the project's rules block is.
+ *
+ * The writer projects the block into RULES_BLOCK_BUDGET_BYTES, so a saturated
+ * block is working as designed, not failing: families beyond the budget are
+ * demoted to headings and return on their next recurrence. What is worth
+ * reporting is saturation, because it means the tier has stopped accepting new
+ * full rules and the honest next step is folding the surviving ones together
+ * rather than adding more.
+ *
+ * A block over budget means the file was written by an older version or edited
+ * by hand — the reader bounds it on section boundaries. This is diagnostic
+ * only; nothing here prompts a person to go clean anything up.
+ */
+async function inspectRulesBlock(projectDir) {
+  const filePath = path.join(projectDir, ".agent", "rules", "feedback-loop.md");
+  let text;
+  try {
+    text = await readFile(filePath, "utf8");
+  } catch {
+    return { available: false, reason: "unreadable" };
+  }
+  const start = text.indexOf("<!-- afl:rules:start -->");
+  const end = text.indexOf("<!-- afl:rules:end -->");
+  if (start < 0 || end <= start) return { available: false, reason: "no_managed_block" };
+  const block = text.slice(start, end + "<!-- afl:rules:end -->".length);
+  const budget = readRulesBlockBudget(block);
+  const usedBytes = budget ? budget.usedBytes : Buffer.byteLength(block, "utf8");
+  const maxBytes = budget ? budget.maxBytes : RULES_BLOCK_BUDGET_BYTES;
+  const sectionCount = (block.match(/^### /gmu) || []).length;
+  return {
+    available: true,
+    usedBytes,
+    maxBytes,
+    sectionCount,
+    demotedCount: budget ? budget.demotedCount : null,
+    // Two different conditions, reported separately: a saturated block is the
+    // writer's own projection at its ceiling, while an over-budget one means
+    // the file no longer matches what the writer produces.
+    saturated: (budget?.demotedCount ?? 0) > 0,
+    overBudget: Buffer.byteLength(block, "utf8") > maxBytes
+  };
+}
+
 async function inspectConvergencePackage() {
   const moduleChecks = await Promise.all(CONVERGENCE_MODULES.map((name) =>
     exists(path.join(SRC_DIR, name))));
@@ -975,10 +1020,11 @@ export async function doctor(options = {}) {
   const legacyStopRemoved = CLIS.every((cli) => !clis[cli.id].legacyStopPresent);
   const reflectionDirectoryPath = path.join(options.cwd || process.cwd(), ".agent", "reflections");
   const reflectionProjectDir = options.cwd || process.cwd();
-  const [controlStore, reflectionDirectory, reflectionLanguages] = await Promise.all([
+  const [controlStore, reflectionDirectory, reflectionLanguages, rulesBlock] = await Promise.all([
     inspectControlStore(paths),
     inspectReflectionDirectory(reflectionDirectoryPath),
-    inspectReflectionLanguages(reflectionProjectDir)
+    inspectReflectionLanguages(reflectionProjectDir),
+    inspectRulesBlock(reflectionProjectDir)
   ]);
   const codePackage = await inspectConvergencePackage();
   const installedRuntime = await inspectInstalledConvergence({
@@ -1001,6 +1047,7 @@ export async function doctor(options = {}) {
     controlStore,
     reflectionDirectory,
     reflectionLanguages,
+    rulesBlock,
     reviewerProvider: Object.fromEntries(CLIS.map((cli) => {
       const reviewer = reviewers[cli.id] || { cli: cli.id, available: false, executable: null };
       return [cli.id, {
