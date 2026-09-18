@@ -151,6 +151,9 @@ hooks。它不会注册 Stop/AfterAgent hook，不会导入 Guard state、激活
 
 ### DeepSeek Harness（`dsh`）
 
+dsh 插件已收录于 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
+插件市场（memory 分类）：[条目](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/data/plugins/super3ben__agent-feedback-loop--templates-dsh-plugin.yml)。
+
 若存在 dsh home（`~/.dsh/profiles/`），`agent-feedback-loop install` 还会把独立
 原生插件接线到每个 harness profile：插件复制到 `<packRoot>/dsh-plugin/`，链入
 profile 的 `node_modules`，添加 `link:` 依赖，并在 `dsh.profile.bundles` 登记

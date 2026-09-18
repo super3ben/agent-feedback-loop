@@ -191,6 +191,9 @@ service, or create a learning reader.
 
 ### DeepSeek Harness (`dsh`)
 
+The dsh plugin is listed in the [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)
+marketplace (`memory` category): [entry](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/blob/main/data/plugins/super3ben__agent-feedback-loop--templates-dsh-plugin.yml).
+
 If a dsh home exists (`~/.dsh/profiles/`), `agent-feedback-loop install` also
 wires the standalone native plugin into every harness profile: it copies the
 plugin to `<packRoot>/dsh-plugin/`, links it into the profile's `node_modules`,
