@@ -1,6 +1,6 @@
 # Agent Feedback Loop
 
-Local prompt-time feedback learning and capability-bounded convergence control for
+Local prompt-time feedback learning for
 Codex, Claude Code, and Gemini CLI. [中文说明](README-zh.md)
 
 **Runtime version: `0.9.0`**
@@ -120,49 +120,6 @@ from it, so a big-evidence review that legitimately runs minutes is not cut off
 mid-generation or discarded as lease-lost; raise it further with
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` when a real provider needs longer.
 
-## Convergence control
-
-The convergence Probe is separate from the feedback reviewer. The reviewer decides
-whether real user dissatisfaction justifies a reusable Markdown method. The Probe is
-a bounded semantic adviser after a deterministic Convergence Breaker fires; its
-advice cannot change the contract, raise importance, reset history, create a hard
-gate, or issue a continuation grant.
-
-The Breaker evaluates verified external facts such as unchanged-basis repeated
-mutation, evidence-free work on the same invariant, oscillation, explicit exclusion
-violations, unjustified architecture expansion, scope growth after acceptance, and
-repeated formal review failure. `routine` tasks pause at the first verified
-evidence-free expansion. `important` tasks may receive one falsifiable exploration
-budget. `critical` tasks require new verified risk evidence for every generation;
-they do not receive unlimited exploration.
-
-Enforcement is limited by the adapter's real seam:
-
-- SDD provides a `workflow_gate` at review/fix dispatch boundaries.
-- Approved OpenSpec and Comet revisions provide a `checkpoint_gate` between tasks.
-- Generic prompt observations are `audit_only` with warning as their maximum.
-
-None of these claims generic real-time blocking of arbitrary tools; there is no
-tool-level guard. There is no Stop/AfterAgent convergence hook, user-visible grant
-or receipt, resident service, scheduler, database lesson body, or learning/RAG
-reader.
-
-Independent convergence-effectiveness to Markdown publication is deferred. It
-requires a named workflow producer, a bounded evidence envelope, and an independently
-approved learning-job authority and result contract. Today, the real-dissatisfaction
-feedback reviewer remains the only automatic Markdown producer.
-
-## Execution guard (retired)
-
-A `PreToolUse` execution guard — a per-artifact rewrite counter with warn-then-block
-escalation and a background direction review — was retired on 2026-08-31. It was
-built for GPT-era runs that circle in review-then-improve loops; measured on live
-sessions its false blocks cost more than the circling it caught. The `PreToolUse`
-hooks are uninstalled from both hosts and the runtime dispatch is commented out in
-`src/cli.mjs`, so even a reinstalled hook passes every call through. The store, hook
-logic, and their tests remain in the tree; reviving means restoring that dispatch and
-reinstalling the hooks.
-
 ## Install and diagnose
 
 Node.js 24.15 or newer is required. Ask for authorization before a real global
@@ -185,9 +142,8 @@ rm -rf "$tmp_home"
 ```
 
 Installation copies package assets, selects the runtime, migrates the selected
-control schema, and configures the prompt hooks. It does not register Stop/AfterAgent hooks,
-import Guard state, activate Guard authority, cut over a repository, start a
-service, or create a learning reader.
+control schema, and configures the prompt hooks. It does not register Stop/AfterAgent
+hooks, start a service, or create a learning reader.
 
 ### DeepSeek Harness (`dsh`)
 
@@ -211,40 +167,12 @@ up. The dsh home follows the install home (`~/.dsh` for the real user); pass
 profile.
 
 `doctor` returns `{ version, status }`. `status.ready` remains the prompt/Markdown
-pipeline gate. `status.convergence` separately reports:
+pipeline gate.
 
-- code/package availability;
-- selected installed runtime, schema, provider, Probe assets, and current-platform
-  support;
-- `audit_only`, `checkpoint_gate`, and `workflow_gate` adapter capabilities;
-- repository authority as `unknown` unless a separate explicit repository-bound
-  check proves it.
+Package presence and a static doctor result are not proof of live provider success
+or production effectiveness.
 
-Package presence and a static doctor result are not proof of live provider success,
-native Linux acceptance, real cutover, generic real-time blocking, or production
-effectiveness.
-
-## Guard migration and rollback
-
-Repository identity initialization is a separate, explicitly authorized step. It
-creates or reuses only the owner-private `afl-lineage-id` in the Git common directory;
-it does not accept legacy state or HOME input and does not create an AFL control store,
-import state, change authority, or modify hooks. Then inspect the legacy Guard state
-without writing AFL or legacy state:
-
-```sh
-agent-feedback-loop lineage-init --repo-root "$PWD" --apply
-agent-feedback-loop guard --repo-root "$PWD" import \
-  --state-file .superpowers/sdd/review-loop-state.json --dry-run
-```
-
-The controlled sequence is explicit identity initialization, read-only dry-run,
-explicitly authorized import, bounded shadow parity, explicitly authorized
-per-repository cutover, and exact snapshot rollback.
-Import, shadow, cutover, and rollback are explicit machine-readable commands; no
-long-term dual write is used. Real import or cutover, global SDD Skill changes, and a
-runtime canary each require separate user authorization. Installation never performs
-them automatically.
+## Legacy data export
 
 The legacy export of feedback data remains explicit and source-read-only:
 
@@ -261,11 +189,10 @@ control data and keys unless the operator separately removes them.
 
 ## Evidence states
 
-Code tests, package inventory, a temporary installed runtime, a repository Guard
-dry-run, an authorized cutover canary, and production effectiveness are separate
-evidence states. Passing an earlier state must not be reported as a later one.
+Code tests, package inventory, a temporary installed runtime, and production
+effectiveness are separate evidence states. Passing an earlier state must not be
+reported as a later one.
 
 Structured logs contain only fixed event names, bounded reason codes, counters, and
-opaque identifiers or hashes. They do not contain raw prompts, diffs, reviewer or
-Probe bodies, state bodies, tokens, grant artifact contents, or absolute project
-paths.
+opaque identifiers or hashes. They do not contain raw prompts, diffs, reviewer
+bodies, tokens, or absolute project paths.

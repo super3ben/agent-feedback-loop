@@ -1,6 +1,6 @@
 # Agent Feedback Loop 中文说明
 
-面向 Codex、Claude Code、Gemini CLI 的本地提示时反馈学习与能力受限的收敛控制。
+面向 Codex、Claude Code、Gemini CLI 的本地提示时反馈学习。
 
 **运行时版本：`0.9.0`**
 
@@ -94,38 +94,6 @@ shell 环境变量认证时——例如把 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_
 中途掐断或以 lease 丢失作废；真实 provider 需要更长时间时用
 `AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS` 再调高。
 
-## 收敛控制
-
-Convergence Probe 与 feedback reviewer 职责不同。reviewer 判断真实用户不满是否值得
-形成可复用 Markdown 方法；Probe 只在确定性的 Convergence Breaker 触发后提供有界
-语义建议。Probe 不能修改 contract、提升重要性、重置历史、创建 hard gate 或签发
-continuation grant。
-
-Breaker 根据已验证的外部事实判断，例如：决策依据未变却重复修改、同一 invariant
-没有新证据、方向振荡、触及明确排除项、无依据扩大架构、验收通过后继续扩张，以及
-正式 review 重复失败。`routine` 在第一次已验证的无证据扩张时暂停；`important`
-至多获得一次可证伪探索预算；`critical` 每一代都必须增加与风险直接相关的新验证
-证据，并不享有无限探索。
-
-执行守卫已退役（2026-08-31）。它为 GPT 时代在 review-then-improve 循环里绕圈的运行
-设计；实测当前会话中误拦截的代价高于它抓到的真复发。两端的 `PreToolUse` hook 均已
-卸载，运行时调度也已在 `src/cli.mjs` 中注释——即使 hook 被重装，所有调用都会直接
-放行。store、hook 逻辑与测试保留在代码库中；恢复需要还原该调度并重装 hook。
-
-执行强度受适配器真实边界限制：
-
-- SDD 在 review/fix 调度边界提供 `workflow_gate`。
-- 已批准且 revision 匹配的 OpenSpec、Comet 在 task 之间提供 `checkpoint_gate`。
-- 通用 prompt 观察仅为 `audit_only`，上限是 warning。
-
-这些能力都不声称可以通用、实时地阻断任意工具。系统没有 Stop/AfterAgent 收敛 hook、
-用户可见 grant/receipt、常驻服务、scheduler、数据库 lesson 正文或 learning/RAG reader。
-
-独立的 convergence effectiveness → Markdown 自动发布仍然延期。它必须先具备命名的
-workflow producer、有隐私边界的 evidence envelope，以及独立批准的 learning-job
-authority/result contract。目前只有真实用户不满触发的 feedback reviewer 可以自动
-生成 Markdown。
-
 ## 安装与诊断
 
 需要 Node.js 24.15 或更高版本。真实全局安装或修改真实 HOME 配置前，必须取得授权。
@@ -146,8 +114,7 @@ rm -rf "$tmp_home"
 ```
 
 安装只复制 package assets、选择 runtime、迁移所选 control schema，并配置既有 prompt
-hooks。它不会注册 Stop/AfterAgent hook，不会导入 Guard state、激活 Guard authority、
-切换仓库权威、启动服务或创建 learning reader。
+hooks。它不会注册 Stop/AfterAgent hook，启动服务，或创建 learning reader。
 
 ### DeepSeek Harness（`dsh`）
 
@@ -167,32 +134,10 @@ bundle 层在 loader entry id 上冲突，harness 将拒绝启动）。bundle �
 的情况下试接线。
 
 `doctor` 返回 `{ version, status }`。`status.ready` 仍是 prompt/Markdown 路径的门。
-`status.convergence` 分开报告：
 
-- code/package 是否可用；
-- 已选择的安装 runtime、schema、provider、Probe assets 和当前平台支持；
-- `audit_only`、`checkpoint_gate`、`workflow_gate` 适配器能力；
-- repository authority；除非另一次显式的仓库绑定检查能够证明，否则为 `unknown`。
+package 存在或静态 doctor 通过，不能证明 live provider 成功或生产有效性。
 
-package 存在或静态 doctor 通过，不能证明 live provider 成功、Linux 原生验收、真实
-cutover、通用实时阻断或生产有效性。
-
-## Guard 迁移与回滚
-
-身份初始化是独立且需显式授权的步骤。它只会在 Git common directory 中创建或复用
-owner-private 的 `afl-lineage-id`；不接受旧 state 或 HOME 输入，不创建 AFL control
-store、不导入 state、不切换权威，也不修改 hook。然后再对旧 Guard state 做无写入检查：
-
-```sh
-agent-feedback-loop lineage-init --repo-root "$PWD" --apply
-agent-feedback-loop guard --repo-root "$PWD" import \
-  --state-file .superpowers/sdd/review-loop-state.json --dry-run
-```
-
-受控顺序是显式身份初始化、只读 dry-run、单独授权的 import、有界 shadow parity、
-单独授权的逐仓库 cutover，以及完整 snapshot rollback。import、shadow、cutover、
-rollback 都是显式的机器可读命令，不做长期双写。真实 import/cutover、全局 SDD
-Skill 修改和 runtime canary 都需要各自的用户授权；安装不会自动执行。
+## 旧数据导出
 
 旧反馈导出仍然显式且对源数据库只读：
 
@@ -209,8 +154,8 @@ prompt hook 回滚时，先检查 `agent-feedback-loop uninstall --dry-run`，�
 
 ## 证据状态
 
-代码测试、package inventory、临时安装 runtime、仓库 Guard dry-run、已授权 cutover
-canary 和生产有效性是不同证据状态。前一层通过不能被报告成后一层完成。
+代码测试、package inventory、临时安装 runtime 和生产有效性是不同证据状态。前一层
+通过不能被报告成后一层完成。
 
 结构化日志只包含固定事件名、有界 reason code、计数及 opaque 标识符或 hash；不得包含
-原始 prompt、diff、reviewer/Probe/state 正文、token、grant artifact 内容或绝对项目路径。
+原始 prompt、diff、reviewer 正文、token 或绝对项目路径。
