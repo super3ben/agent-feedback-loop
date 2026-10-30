@@ -139,13 +139,13 @@ paraphrase. Matching is literal, so a lesson that says 连接 never matches a
 request that says 登录. Carry the user's own terms — and the concrete tool,
 host, and command names from the evidence — into the conditions verbatim.
 
-Write every `applies_when` condition twice: once in the language of the user's
-complaint, and once in English. A later session is matched to this lesson by
-word overlap alone, so a condition recorded only in English is unreachable from
-a Chinese prompt and vice versa — the lesson is stored but can never be
-delivered. Keep both renderings of the same condition adjacent, and keep
-technical identifiers (tool names, flags, paths) verbatim in both. If the
-complaint is already in English, one rendering per condition is enough.
+Write every `applies_when` condition once, in the language the user wrote in.
+Do not also translate it: the user works in one language, so a second rendering
+spends the condition budget on a string that will never match anything they
+type, and the budget is small enough that the duplicate costs real coverage.
+Keep technical identifiers (tool names, flags, paths, command names) verbatim
+even when the surrounding sentence is Chinese — those are what a later prompt
+actually repeats.
 
 Ground `facts`, `user_complaint`, `root_cause`, and
 `repeated_pattern_evidence` only in the supplied source, direct referent, nearby

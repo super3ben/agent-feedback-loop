@@ -145,7 +145,13 @@ export function validateReflectionModel(result, source) {
     responsibility: "agent_fault",
     method_class: methodClass,
     family_id: familyId,
-    applies_when: boundedStrings(result.applies_when, "applies_when", { min: 1, max: 16, itemMax: 160 }),
+    // Six, not sixteen. A condition list is the matching surface, and matching
+    // runs over all of them — but each entry also costs injection budget every
+    // turn it is selected. Measured on a live project: documents carried up to
+    // 12 conditions, and the average document exceeded the per-document
+    // injection cap outright. Six is enough to state the trigger, its English
+    // twin, and a couple of concrete variants.
+    applies_when: boundedStrings(result.applies_when, "applies_when", { min: 1, max: 6, itemMax: 160 }),
     effectiveness: "unknown",
     source_identity_hash: identityHash,
     title: titleFromMistakeClass(classOfMistake, methodClass),
@@ -153,7 +159,11 @@ export function validateReflectionModel(result, source) {
     user_complaint: boundedString(result.user_complaint, "user_complaint", 2_048),
     root_cause: boundedString(result.root_cause, "root_cause", 2_048),
     class_of_mistake: classOfMistake,
-    method_changes: boundedStrings(result.method_changes, "method_changes", { min: 1, max: 8, itemMax: 512 }),
+    // Five entries of 240 characters, not eight of 512. A method change is an
+    // instruction the next session must follow; past a few sentences it stops
+    // being an instruction and becomes an essay about one. The live project had
+    // entries up to 259 characters that never got read past the first clause.
+    method_changes: boundedStrings(result.method_changes, "method_changes", { min: 1, max: 5, itemMax: 240 }),
     repeated_pattern_evidence: boundedStrings(result.repeated_pattern_evidence, "repeated_pattern_evidence", { max: 8, itemMax: 512 })
   };
 }

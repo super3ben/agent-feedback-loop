@@ -8,6 +8,10 @@ const MAX_JOB_ID_BYTES = 512;
 const MAX_EXTRA_ENV_NAMES = 64;
 const MAX_ENV_VALUE_BYTES = 16 * 1_024;
 const REVIEW_LAUNCH_COOLDOWN_MS = 5_000;
+// How many jobs one recovery pass may spawn. Bounded because the prompt hook is
+// synchronous and each spawn is cheap but not free; large enough that a backlog
+// drains in minutes rather than in one-job-per-turn perpetuity.
+const RECOVERY_BATCH_LIMIT = 4;
 
 function boundedString(value, maxBytes) {
   return typeof value === "string"
@@ -225,7 +229,11 @@ export function launchDetachedDirectionReview({
 }
 
 export function recoverDueReviewers({ store, launchReviewer, limit = 1 } = {}) {
-  const effectiveLimit = Number.isInteger(limit) && limit > 0 ? 1 : 0;
+  // Same bounded-batch change as recoverDueClassifiers: one job per prompt
+  // cannot outrun a backlog.
+  const effectiveLimit = Number.isInteger(limit) && limit > 0
+    ? Math.min(limit, RECOVERY_BATCH_LIMIT)
+    : 0;
   if (!effectiveLimit || !store || typeof launchReviewer !== "function") {
     return { scanned: 0, attempted: 0 };
   }
@@ -236,41 +244,49 @@ export function recoverDueReviewers({ store, launchReviewer, limit = 1 } = {}) {
   } catch {
     return { scanned: 0, attempted: 0 };
   }
-  const job = Array.isArray(due) ? due[0] : null;
-  if (!job) return { scanned: 0, attempted: 0 };
+  if (!Array.isArray(due) || due.length === 0) return { scanned: 0, attempted: 0 };
 
-  let reservation;
-  try {
-    reservation = store.reserveReviewLaunch({
-      jobId: job.job_id,
-      cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
-    });
-  } catch {
-    return { scanned: 1, attempted: 0 };
-  }
-  if (!reservation?.launch) return { scanned: 1, attempted: 0 };
-
-  let failureReason = null;
-  try {
-    const result = launchReviewer(job.job_id, reservation.launchEpoch);
-    if (result?.attempted === false) failureReason = safeReason(result.reason);
-  } catch {
-    failureReason = "spawn_failed";
-  }
-  if (failureReason) {
+  let attempted = 0;
+  for (const job of due) {
+    let reservation;
     try {
-      store.recordReviewLaunchFailure({
+      reservation = store.reserveReviewLaunch({
         jobId: job.job_id,
-        launchEpoch: reservation.launchEpoch,
-        reasonCode: failureReason
+        cooldownMs: REVIEW_LAUNCH_COOLDOWN_MS
       });
-    } catch {}
+    } catch {
+      continue;
+    }
+    if (!reservation?.launch) continue;
+
+    let failureReason = null;
+    try {
+      const result = launchReviewer(job.job_id, reservation.launchEpoch);
+      if (result?.attempted === false) failureReason = safeReason(result.reason);
+    } catch {
+      failureReason = "spawn_failed";
+    }
+    if (failureReason) {
+      try {
+        store.recordReviewLaunchFailure({
+          jobId: job.job_id,
+          launchEpoch: reservation.launchEpoch,
+          reasonCode: failureReason
+        });
+      } catch {}
+    }
+    attempted += 1;
   }
-  return { scanned: 1, attempted: 1 };
+  return { scanned: due.length, attempted };
 }
 
 export function recoverDueClassifiers({ store, launchClassifier, limit = 1 } = {}) {
-  const effectiveLimit = Number.isInteger(limit) && limit > 0 ? 1 : 0;
+  // Was hard-coded to one job per prompt. A backlog that grows faster than one
+  // spawn per user turn never drains — 400+ jobs sat for over two months at
+  // that rate — so the pass now works through a bounded batch instead.
+  const effectiveLimit = Number.isInteger(limit) && limit > 0
+    ? Math.min(limit, RECOVERY_BATCH_LIMIT)
+    : 0;
   if (!effectiveLimit || !store || typeof launchClassifier !== "function") {
     return { scanned: 0, attempted: 0 };
   }
@@ -281,17 +297,21 @@ export function recoverDueClassifiers({ store, launchClassifier, limit = 1 } = {
   } catch {
     return { scanned: 0, attempted: 0 };
   }
-  const job = Array.isArray(due) ? due[0] : null;
-  if (!job) return { scanned: 0, attempted: 0 };
+  if (!Array.isArray(due) || due.length === 0) return { scanned: 0, attempted: 0 };
 
-  let failureReason = null;
-  try {
-    const result = launchClassifier(job.job_id, 1);
-    if (result?.attempted === false) failureReason = safeReason(result.reason);
-  } catch {
-    failureReason = "spawn_failed";
+  let attempted = 0;
+  for (const job of due) {
+    let failureReason = null;
+    try {
+      const result = launchClassifier(job.job_id, 1);
+      if (result?.attempted === false) failureReason = safeReason(result.reason);
+    } catch {
+      failureReason = "spawn_failed";
+    }
+    // A classifier claim protects against double-processing; a failed spawn is
+    // best-effort and leaves the job in llm_pending for the next pass. One
+    // broken spawn must not abort the rest of the batch.
+    if (!failureReason) attempted += 1;
   }
-  // A classifier claim protects against double-processing; the recovery spawn is
-  // best-effort and leaves the job in llm_pending for the next recovery pass.
-  return { scanned: 1, attempted: failureReason ? 0 : 1 };
+  return { scanned: due.length, attempted };
 }

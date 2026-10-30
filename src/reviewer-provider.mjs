@@ -262,8 +262,17 @@ const CODEX_ROUTING_PATTERNS = Object.freeze({
   name: /^[A-Za-z0-9_-]{1,64}$/u,
   model: /^[A-Za-z0-9._\-\[\]]{1,128}$/u,
   wireApi: /^[a-z_]{1,32}$/u,
-  baseUrl: /^https:\/\/[A-Za-z0-9.-]{1,255}(?::\d{1,5})?(?:\/[A-Za-z0-9._\/-]{0,255})?$/u
+  baseUrl: /^https:\/\/[A-Za-z0-9.-]{1,255}(?::\d{1,5})?(?:\/[A-Za-z0-9._\/-]{0,255})?$/u,
+  // A provider token is opaque, so validate only its character class and
+  // length. It never joins the argument list: it travels through the child's
+  // environment under this fixed name, which keeps it out of `ps` output.
+  bearerToken: /^[A-Za-z0-9._\-]{8,512}$/u
 });
+
+// The environment variable the isolated codex child reads its gateway token
+// from. Fixed rather than derived from the provider name so the name is
+// known before the child starts and cannot be influenced by config content.
+const CODEX_BEARER_ENV_NAME = "AFL_REVIEW_CODEX_KEY";
 
 function tomlTopLevelString(text, key) {
   const match = new RegExp(`^${key}\\s*=\\s*"([^"\\\\]{1,255})"\\s*$`, "mu").exec(text);
@@ -277,40 +286,61 @@ function tomlSectionValue(sectionBody, key) {
   return booleanMatch ? booleanMatch[1] === "true" : null;
 }
 
+function emptyCodexRouting() {
+  return { args: [], env: {} };
+}
+
+/**
+ * Returns the routing `-c` overrides AND the environment the child needs for
+ * them to authenticate.
+ *
+ * The env half exists because a gateway token is required to actually reach the
+ * endpoint that `--ignore-user-config` otherwise keeps working through the
+ * user's own config. A bearer token passed as a `-c` argument would be visible
+ * in the process table for the lifetime of the provider call, on a machine the
+ * user shares with other tools, so it travels through the child's environment
+ * under a fixed name and the argument list carries only that name.
+ *
+ * A token that fails validation is dropped rather than dropping the whole
+ * routing set: without the routing the isolated call hangs against the default
+ * endpoint until the timeout, which is the exact failure this function exists
+ * to prevent. A missing token instead fails fast with an auth error that names
+ * the real problem.
+ */
 export async function codexProviderRouting({ configFile } = {}) {
   let text;
   try {
     text = await readFile(configFile, "utf8");
   } catch {
-    return [];
+    return emptyCodexRouting();
   }
-  if (typeof text !== "string" || text.length > 262_144) return [];
+  if (typeof text !== "string" || text.length > 262_144) return emptyCodexRouting();
   const providerName = tomlTopLevelString(text, "model_provider");
-  if (providerName === null) return [];
-  if (!CODEX_ROUTING_PATTERNS.name.test(providerName)) return [];
+  if (providerName === null) return emptyCodexRouting();
+  if (!CODEX_ROUTING_PATTERNS.name.test(providerName)) return emptyCodexRouting();
   // providerName is validated to [A-Za-z0-9_-] above, so it is regex-safe as-is.
   const sectionMatch = new RegExp(
     `^\\[model_providers\\.${providerName}\\]\\s*$([\\s\\S]*?)(?=^\\[|$(?![\\s\\S]))`,
     "mu"
   ).exec(text);
-  if (!sectionMatch) return [];
+  if (!sectionMatch) return emptyCodexRouting();
   const body = sectionMatch[1];
   const baseUrl = tomlSectionValue(body, "base_url");
-  if (typeof baseUrl !== "string" || !CODEX_ROUTING_PATTERNS.baseUrl.test(baseUrl)) return [];
+  if (typeof baseUrl !== "string" || !CODEX_ROUTING_PATTERNS.baseUrl.test(baseUrl)) return emptyCodexRouting();
   const routing = ["-c", `model_provider="${providerName}"`];
   const model = tomlTopLevelString(text, "model");
   if (model !== null) {
-    if (!CODEX_ROUTING_PATTERNS.model.test(model)) return [];
+    if (!CODEX_ROUTING_PATTERNS.model.test(model)) return emptyCodexRouting();
     routing.push("-c", `model="${model}"`);
   }
   const name = tomlSectionValue(body, "name");
   if (typeof name === "string") {
-    if (!CODEX_ROUTING_PATTERNS.name.test(name)) return [];
+    if (!CODEX_ROUTING_PATTERNS.name.test(name)) return emptyCodexRouting();
     routing.push("-c", `model_providers.${providerName}.name="${name}"`);
   }
   const wireApi = tomlSectionValue(body, "wire_api");
   if (typeof wireApi === "string") {
-    if (!CODEX_ROUTING_PATTERNS.wireApi.test(wireApi)) return [];
+    if (!CODEX_ROUTING_PATTERNS.wireApi.test(wireApi)) return emptyCodexRouting();
     routing.push("-c", `model_providers.${providerName}.wire_api="${wireApi}"`);
   }
   const requiresOpenaiAuth = tomlSectionValue(body, "requires_openai_auth");
@@ -318,10 +348,21 @@ export async function codexProviderRouting({ configFile } = {}) {
     routing.push("-c", `model_providers.${providerName}.requires_openai_auth=${requiresOpenaiAuth}`);
   }
   routing.push("-c", `model_providers.${providerName}.base_url="${baseUrl}"`);
-  return routing;
+
+  const env = {};
+  for (const key of ["experimental_bearer_token", "api_key"]) {
+    const token = tomlSectionValue(body, key);
+    if (typeof token !== "string") continue;
+    if (!CODEX_ROUTING_PATTERNS.bearerToken.test(token)) continue;
+    routing.push("-c", `model_providers.${providerName}.env_key="${CODEX_BEARER_ENV_NAME}"`);
+    env[CODEX_BEARER_ENV_NAME] = token;
+    break;
+  }
+
+  return { args: routing, env };
 }
 
-export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null, codexRouting = [] }) {
+export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, resultFile, schemaText = "{}", policyFile = null, codexRouting = null }) {
   if (cli === "codex") {
     return {
       command: executable,
@@ -333,7 +374,7 @@ export function buildReviewerInvocation({ cli, executable, workDir, schemaFile, 
         "--skip-git-repo-check",
         "--sandbox", "read-only",
         "--color", "never",
-        ...codexRouting,
+        ...(Array.isArray(codexRouting) ? codexRouting : codexRouting?.args ?? []),
         "-C", workDir,
         "--output-schema", schemaFile,
         "--output-last-message", resultFile,
@@ -517,6 +558,9 @@ export async function runReviewerProvider({
       });
       await chmod(invocationSchemaFile, 0o600);
     }
+    const codexRouting = cli === "codex" && typeof env?.HOME === "string" && env.HOME
+      ? await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") })
+      : null;
     const invocation = buildReviewerInvocation({
       cli,
       executable,
@@ -525,14 +569,16 @@ export async function runReviewerProvider({
       resultFile,
       schemaText: schemaText.trim(),
       policyFile,
-      codexRouting: cli === "codex" && typeof env?.HOME === "string" && env.HOME
-        ? await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") })
-        : []
+      codexRouting
     });
     const isolatedEnv = reviewerEnvironment(env);
+    // The gateway token is not in the parent environment — codexProviderRouting
+    // read it from the user's config — so it is added here, after the allowlist
+    // filter that would otherwise drop it. Only the child sees it.
+    const routingEnv = codexRouting?.env ?? {};
     const providerEnv = cli === "gemini"
-      ? { ...isolatedEnv, GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsFile }
-      : isolatedEnv;
+      ? { ...isolatedEnv, ...routingEnv, GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsFile }
+      : { ...isolatedEnv, ...routingEnv };
     const output = await runProcess({ ...invocation, cwd: workDir, env: providerEnv, input, timeoutMs });
     if (cli !== "codex") await normalizeStdoutResult(output.stdout, resultFile, discriminator);
     try {

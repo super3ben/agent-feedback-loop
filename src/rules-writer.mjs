@@ -34,8 +34,24 @@ export const RULES_BLOCK_BUDGET_BYTES = 6 * 1_024;
  * flat reserve would swallow a small budget whole, which matters because the
  * budget is a parameter the tests and future callers may tighten.
  */
-const INDEX_RESERVE_FRACTION = 1 / 6;
+const INDEX_RESERVE_FRACTION = 1 / 4;
 const INDEX_RESERVE_MIN_BYTES = 64;
+
+/**
+ * A single full section may not exceed this. Without a cap one verbose lesson
+ * takes a quarter of the block and pushes several shorter lessons down to
+ * headings; capping trades detail nobody reads for coverage that everybody gets.
+ */
+const MAX_SECTION_BYTES = 1_200;
+
+/**
+ * How much of a demoted family's first method change survives compression.
+ * A demoted family used to render as a bare heading, which is not an
+ * instruction — it names a rule without saying what to do. Measured on a live
+ * project: six families, including the one that had just recurred seven times,
+ * were headings only. Compression keeps the imperative and drops the prose.
+ */
+const DEMOTED_CHANGE_MAX_CHARS = 110;
 
 export function qualifyForRules(severity, occurrences) {
   if (!severity || !SEVERITY_ORDER.hasOwnProperty(severity)) return false;
@@ -47,12 +63,22 @@ function byteLength(value) {
 }
 
 /**
- * Two sections are the same lesson when their bodies match. Comparing the
- * rendered body rather than a key means the merge also works for lessons that
- * were published before method_class was recorded.
+ * Two sections are the same lesson when their bodies AND their method class
+ * match.
+ *
+ * Body alone was not enough. The escalation path publishes one shared
+ * boilerplate body ("the review kept declining this as not worth learning")
+ * for every family it rescues, so fifteen unrelated problems merged into a
+ * single 91x section whose text described none of them. The method class is
+ * what actually distinguishes "declined too often" applied to a card
+ * regression from the same sentence applied to a deploy confirmation.
+ *
+ * Families published before method_class was recorded carry null, which
+ * compares equal to other nulls and so keeps the old behaviour for them.
  */
 function bodyOf(family) {
   return [
+    family.methodClass ?? "",
     family.incidentSummary ?? "",
     ...(family.methodChanges ?? [])
   ].join("\n").trim();
@@ -76,6 +102,7 @@ function mergeFamilies(families) {
         severity: family.severity,
         occurrences: family.occurrences,
         incidentSummary: family.incidentSummary ?? null,
+        methodClass: family.methodClass ?? null,
         methodChanges: family.methodChanges ?? [],
         familyKeys: [family.familyKey],
         latestRecurrenceAt: family.latestRecurrenceAt ?? null
@@ -123,16 +150,70 @@ function rankFamilies(families) {
   });
 }
 
+/**
+ * Trims a string to at most `max` characters, cutting at a sentence or clause
+ * boundary rather than mid-word.
+ */
+function trimToChars(value, max) {
+  const text = String(value ?? "").trim();
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  const clipped = chars.slice(0, max).join("");
+  // Prefer ending on a complete clause; fall back to the hard cut.
+  const boundary = Math.max(
+    clipped.lastIndexOf("；"),
+    clipped.lastIndexOf("。"),
+    clipped.lastIndexOf("，"),
+    clipped.lastIndexOf("; ")
+  );
+  return `${(boundary > max * 0.5 ? clipped.slice(0, boundary) : clipped).trimEnd()}…`;
+}
+
+/**
+ * Renders one family.
+ *
+ * A demoted family is no longer a bare heading. A heading names a rule without
+ * saying what to do, which is not an instruction the model can follow — the
+ * live project had six of them, including the family that had recurred seven
+ * times since its lesson was published. Demoted sections now carry the first
+ * method change, compressed, so the block always states an action.
+ *
+ * A full section is capped too. One verbose lesson used to take a quarter of
+ * the budget and demote several shorter ones; capping detail nobody reads buys
+ * coverage everybody gets.
+ */
 function renderSection(family, demoted) {
   const label = family.familyKeys.join(", ");
   const lines = [`### ${label} (${family.occurrences}×, ${family.severity})`, ""];
-  if (!demoted) {
-    if (family.incidentSummary) lines.push(family.incidentSummary, "");
-    lines.push("**Do not repeat this mistake:**");
-    for (const change of family.methodChanges) lines.push(`- ${change}`);
-    lines.push("");
+  if (demoted) {
+    const first = (family.methodChanges ?? [])[0];
+    if (first) {
+      lines.push(`→ ${trimToChars(first, DEMOTED_CHANGE_MAX_CHARS)}`, "");
+    }
+    return lines.join("\n");
   }
-  return lines.join("\n");
+
+  const summaryBudget = Math.floor(MAX_SECTION_BYTES * 0.35);
+  if (family.incidentSummary) {
+    lines.push(trimToChars(family.incidentSummary, Math.min(400, summaryBudget)), "");
+  }
+  lines.push("**Do not repeat this mistake:**");
+  for (const change of family.methodChanges) lines.push(`- ${trimToChars(change, 300)}`);
+  lines.push("");
+
+  let rendered = lines.join("\n");
+  // Cap by dropping trailing method changes, never by cutting a line in half:
+  // a truncated method change reads as a complete instruction while missing
+  // the part that made it actionable.
+  while (byteLength(rendered) > MAX_SECTION_BYTES && lines.length > 4) {
+    const lastChange = lines.map((line, index) => (line.startsWith("- ") ? index : -1))
+      .filter((index) => index >= 0)
+      .pop();
+    if (lastChange === undefined) break;
+    lines.splice(lastChange, 1);
+    rendered = lines.join("\n");
+  }
+  return rendered;
 }
 
 function budgetLine(used, demotedCount, maxBytes) {

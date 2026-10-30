@@ -298,10 +298,18 @@ export async function runReviewJob({
     // deterministic escalation publishes a lesson instead of letting a third
     // excuse win. This does not rely on the model honoring its own
     // would_qualify_if.
+    const permanentDeclines = context.job.project_id && result.family_key
+      && typeof store.countFamilyDeclines === "function"
+      ? store.countFamilyDeclines({
+        projectId: context.job.project_id,
+        familyKey: result.family_key
+      })
+      : null;
     const escalated = escalateDeclinedFamily({
       verdict: result,
       declines: context.recurrence?.prior_declines ?? [],
       job: context.job,
+      permanentDeclines,
       hasPublishedLesson: Boolean(
         context.job.project_id
         && typeof store.getLatestPublishedJobForFamily === "function"

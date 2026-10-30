@@ -3,7 +3,11 @@ coverage/
 *.tgz
 .DS_Store
 npm-debug.log*
-.agent/reflections/
+# Reflections are local session data. The leading pattern is anchored to the
+# repository root, so a nested copy (for example under templates/dsh-plugin/,
+# which the install pipeline runs inside) slipped through and was offered for
+# commit. Match at any depth.
+**/.agent/reflections/
 .worktrees/
 /.comet/
 .cutover-snapshot-*/

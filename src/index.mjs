@@ -726,10 +726,14 @@ async function inspectControlStore(paths) {
   }
 }
 
-// Which languages a lesson can be matched from. Selection is word overlap, so a
-// condition written only in English cannot be reached by a Chinese prompt and
-// vice versa — the lesson is stored but never delivered. This is only a defect
-// when the catalog and the prompts disagree, so it is reported, not gated.
+// Which language a lesson's conditions are written in.
+//
+// Lessons are written once, in the language the user works in — recording every
+// condition twice spent the condition budget on a rendering that never matched
+// anything. So "single language" is the intended shape, not a defect. What is
+// still a defect is a lesson written in a language this project's prompts do not
+// use: matching is word overlap, so a Chinese prompt cannot reach a lesson whose
+// conditions are English-only, and that failure is silent.
 function appliesWhenReach(appliesWhen) {
   const text = (Array.isArray(appliesWhen) ? appliesWhen : []).join(" ");
   return {
@@ -744,22 +748,28 @@ async function inspectReflectionLanguages(projectDir) {
       projectDir,
       publishedBefore: new Date(Date.now() + 60_000).toISOString()
     });
-    const counts = { total: 0, bilingual: 0, cjkOnly: 0, latinOnly: 0, noConditions: 0 };
+    const counts = { total: 0, cjk: 0, latin: 0, mixed: 0, noConditions: 0 };
+    const reaches = [];
     for (const document of catalog.documents) {
       const reach = appliesWhenReach(document.appliesWhen);
       counts.total += 1;
-      if (reach.cjk && reach.latin) counts.bilingual += 1;
-      else if (reach.cjk) counts.cjkOnly += 1;
-      else if (reach.latin) counts.latinOnly += 1;
+      if (reach.cjk && reach.latin) counts.mixed += 1;
+      else if (reach.cjk) counts.cjk += 1;
+      else if (reach.latin) counts.latin += 1;
       // applies_when carries the heaviest matching weight, so a lesson without
       // it is barely reachable from any prompt. Legacy hand-written documents
       // predate the field entirely.
       else counts.noConditions += 1;
+      reaches.push(reach);
     }
-    // A lesson reachable from only one language is invisible to prompts written
-    // in the other one.
-    const singleLanguage = counts.cjkOnly + counts.latinOnly;
-    return { ...counts, singleLanguage, available: true };
+    // The language this project's lessons are mostly written in. A lesson whose
+    // only language is the other one will never be reached by the prompts this
+    // project actually receives — that, not the absence of a translation, is
+    // the failure worth reporting.
+    const dominant = counts.cjk >= counts.latin ? "cjk" : "latin";
+    const foreignLanguage = reaches.filter((reach) =>
+      (reach.cjk || reach.latin) && !(dominant === "cjk" ? reach.cjk : reach.latin)).length;
+    return { ...counts, dominant, foreignLanguage, available: true };
   } catch {
     return { available: false };
   }

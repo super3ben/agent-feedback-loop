@@ -46,8 +46,21 @@ function joinSummaries(declines, max = 600) {
  *   published lesson. Escalation exists to break a never-published family out
  *   of a decline loop; once published, normal recurrence machinery owns the
  *   family and escalating again would pile up duplicate meta-lessons.
+ * @param {{declines: number, firstDeclinedAt?: string|null}} [params.permanentDeclines]
+ *   how many times this family was declined according to the permanent job
+ *   table. The prior_declines records live in a capped store_meta ring that is
+ *   evicted across ALL families, so they undercount badly on a busy project —
+ *   one family had 53 declined reviews and 2 surviving records. The stored
+ *   ring still supplies the prose (what each review actually said); this count
+ *   supplies the truth about how often it happened.
  */
-export function escalateDeclinedFamily({ verdict, declines = [], job, hasPublishedLesson = false }) {
+export function escalateDeclinedFamily({
+  verdict,
+  declines = [],
+  job,
+  hasPublishedLesson = false,
+  permanentDeclines = null
+}) {
   const familyKey = String(verdict?.family_key ?? "").trim();
   if (!familyKey) return null;
   if (!job?.source_identity) return null;
@@ -76,11 +89,27 @@ export function escalateDeclinedFamily({ verdict, declines = [], job, hasPublish
     const at = entry.declinedAt ? Date.parse(entry.declinedAt) : NaN;
     return Number.isFinite(at) ? at >= cutoff : true;
   });
-  if (inWindow.length < ESCALATION_THRESHOLD) return null;
+
+  // The ring buffer above is capped and shared across every family, so on a
+  // busy project it holds a small fraction of the real history: one family had
+  // 53 declined reviews and 2 surviving records, which read as "not recurring"
+  // and was declined a 54th time. The permanent count wins when it is larger.
+  const permanentCount = Number.isFinite(permanentDeclines?.declines)
+    ? permanentDeclines.declines
+    : 0;
+  const permanentFirst = permanentDeclines?.firstDeclinedAt
+    ? Date.parse(permanentDeclines.firstDeclinedAt)
+    : NaN;
+  const permanentInWindow = Number.isFinite(permanentFirst) ? permanentFirst >= cutoff : true;
+  const effectiveCount = permanentInWindow
+    ? Math.max(inWindow.length, permanentCount)
+    : inWindow.length;
+
+  if (effectiveCount < ESCALATION_THRESHOLD) return null;
 
   // The current verdict is being declined too — it is part of the run that
   // proved repetition. Count it even though it is not in prior_declines yet.
-  const total = inWindow.length + 1;
+  const total = effectiveCount + 1;
 
   const methodClass = "recurring_decline_after_user_feedback";
   const classOfMistake = bounded(

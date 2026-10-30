@@ -19,7 +19,11 @@ import { redactText } from "./capture.mjs";
 const EVENT_TEXT_FIELDS = ["text", "prompt", "message", "content", "output", "response"];
 const MAX_PROMPT_CHARACTERS = 8_192;
 const MAX_OUTPUT_CHARACTERS = 2_048;
-const DEFAULT_TIMEOUT_MS = 60_000;
+// A classifier call is a full model round trip, and the measured range on a
+// reasoning-heavy codex model is 37-56s — close enough to one minute that a
+// slower network turns a healthy call into provider_timeout. Matches the
+// reviewer's 185s lease so both providers share one notion of "still working".
+const DEFAULT_TIMEOUT_MS = 185_000;
 // After a failed classifier call the job is released with this backoff so the
 // per-hook recovery pass does not re-fire a classifier that keeps failing.
 const RELEASE_BACKOFF_MS = 30_000;
@@ -133,7 +137,7 @@ function parseVerdict(stdout) {
 
 // A lean yes/no call, not the full evidence/schema contract the reviewer uses.
 // The prompt goes on stdin; the CLI's plain-text output is the verdict.
-function classifierInvocation({ cli, executable, codexRouting = [] }) {
+function classifierInvocation({ cli, executable, codexRouting = null }) {
   if (cli === "claude") {
     return {
       command: executable,
@@ -162,7 +166,7 @@ function classifierInvocation({ cli, executable, codexRouting = [] }) {
         // (base_url etc.). Without re-injecting it the isolated codex call
         // cannot reach the gateway and reconnect-loops until the timeout —
         // exactly what wedged every codex classification in llm_pending.
-        ...codexRouting,
+        ...(Array.isArray(codexRouting) ? codexRouting : codexRouting?.args ?? []),
         "-"
       ]
     };
@@ -186,12 +190,23 @@ export async function runLLMClassifier({
   const claimed = store.claimLLMClassification({ jobId, ownerId, leaseMs: timeoutMs });
   if (!claimed) throw new LLMClassifyError("lease_lost");
 
+  // Every failure path releases the lease with the reason it failed, so the
+  // store can fail the job once its attempts are spent. Without the code the
+  // job was re-queued forever and the reason was lost with the process.
+  const release = ({ code }) => store.releaseLLMClassification({
+    jobId,
+    ownerId,
+    leaseEpoch: claimed.leaseEpoch,
+    backoffMs: RELEASE_BACKOFF_MS,
+    errorCode: code
+  });
+
   let evidence;
   try {
     evidence = await sourceEventText({ store, blobs, jobId });
   } catch (error) {
     const code = error instanceof LLMClassifyError ? error.code : "context_invalid";
-    store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
+    release({ code });
     throw new LLMClassifyError(code, error);
   }
 
@@ -200,17 +215,17 @@ export async function runLLMClassifier({
   const invocationCli = evidence.sourceProvider === "dsh" ? "claude" : evidence.sourceProvider;
   const executable = await resolveExecutable({ cli: invocationCli, env });
   if (!executable) {
-    store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
+    release({ code: "provider_unavailable" });
     throw new LLMClassifyError("provider_unavailable");
   }
   // Same gateway routing the full reviewer injects for codex: without it the
   // isolated call cannot reach the user's model provider.
-  let codexRouting = [];
+  let codexRouting = null;
   if (invocationCli === "codex" && typeof env?.HOME === "string" && env.HOME) {
     try {
       codexRouting = await codexProviderRouting({ configFile: path.join(env.HOME, ".codex", "config.toml") });
     } catch {
-      codexRouting = [];
+      codexRouting = null;
     }
   }
   // The provider shell-outs bind the schema to their own transport. The
@@ -226,18 +241,22 @@ export async function runLLMClassifier({
     output = await runProcess({
       ...invocation,
       cwd: path.dirname(invocation.command),
-      env: reviewerEnvironment(env),
+      // codexProviderRouting carries the gateway token in its own env half
+      // because reviewerEnvironment only forwards allowlisted names and the
+      // token lives in the user's config, not in this process's environment.
+      env: { ...reviewerEnvironment(env), ...(codexRouting?.env ?? {}) },
       input,
       timeoutMs
     });
   } catch (error) {
-    store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
     const code = String(error?.code || "provider_unavailable");
-    throw new LLMClassifyError(code === "reviewer_timeout" ? "provider_timeout" : code, error);
+    const failureCode = code === "reviewer_timeout" ? "provider_timeout" : code;
+    release({ code: failureCode });
+    throw new LLMClassifyError(failureCode, error);
   }
   const verdict = parseVerdict(output?.stdout);
   if (!verdict) {
-    store.releaseLLMClassification({ jobId, ownerId, leaseEpoch: claimed.leaseEpoch, backoffMs: RELEASE_BACKOFF_MS });
+    release({ code: "provider_invalid" });
     throw new LLMClassifyError("provider_invalid");
   }
   let resolved;

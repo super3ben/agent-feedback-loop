@@ -1289,11 +1289,17 @@ function createStore(database, now) {
       const safeLimit = assertLimit(limit, "limit", MAX_RECOVERABLE_REVIEW_JOBS, MAX_RECOVERABLE_REVIEW_JOBS);
       if (safeLimit === 0) return [];
       const timestamp = reviewTimestamp(at).toISOString();
+      // Jobs that already spent their attempts are excluded: they are failed on
+      // the next claim, and leaving them in the due set would let them sit at
+      // the head of an age-ordered queue and starve everything behind them.
       return database.prepare(`SELECT * FROM reviewer_jobs
         WHERE state='llm_pending'
+          AND attempt<?
           AND (next_launch_at IS NULL OR next_launch_at<=?)
           AND (lease_until IS NULL OR lease_until<=?)
-        ORDER BY created_at, job_id LIMIT ?`).all(timestamp, timestamp, safeLimit).map((row) => ({ ...row }));
+        ORDER BY created_at, job_id LIMIT ?`).all(
+        MAX_REVIEW_ATTEMPTS, timestamp, timestamp, safeLimit
+      ).map((row) => ({ ...row }));
     },
     claimLLMClassification({ jobId, ownerId, leaseMs = DEFAULT_REVIEW_LEASE_MS }) {
       const safeJobId = assertString(jobId, "jobId", 512);
@@ -1303,17 +1309,44 @@ function createStore(database, now) {
       const timestamp = current.toISOString();
       const leaseUntil = new Date(current.getTime() + safeLeaseMs).toISOString();
       return transaction(() => {
-        // A job is claimable when it is llm_pending AND either never claimed
-        // (first attempt) or released/expired (owner_id IS NULL and lease
-        // expired or not set). The lease is the concurrency guard; claimed_at
-        // is only an audit field and must not block recovery re-claims.
+        // A job is claimable when it is llm_pending and its lease is free or
+        // expired. The lease alone is the guard: requiring owner_id IS NULL as
+        // well left a job whose classifier died mid-call unreclaimable forever,
+        // because the dead owner id outlives the lease it took.
+        // attempt is incremented here for the same reason claimReviewJob
+        // increments it: without a count a classifier that keeps failing is
+        // retried forever and the queue never reports a terminal state. The
+        // bound is what lets releaseLLMClassification fail the job instead of
+        // re-queuing it indefinitely.
         const claimed = database.prepare(`UPDATE reviewer_jobs
-          SET state='llm_pending', owner_id=?, lease_epoch=lease_epoch+1, lease_until=?,
+          SET state='llm_pending', owner_id=?, attempt=attempt+1,
+              lease_epoch=lease_epoch+1, lease_until=?,
               claimed_at=?, next_attempt_at=NULL
-          WHERE job_id=? AND state='llm_pending'
-            AND (owner_id IS NULL AND (lease_until IS NULL OR lease_until<=?))
-          RETURNING *`).get(safeOwnerId, leaseUntil, timestamp, safeJobId, timestamp);
-        if (!claimed) return null;
+          WHERE job_id=? AND state='llm_pending' AND attempt<?
+            AND (lease_until IS NULL OR lease_until<=?)
+          RETURNING *`).get(
+          safeOwnerId, leaseUntil, timestamp, safeJobId, MAX_REVIEW_ATTEMPTS, timestamp
+        );
+        if (!claimed) {
+          // Same terminal transition claimReviewJob makes: a job that has spent
+          // its attempts is failed rather than left claimable, so the backlog
+          // count stops including work that can never succeed.
+          const exhausted = database.prepare(`UPDATE reviewer_jobs
+            SET state='failed', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+                next_launch_at=NULL, completed_at=?, error_code='attempts_exhausted'
+            WHERE job_id=? AND state='llm_pending' AND attempt>=?
+            RETURNING *`).get(timestamp, safeJobId, MAX_REVIEW_ATTEMPTS);
+          if (exhausted) {
+            insertReviewJobEvent({
+              jobId: safeJobId,
+              eventType: "failed",
+              reasonCode: "attempts_exhausted",
+              leaseEpoch: Number(exhausted.lease_epoch),
+              timestamp
+            });
+          }
+          return null;
+        }
         insertReviewJobEvent({
           jobId: safeJobId,
           eventType: "llm_claimed",
@@ -1323,27 +1356,53 @@ function createStore(database, now) {
         return { job: { ...claimed }, leaseEpoch: Number(claimed.lease_epoch) };
       });
     },
-    releaseLLMClassification({ jobId, ownerId, leaseEpoch, backoffMs = 0 }) {
+    releaseLLMClassification({ jobId, ownerId, leaseEpoch, backoffMs = 0, errorCode = null }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
       const safeBackoffMs = assertMilliseconds(backoffMs, "backoffMs");
+      const safeErrorCode = errorCode === null ? null : assertString(errorCode, "errorCode", 128);
       const timestamp = nowIso(now);
       const current = reviewTimestamp();
       const nextLaunchAt = new Date(current.getTime() + safeBackoffMs).toISOString();
       return transaction(() => {
+        // A classifier that exhausts its attempts becomes a terminal failure
+        // carrying the last error, so the backlog distinguishes "retrying" from
+        // "given up" and doctor can report a real failure count. Without this
+        // the job stayed llm_pending forever and every failure was invisible.
+        if (safeErrorCode !== null) {
+          const exhausted = database.prepare(`UPDATE reviewer_jobs
+            SET state='failed', owner_id=NULL, lease_until=NULL, next_attempt_at=NULL,
+                next_launch_at=NULL, completed_at=?, result_code=NULL, error_code=?
+            WHERE job_id=? AND state='llm_pending' AND owner_id=? AND lease_epoch=?
+              AND attempt>=?
+            RETURNING *`).get(
+            timestamp, safeErrorCode, safeJobId, safeOwnerId, safeLeaseEpoch, MAX_REVIEW_ATTEMPTS
+          );
+          if (exhausted) {
+            insertReviewJobEvent({
+              jobId: safeJobId,
+              eventType: "failed",
+              reasonCode: safeErrorCode,
+              leaseEpoch: safeLeaseEpoch,
+              timestamp
+            });
+            return { released: true, exhausted: true, attempts: Number(exhausted.attempt) };
+          }
+        }
         const released = database.prepare(`UPDATE reviewer_jobs
-          SET owner_id=NULL, lease_until=NULL, next_launch_at=?
+          SET owner_id=NULL, lease_until=NULL, next_launch_at=?, error_code=COALESCE(?, error_code)
           WHERE job_id=? AND state='llm_pending' AND owner_id=? AND lease_epoch=?
-          RETURNING job_id`).get(nextLaunchAt, safeJobId, safeOwnerId, safeLeaseEpoch);
+          RETURNING job_id, attempt`).get(nextLaunchAt, safeErrorCode, safeJobId, safeOwnerId, safeLeaseEpoch);
         if (!released) return { released: false };
         insertReviewJobEvent({
           jobId: safeJobId,
           eventType: "llm_released",
+          reasonCode: safeErrorCode ?? undefined,
           leaseEpoch: safeLeaseEpoch,
           timestamp
         });
-        return { released: true };
+        return { released: true, exhausted: false, attempts: Number(released.attempt) };
       });
     },
     // The classifier's verdict. admission=true flips the job to 'pending' so the
@@ -1549,6 +1608,58 @@ function createStore(database, now) {
         WHERE project_id=? AND family_key=? AND state='published' AND published_path IS NOT NULL
         ORDER BY completed_at DESC LIMIT 1`).get(safeProjectId, safeFamilyKey) ?? null;
     },
+    // Absolute paths of reflection documents that actually reached a session.
+    // The archive pass uses this to decide what may be retired: a document that
+    // was delivered is doing its job regardless of its age, and a document that
+    // never was may simply not have matched yet.
+    listEmittedReflectionPaths({ projectDir }) {
+      const safeProjectDir = assertString(projectDir, "projectDir", 4096);
+      const prefix = `${safeProjectDir.replace(/\/+$/u, "")}/.agent/reflections/`;
+      return database.prepare(`SELECT DISTINCT document_path FROM reflection_emissions
+        WHERE outcome='emitted' AND document_path LIKE ?`)
+        .all(`${prefix}%`)
+        .map((row) => row.document_path);
+    },
+    // Every emission for this project's documents, newest first, with the family
+    // it belongs to. Effectiveness is a per-family question: how often was THIS
+    // lesson delivered, and did the problem come back afterwards.
+    listReflectionEmissionsByFamily({ projectDir }) {
+      const safeProjectDir = assertString(projectDir, "projectDir", 4096);
+      const prefix = `${safeProjectDir.replace(/\/+$/u, "")}/.agent/reflections/`;
+      // The family comes from the publishing job, joined on the document path.
+      // reflection_emissions.family_id is a derived document identity
+      // (legacy-family-…) while reviewer_jobs.family_key is the reviewer's key
+      // for the recurring problem. They are different namespaces: joining them
+      // directly matched nothing and reported every lesson as never delivered.
+      return database.prepare(`SELECT job.family_key AS family, emission.document_path, emission.emitted_at
+        FROM reflection_emissions AS emission
+        JOIN reviewer_jobs AS job ON job.published_path = emission.document_path
+        WHERE emission.outcome='emitted' AND emission.emitted_at IS NOT NULL
+          AND emission.document_path LIKE ? AND job.project_id=?
+        ORDER BY emission.emitted_at`).all(`${prefix}%`, safeProjectDir)
+        .map((row) => ({ ...row }));
+    },
+    // Published lessons with the family they were filed under and when. Paired
+    // with the emission log this answers "was this lesson ever delivered", which
+    // is the half of effectiveness the emission log cannot answer alone.
+    listPublishedJobsWithFamily({ projectId }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      return database.prepare(`SELECT family_key, published_path, completed_at, final_severity
+        FROM reviewer_jobs
+        WHERE project_id=? AND published_path IS NOT NULL
+        ORDER BY completed_at`).all(safeProjectId).map((row) => ({ ...row }));
+    },
+    // How often each family was declined, from the permanent table. The decline
+    // ring in store_meta is capped and evicted across families, so it cannot
+    // answer this; reviewer_jobs is never evicted.
+    listFamilyDeclineCounts({ projectId }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      return database.prepare(`SELECT family_key, COUNT(*) AS declines,
+          MIN(created_at) AS first_declined_at, MAX(created_at) AS last_declined_at
+        FROM reviewer_jobs
+        WHERE project_id=? AND family_key IS NOT NULL AND state='reviewed_no_lesson'
+        GROUP BY family_key`).all(safeProjectId).map((row) => ({ ...row }));
+    },
     listRecentReviewJobs({ limit = 64 } = {}) {
       const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 512) : 64;
       return database.prepare(`SELECT job_id, state, created_at, completed_at, published_path
@@ -1749,6 +1860,31 @@ function createStore(database, now) {
         LIMIT ?`)
         .all(safeProjectId, safeLimit)
         .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
+    },
+    // How many times a family has been DECLINED, from the permanent job table.
+    //
+    // The decline records in store_meta are capped at REVIEW_DECLINE_MAX_STORED
+    // and evicted oldest-first across ALL families, so a busy project silently
+    // loses most of them: one family had 53 declined reviews and only 2
+    // surviving records. The escalation gate counted those records, saw 2, and
+    // concluded the family was not recurring. reviewer_jobs is never evicted,
+    // so the count belongs here.
+    countFamilyDeclines({ projectId, familyKey }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
+      const row = database.prepare(`SELECT
+          COUNT(*) AS declines,
+          MIN(created_at) AS firstDeclinedAt,
+          MAX(created_at) AS lastDeclinedAt
+        FROM reviewer_jobs
+        WHERE project_id=? AND family_key=? AND state='reviewed_no_lesson'`)
+        .get(safeProjectId, safeFamilyKey);
+      return {
+        declines: Number(row?.declines ?? 0),
+        firstDeclinedAt: row?.firstDeclinedAt ?? null,
+        lastDeclinedAt: row?.lastDeclinedAt ?? null
+      };
     },
     // The family keys this project has already seen, with how often each was
     // reached. Feeding these back is what lets a later review recognise a

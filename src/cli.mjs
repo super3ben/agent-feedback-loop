@@ -26,9 +26,14 @@ import { runConvergenceProbeJob } from "./convergence-probe-runner.mjs";
 import { ensureRepositoryLineage } from "./convergence-identity.mjs";
 import { handleExecutionHook, resetExecutionMonitorForPrompt } from "./execution-hook.mjs";
 import { resolveDesignPermit } from "./design-permit.mjs";
+import { archiveReflections, selectArchivableReflections, DEFAULT_ARCHIVE_AFTER_DAYS } from "./reflection-archive.mjs";
+import { summarizeReflectionEffectiveness } from "./reflection-effectiveness.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
+// Jobs one prompt-time recovery pass may spawn. The hook is synchronous, so this
+// trades a little latency per turn for a backlog that actually drains.
+const RECOVERY_BATCH = 4;
 
 function optionValue(args, name, fallback = null) {
   const index = args.indexOf(name);
@@ -350,7 +355,16 @@ async function readProjectRulesBlock(projectDir) {
       "【复发教训规则 — 以下每条都对应本项目已发生 ≥3 次的同类错误，本轮必须遵守】",
       bounded.text
     ].join("\n"),
-    dropped: bounded.dropped
+    dropped: bounded.dropped,
+    // The families this block already injects on every turn. Selecting the same
+    // family again below would inject one lesson twice in one prompt: the rule
+    // block is the every-turn channel, so the selector's job is the rest.
+    coveredFamilies: new Set(
+      [...bounded.text.matchAll(/^### (.+?) \(\d+×/gmu)]
+        .flatMap((match) => match[1].split(","))
+        .map((key) => key.trim())
+        .filter(Boolean)
+    )
   };
 }
 
@@ -636,6 +650,17 @@ export async function handlePromptHook({
   } catch {
     promptLog("reflection_parse_omitted", { reason: "selection_record_failed" });
   }
+  // Read the every-turn rules block BEFORE selecting, because selection has to
+  // know which families it already covers. A family that reached the rules tier
+  // is injected on every prompt; selecting its document again injects the same
+  // lesson twice in one turn and spends the selection budget on a repeat.
+  let rulesBlock = null;
+  try {
+    rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir);
+  } catch (error) {
+    promptLog("rules_block_injected", { reason: "read_failed" });
+  }
+
   try {
     const catalog = await loadDocuments({
       projectDir: result.selectionInput.projectDir,
@@ -643,18 +668,50 @@ export async function handlePromptHook({
       maxFileBytes: result.selectionInput.maxFileBytes
     });
     let familyRecurrence = {};
+    // Which reviewer family a document belongs to, and how often that family has
+    // recurred. Selection needs both to recognise a document whose family the
+    // rules block already injects every turn.
+    //
+    // Resolved by path first. The publishing job records the exact document it
+    // wrote, so this is a direct join — free. The previous implementation only
+    // had the derivation, and recomputed the family id for every (document, key)
+    // pair: 53 documents against 45 keys is ~2,400 derivations on every prompt,
+    // measured at 3.2ms against 0.003ms for a lookup. Derivation is now the
+    // fallback for documents the job table has no record of.
+    const familyKeyByFamilyId = new Map();
     try {
       const counts = controlStore.listFamilyRecurrenceByProject({
         projectId: result.selectionInput.projectDir
       });
       const byKey = new Map(counts.map((entry) => [entry.familyKey, entry.occurrences]));
-      // A document names its family by id; the store counts by key. The id is
-      // derived from (methodClass, key), so the document supplies both halves.
+      let byPath = new Map();
+      try {
+        byPath = new Map(
+          controlStore.listPublishedJobsWithFamily({ projectId: result.selectionInput.projectDir })
+            .filter((job) => job.published_path && job.family_key)
+            .map((job) => [job.published_path, job.family_key])
+        );
+      } catch {
+        byPath = new Map();
+      }
       for (const document of catalog.documents) {
+        const direct = byPath.get(document.path);
+        if (direct && byKey.has(direct)) {
+          familyRecurrence[document.familyId] = byKey.get(direct);
+          familyKeyByFamilyId.set(document.familyId, direct);
+          continue;
+        }
+        // A legacy document has nothing to derive from: its method_class is not
+        // a reviewer method class, so no key could ever produce its id. Skipping
+        // it here is what keeps the fallback from being paid on every document.
+        if (!document.canonical) continue;
+        // A document names its family by id; the store counts by key. The id is
+        // derived from (methodClass, key), so the document supplies both halves.
         for (const [key, occurrences] of byKey) {
           try {
             if (deriveReviewerFamilyId(document.methodClass, key) === document.familyId) {
               familyRecurrence[document.familyId] = occurrences;
+              familyKeyByFamilyId.set(document.familyId, key);
               break;
             }
           } catch {}
@@ -675,7 +732,9 @@ export async function handlePromptHook({
         maxTotalTokens: lowerOnlyLimit(selectionLimits.maxTotalTokens, PROMPT_SELECTION_LIMITS.maxTotalTokens)
       },
       priorEmissions,
-      publishedBefore: selectionPublishedBefore
+      publishedBefore: selectionPublishedBefore,
+      coveredFamilies: rulesBlock?.coveredFamilies ?? null,
+      familyKeyOf: (document) => familyKeyByFamilyId.get(document.familyId) ?? null
     });
     const selectionOmissions = [...catalog.omissions, ...selection.omissions];
     for (const item of selectionOmissions.slice(0, 8)) {
@@ -714,10 +773,12 @@ export async function handlePromptHook({
   // mechanical: a rule that reached ≥3 occurrences is seen each turn without
   // depending on the model choosing to open the file.
   try {
-    const rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir);
     if (rulesBlock) {
       result.guidance = rulesBlock.text + (result.guidance ? `\n\n${result.guidance}` : "");
-      promptLog("rules_block_injected", { bytes: Buffer.byteLength(rulesBlock.text, "utf8") });
+      promptLog("rules_block_injected", {
+        bytes: Buffer.byteLength(rulesBlock.text, "utf8"),
+        covered: rulesBlock.coveredFamilies.size
+      });
     }
   } catch (error) {
     promptLog("rules_block_injected", { reason: "selection_failed" });
@@ -765,6 +826,8 @@ Usage:
   agent-feedback-loop doctor [--home <path>]
   agent-feedback-loop doctor --live [--home <path>]
   agent-feedback-loop status [--home <path>] [--lang en|zh]
+  agent-feedback-loop reflections archive [--home <path>] [--after-days <n>] [--apply]
+  agent-feedback-loop reflections effectiveness [--home <path>] [--project <path>]
   agent-feedback-loop legacy-export --source-db <absolute-path> --output-dir <absolute-path> --dry-run|--apply
   agent-feedback-loop lineage-init --repo-root <path> --apply
   agent-feedback-loop paths [--home <path>]
@@ -1035,6 +1098,58 @@ export async function main(args, {
     }
     return;
   }
+  if (command === "reflections") {
+    const subcommand = options.args[0] || "effectiveness";
+    const projectDir = optionValue(options.args, "--project", options.cwd || process.cwd());
+    const reflectionsDir = path.join(projectDir, ".agent", "reflections");
+    const paths = pathsFor(options.home);
+    const store = openControlStore({ paths });
+    try {
+      if (subcommand === "archive") {
+        const afterDaysRaw = optionValue(options.args, "--after-days", String(DEFAULT_ARCHIVE_AFTER_DAYS));
+        const afterDays = Number(afterDaysRaw);
+        if (!Number.isSafeInteger(afterDays) || afterDays < 0) {
+          throw new Error("--after-days must be a non-negative integer");
+        }
+        // A document that reached a session is doing its job wherever it sits,
+        // so the emission log decides what may be retired — never the calendar
+        // alone.
+        const emittedPaths = new Set(
+          store.listEmittedReflectionPaths({ projectDir }).map((value) => path.resolve(value))
+        );
+        const { candidates, scanned } = await selectArchivableReflections({
+          reflectionsDir,
+          emittedPaths,
+          afterDays
+        });
+        const apply = options.args.includes("--apply");
+        const result = await archiveReflections({ reflectionsDir, candidates, dryRun: !apply });
+        console.log(JSON.stringify({
+          status: apply ? "archived" : "dry_run",
+          reflectionsDir,
+          scanned,
+          neverEmitted: candidates.length,
+          moved: result.movedCount,
+          archiveDir: result.archiveDir,
+          afterDays,
+          files: result.moved.map((entry) => entry.name)
+        }, null, 2));
+        return;
+      }
+      if (subcommand === "effectiveness") {
+        const summary = summarizeReflectionEffectiveness({
+          emitters: store.listReflectionEmissionsByFamily({ projectDir }),
+          publishedJobs: store.listPublishedJobsWithFamily({ projectId: projectDir }),
+          declines: store.listFamilyDeclineCounts({ projectId: projectDir })
+        });
+        console.log(JSON.stringify(summary, null, 2));
+        return;
+      }
+      throw new Error(`unknown reflections subcommand: ${subcommand}`);
+    } finally {
+      store.close();
+    }
+  }
   if (command === "status") {
     const paths = pathsFor(options.home);
     const store = openControlStore({ paths });
@@ -1282,7 +1397,7 @@ export async function main(args, {
         recoverReviewers() {
           const reviewers = recoverDueReviewers({
             store: controlStore,
-            limit: 1,
+            limit: RECOVERY_BATCH,
             launchReviewer(jobId, launchEpoch) {
               return launchDetachedReviewer({
                 platform: process.platform,
@@ -1299,7 +1414,7 @@ export async function main(args, {
           // picked back up here, not left stuck next to the reviewer recovery.
           recoverDueClassifiers({
             store: controlStore,
-            limit: 1,
+            limit: RECOVERY_BATCH,
             launchClassifier(jobId) {
               return launchDetachedLLMClassifier({
                 platform: process.platform,

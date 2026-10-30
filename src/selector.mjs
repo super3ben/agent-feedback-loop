@@ -8,6 +8,23 @@ const HARD_LIMITS = Object.freeze({
   maxDocumentTokens: 640,
   maxTotalTokens: 1600
 });
+
+/**
+ * What goes into the injected text, as opposed to what selection matches on.
+ *
+ * Matching runs over the FULL document (every applies_when entry, every method
+ * change), so trimming the injected copy costs no recall — it only stops the
+ * model from being shown the same match surface twice. Measured on a live
+ * project: the average document cost 667 tokens against a 640-token per-document
+ * cap, so 57% of documents could not be selected at all. These limits bring the
+ * average under the cap without dropping any lesson.
+ */
+const GUIDANCE_LIMITS = Object.freeze({
+  appliesWhen: 3,
+  methodChanges: 4,
+  classOfMistakeChars: 240,
+  methodChangeChars: 300
+});
 const SEVERITY_RANK = Object.freeze({ Major: 1, Critical: 2, Blocker: 3 });
 const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const LATIN_WORD = /[\p{Script=Latin}\p{Number}]+/gu;
@@ -89,15 +106,52 @@ function limitsFrom(budget = {}) {
   };
 }
 
+function clip(value, max) {
+  const text = String(value ?? "");
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  // Cut on a clause boundary when one is near the end, so a clipped condition
+  // still reads as a complete phrase instead of stopping mid-word.
+  const clipped = chars.slice(0, max).join("");
+  const boundary = Math.max(
+    clipped.lastIndexOf("；"), clipped.lastIndexOf("。"), clipped.lastIndexOf("，"), clipped.lastIndexOf("; ")
+  );
+  return `${(boundary > max * 0.6 ? clipped.slice(0, boundary) : clipped).trimEnd()}…`;
+}
+
+/**
+ * The text injected into the model's context.
+ *
+ * Deliberately narrower than the document: selection matched on every
+ * applies_when entry and every method change, and repeating all of them here
+ * doubles the cost for no extra recall.
+ *
+ * The list of applies_when entries is capped, not the document: a lesson with
+ * twelve conditions still matches on all twelve, it just shows the first few.
+ */
 function documentGuidance(document) {
-  return [
+  const conditions = (document.appliesWhen ?? []).slice(0, GUIDANCE_LIMITS.appliesWhen);
+  const changes = (document.methodChanges ?? []).slice(0, GUIDANCE_LIMITS.methodChanges);
+  const lines = [
+    // Kept despite costing ~21 tokens: it is the only handle that ties the text
+    // the model sees back to the exact document in the store, which is what makes
+    // "was this lesson actually delivered" answerable from the session itself.
     `document_hash: ${document.documentHash}`,
     "applies_when:",
-    ...document.appliesWhen.map((value) => `- ${value}`),
-    `class_of_mistake: ${document.classOfMistake}`,
-    "method_changes:",
-    ...document.methodChanges.map((value, index) => `${index + 1}. ${value}`)
-  ].join("\n");
+    ...conditions.map((value) => `- ${clip(value, GUIDANCE_LIMITS.methodChangeChars)}`)
+  ];
+  if ((document.appliesWhen ?? []).length > conditions.length) {
+    lines.push(`- (共 ${(document.appliesWhen ?? []).length} 条匹配条件，此处只列前 ${conditions.length} 条)`);
+  }
+  lines.push(`class_of_mistake: ${clip(document.classOfMistake, GUIDANCE_LIMITS.classOfMistakeChars)}`);
+  lines.push("method_changes:");
+  for (const [index, value] of changes.entries()) {
+    lines.push(`${index + 1}. ${clip(value, GUIDANCE_LIMITS.methodChangeChars)}`);
+  }
+  if ((document.methodChanges ?? []).length > changes.length) {
+    lines.push(`(共 ${(document.methodChanges ?? []).length} 条方法，此处只列前 ${changes.length} 条)`);
+  }
+  return lines.join("\n");
 }
 
 export function estimateGuidanceTokens(value) {
@@ -191,7 +245,9 @@ export function selectReflections({
   budget,
   priorEmissions = [],
   publishedBefore,
-  familyRecurrence = {}
+  familyRecurrence = {},
+  coveredFamilies = null,
+  familyKeyOf = null
 }) {
   const limits = limitsFrom(budget);
   const cutoffMs = Date.parse(publishedBefore);
@@ -212,18 +268,43 @@ export function selectReflections({
     loaded.push(document);
   }
 
+  // A family that reached the rules tier is injected on every prompt by the
+  // every-turn block. Selecting its document here too would put the same lesson
+  // in one prompt twice and spend the selection budget on a repeat — measured
+  // on a live project, 29 of 53 catalog documents duplicated a family the rules
+  // block already carried. The block is the mechanical channel; selection is
+  // for everything that did not make that cut.
+  let candidates = loaded;
+  if (coveredFamilies && typeof coveredFamilies.has === "function" && typeof familyKeyOf === "function") {
+    const kept = [];
+    for (const document of loaded) {
+      let familyKey = null;
+      try {
+        familyKey = familyKeyOf(document);
+      } catch {
+        familyKey = null;
+      }
+      if (familyKey && coveredFamilies.has(familyKey)) {
+        omissions.push(omission(document, "covered_by_rules"));
+        continue;
+      }
+      kept.push(document);
+    }
+    candidates = kept;
+  }
+
   // How often each family has actually recurred. Counting documents instead
   // only ever yields 1, because family projection keeps one document per
   // family — so without this the tie-break carried no information at all.
   const recurrence = new Map();
-  for (const document of loaded) recurrence.set(document.familyId, (recurrence.get(document.familyId) ?? 0) + 1);
+  for (const document of candidates) recurrence.set(document.familyId, (recurrence.get(document.familyId) ?? 0) + 1);
   for (const [familyId, occurrences] of Object.entries(familyRecurrence ?? {})) {
     if (Number.isSafeInteger(occurrences) && occurrences > 0) {
       recurrence.set(familyId, Math.max(recurrence.get(familyId) ?? 0, occurrences));
     }
   }
   const applicable = [];
-  for (const document of loaded) {
+  for (const document of candidates) {
     const score = relevanceScore(document, prompt, task);
     if (score <= 0) {
       omissions.push(omission(document, "not_applicable"));
