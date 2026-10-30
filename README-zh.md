@@ -137,6 +137,25 @@ bundle 层在 loader entry id 上冲突，harness 将拒绝启动）。bundle �
 
 package 存在或静态 doctor 通过，不能证明 live provider 成功或生产有效性。
 
+## 反思治理
+
+两个以读取为主的命令用于管理已发布的反思目录：
+
+```sh
+agent-feedback-loop reflections effectiveness --project /绝对路径/项目
+agent-feedback-loop reflections archive --project /绝对路径/项目            # 预演
+agent-feedback-loop reflections archive --project /绝对路径/项目 --apply    # 实际移动
+```
+
+`effectiveness` 依据投递日志与评审历史回答「这条教训到底有没有起作用」，把每个家族
+归入 `never_delivered`（从未投递）、`recurred_after_delivery`（投递后仍复发）、
+`too_early_to_tell`（投递过早，尚不能判断）或 `quiet_since_delivery`（投递后未见复发）。
+输出标注 `causality: correlation_only`：家族安静可能意味着教训生效了，也可能意味着
+同类工作根本没再出现。**不要把它读成生效证明。**
+
+`archive` 退役**同时**满足「早于 `--after-days`（默认 30 天）」且「从未投递过」的文档，
+移动到 `reflections/archive/`。投递过的文档无论多旧都不动。它是移动而非删除，且默认只预演。
+
 ## 旧数据导出
 
 旧反馈导出仍然显式且对源数据库只读：

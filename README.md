@@ -172,6 +172,28 @@ pipeline gate.
 Package presence and a static doctor result are not proof of live provider success
 or production effectiveness.
 
+## Reflection housekeeping
+
+Two read-mostly commands manage the published reflections directory:
+
+```sh
+agent-feedback-loop reflections effectiveness --project /abs/project
+agent-feedback-loop reflections archive --project /abs/project            # dry run
+agent-feedback-loop reflections archive --project /abs/project --apply    # move files
+```
+
+`effectiveness` answers "is this lesson doing anything" from the delivery log and
+the review history, and reports each family as `never_delivered`,
+`recurred_after_delivery`, `too_early_to_tell`, or `quiet_since_delivery`. Its
+output is labelled `causality: correlation_only`: a quiet family may mean the
+lesson worked, or that the same kind of work never came up again. Do not read it
+as proof of effect.
+
+`archive` retires documents that are **both** older than `--after-days` (default
+30) **and** have never been delivered to a session, moving them to
+`reflections/archive/`. Delivered documents are left alone regardless of age. It
+is a move, not a delete, and it defaults to a dry run.
+
 ## Legacy data export
 
 The legacy export of feedback data remains explicit and source-read-only:
