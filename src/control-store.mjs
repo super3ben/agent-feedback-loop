@@ -74,6 +74,34 @@ const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 const REVIEW_DECLINE_META_PREFIX = "review_decline:v1:";
 const REVIEW_DECLINE_MAX_STORED = 256;
 const REVIEW_DECLINE_MAX_TEXT = 600;
+// What rules block this session has already been sent, and when it was last
+// sent in full.
+//
+// Kept in store_meta for the same reason as the decline ring: this is a
+// per-session delivery record, not something queries join on, and adding it as
+// a column would force a schema migration for a reporting detail.
+//
+// Capped, because one row per session accumulates. The cap is generous next to
+// REVIEW_DECLINE_MAX_STORED: losing a row costs one extra full injection, while
+// losing the whole ledger would restore the repeated-injection problem this
+// exists to fix.
+const INJECTION_LEDGER_META_PREFIX = "rules_injection:v1:";
+const INJECTION_LEDGER_MAX_STORED = 2_048;
+// What each prompt actually received from the rules block.
+//
+// This is the record that makes "did the matching work" answerable after the
+// fact. The hook already computes it — which families were expanded, at what
+// score, how many bytes went out — but only ever wrote it to a debug log that
+// production never enables, so every change to the selection had to be judged
+// on a 47-row hand-labelled corpus instead of on real traffic. Measured: that
+// corpus has 11 rows whose text appears verbatim in the documents being
+// searched, so its numbers were optimistic by ~17pp and nothing could be
+// trusted to within less than that.
+//
+// Append-only and capped: one row per prompt accumulates quickly, and the value
+// is in the recent past, not the whole history.
+const INJECTION_TELEMETRY_META_PREFIX = "injection_telemetry:v1:";
+const INJECTION_TELEMETRY_MAX_STORED = 4_096;
 const EXECUTION_MONITOR_MAX_STORED = 128;
 const EXECUTION_MONITOR_MAX_TOOLS = 64;
 const EXECUTION_MONITOR_MAX_TARGETS = 64;
@@ -1608,6 +1636,29 @@ function createStore(database, now) {
         WHERE project_id=? AND family_key=? AND state='published' AND published_path IS NOT NULL
         ORDER BY completed_at DESC LIMIT 1`).get(safeProjectId, safeFamilyKey) ?? null;
     },
+    // Every published document for a family, not just the newest.
+    //
+    // A family that recurs gets a new document each time, and each one records
+    // the trigger conditions of the incident it came from. Taking only the
+    // newest throws the rest away: measured on a live project,
+    // remote-server-log-diagnosis had six published documents, and the phrase
+    // users actually type — 「更新失败了」「看下日志是什么问题」 — lived in the
+    // 2026-08-21 one. The newest document described normalize_diff_scalar and
+    // state.json, so the family could not be matched by the words a user uses
+    // for it. The union is what a family knows; the latest document is only the
+    // most recent thing it learned.
+    listPublishedJobsForFamily({ projectId, familyKey, limit = 32 }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 128) : 32;
+      return database.prepare(`SELECT job_id, family_key, final_severity, published_path, completed_at
+        FROM reviewer_jobs
+        WHERE project_id=? AND family_key=? AND state='published' AND published_path IS NOT NULL
+        ORDER BY completed_at DESC LIMIT ?`)
+        .all(safeProjectId, safeFamilyKey, safeLimit)
+        .map((row) => ({ ...row }));
+    },
     // Absolute paths of reflection documents that actually reached a session.
     // The archive pass uses this to decide what may be retired: a document that
     // was delivered is doing its job regardless of its age, and a document that
@@ -1886,7 +1937,242 @@ function createStore(database, now) {
         lastDeclinedAt: row?.lastDeclinedAt ?? null
       };
     },
-    // The family keys this project has already seen, with how often each was
+    // How often each REASON has already been used to decline this family.
+    //
+    // This is the read that makes "look before you decline again" a fact rather
+    // than a request. It answers one question, per reason: has this family been
+    // turned away for this same stated reason before? A reviewer that says
+    // "insufficient evidence" for the fifth time is not making a fresh
+    // judgement, it is repeating one, and the count is what proves it.
+    //
+    // Source is review_job_events, not the store_meta decline ring: the ring is
+    // capped at REVIEW_DECLINE_MAX_STORED and evicted oldest-first across ALL
+    // families, so the family that most needs the history is exactly the one
+    // whose records it loses. review_job_events is append-only.
+    //
+    // Unwindowed on purpose. ESCALATION_WINDOW_MS assumes recurrence is fast,
+    // and a lesson worth keeping is by nature slow: the SSH family was declined
+    // across four months, which is 0 hits inside any 14-day lookback. A slow
+    // repeat is still a repeat, so this counts the whole history and reports
+    // firstSeen/lastSeen for callers that want to judge pace themselves.
+    listFamilyReasonDeclines({ projectId, familyKey, excludeJobId = null }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
+      const safeExclude = excludeJobId === null
+        ? null
+        : assertString(excludeJobId, "excludeJobId", 512);
+      return database.prepare(`SELECT event.reason_code AS reasonCode,
+          COUNT(*) AS declines,
+          MIN(event.created_at) AS firstSeen,
+          MAX(event.created_at) AS lastSeen
+        FROM review_job_events AS event
+        JOIN reviewer_jobs AS job ON job.job_id=event.job_id
+        WHERE job.project_id=? AND job.family_key=?
+          AND event.event_type='reviewed_no_lesson'
+          AND event.reason_code IS NOT NULL
+          AND (? IS NULL OR event.job_id<>?)
+        GROUP BY event.reason_code
+        ORDER BY declines DESC, event.reason_code`)
+        .all(safeProjectId, safeFamilyKey, safeExclude, safeExclude)
+        .map((row) => ({
+          reasonCode: row.reasonCode,
+          declines: Number(row.declines ?? 0),
+          firstSeen: row.firstSeen ?? null,
+          lastSeen: row.lastSeen ?? null
+        }));
+    },
+    // Records that a published family's lesson did not hold: the problem came
+    // back. Append-only, and deliberately not a new job state — the lesson is
+    // still published, this only says the lesson needs rewriting.
+    recordLessonRecurred({ jobId, reasonCode = null, familyKey = null }) {
+      const safeJobId = assertString(jobId, "jobId", 512);
+      const safeReason = reasonCode === null
+        ? null
+        : assertString(reasonCode, "reasonCode", 64);
+      const job = getReviewJob(safeJobId);
+      if (!job) throw new TypeError("jobId does not identify a review job");
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        insertReviewJobEvent({
+          jobId: safeJobId,
+          eventType: "recurred_after_lesson",
+          reasonCode: safeReason,
+          leaseEpoch: job.lease_epoch ?? 0,
+          timestamp
+        });
+        return { jobId: safeJobId, familyKey, reasonCode: safeReason };
+      });
+    },
+    // What this session was last sent from the rules block, and when it was
+    // last sent in full.
+    //
+    // The every-turn channel used to re-paste the whole block on every prompt:
+    // measured on live sessions, a 6 KB block went out 36 times in a 31-turn
+    // session, 224.7 KB cumulative. The block was under its cap the whole time,
+    // which is why the cap never noticed.
+    getRulesInjectionLedger({ sessionUid }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      let row;
+      try {
+        row = database.prepare("SELECT value FROM store_meta WHERE key=?")
+          .get(`${INJECTION_LEDGER_META_PREFIX}${safeSessionUid}`);
+      } catch {
+        return null;
+      }
+      if (!row) return null;
+      try {
+        const parsed = JSON.parse(row.value);
+        if (!parsed || typeof parsed !== "object") return null;
+        return {
+          digest: typeof parsed.digest === "string" ? parsed.digest : null,
+          turn: Number.isSafeInteger(parsed.turn) ? parsed.turn : 0,
+          lastFullTurn: Number.isSafeInteger(parsed.lastFullTurn) ? parsed.lastFullTurn : 0,
+          lastFullAt: typeof parsed.lastFullAt === "string" ? parsed.lastFullAt : null
+        };
+      } catch {
+        // A ledger row that no longer parses is treated as absent, which costs
+        // one full injection. Throwing here would fail the whole prompt hook for
+        // a delivery detail.
+        return null;
+      }
+    },
+    recordRulesInjection({ sessionUid, digest, turn, mode, lastFullTurn = null }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      const safeDigest = assertString(digest, "digest", 256);
+      const safeTurn = Number.isSafeInteger(turn) && turn >= 0 ? turn : 0;
+      const safeMode = assertString(mode, "mode", 32);
+      if (safeMode !== "full" && safeMode !== "compact") {
+        throw new TypeError("mode must be full or compact");
+      }
+      // The planner already decided where the anchor sits; recording its value
+      // rather than recomputing keeps one source of truth. Recomputing from mode
+      // alone is how the cadence silently stops advancing when a caller supplies
+      // a stale turn.
+      const explicitFullTurn = Number.isSafeInteger(lastFullTurn) && lastFullTurn >= 0
+        ? lastFullTurn
+        : null;
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        const existing = database.prepare("SELECT value FROM store_meta WHERE key=?")
+          .get(`${INJECTION_LEDGER_META_PREFIX}${safeSessionUid}`);
+        let prior = null;
+        try {
+          prior = existing ? JSON.parse(existing.value) : null;
+        } catch {
+          prior = null;
+        }
+        const record = {
+          digest: safeDigest,
+          turn: safeTurn,
+          lastFullTurn: explicitFullTurn ?? (safeMode === "full"
+            ? safeTurn
+            : (Number.isSafeInteger(prior?.lastFullTurn) ? prior.lastFullTurn : 0)),
+          lastFullAt: safeMode === "full"
+            ? timestamp
+            : (typeof prior?.lastFullAt === "string" ? prior.lastFullAt : null)
+        };
+        database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+          .run(`${INJECTION_LEDGER_META_PREFIX}${safeSessionUid}`, JSON.stringify(record));
+        // Oldest-first eviction, like every other ring here: the sessions being
+        // written now are the ones still running.
+        const retained = database.prepare(
+          "SELECT key FROM store_meta WHERE key LIKE ? ORDER BY rowid"
+        ).all(`${INJECTION_LEDGER_META_PREFIX}%`);
+        if (retained.length > INJECTION_LEDGER_MAX_STORED) {
+          const remove = database.prepare("DELETE FROM store_meta WHERE key=?");
+          for (const stale of retained.slice(0, retained.length - INJECTION_LEDGER_MAX_STORED)) {
+            remove.run(stale.key);
+          }
+        }
+        return record;
+      });
+    },
+    // Records what one prompt actually received from the rules block.
+    //
+    // The point is not logging for its own sake. Every previous change to the
+    // selection logic had to be judged on a hand-labelled corpus, and that corpus
+    // turned out to contain 11 of 47 rows whose text appears verbatim inside the
+    // documents being searched — the measurement flattered itself by ~17pp, and
+    // no smaller difference was distinguishable from noise. Real traffic is the
+    // only place the answer exists, so it has to be written down as it happens.
+    recordInjectionTelemetry({
+      projectId,
+      promptDigest,
+      expandedFamilies = [],
+      topScores = [],
+      indexCount = 0,
+      sectionCount = 0,
+      injectedBytes = 0,
+      mode = "full",
+      reason = null
+    }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeDigest = assertString(promptDigest, "promptDigest", 256);
+      const safeMode = assertString(mode, "mode", 32);
+      const timestamp = nowIso(now);
+      const families = (Array.isArray(expandedFamilies) ? expandedFamilies : [])
+        .filter((value) => typeof value === "string" && FAMILY_KEY_PATTERN.test(value))
+        .slice(0, 16);
+      const scores = (Array.isArray(topScores) ? topScores : [])
+        .filter((entry) => entry && typeof entry.family === "string" && FAMILY_KEY_PATTERN.test(entry.family))
+        .slice(0, 8)
+        .map((entry) => ({ family: entry.family, score: Number(entry.score) || 0 }));
+      const record = {
+        projectId: safeProjectId,
+        promptDigest: safeDigest,
+        expandedFamilies: families,
+        topScores: scores,
+        indexCount: Number.isSafeInteger(indexCount) ? indexCount : 0,
+        sectionCount: Number.isSafeInteger(sectionCount) ? sectionCount : 0,
+        injectedBytes: Number.isSafeInteger(injectedBytes) ? injectedBytes : 0,
+        mode: safeMode,
+        reason: typeof reason === "string" ? reason.slice(0, 64) : null,
+        at: timestamp
+      };
+      return transaction(() => {
+        database.prepare("INSERT INTO store_meta(key, value) VALUES (?, ?)")
+          .run(`${INJECTION_TELEMETRY_META_PREFIX}${safeDigest}:${timestamp}`, JSON.stringify(record));
+        // Oldest-first eviction. The recent past is what a person reasons about
+        // after a change; the whole history would grow without bound on a busy
+        // project and nobody would read it.
+        const retained = database.prepare(
+          "SELECT key FROM store_meta WHERE key LIKE ? ORDER BY rowid"
+        ).all(`${INJECTION_TELEMETRY_META_PREFIX}%`);
+        if (retained.length > INJECTION_TELEMETRY_MAX_STORED) {
+          const remove = database.prepare("DELETE FROM store_meta WHERE key=?");
+          for (const stale of retained.slice(0, retained.length - INJECTION_TELEMETRY_MAX_STORED)) {
+            remove.run(stale.key);
+          }
+        }
+        return record;
+      });
+    },
+    // The telemetry rows, newest first, optionally scoped to one project.
+    listInjectionTelemetry({ projectId = null, limit = 200 } = {}) {
+      const safeLimit = Number.isSafeInteger(limit) && limit > 0
+        ? Math.min(limit, 2_000)
+        : 200;
+      const rows = database.prepare(
+        "SELECT value FROM store_meta WHERE key LIKE ? ORDER BY rowid DESC LIMIT ?"
+      ).all(`${INJECTION_TELEMETRY_META_PREFIX}%`, safeLimit * 4);
+      const out = [];
+      for (const row of rows) {
+        let parsed;
+        try {
+          parsed = JSON.parse(row.value);
+        } catch {
+          continue;
+        }
+        if (!parsed || typeof parsed !== "object") continue;
+        if (projectId && parsed.projectId !== projectId) continue;
+        out.push(parsed);
+        if (out.length >= safeLimit) break;
+      }
+      return out;
+    },
+
     // reached. Feeding these back is what lets a later review recognise a
     // repeat instead of inventing a fresh key for the same problem.
     listReviewFamilyKeys({ jobId, limit = 32 }) {

@@ -22,11 +22,33 @@ const SEVERITY_ORDER = { Blocker: 0, Critical: 1, Major: 2 };
 const SEVERITY_THRESHOLDS = { Major: 3, Critical: 2, Blocker: 1 };
 
 /**
- * The injection budget the reader already enforces (`RULES_BLOCK_MAX_BYTES` in
- * cli.mjs). The writer must produce a block that fits it, so the reader's cap
- * stops being the place where rules quietly disappear.
+ * The injection budget the reader enforces (`RULES_BLOCK_MAX_BYTES` in
+ * cli.mjs). Kept exported because `doctor` reports against it and older callers
+ * pass it; the writer itself no longer projects to this size.
  */
 export const RULES_BLOCK_BUDGET_BYTES = 6 * 1_024;
+
+/**
+ * How large the FILE may grow.
+ *
+ * Separate from the injection budget on purpose. The file stores the full
+ * instruction text for every qualified family so the injector has something to
+ * expand into; the injection then sends only the families the current prompt
+ * touches. Bounding both by 6 KB is what forced the writer to discard
+ * instructions that a relevant turn then could not use.
+ *
+ * 64 KB holds roughly 100 full sections at the measured 613-byte average, which
+ * is far more than any project here has produced. It is a runaway guard, not a
+ * working limit.
+ */
+export const RULES_FILE_BUDGET_BYTES = 64 * 1_024;
+
+/**
+ * Marks the start of the L0 index inside the managed block. The parser keys on
+ * the one-line entries rather than this heading, so a block without it still
+ * parses; it exists so a person reading the file can tell the layers apart.
+ */
+const INDEX_HEADING = "**本项目已记录的全部教训家族**";
 
 /**
  * Reserve for the demoted index, so evicting families cannot starve the index
@@ -53,6 +75,16 @@ const MAX_SECTION_BYTES = 1_200;
  */
 const DEMOTED_CHANGE_MAX_CHARS = 110;
 
+/**
+ * How many trigger conditions a section renders.
+ *
+ * They exist to be matched against a future prompt, and the injector scores on
+ * them, so a few well-chosen ones beat all of them: the document carries up to
+ * sixteen, most of them generic restatements ("当用户表达不满时") that match
+ * everything and therefore discriminate nothing.
+ */
+const APPLIES_WHEN_MAX = 4;
+
 export function qualifyForRules(severity, occurrences) {
   if (!severity || !SEVERITY_ORDER.hasOwnProperty(severity)) return false;
   return occurrences >= (SEVERITY_THRESHOLDS[severity] ?? Infinity);
@@ -76,7 +108,37 @@ function byteLength(value) {
  * Families published before method_class was recorded carry null, which
  * compares equal to other nulls and so keeps the old behaviour for them.
  */
+/**
+ * The text that decides whether two families are the same lesson.
+ *
+ * Body alone was not enough: the escalation path publishes one shared
+ * boilerplate class_of_mistake for every family it rescues ("the review kept
+ * declining this as not worth learning"), so unrelated problems merged into a
+ * single section whose text described none of them. The method class is what
+ * actually distinguishes "declined too often" applied to a card regression from
+ * the same sentence applied to a deploy confirmation.
+ *
+ * But including `methodClass` verbatim has the opposite failure: every escalated
+ * family carries the SAME literal ("recurring_decline_after_user_feedback"), so
+ * the class contributes nothing there and the merge key collapses to
+ * incidentSummary + methodChanges — which for escalated families is also
+ * boilerplate. That is how a live project ended up with seven distinct problems
+ * sharing one 67× section whose body described the review process rather than
+ * any of the seven.
+ *
+ * The fix is to key an escalated family on the incident itself. When the family
+ * was synthesized from declines, its identity is what the user complained about,
+ * not the fact that it was declined. Families published normally keep the old
+ * key, so their behaviour does not change.
+ */
 function bodyOf(family) {
+  const escalatedClass = family.methodClass === "recurring_decline_after_user_feedback";
+  if (escalatedClass) {
+    // Deliberately excludes methodChanges: those are the same two template
+    // sentences for every escalated family, and including them re-merges
+    // everything the incident key just separated.
+    return [family.incidentSummary ?? "", family.familyKeys?.[0] ?? ""].join("\n").trim();
+  }
   return [
     family.methodClass ?? "",
     family.incidentSummary ?? "",
@@ -104,6 +166,11 @@ function mergeFamilies(families) {
         incidentSummary: family.incidentSummary ?? null,
         methodClass: family.methodClass ?? null,
         methodChanges: family.methodChanges ?? [],
+        // Carried through the merge, not just into it. This is the surface the
+        // injector matches a new prompt against; dropping it here made every
+        // section render without trigger conditions and left relevance scoring
+        // with nothing but the incident narrative to match on.
+        appliesWhen: family.appliesWhen ?? [],
         familyKeys: [family.familyKey],
         latestRecurrenceAt: family.latestRecurrenceAt ?? null
       });
@@ -114,6 +181,12 @@ function mergeFamilies(families) {
     // established the lesson is.
     existing.occurrences += family.occurrences;
     existing.familyKeys.push(family.familyKey);
+    // Union the trigger conditions: a merged family is reachable by any of its
+    // members' triggers, so dropping the incoming ones would make the merge
+    // invisible to prompts that mention only the second family.
+    for (const condition of family.appliesWhen ?? []) {
+      if (!existing.appliesWhen.includes(condition)) existing.appliesWhen.push(condition);
+    }
     for (const key of [family.latestRecurrenceAt, existing.latestRecurrenceAt]) {
       if (!key) continue;
       if (!existing.latestRecurrenceAt || Date.parse(key) > Date.parse(existing.latestRecurrenceAt)) {
@@ -194,24 +267,69 @@ function renderSection(family, demoted) {
   }
 
   const summaryBudget = Math.floor(MAX_SECTION_BYTES * 0.35);
-  if (family.incidentSummary) {
-    lines.push(trimToChars(family.incidentSummary, Math.min(400, summaryBudget)), "");
-  }
-  lines.push("**Do not repeat this mistake:**");
-  for (const change of family.methodChanges) lines.push(`- ${trimToChars(change, 300)}`);
-  lines.push("");
+  const heading = `### ${label} (${family.occurrences}×, ${family.severity})`;
+  // The trigger conditions come first on purpose. They are what the injector
+  // matches a new prompt against, so a reader skimming a section sees when it
+  // applies before seeing what happened once. Rendering only the incident made
+  // a "页面样式不一致" prompt match a diagram lesson on an incidental word.
+  let conditions = (family.appliesWhen ?? []).slice(0, APPLIES_WHEN_MAX)
+    .map((condition) => trimToChars(condition, 160));
+  let summary = family.incidentSummary
+    ? trimToChars(family.incidentSummary, Math.min(400, summaryBudget))
+    : null;
+  let changes = (family.methodChanges ?? []).map((change) => trimToChars(change, 300));
 
-  let rendered = lines.join("\n");
-  // Cap by dropping trailing method changes, never by cutting a line in half:
-  // a truncated method change reads as a complete instruction while missing
-  // the part that made it actionable.
-  while (byteLength(rendered) > MAX_SECTION_BYTES && lines.length > 4) {
-    const lastChange = lines.map((line, index) => (line.startsWith("- ") ? index : -1))
-      .filter((index) => index >= 0)
-      .pop();
-    if (lastChange === undefined) break;
-    lines.splice(lastChange, 1);
-    rendered = lines.join("\n");
+  const compose = () => {
+    const out = [heading, ""];
+    if (conditions.length) {
+      out.push("**何时适用：**");
+      for (const condition of conditions) out.push(`- ${condition}`);
+      out.push("");
+    }
+    if (summary) out.push(summary, "");
+    out.push("**Do not repeat this mistake:**");
+    for (const change of changes) out.push(`- ${change}`);
+    out.push("");
+    return out.join("\n");
+  };
+
+  // Shrinking is ordered by what the section is FOR. The method changes are the
+  // instruction; everything else is context for it. The previous cap removed
+  // trailing "- " lines without knowing which list they belonged to, so on a
+  // long section it stripped every method change and kept the narrative — a
+  // live section rendered as a heading, an incident paragraph and an empty
+  // "Do not repeat this mistake:" with nothing under it. A rule with no
+  // instruction is the one outcome this must never produce.
+  //
+  // Order: shorten the narrative, then drop extra trigger conditions (keeping
+  // one), then drop the narrative, then drop trailing method changes but never
+  // the first.
+  let rendered = compose();
+  const shrinkSteps = [
+    () => {
+      if (!summary || Array.from(summary).length <= 120) return false;
+      summary = trimToChars(summary, 120);
+      return true;
+    },
+    () => {
+      if (conditions.length <= 1) return false;
+      conditions = conditions.slice(0, -1);
+      return true;
+    },
+    () => {
+      if (!summary) return false;
+      summary = null;
+      return true;
+    },
+    () => {
+      if (changes.length <= 1) return false;
+      changes = changes.slice(0, -1);
+      return true;
+    }
+  ];
+  for (const step of shrinkSteps) {
+    while (byteLength(rendered) > MAX_SECTION_BYTES && step()) rendered = compose();
+    if (byteLength(rendered) <= MAX_SECTION_BYTES) break;
   }
   return rendered;
 }
@@ -237,75 +355,101 @@ export function readRulesBlockBudget(block) {
 }
 
 /**
- * Builds the managed block within `maxBytes`.
+ * Builds the managed block.
  *
- * Selection is a projection under a byte budget, not an accumulation: families
- * that fit keep their full text, families that do not are demoted to their
- * heading rather than dropped. A demoted family is therefore never lost — it
- * stays visible, keeps its recurrence count, and returns automatically the
- * moment it recurs and outranks something else.
+ * This used to be a projection under one flat byte budget: families that fit
+ * kept their full text and the rest were demoted to a heading. That worked
+ * until it didn't. On a live project 16 families saturated the block at 97%,
+ * 12 of them were demoted to a single line, and the section that did survive
+ * was a merged 7-family paragraph describing the review process rather than any
+ * of the seven. The root cause was not the budget: it was that every turn got
+ * the same list regardless of what had been asked.
+ *
+ * The block now holds two layers, and the file is allowed to be larger than the
+ * injection because only part of it is ever injected:
+ *
+ * - L1 sections carry the full instruction text for every qualified family.
+ * - L0 carries a one-line index of the same families.
+ *
+ * The file is the durable record; what reaches a turn is decided at injection
+ * time by lesson-layers.mjs, which picks the L1 sections the prompt actually
+ * touches and always includes L0. Storing all of L1 on disk is the point — the
+ * old budget forced the writer to throw instructions away, so a family that was
+ * relevant had nothing left to expand into.
+ *
+ * `maxBytes` now bounds the FILE, not the injection. The injection has its own
+ * budget (RULES_BLOCK_MAX_BYTES in cli.mjs) and is bounded by L0 plus a couple
+ * of L1 sections, which is far smaller than this.
  *
  * @param {Array<{familyKey: string, severity: string, occurrences: number,
  *   incidentSummary?: string, methodChanges?: string[],
  *   latestRecurrenceAt?: string|null}>} families
  * @param {{maxBytes?: number}} [options]
  */
-export function buildRulesBlock(families, { maxBytes = RULES_BLOCK_BUDGET_BYTES } = {}) {
+export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES } = {}) {
   if (!Array.isArray(families) || families.length === 0) return null;
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 256) {
     throw new TypeError("maxBytes must be a safe integer of at least 256");
   }
 
   const merged = rankFamilies(mergeFamilies(families));
-  const reserve = Math.max(INDEX_RESERVE_MIN_BYTES, Math.floor(maxBytes * INDEX_RESERVE_FRACTION));
-  const fullBudget = maxBytes - reserve;
 
+  // Every family that fits the file budget gets a full section. Shedding the
+  // tail here is a file-size concern only; it no longer decides what a turn
+  // sees, because L0 below still lists what was shed.
   const sections = [];
-  const demoted = [];
-  let used = byteLength(AFL_RULES_START) + byteLength(AFL_RULES_END) + 2;
+  const overflowed = [];
+  let used = byteLength(AFL_RULES_START) + byteLength(AFL_RULES_END) + 8;
   for (const family of merged) {
     const section = renderSection(family, false);
     const cost = byteLength(section);
-    // Merge before evicting: a family only demotes once its section genuinely
-    // does not fit, which is why the dedupe pass above runs first.
-    if (used + cost > fullBudget) {
-      demoted.push(family);
+    if (used + cost > maxBytes) {
+      overflowed.push(family);
       continue;
     }
     used += cost;
-    sections.push(section);
+    sections.push({ family, text: section });
   }
 
-  // Demoted families keep a heading-only line so the block still names them.
-  // An index entry that would itself overflow the reserve is dropped, but the
-  // count is recorded so the loss is visible rather than silent.
-  let unlisted = 0;
-  const indexLines = [];
-  for (const family of demoted) {
-    const section = renderSection(family, true);
-    if (used + byteLength(section) > maxBytes) { unlisted += 1; continue; }
-    used += byteLength(section);
-    indexLines.push(section);
-  }
+  // L0 names every family, including any whose full section did not fit. This is
+  // the guarantee the flat budget could not give: a family is never invisible.
+  const index = merged.map((family) => ({
+    familyKey: family.familyKeys[0],
+    occurrences: family.occurrences
+  }));
 
-  const lines = [AFL_RULES_START, "", budgetLine(used, demoted.length + unlisted, maxBytes)];
-  lines.push(...sections.map((section) => section.trimEnd()));
-  if (indexLines.length) {
+  const compose = (bodySections) => {
+    const lines = [
+      AFL_RULES_START,
+      "",
+      budgetLine(0, overflowed.length, maxBytes),
+      ""
+    ];
+    for (const section of bodySections) lines.push(section.text.trimEnd(), "");
+    lines.push(INDEX_HEADING, "");
+    for (const entry of index) lines.push(`- ${entry.familyKey} (${entry.occurrences}×)`);
     lines.push("");
-    lines.push("_Demoted: over budget, still counted. A recurrence moves them back up._");
-    lines.push("");
-    lines.push(...indexLines.map((section) => section.trimEnd()));
-  }
-  lines.push("");
-  lines.push(AFL_RULES_END);
+    lines.push(AFL_RULES_END);
+    return lines;
+  };
 
-  const block = lines.join("\n");
-  if (byteLength(block) > maxBytes) {
-    // The invariant is what the reader relied on the byte-slice for; failing
-    // loudly here is better than emitting a block that gets cut mid-character.
-    throw new Error("rules block exceeds budget after projection");
+  // Shrink until the file fits. The index goes last because it is the cheap
+  // layer: dropping a full section costs detail a reader can still reach through
+  // the index, while dropping an index line costs the visibility entirely.
+  let body = [...sections];
+  for (;;) {
+    const lines = compose(body);
+    const measured = byteLength(lines.join("\n"));
+    lines[2] = budgetLine(measured, merged.length - body.length, maxBytes);
+    const final = lines.join("\n");
+    if (byteLength(final) <= maxBytes) return final;
+    if (!body.length) {
+      // Even the index alone does not fit. Returning null beats throwing: the
+      // caller keeps its previous block instead of freezing on an exception.
+      return null;
+    }
+    body = body.slice(0, -1);
   }
-  return block;
 }
 
 export async function getRulesPath(projectDir) {

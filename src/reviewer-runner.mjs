@@ -305,19 +305,48 @@ export async function runReviewJob({
         familyKey: result.family_key
       })
       : null;
+    const publishedLesson = Boolean(
+      context.job.project_id
+      && typeof store.getLatestPublishedJobForFamily === "function"
+      && store.getLatestPublishedJobForFamily({
+        projectId: context.job.project_id,
+        familyKey: result.family_key
+      })
+    );
+    // Before this decline is accepted, look up whether this family already
+    // collected the SAME stated reason. Reading it here, rather than asking the
+    // prompt to, is the whole point: the reviewer used to be handed
+    // prior_declines and used none of them, so "insufficient evidence" could be
+    // said five times about the same family and each time read as a fresh
+    // judgement. This query is what turns that repetition into a fact the code
+    // acts on. Unwindowed: slow recurrence is still recurrence.
+    const priorReasonDeclines = context.job.project_id && result.family_key
+      && typeof store.listFamilyReasonDeclines === "function"
+      ? store.listFamilyReasonDeclines({
+        projectId: context.job.project_id,
+        familyKey: result.family_key,
+        excludeJobId: jobId
+      })
+      : [];
+    const repeatedReason = priorReasonDeclines.find(
+      (entry) => entry.reasonCode === result.reason_code
+    ) ?? null;
+    const repeatDecline = repeatedReason
+      ? {
+        reasonCode: repeatedReason.reasonCode,
+        priorDeclines: repeatedReason.declines,
+        firstSeen: repeatedReason.firstSeen,
+        lastSeen: repeatedReason.lastSeen,
+        hasPublishedLesson: publishedLesson
+      }
+      : null;
     const escalated = escalateDeclinedFamily({
       verdict: result,
       declines: context.recurrence?.prior_declines ?? [],
       job: context.job,
       permanentDeclines,
-      hasPublishedLesson: Boolean(
-        context.job.project_id
-        && typeof store.getLatestPublishedJobForFamily === "function"
-        && store.getLatestPublishedJobForFamily({
-          projectId: context.job.project_id,
-          familyKey: result.family_key
-        })
-      )
+      repeatDecline,
+      hasPublishedLesson: publishedLesson
     });
     if (escalated) {
       let escalatedModel;
@@ -372,6 +401,24 @@ export async function runReviewJob({
       }
     }
     try {
+      // A family that already carries a published lesson and is now declined
+      // again for the same reason has not "kept" — the lesson failed. Escalating
+      // would pile up a second near-identical document and re-feed the merge
+      // that produced the 67× meta-template, so record the recurrence instead.
+      // The lesson stays published; what changes is that the next rules
+      // projection knows it does not hold.
+      const recordAsRecurred = Boolean(
+        repeatDecline
+        && publishedLesson
+        && typeof store.recordLessonRecurred === "function"
+      );
+      if (recordAsRecurred) {
+        store.recordLessonRecurred({
+          jobId,
+          reasonCode: result.reason_code,
+          familyKey: result.family_key
+        });
+      }
       store.completeReviewNoLesson({
         jobId,
         ownerId,
@@ -384,7 +431,20 @@ export async function runReviewJob({
         whyNotALesson: result.why_not_a_lesson,
         wouldQualifyIf: result.would_qualify_if
       });
-      return { outcome: "reviewed_no_lesson", documentPath: null };
+      // The base shape is unchanged for every ordinary decline: callers (and
+      // their tests) compare it whole. The repeat marker is added only when a
+      // repeat actually happened, so "a first, considered decline" and "the same
+      // objection used again" stay distinguishable without reshuffling the
+      // contract everyone already depends on.
+      const outcome = { outcome: "reviewed_no_lesson", documentPath: null };
+      if (repeatDecline) {
+        outcome.repeatedReason = {
+          reasonCode: repeatDecline.reasonCode,
+          priorDeclines: repeatDecline.priorDeclines,
+          recordedAs: recordAsRecurred ? "recurred_after_lesson" : "declared_unpublishable"
+        };
+      }
+      return outcome;
     } catch (error) {
       const failure = new ReviewJobError(causeCode(error) || "lease_lost", error);
       recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });

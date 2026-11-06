@@ -128,8 +128,25 @@ function clip(value, max) {
  *
  * The list of applies_when entries is capped, not the document: a lesson with
  * twelve conditions still matches on all twelve, it just shows the first few.
+ *
+ * When `pointerOnly` is set the document body is replaced by a reference. That
+ * is the case when the rules block already carries this document's family: the
+ * block renders the same method changes from the same file, so sending both is
+ * one lesson twice in one prompt. Measured on a live project, the selected
+ * documents accounted for 4.7 KB of a 6.9 KB injection while the layered rules
+ * block — which held every one of those lessons, plus the index — cost 1.8 KB.
+ *
+ * A pointer still carries the hash, so "was this lesson delivered" stays
+ * answerable from the session, and the path, so the reader can open the whole
+ * incident when the summary is not enough. What it drops is the duplication.
  */
-function documentGuidance(document) {
+function documentGuidance(document, { pointerOnly = false } = {}) {
+  if (pointerOnly) {
+    return [
+      `document_hash: ${document.documentHash}`,
+      `（本家族的完整条目已在上方规则块中，此处只登记送达；需要完整经过时读 ${document.path ?? "对应反思文档"}）`
+    ].join("\n");
+  }
   const conditions = (document.appliesWhen ?? []).slice(0, GUIDANCE_LIMITS.appliesWhen);
   const changes = (document.methodChanges ?? []).slice(0, GUIDANCE_LIMITS.methodChanges);
   const lines = [
@@ -247,6 +264,15 @@ export function selectReflections({
   publishedBefore,
   familyRecurrence = {},
   coveredFamilies = null,
+  // The families the rules block rendered IN FULL this turn. Distinct from
+  // coveredFamilies, which is what selection must skip; this is what selection
+  // may compress to a pointer because the instructions are already above it.
+  expandedFamilies = null,
+  // The text the rules block already contributed to this same prompt. Used to
+  // detect a document whose instructions are already stated verbatim above it;
+  // family identity cannot catch that, because the duplicated sentences come
+  // from a shared template rather than from a shared family.
+  injectedText = "",
   familyKeyOf = null
 }) {
   const limits = limitsFrom(budget);
@@ -341,13 +367,43 @@ export function selectReflections({
 
   const budgeted = [];
   for (const document of ranked) {
-    const guidance = documentGuidance(document);
+    // When is a document's body redundant with what the rules block already
+    // put in this same prompt? Two distinct cases, and the second is the one
+    // that actually occurs:
+    //
+    // 1. Its family was expanded in full above. Selection normally skips those
+    //    already (covered_by_rules), so this is a belt-and-braces check for a
+    //    family that resolved here but not there.
+    // 2. Its instructions already appear verbatim in the block. This is the
+    //    real case: the escalation template writes the same two method sentences
+    //    for every family it rescues, so a document for family A repeats what
+    //    the block says about family B. Measured on a live project, the injected
+    //    document was 1,492 B and both of its method changes were byte-identical
+    //    to lines already in the block — 2 of 2.
+    //
+    // Identity alone cannot catch case 2; the families genuinely differ. Only
+    // comparing the text can, so that is what decides.
+    let pointerOnly = false;
+    if (expandedFamilies && typeof expandedFamilies.has === "function" && typeof familyKeyOf === "function") {
+      try {
+        const familyKey = familyKeyOf(document);
+        pointerOnly = Boolean(familyKey && expandedFamilies.has(familyKey));
+      } catch {
+        pointerOnly = false;
+      }
+    }
+    if (!pointerOnly && injectedText) {
+      const changes = (document.methodChanges ?? []).filter((entry) => String(entry ?? "").trim());
+      const unique = changes.filter((entry) => !injectedText.includes(clip(entry, GUIDANCE_LIMITS.methodChangeChars)));
+      pointerOnly = changes.length > 0 && unique.length === 0;
+    }
+    const guidance = documentGuidance(document, { pointerOnly });
     const tokenEstimate = estimateGuidanceTokens(guidance);
     if (tokenEstimate > limits.maxDocumentTokens) {
       omissions.push(omission(document, "token_budget"));
       continue;
     }
-    budgeted.push({ ...document, guidance, tokenEstimate });
+    budgeted.push({ ...document, guidance, tokenEstimate, pointerOnly });
   }
 
   const selected = [];

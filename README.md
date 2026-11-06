@@ -67,34 +67,94 @@ Publication is not delivery. Three channels carry a lesson forward:
   overreach as agent fault even when the agent later corrects it.
 - Families that reach `Major+3` / `Critical+2` / `Blocker+1` occurrences are
   compiled into the managed block of `.agent/rules/feedback-loop.md`.
-- The prompt hook injects that managed block into every prompt's context
-  (bounded to 6 KB), so a rule that has recurred enough is seen each turn
-  mechanically rather than depending on the model choosing to open the file.
+- The prompt hook injects that managed block into every prompt's context, so a
+  rule that has recurred enough is seen each turn mechanically rather than
+  depending on the model choosing to open the file. The block is layered, and
+  only part of it is injected — see below.
+
+#### The rules block is layered: index always, instructions on demand
+
+The block holds two layers, and the file is deliberately allowed to be larger
+than any single injection:
+
+- **L0 — the index.** One line per family (`- family-key (N×)`), always
+  injected. Its job is to guarantee nothing is ever invisible: every family this
+  project has learned about is named on every turn, at roughly 40 bytes each.
+- **L1 — the instructions.** The full text for each family: when it applies, what
+  the incident was, and what to do differently. Only the sections the current
+  prompt actually touches are injected, at most two per turn.
+- **L2 — the reflection document.** The complete incident, under
+  `.agent/reflections/`. Never injected; it is where a reader goes when L1 is not
+  enough.
+
+Measured on a live project, the previous flat design saturated one 6 KB block at
+97%, demoted 12 of 16 families to a one-line heading with no instruction at all,
+and still showed the same 6 KB to every turn regardless of what was asked. The
+file now carries every family in full (17 KB) while a typical injection is
+2–5 KB, and an ordinary turn that matches nothing costs about 800 bytes.
+
+#### When a lesson is injected at all
+
+L1 is gated on what the user is doing, not on whether the words look similar:
+
+- **Shown when the user reports a problem or objects** — 「今天的日报没有发出去」,
+  「你这个详细设计也太简单了」, 「之前密码不是给你了怎么又问我」. A lesson records a
+  problem that was reported before, so this is its moment.
+- **Held back for ordinary instructions** — 「把这个汇总报告存到 docs/ 下」,
+  「继续做审美的也一样做完」. No lesson applies however many words overlap.
+
+The distinction matters because lexical similarity cannot make it. Measured on
+real messages, 「之前密码不是给你了怎么又问我」 and 「继续做审美的也一样做完」 scored
+identically (2.4), and every threshold on the score traded one error for the
+other, topping out at 15/21. Gating on the user's intent instead scores 39/40 on
+40 real user messages. Holding back is cheap: L0 still names every family, and
+the saved 2 KB would have been an instruction that did not apply.
+
+Both channels obey the same gate — the layered block and the reflection-document
+selector. Before that, gating only the block left the selector shipping two
+unrelated documents (3 KB) on an ordinary instruction.
 
 #### The rules block is a projection, not an accumulating log
 
-The managed block is rebuilt from store state on every publication and is held
-under a fixed byte budget, so it cannot grow without bound and nobody has to
-prune it. Three properties make that automatic:
+The managed block is rebuilt from store state on every publication, so it cannot
+grow without bound and nobody has to prune it. Four properties make that
+automatic:
 
 - **Merge.** Families are merged when their rendered bodies are identical. The
   family id hashes the reviewer's free-text `family_key` alongside its method
   class, so the same lesson arrives under a new id whenever the reviewer
   phrases the key differently. One live project carried seven such duplicates,
   36.6% of its block.
-- **Rank.** Surviving sections are ordered by severity, then occurrence count,
-  then most recent recurrence. Without the third term a family hit 39 times
-  months ago and never since outranks one hit five times this week.
-- **Demote, never drop.** A family that does not fit the budget keeps a
-  heading-only line, naming it and carrying its count. It is never deleted: it
-  stays published, stays counted, and returns to full text automatically the
-  moment it recurs and outranks something else.
+- **Merge on the incident, not the template.** Escalated families all carry the
+  same `method_class` literal and the same boilerplate prose, so keying the merge
+  on those collapsed seven unrelated problems into one section whose text
+  described the review process rather than any of the seven. They are keyed on
+  the user's own complaint instead.
+- **Rank.** Families are ordered by severity, then occurrence count, then most
+  recent recurrence. Without the third term a family hit 39 times months ago and
+  never since outranks one hit five times this week.
+- **Union the trigger conditions.** A family that recurs gets a new document per
+  incident, and each records the words of the complaint it came from. Reading
+  only the newest threw the rest away: one family had six documents, and the
+  phrase users actually type lived in the oldest. All published documents for a
+  family now contribute conditions.
 
-The writer guarantees the block fits, which replaces a byte-slice the reader
-used to apply at injection time. That slice cut mid-character and silently
-dropped 44% of a live block — including five families that had qualified. An
-over-budget block now means the file was written by an older version or edited
-by hand; the reader then trims whole sections and logs how many it dropped.
+#### What each turn actually received is recorded
+
+Every injection writes a telemetry row — which families were expanded, at what
+score, how many bytes went out, and why the gate did or did not open
+(`not_a_problem`, `no_match`, `no_distinctive_term`). Reading it:
+
+```bash
+sqlite3 ~/.agent/feedback-loop-data/store/control.sqlite3 \
+  "select value from store_meta where key like 'injection_telemetry:%' order by rowid desc limit 5;"
+```
+
+This exists because every previous change to the selection logic had to be judged
+on a hand-labelled corpus, and that corpus turned out to contain 11 of 47 rows
+whose text appears verbatim inside the documents being searched — the measurement
+flattered itself by about 17 points, and no smaller difference was distinguishable
+from noise. Real traffic is the only place the answer exists.
 
 `doctor` reports the block under `status.rulesBlock` with two separate flags:
 `saturated` (the projection reached its ceiling — working as designed) and

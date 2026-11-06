@@ -42,6 +42,10 @@ export function summarizeReflectionEffectiveness({
   const declineCounts = new Map(
     declines.map((row) => [row.family_key, Number(row.declines) || 0])
   );
+  // The same rows, kept whole, because the count alone cannot answer "when".
+  const declineRows = new Map(
+    declines.map((row) => [row.family_key, row])
+  );
 
   // A family is "quiet" only once enough time has passed for a recurrence to
   // have been plausible. Anything newer is "too early", not "fixed".
@@ -54,16 +58,42 @@ export function summarizeReflectionEffectiveness({
     const delivery = deliveries.get(family) ?? null;
     const publishedAt = job.completed_at ? Date.parse(job.completed_at) : NaN;
 
-    // Recurrences are counted from the job table by the caller's decline data;
-    // a published family that keeps being declined afterwards is recurring.
-    const declinesAfter = delivery?.firstAt
-      ? (declineCounts.get(family) ?? 0)
-      : 0;
+    // A recurrence is a decline that happened AFTER the lesson was delivered.
+    //
+    // The previous version counted every decline the family had ever collected,
+    // including the ones that produced the lesson in the first place. Every
+    // family is by definition declined at least once before it is published — so
+    // any family that was ever delivered had already "recurred", and the report
+    // said recurred_after_delivery for 32 of 32. A lesson could have prevented
+    // every subsequent recurrence and the number would not have moved, which is
+    // the one property a measuring instrument must not have.
+    //
+    // The lower bound is the first delivery: that is the earliest moment the
+    // lesson could have had any effect. Rows carry a count, not timestamps, so
+    // the caller passes per-family decline history with `last_declined_at`; when
+    // that is missing the family is reported as `too_early_to_tell` rather than
+    // being credited with a recurrence it may not have had.
+    const deliveryAt = delivery?.firstAt ? Date.parse(delivery.firstAt) : NaN;
+    const declineEntry = declineRows.get(family) ?? null;
+    const lastDeclineAt = declineEntry?.last_declined_at ? Date.parse(declineEntry.last_declined_at) : NaN;
+    const hasDeclines = (Number(declineCounts.get(family)) || 0) > 0;
+    const declinesAfter = Number.isFinite(deliveryAt) && Number.isFinite(lastDeclineAt)
+      ? lastDeclineAt >= deliveryAt
+      : false;
 
     let state;
     if (!delivery) state = "never_delivered";
-    else if (declinesAfter > 0) state = "recurred_after_delivery";
-    else if (Number.isFinite(publishedAt) && publishedAt > quietCutoff) state = "too_early_to_tell";
+    else if (declinesAfter) state = "recurred_after_delivery";
+    else if (hasDeclines && !Number.isFinite(lastDeclineAt)) {
+      // Declines exist but carry no timestamp, so whether they happened before
+      // or after delivery is unknowable. Saying "quiet" would claim the lesson
+      // held; saying "recurred" would repeat the original bug of counting the
+      // declines that produced the lesson. Neither is honest, so the state says
+      // exactly what is known: something happened, and when it happened is
+      // missing. The store always supplies last_declined_at, so this is a
+      // backfilled-row case rather than a normal one.
+      state = "recurrence_timing_unknown";
+    } else if (Number.isFinite(publishedAt) && publishedAt > quietCutoff) state = "too_early_to_tell";
     else state = "quiet_since_delivery";
 
     families.push({
@@ -74,7 +104,12 @@ export function summarizeReflectionEffectiveness({
       deliveries: delivery?.count ?? 0,
       firstDeliveredAt: delivery?.firstAt ?? null,
       lastDeliveredAt: delivery?.lastAt ?? null,
-      declines: declineCounts.get(family) ?? 0
+      declines: declineCounts.get(family) ?? 0,
+      // Kept so a reader can see WHY a family landed in its state: the whole
+      // point of the fix is that "declined before delivery" no longer counts as
+      // recurrence, and that is only checkable if both timestamps are visible.
+      firstDeclinedAt: declineEntry?.first_declined_at ?? null,
+      lastDeclinedAt: declineEntry?.last_declined_at ?? null
     });
   }
 

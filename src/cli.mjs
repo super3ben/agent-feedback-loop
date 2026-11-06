@@ -16,8 +16,12 @@ import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./sta
 import { resolveLanguage, padLabel, strings } from "./language.mjs";
 import { runReviewJob } from "./reviewer-runner.mjs";
 import { runLLMClassifier } from "./llm-classifier.mjs";
+import { planRulesInjection, renderRulesIndex, REANCHOR_TURNS } from "./injection-ledger.mjs";
+import { composeInjection, parseLayeredBlock, readsAsProblemOrObjection, selectL1Sections } from "./lesson-layers.mjs";
+import { inspectMemoryIndex, renderMemoryDriftNotice, resolveMemoryDir } from "./memory-drift.mjs";
+import { maybeUpdateRulesTier } from "./update-rules-tier.mjs";
 import { resolveReviewerExecutable, runReviewerProvider } from "./reviewer-provider.mjs";
-import { loadReflectionDocuments, selectReflections } from "./selector.mjs";
+import { estimateGuidanceTokens, loadReflectionDocuments, selectReflections } from "./selector.mjs";
 import { deriveReviewerFamilyId } from "./reviewer-result.mjs";
 import { executeLegacyExport, inspectLegacyExport } from "./legacy-export.mjs";
 import { executeGuardCli } from "./convergence-cli.mjs";
@@ -329,7 +333,7 @@ function boundBlockOnSectionBoundaries(body, maxBytes) {
   return { text: kept.join("\n"), dropped };
 }
 
-async function readProjectRulesBlock(projectDir) {
+async function readProjectRulesBlock(projectDir, { prompt = null } = {}) {
   if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) return null;
   const file = path.join(projectDir, ".agent", "rules", "feedback-loop.md");
   let text;
@@ -343,6 +347,61 @@ async function readProjectRulesBlock(projectDir) {
   if (start < 0 || end <= start) return null;
   const body = text.slice(start + "<!-- afl:rules:start -->".length, end).trim();
   if (!body) return null;
+
+  // The block is layered: L0 is a compact index of every family, L1 is the full
+  // instruction text. The file holds all of L1 so a relevant turn can expand
+  // into it; only the sections this prompt touches are injected.
+  //
+  // A block that does not parse as layered (older version, hand edit) falls
+  // through to the flat behaviour below unchanged rather than being dropped.
+  const layered = parseLayeredBlock(body);
+  if (layered) {
+    const { selected, scores } = selectL1Sections({ l1: layered.l1, prompt: prompt ?? "" });
+    const composed = composeInjection({
+      preamble: layered.preamble,
+      l0: layered.l0,
+      selected,
+      maxBytes: RULES_BLOCK_MAX_BYTES,
+      header: "【复发教训规则 — 以下每条都对应本项目已发生 ≥3 次的同类错误，本轮必须遵守】"
+    });
+    if (composed.overBudget) {
+      promptLog("rules_block_injected", { reason: "index_over_budget", count: composed.indexCount });
+    }
+    return {
+      text: composed.text,
+      dropped: 0,
+      // What the turn was actually shown in full. Selection below must still
+      // skip these: injecting one lesson twice in one prompt spends the selection
+      // budget on a repeat. Crucially this is the EXPANDED set, not the whole
+      // index — using the index would suppress every document whose family
+      // appears there, which after this change is every family.
+      coveredFamilies: new Set(
+        selected.map((section) => section.familyKey).filter(Boolean)
+      ),
+      // The same set, published under the name the selector reads when deciding
+      // whether a document may be reduced to a pointer. It is separate because
+      // the two answer different questions: coveredFamilies means "do not inject
+      // this document at all", expandedFamilies means "this document's
+      // instructions are already above, so a pointer is enough".
+      //
+      // Until now this field was never returned, so the selector's pointer
+      // branch at selector.mjs:387 never ran — it read a property that was
+      // always undefined. Only the verbatim method comparison was doing any
+      // work, which is why documents that clearly duplicated the block were
+      // still shipped in full.
+      expandedFamilies: new Set(
+        selected.map((section) => section.familyKey).filter(Boolean)
+      ),
+      layer: {
+        mode: "layered",
+        indexCount: layered.l0.length,
+        sectionCount: layered.l1.length,
+        expanded: selected.length,
+        topScores: scores.slice(0, 3).map((entry) => ({ family: entry.familyKey, score: Number(entry.score.toFixed(2)) }))
+      }
+    };
+  }
+
   const bounded = boundBlockOnSectionBoundaries(body, RULES_BLOCK_MAX_BYTES);
   if (bounded.oversized || bounded.dropped > 0) {
     promptLog("rules_block_injected", {
@@ -356,6 +415,7 @@ async function readProjectRulesBlock(projectDir) {
       bounded.text
     ].join("\n"),
     dropped: bounded.dropped,
+    layer: { mode: "flat" },
     // The families this block already injects on every turn. Selecting the same
     // family again below would inject one lesson twice in one prompt: the rule
     // block is the every-turn channel, so the selector's job is the rest.
@@ -656,9 +716,41 @@ export async function handlePromptHook({
   // lesson twice in one turn and spends the selection budget on a repeat.
   let rulesBlock = null;
   try {
-    rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir);
+    // The prompt is passed so the layered block can expand the sections this
+    // turn actually touches. Reading the block without it would inject the
+    // index alone and lose every instruction.
+    rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir, {
+      prompt: userText
+    });
   } catch (error) {
     promptLog("rules_block_injected", { reason: "read_failed" });
+  }
+
+  // A memory index that is older than the memories it indexes is worse than no
+  // index: it is delivered first, in a position of authority, with the wrong
+  // content. The compiler does not fix that — it cannot know which of the two
+  // texts is right — but it can stop the stale one from being trusted. The
+  // notice is one line naming the drifted files; the bodies stay on disk, so
+  // this costs context only in proportion to how much has actually drifted.
+  let memoryNotice = null;
+  try {
+    const memoryDir = resolveMemoryDir({
+      transcriptPath: input.transcript_path ?? input.transcriptPath ?? null,
+      home: os.homedir(),
+      cwd: input.cwd ?? result.selectionInput.projectDir ?? null
+    });
+    if (memoryDir) {
+      const report = await inspectMemoryIndex({ memoryDir });
+      memoryNotice = renderMemoryDriftNotice(report);
+      if (memoryNotice) {
+        promptLog("memory_drift_noticed", {
+          stale: report.stale.map((entry) => entry.name),
+          count: report.staleCount
+        });
+      }
+    }
+  } catch (error) {
+    memoryNotice = null;
   }
 
   try {
@@ -720,8 +812,23 @@ export async function handlePromptHook({
     } catch {
       familyRecurrence = {};
     }
+    // The same gate the rules block uses, applied to the second channel.
+    //
+    // Gating only the layered block left the job half done: measured on the
+    // instruction 「把这个汇总报告存到 docs/ 下」, the block correctly collapsed
+    // to its 900-byte index while the selector still shipped two full documents
+    // (3 KB) — a lesson about framework-diagram layout and one about release
+    // worktrees. The totals barely moved because the smaller channel was never
+    // the loud one.
+    //
+    // Both channels answer the same question ("does a past lesson apply to this
+    // turn"), so both must answer it the same way. Applying it here also stops
+    // an ordinary instruction from burning an emission record, which would make
+    // that lesson look "delivered" in the effectiveness report for a turn that
+    // could not have used it.
+    const selectionApplies = readsAsProblemOrObjection(result.selectionInput.prompt);
     const selection = selectDocuments({
-      documents: catalog.documents,
+      documents: selectionApplies ? catalog.documents : [],
       familyRecurrence,
       prompt: result.selectionInput.prompt,
       session: result.selectionInput.session,
@@ -729,11 +836,24 @@ export async function handlePromptHook({
       budget: {
         maxCards: lowerOnlyLimit(selectionLimits.maxCards, PROMPT_SELECTION_LIMITS.maxCards),
         maxDocumentTokens: lowerOnlyLimit(selectionLimits.maxDocumentTokens, PROMPT_SELECTION_LIMITS.maxDocumentTokens),
-        maxTotalTokens: lowerOnlyLimit(selectionLimits.maxTotalTokens, PROMPT_SELECTION_LIMITS.maxTotalTokens)
+        // The rules block and the selected documents share one prompt, so they
+        // must share one budget. Layering the block made it much smaller, and
+        // the selector — which had its own separate cap — immediately spent the
+        // freed room on three more documents, landing the combined injection at
+        // 6.9 KB: worse than the flat 5.8 KB it replaced. Measuring each channel
+        // against its own ceiling does not bound the thing the host actually
+        // receives.
+        maxTotalTokens: Math.max(
+          200,
+          lowerOnlyLimit(selectionLimits.maxTotalTokens, PROMPT_SELECTION_LIMITS.maxTotalTokens)
+            - estimateGuidanceTokens(rulesBlock?.text ?? "")
+        )
       },
       priorEmissions,
       publishedBefore: selectionPublishedBefore,
       coveredFamilies: rulesBlock?.coveredFamilies ?? null,
+      expandedFamilies: rulesBlock?.expandedFamilies ?? null,
+      injectedText: rulesBlock?.text ?? "",
       familyKeyOf: (document) => familyKeyByFamilyId.get(document.familyId) ?? null
     });
     const selectionOmissions = [...catalog.omissions, ...selection.omissions];
@@ -769,16 +889,110 @@ export async function handlePromptHook({
 
   // The rules tier compiles recurring lessons into the project rules file, but
   // a file the model is merely told to read is advisory. Injecting the managed
-  // block into every prompt's context makes the recurrence guarantee
-  // mechanical: a rule that reached ≥3 occurrences is seen each turn without
-  // depending on the model choosing to open the file.
+  // block into the prompt's context makes the recurrence guarantee mechanical:
+  // a rule that reached ≥3 occurrences is seen without depending on the model
+  // choosing to open the file.
+  //
+  // What it does NOT do is justify re-pasting the same 6 KB every turn. Measured
+  // on live sessions: a 31-turn session received the block 36 times, 224.7 KB
+  // cumulative, every one of them byte-identical. The block was inside its byte
+  // budget the whole time — that budget governs one injection, not the total,
+  // and nothing was governing the total. The ledger below does: full text on
+  // the first turn, whenever the block changes, and on a fixed cadence; an
+  // index of the covered families in between, so a turn that is not re-sent the
+  // prose still knows which lessons exist.
   try {
     if (rulesBlock) {
-      result.guidance = rulesBlock.text + (result.guidance ? `\n\n${result.guidance}` : "");
+      const sessionUid = result.selectionInput.session?.sessionUid ?? null;
+      const blockDigest = createHash("sha256").update(rulesBlock.text).digest("hex");
+      let ledger = null;
+      try {
+        ledger = sessionUid && typeof controlStore?.getRulesInjectionLedger === "function"
+          ? controlStore.getRulesInjectionLedger({ sessionUid })
+          : null;
+      } catch {
+        ledger = null;
+      }
+      const plan = planRulesInjection({
+        prior: ledger,
+        digest: blockDigest
+      });
+      const families = [...rulesBlock.coveredFamilies];
+      let injected = rulesBlock.text;
+      // The ledger exists to stop re-pasting an UNCHANGING block every turn.
+      // Layering already achieves that a different way: each turn gets the
+      // compact index plus only the sections its own prompt touches, so no two
+      // turns send the same text and the usual size is 2-5 KB rather than 6.
+      //
+      // Replacing that with a family-name index — which is what the flat design
+      // needed — threw away the instructions the layer had just selected. Every
+      // turn after the first received a list of names and no method changes at
+      // all: strictly worse than the flat block it replaced.
+      const layered = rulesBlock.layer?.mode === "layered";
+      if (plan.mode === "compact" && !layered) {
+        const index = renderRulesIndex({
+          families,
+          nextFullAt: plan.lastFullTurn + REANCHOR_TURNS
+        });
+        // No index (a block with no recognisable headings) falls back to the
+        // full text: sending nothing would silently drop the rules channel.
+        if (index) injected = index;
+        else plan.mode = "full";
+      }
+      // The drift notice goes above everything else: it is the only line that
+      // says "something you are about to rely on is wrong", and burying it
+      // between the rules block and the selected lessons would make it the one
+      // line a model skims past.
+      result.guidance = [memoryNotice, injected, result.guidance]
+        .filter(Boolean)
+        .join("\n\n");
       promptLog("rules_block_injected", {
-        bytes: Buffer.byteLength(rulesBlock.text, "utf8"),
+        bytes: Buffer.byteLength(injected, "utf8"),
+        fullBytes: Buffer.byteLength(rulesBlock.text, "utf8"),
+        mode: plan.mode,
+        reason: plan.reason,
+        turn: plan.turn,
         covered: rulesBlock.coveredFamilies.size
       });
+      // The same facts, written where they survive. promptLog is debug-only, so
+      // until now the question "which families did this prompt actually expand,
+      // and was that the right choice" had no record outside a hand-labelled
+      // corpus. That corpus is optimistically biased (11 of 47 rows quote the
+      // document verbatim), so no change to the matching could be judged on it.
+      // Real traffic is the only honest source; this is where it comes from.
+      try {
+        const projectId = result.selectionInput.projectDir ?? result.selectionInput.task?.fingerprint ?? null;
+        if (projectId && typeof controlStore?.recordInjectionTelemetry === "function") {
+          controlStore.recordInjectionTelemetry({
+            projectId,
+            promptDigest: createHash("sha256").update(userText, "utf8").digest("hex"),
+            expandedFamilies: [...(rulesBlock.expandedFamilies ?? rulesBlock.coveredFamilies ?? [])],
+            topScores: rulesBlock.layer?.topScores ?? [],
+            indexCount: rulesBlock.layer?.indexCount ?? 0,
+            sectionCount: rulesBlock.layer?.sectionCount ?? 0,
+            injectedBytes: Buffer.byteLength(injected, "utf8"),
+            mode: plan.mode,
+            reason: plan.reason
+          });
+        }
+      } catch {
+        // Telemetry must never fail the prompt. A missed row costs one data
+        // point; a thrown error costs the user their turn.
+      }
+      if (sessionUid && typeof controlStore?.recordRulesInjection === "function") {
+        try {
+          controlStore.recordRulesInjection({
+            sessionUid,
+            digest: blockDigest,
+            turn: plan.turn,
+            lastFullTurn: plan.lastFullTurn,
+            mode: plan.mode
+          });
+        } catch {
+          // A failed ledger write costs at most one extra full injection next
+          // turn; it must never fail the prompt itself.
+        }
+      }
     }
   } catch (error) {
     promptLog("rules_block_injected", { reason: "selection_failed" });
@@ -1143,6 +1357,25 @@ export async function main(args, {
           declines: store.listFamilyDeclineCounts({ projectId: projectDir })
         });
         console.log(JSON.stringify(summary, null, 2));
+        return;
+      }
+      if (subcommand === "rules") {
+        // Re-projects the every-turn rules block from current store state.
+        //
+        // Without this, the block only changes when a review publishes a new
+        // lesson — so a change to how the block is composed (a new merge key, a
+        // better summary source) never reaches an existing project until its
+        // next publication, which on a quiet project may be never. That is the
+        // difference between "the fix is deployed" and "the fix is in effect".
+        const result = await maybeUpdateRulesTier({ store, projectId: projectDir, projectDir });
+        console.log(JSON.stringify({
+          projectDir,
+          updated: result.updated,
+          reason: result.reason ?? null,
+          path: result.path ?? null,
+          familyCount: result.familyCount ?? null,
+          budget: result.budget ?? null
+        }, null, 2));
         return;
       }
       throw new Error(`unknown reflections subcommand: ${subcommand}`);
