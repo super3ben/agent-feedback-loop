@@ -1,6 +1,6 @@
 {
   "name": "agent-feedback-loop-dsh",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Native DeepSeek Harness plugin: feeds every prompt into the local agent-feedback-loop capture pipeline and injects compiled recurrence rules back as context.",
   "type": "module",
   "main": "index.js",

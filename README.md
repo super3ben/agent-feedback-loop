@@ -3,7 +3,7 @@
 Local prompt-time feedback learning for
 Codex, Claude Code, and Gemini CLI. [中文说明](README-zh.md)
 
-**Runtime version: `0.9.0`**
+**Runtime version: `0.10.0`**
 
 ## Feedback learning
 

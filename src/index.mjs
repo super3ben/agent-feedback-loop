@@ -29,7 +29,7 @@ import { RULES_BLOCK_BUDGET_BYTES, readRulesBlockBudget } from "./rules-writer.m
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SRC_DIR, "..");
 const TEMPLATE_ROOT = path.join(PACKAGE_ROOT, "templates");
-export const RUNTIME_VERSION = "0.9.0";
+export const RUNTIME_VERSION = "0.10.0";
 
 const CONVERGENCE_MODULES = Object.freeze([
   "convergence-adapters.mjs",
