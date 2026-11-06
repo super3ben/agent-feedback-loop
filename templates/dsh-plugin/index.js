@@ -19,6 +19,34 @@ export const name = "agent-feedback-loop";
 
 const DEFAULT_HOOK_TIMEOUT_MS = 10_000;
 
+/**
+ * The `source` this plugin stamps on the message it injects.
+ *
+ * DSH's durable session format owns message-source syntax, and it changed
+ * between versions. Format v3 accepted `{ kind: "plugin", plugin: "<name>" }`;
+ * format v4 refuses it — `@deepseek-ai/dsh-session-format-v3-to-v4` throws
+ * "format v4 message requires a producer-owned source kind" from row admission,
+ * and the throw terminates the whole turn. The failure surfaces to the user as
+ * "本轮运行失败" with no assistant message logged at all, because the injected
+ * message is rejected as it is written to disk.
+ *
+ * v4's own rule (`producerKind`) is to name the producer: third-party plugins
+ * get `plugin:<package>`, which is also what historical v3 rows were migrated
+ * to. Emitting that shape is therefore correct on v4 and consistent with what
+ * the same log already contains.
+ *
+ * The version comes from the session header — the log's format version, not the
+ * plugin's. Anything that is not a number below 4 gets the v4 shape, including
+ * an absent header: guessing "old" would recreate the exact failure this exists
+ * to prevent, while guessing "new" at worst produces a source kind a v3 log
+ * tolerates (v3 does not police `kind`).
+ */
+export function producerSource(sessionFormatVersion) {
+  return typeof sessionFormatVersion === "number" && sessionFormatVersion < 4
+    ? { kind: "plugin", plugin: name }
+    : { kind: `plugin:${name}` };
+}
+
 function defaultHookCommand() {
   return path.join(homedir(), ".agent", "feedback-loop", "hooks", "core-hook.sh");
 }
@@ -113,7 +141,7 @@ export function apply(ctx, config = {}) {
           id: randomUUID(),
           role: "user",
           content: [{ type: "text", text: additionalContext }],
-          source: { kind: "plugin", plugin: name }
+          source: producerSource(agent?.session?.header?.version)
         }
       ]
     };

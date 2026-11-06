@@ -179,6 +179,14 @@ patch 层激活；`install` 绝不写 profile 的 `cordis.patch.yml`（那里的
 bundle 层在 loader entry id 上冲突，harness 将拒绝启动）。bundle 登记机制之前
 的旧安装会被自动迁移：其写入的托管 patch 行会被移除。
 
+插件注入的消息带一个 `source`，其 `kind` 必须是生产者自有 kind
+（`plugin:<包名>`），不能再用已退役的 `{ kind: "plugin", plugin }` 包装。DSH 的
+持久化会话格式管这套语法：格式 v4 在落盘准入阶段拒绝该包装
+（`format v4 message requires a producer-owned source kind`），而这个异常会终止
+整个轮次，用户看到的是「本轮运行失败」且日志里没有任何 assistant 消息。插件会读
+会话的格式版本并下发对应写法；版本缺失时按 v4 下发——猜「旧」会重现这个故障，
+猜「新」最坏只是发出一个 v3 日志本来就不校验的 kind。
+
 安装后需重启 harness，运行中的实例才会加载插件。dsh home 跟随安装 home
 （真实用户即 `~/.dsh`）；用 `--home` 指向一次性目录即可在不触碰真实 profile
 的情况下试接线。

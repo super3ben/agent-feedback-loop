@@ -226,6 +226,16 @@ up. The dsh home follows the install home (`~/.dsh` for the real user); pass
 `--home` with a disposable directory to try the wiring without touching a real
 profile.
 
+The message the plugin injects carries a `source` whose `kind` must be a
+producer-owned kind — `plugin:<package>` — not the retired
+`{ kind: "plugin", plugin }` wrapper. DSH's durable session format owns that
+syntax: format v4 rejects the wrapper during row admission
+(`format v4 message requires a producer-owned source kind`), and the throw ends
+the whole turn, so the user sees a failed turn with no assistant message at all.
+The plugin reads the session's format version and emits the matching shape, and
+falls back to the v4 form when the version is absent — guessing "old" recreates
+the failure, while guessing "new" at worst emits a kind a v3 log tolerates.
+
 `doctor` returns `{ version, status }`. `status.ready` remains the prompt/Markdown
 pipeline gate.
 
