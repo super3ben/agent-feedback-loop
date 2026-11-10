@@ -11,6 +11,7 @@ import { initializeControlStore, openControlStore } from "./control-store.mjs";
 import { BlobKeyProvider, EncryptedBlobStore } from "./crypto-store.mjs";
 import { detectFeedbackCandidate, feedbackSourceIdentity, isNeutralOperationPrompt } from "./feedback-signal.mjs";
 import { launchDetachedDirectionReview, launchDetachedLLMClassifier, launchDetachedReviewer, recoverDueClassifiers, recoverDueReviewers } from "./reviewer-launcher.mjs";
+import { hardCapFor, startProcessWatchdog } from "./process-watchdog.mjs";
 import { buildDirectionContext, readTranscriptTail } from "./direction-review.mjs";
 import { lessonGist, listLessons, summarizeGuard, summarizeReviews } from "./status-report.mjs";
 import { resolveLanguage, padLabel, strings } from "./language.mjs";
@@ -1227,6 +1228,16 @@ export async function main(args, {
     const ownerId = `reviewer-${process.pid}`;
     const startedAt = Date.now();
     let providerName = "unknown";
+    // Hard wall-clock cap enforced from a second thread. The provider timeout
+    // below cannot cover the failure that actually happened: five detached
+    // reviewers finished (job state "published") and then spun at 99% CPU for
+    // nineteen hours, because a flood of promise microtasks starved the timer
+    // queue. A deadline that shares the stalled thread never runs, so this one
+    // lives in a worker. See src/process-watchdog.mjs.
+    const watchdog = startProcessWatchdog({
+      hardCapMs: hardCapFor(Number(optionValue(options.args, "--timeout-ms",
+        process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 300_000)))
+    });
     try {
       const storedContext = store.getReviewContext({ jobId, priorLimit: 0, followingLimit: 0 });
       providerName = storedContext?.source?.source_provider ?? "unknown";
@@ -1273,6 +1284,9 @@ export async function main(args, {
       });
       throw error;
     } finally {
+      // Releasing the watchdog on the normal path is what keeps this a floor
+      // rather than a time bomb: a run that finished has nothing left to cap.
+      watchdog.stop();
       store.close();
     }
     return;
@@ -1287,6 +1301,12 @@ export async function main(args, {
     const jobId = optionValue(options.args, "--job-id");
     const ownerId = `classifier-${process.pid}`;
     const startedAt = Date.now();
+    // Same detached shape, same unbounded-exit risk: a classifier whose model
+    // call returns but whose promise chain spins would keep a core forever.
+    const watchdog = startProcessWatchdog({
+      hardCapMs: hardCapFor(Number(optionValue(options.args, "--timeout-ms",
+        process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 300_000)))
+    });
     try {
       const verdict = await runLLMClassifier({
         store,
@@ -1308,6 +1328,7 @@ export async function main(args, {
         durationMs: Date.now() - startedAt
       });
     } finally {
+      watchdog.stop();
       store.close();
     }
     return;
@@ -1471,6 +1492,12 @@ export async function main(args, {
     const transcriptPath = optionValue(options.args, "--transcript");
     const startedAt = Date.now();
     let outcome = "failed";
+    // Third detached entry, same risk: verdict delivery runs after the model
+    // call returns, so a spin there outlives every provider timeout.
+    const watchdog = startProcessWatchdog({
+      hardCapMs: hardCapFor(Number(optionValue(options.args, "--timeout-ms",
+        process.env.AGENT_FEEDBACK_LOOP_REVIEWER_TIMEOUT_MS || 180_000)))
+    });
     try {
       const monitor = store.getExecutionMonitor({ monitorId });
       if (!monitor) throw new Error("monitor_missing");
@@ -1510,6 +1537,7 @@ export async function main(args, {
     } catch {
       try { store.recordExecutionDiagnosis({ monitorId, failed: true }); } catch {}
     } finally {
+      watchdog.stop();
       reviewerTerminalLog({ outcome, job: monitorId, durationMs: Date.now() - startedAt });
       store.close();
     }
