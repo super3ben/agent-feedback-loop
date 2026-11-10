@@ -24,3 +24,10 @@ test/
 docs/
 openspec/
 .superpowers/
+
+# Never commit registry credentials: a token here can publish as the owner.
+.npmrc
+
+# Runtime artifacts (reflections, rules, state) belong to a project, never to a
+# shipped template: install copies the template tree recursively.
+templates/**/.agent/
