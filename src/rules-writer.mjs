@@ -231,7 +231,15 @@ function trimToChars(value, max) {
   const text = String(value ?? "").trim();
   const chars = Array.from(text);
   if (chars.length <= max) return text;
-  const clipped = chars.slice(0, max).join("");
+  // The ellipsis is part of the budget. Clipping to `max` and then appending
+  // "…" returned max+1 characters, so this function had a fixed point ABOVE
+  // its own limit: trimming a 121-character result asked for ≤120 produced the
+  // same 121-character string again, forever. That is what hung five detached
+  // reviewers at 99% CPU for nineteen hours — the shrink loop in renderFamily
+  // treats "still over the limit" as "made progress" and never exits.
+  const budget = Math.max(0, max - 1);
+  if (budget === 0) return "…";
+  const clipped = chars.slice(0, budget).join("");
   // Prefer ending on a complete clause; fall back to the hard cut.
   const boundary = Math.max(
     clipped.lastIndexOf("；"),
@@ -239,7 +247,7 @@ function trimToChars(value, max) {
     clipped.lastIndexOf("，"),
     clipped.lastIndexOf("; ")
   );
-  return `${(boundary > max * 0.5 ? clipped.slice(0, boundary) : clipped).trimEnd()}…`;
+  return `${(boundary > budget * 0.5 ? clipped.slice(0, boundary) : clipped).trimEnd()}…`;
 }
 
 /**
@@ -327,8 +335,19 @@ function renderSection(family, demoted) {
       return true;
     }
   ];
+  // The loop must make progress or stop. "Still over the limit" is not the
+  // same as "the step shrank something": trimToChars used to return a fixed
+  // point just above the limit it was given, so step 0 reported success while
+  // changing nothing and this loop never exited. Comparing the rendered length
+  // between iterations catches that class of bug for any future step, instead
+  // of depending on each step's guard being exactly right.
   for (const step of shrinkSteps) {
-    while (byteLength(rendered) > MAX_SECTION_BYTES && step()) rendered = compose();
+    while (byteLength(rendered) > MAX_SECTION_BYTES) {
+      const before = rendered;
+      if (!step()) break;
+      rendered = compose();
+      if (rendered === before) break;
+    }
     if (byteLength(rendered) <= MAX_SECTION_BYTES) break;
   }
   return rendered;
