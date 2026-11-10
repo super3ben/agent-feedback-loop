@@ -17,6 +17,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { syncMarketplace } from "./marketplace.mjs";
+
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, "..");
 
@@ -130,7 +132,24 @@ async function main() {
   }
   say(`${name}@${version} is live`);
 
-  process.stdout.write(`\n✓ ${name}@${version} pushed to GitHub and published to npm\n`);
+  // Runs last on purpose: the marketplace is a separate repository with its own
+  // maintainers, so a problem there must not fail a release that already
+  // reached npm. It opens a pull request; it never writes to their main.
+  const marketplace = await syncMarketplace({ dryRun: false });
+
+  const summary = [
+    `✓ ${name}@${version}`,
+    "  GitHub   pushed",
+    "  npm      published"
+  ];
+  summary.push(
+    marketplace.status === "opened"
+      ? `  dsh      pull request opened (${marketplace.url})`
+      : marketplace.status === "unchanged"
+        ? "  dsh      entry already current"
+        : "  dsh      not updated — see the warning above"
+  );
+  process.stdout.write(`\n${summary.join("\n")}\n`);
 }
 
 main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
