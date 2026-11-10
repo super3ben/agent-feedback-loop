@@ -174,24 +174,70 @@
 
 <!-- afl:rules:start -->
 
-<!-- afl:rules:budget 2646/6144 demoted=0 -->
-### backtest-calculation-metric-validity, backtest-conclusion-inconsistency, platform-formula-syntax-support (16×, Major)
+<!-- afl:rules:budget 5623/65536 demoted=0 -->
 
-同一类问题在评审中反复被拒为「不足以沉淀」的时机/证据门槛不成立：用户已明确反馈，评审却以事后纠正、未部署、用户转述或前瞻建议为由拒绝沉淀，导致该问题反复发生却从未被记入反思。
+### platform-formula-syntax-support (7×, Major)
+
+**何时适用：**
+- 当任务涉及「一句话选股、现在是什么问题导致我同花顺选不出来？没看到原因、连续多轮反馈选到 0 只」时，或用户以相近说法指出同类问题时
+- when the task involves 一句话选股、现在是什么问题导致我同花顺选不出来？没看到原因、连续多轮反馈选到 0 只, or the user raises the same class of problem in similar words
+
+用户在同花顺「一句话选股」跑超卖策略，连续多轮反馈选到 0 只，本次追问「现在是什么问题导致我同花顺选不出来？没看到原因」…
 
 **Do not repeat this mistake:**
 - 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
 - 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
+
+### backtest-calculation-metric-validity (7×, Major)
+
+**何时适用：**
+- 当任务涉及「用户在迭代S3策略次日买入时机规则（C/D/E对比）时、agent交付了完整的五版规则对比分析、以总收益为主要排序依据（D版+332.4%最高」时，或用户以相近说法指出同类问题时
+
+用户在迭代S3策略次日买入时机规则（C/D/E对比）时，agent交付了完整的五版规则对比分析，以总收益为主要排序依据（D版+332.4%最高，E版+280.6%推荐）。用户随后反馈两个问题：(1)自己关注的是优化亏损而非盈利…
+
+**Do not repeat this mistake:**
+- 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
+- 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
+
 ### design-phase-generation-counting (7×, Major)
 
-在「用户报告的症状」和「我改动的代码路径」之间缺少闭环校验就宣布修复完成：用替代性证据（新增测试全绿、修改文件数量）代替对原始触发场景的复现，导致修复落到与自己诊断结论不同的子系统上，且豁免默认不生效，症状照旧而用户被告知「已经修好了」。
+**何时适用：**
+- 当用户说 guard 经常误报、阻塞比正常修复还多，要求先关掉或放宽守卫时
 
 **Do not repeat this mistake:**
 - 修复用户报告的拦截/误报前，先写下触发它的确切路径（模块 + 函数 + 判定分支，如 convergence-policy.mjs 的 unchangedBasisRepeatedMutation），交付时逐条核对改动是否落在同一路径；若落在别处，必须在交付说明中写明覆盖差异，不得宣称「已修好」。
 - 当仓库存在多套同职责守卫（execution-hook.mjs 的 recordExecutionToolCall 与 convergence-policy.mjs 的 evaluateConvergence）时，先确认用户看到的那条阻塞消息由哪一套产生，再动手改。
 - 以复现原始触发场景（重跑用户截图/日志里那次被拦的操作并确认不再触发）作为完成判据；单元测试通过只是辅助证据，不能单独支撑「现在已经修好了」。
-- 当豁免依赖外部信号文件或环境状态时，先验证这些文件在用户实际工作环境中是否存在并会被写入；若默认不存在，则默认等于未生效，须在交付说明中标注默认行为与开启方式。
-- 交付说明区分「已解决的部分」与「未覆盖的部分」，禁止用一句总括式「现在已经修好了」覆盖只完成一半的改动。
-- 当用户在实现过程中仍抱怨被守卫或 grant 打断时，把它当作验收未通过的信号当场核对，而不是在总结里重述「这正是本 feature 要解决的问题」。
+
+### backtest-conclusion-inconsistency (5×, Major)
+
+**何时适用：**
+- 当任务涉及「用户询问为何此前的策略都没达到50%胜率、或加入-3%/-8%卖出规则后胜率仍只有约30%、要求分析原因」时，或用户以相近说法指出同类问题时
+- when the task involves 用户询问为何此前的策略都没达到50%胜率、或加入-3%/-8%卖出规则后胜率仍只有约30%、要求分析原因, or the user raises the same class of problem in similar words
+
+用户询问为何此前的策略都没达到50%胜率，或加入-3%/-8%卖出规则后胜率仍只有约30%，要求分析原因。被评审的agent先整理了同花顺一句话选股条件（量能三限制、形态过滤等）…
+
+**Do not repeat this mistake:**
+- 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
+- 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
+
+### reflection-context-ineffective (3×, Major)
+
+**何时适用：**
+- 当任务涉及「ssh 每次都用密钥而不是用密码去登录、连不上 / 登不进去、key 免密直连可用、key 已失效、用密码、事实与教训分离、让 agent 自组方案智脑团队研究如何保证用户澄清过的」时，或用户以相近说法指出同类问题时
+
+用户要求以「ssh 每次都用密钥而不是用密码去登录」这个反复出现的例子，让 agent 自组方案智脑团队研究如何保证用户澄清过的事不再重复、以及现在怎么改。被评审交付是两份审计回来后的阶段性合成：该 SSH 教训注入 85 次问题仍复发…
+
+**Do not repeat this mistake:**
+- 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
+- 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
+
+**本项目已记录的全部教训家族**
+
+- platform-formula-syntax-support (7×)
+- backtest-calculation-metric-validity (7×)
+- design-phase-generation-counting (7×)
+- backtest-conclusion-inconsistency (5×)
+- reflection-context-ineffective (3×)
 
 <!-- afl:rules:end -->
