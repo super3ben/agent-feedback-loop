@@ -139,6 +139,35 @@ automatic:
   phrase users actually type lived in the oldest. All published documents for a
   family now contribute conditions.
 
+#### A fact is a claim with a window, not a permanent truth
+
+An index line can carry a short fact, and that fact is what makes the entry
+actionable rather than merely named. But a fact decays: guidance that was
+correct in November was wrong in October, because the constraint it described
+had changed under it. Nothing in the block used to distinguish those two states.
+
+Index facts now carry their age in three steps:
+
+- **Current** — confirmed within 90 days. Stated flatly.
+- **Stale** — 90 to 120 days. The text stays, plus 可能已过期·先验证. Deleting it
+  would throw away what was learned; the warning is what changes.
+- **Dormant** — past 120 days with no recurrence and nothing live. The fact is
+  withdrawn but the family keeps its name, so the lesson is still discoverable.
+
+Dormancy is gated: if more than 30% of recent review jobs failed to classify,
+the pipeline cannot tell "quiet" from "not observed", and nothing is marked
+dormant. A family with no datable evidence is marked stale, never dormant —
+absence of a date is not evidence of age.
+
+#### Same class, one document
+
+One file per reviewed incident means a class the user keeps hitting arrives as N
+near-identical documents, each competing for the same injection budget as a
+genuinely different lesson. Documents whose mistake class matches are collapsed
+into one at read time — never on disk, so the delivery log's document hashes
+stay intact — with the newest document's instructions winning within a family
+and method changes unioned across families, capped at five.
+
 #### What each turn actually received is recorded
 
 Every injection writes a telemetry row — which families were expanded, at what
@@ -204,6 +233,36 @@ rm -rf "$tmp_home"
 Installation copies package assets, selects the runtime, migrates the selected
 control schema, and configures the prompt hooks. It does not register Stop/AfterAgent
 hooks, start a service, or create a learning reader.
+
+### Releasing
+
+Releases are cut locally and published by CI, never by a stored credential:
+
+```sh
+node scripts/publish.mjs              # verify, push main, tag vX.Y.Z, wait for CI
+node scripts/publish.mjs --dry-run    # every check, push and publish nothing
+```
+
+The tag triggers `.github/workflows/publish.yml`, which re-runs the suite,
+re-runs the tarball guard, skips a version already on the registry, publishes
+with `--provenance`, and polls until the registry actually serves the new
+version. Authentication is an OIDC exchange between GitHub and npm: there is no
+`NODE_AUTH_TOKEN`, no `_authToken` in `~/.npmrc`, and nothing to rotate.
+
+This matters because npm is retiring 2FA-bypass tokens for direct publishing —
+account changes since August 2026, direct publishing from January 2027. A local
+token is no longer a durable release path, so the workflow token is the release
+identity instead. A release is traceable to one immutable tag by construction.
+
+One-time setup lives on npmjs.com, not in this repository: Package → Settings →
+Trusted Publisher → GitHub Actions, workflow `publish.yml`. Until that binding
+exists the publish step fails 404/401, which is the expected symptom of a
+missing binding rather than a broken workflow.
+
+`node scripts/marketplace.mjs` refreshes the dsh marketplace entry separately.
+It opens a pull request from this account's fork of the marketplace repository
+and never writes to its `main`; it runs on ordinary `gh` credentials, so it is
+not part of the release workflow.
 
 ### DeepSeek Harness (`dsh`)
 
