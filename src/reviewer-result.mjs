@@ -83,6 +83,38 @@ function normalizedArray(value, { name, minItems = 0, maxItems, maxLength, scan 
   return normalized;
 }
 
+/**
+ * A method change is a claim about what the NEXT session must do, so it has to
+ * name an action and its objects. A pointer — "先检查项目规则和已有反思，确认
+ * 是否已有授权认证方式" — reads as advice but gives the reader nothing to
+ * execute, and a reader that cannot execute it falls back to what it was going
+ * to do anyway.
+ *
+ * This is not theoretical. The SSH credential lesson delivered exactly that
+ * pointer for months: 85 injections, the same mistake still recurring. The
+ * actionable statement ("连 192.168.100.1 用密码，不加 BatchMode=yes") existed
+ * the whole time, in a hand-written rules file the injection never read.
+ *
+ * Vague phrasing is not banned outright — some evidence genuinely supports only
+ * a direction, and refusing to publish would lose it. What it must not be is the
+ * cheap default, so a pointer that names neither a concrete object nor a
+ * concrete action is refused, and the message says what to add.
+ */
+const POINTER_PHRASE = /^\s*(?:先|要|应|需要|务必|请)?\s*(?:检查|确认|核对|查(?:看|一下|查)?|核实|排查|评估|了解|弄清|回顾|审视|参考|注意)/u;
+const CONCRETE_ANCHOR = /[`'"“”][^`'"“”]{2,}[`'"“”]|[\w.-]+@[\d.]+|\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[A-Za-z][A-Za-z0-9_.-]{2,}\b/u;
+
+function requireActionable(items, { name }) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  // One concrete entry is enough: a lesson may pair a direction with the action
+  // that makes it executable, and requiring every line to be concrete would
+  // reject a useful pairing for the sake of uniformity.
+  const hasConcrete = items.some((item) => !POINTER_PHRASE.test(item) || CONCRETE_ANCHOR.test(item));
+  if (!hasConcrete) {
+    fail(`${name} must state an action and its object, not a pointer to look elsewhere`);
+  }
+  return items;
+}
+
 function allowedFamilySet(value) {
   if (!Array.isArray(value) || value.length > 512) fail("allowedFamilyIds must be a bounded array");
   const result = new Set();
@@ -182,6 +214,9 @@ export function validateReviewerResult(value, {
     maxItems: 16,
     maxLength: 128
   });
+  const methodChanges = normalizedArray(value.method_changes, {
+    name: "method_changes", minItems: 1, maxItems: 8, maxLength: 512, scan: true
+  });
   const families = allowedFamilySet(allowedFamilyIds);
   let familyId = null;
   let proposedFamilyKey = null;
@@ -233,9 +268,7 @@ export function validateReviewerResult(value, {
     class_of_mistake: normalizedString(value.class_of_mistake, {
       name: "class_of_mistake", maxLength: 2_048, scan: true
     }),
-    method_changes: normalizedArray(value.method_changes, {
-      name: "method_changes", minItems: 1, maxItems: 8, maxLength: 512, scan: true
-    }),
+    method_changes: requireActionable(methodChanges, { name: "method_changes" }),
     repeated_pattern_evidence: normalizedArray(value.repeated_pattern_evidence, {
       name: "repeated_pattern_evidence", maxItems: 8, maxLength: 512, scan: true
     }),

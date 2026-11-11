@@ -73,6 +73,37 @@ const UNCLASSIFIED_GRACE_DAYS = 21;
  * protected the wrong families. The pipeline's health is measurable without
  * that guess, and it is the same judgement for every family.
  */
+/**
+ * The one line an index entry can afford, taken from a captured turn.
+ *
+ * The index fact is the only instruction a never-published family carries, so
+ * whatever lands here is all the next session gets. Raw capture text is not
+ * that: measured across three live projects, 2 of 42 index lines were XML
+ * envelopes (`<task-notification>`, `<agent-message>`) and several more were
+ * image placeholders, file listings, or the harness's own scaffolding — text
+ * that mentions the incident without saying anything about what to do.
+ *
+ * A sentence that survives this filter is still not an instruction, but it is at
+ * least the user's own words about the situation, which is what the matching
+ * reads. Anything that is only envelope is dropped so the entry renders as a
+ * bare name rather than a name followed by noise.
+ */
+const ENVELOPE_START = /^\s*(?:<task-notification|<agent-message|<tool-use|<output-file|## Files mentioned by the user|\[Image(?:\s*#\d+)?\]|\[Pasted)/iu;
+const ENVELOPE_ANY = /<task-id>|<tool-use-id>|<output-file>|toolu_[A-Za-z0-9]{10,}|<\/?(?:task-notification|agent-message|tool-use)>/iu;
+const FILE_LISTING = /^\s*(?:```|##\s|[-*]\s+[\w./-]+\.\w{1,6}\s*$)/u;
+const MIN_FACT_CHARS = 6;
+
+function indexFactFrom(text) {
+  const collapsed = String(text ?? "").replace(/\s+/gu, " ").trim();
+  if (collapsed.length < MIN_FACT_CHARS) return null;
+  if (ENVELOPE_START.test(collapsed) || ENVELOPE_ANY.test(collapsed)) return null;
+  if (FILE_LISTING.test(collapsed)) return null;
+  // An image-only turn says "look at this", not what the problem is. The
+  // attachment itself is not in the index, so there is nothing to read.
+  if (/^\[Image[^\]]*\]\s*$/u.test(collapsed)) return null;
+  return collapsed;
+}
+
 function pipelineTrustworthy({ total, unclassified, maxUnclassifiedRatio = 0.3 }) {
   if (!total) return false;
   return unclassified / total <= maxUnclassifiedRatio;
@@ -305,7 +336,7 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
         for (const event of events) {
           if (!event.encrypted_raw_ref) continue;
           const text = await readBlob(event.encrypted_raw_ref);
-          const cleaned = String(text ?? "").replace(/\s+/gu, " ").trim();
+          const cleaned = indexFactFrom(String(text ?? ""));
           if (cleaned) { quote = cleaned; break; }
         }
       } catch {

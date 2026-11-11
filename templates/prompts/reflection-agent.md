@@ -146,18 +146,40 @@ matches after the mistake has been repeated. Phrase it as the trigger instead
 ("when connecting to a remote server over ssh", "when server credentials are
 needed") so the lesson arrives while it can still prevent the mistake.
 
-Build those conditions out of the words the user actually typed, not a tidier
-paraphrase. Matching is literal, so a lesson that says 连接 never matches a
-request that says 登录. Carry the user's own terms — and the concrete tool,
-host, and command names from the evidence — into the conditions verbatim.
+Write each condition as a **summary of the situation**, not as a transcription
+of one utterance. The user will not repeat the same sentence: they will say the
+same thing in a hundred ways, and matching is word overlap, so a condition that
+only quotes this one incident is reached only by someone who happened to phrase
+it identically. A condition earns its place by covering the ways the situation
+actually recurs:
 
-Write every `applies_when` condition once, in the language the user wrote in.
-Do not also translate it: the user works in one language, so a second rendering
-spends the condition budget on a string that will never match anything they
-type, and the budget is small enough that the duplicate costs real coverage.
-Keep technical identifiers (tool names, flags, paths, command names) verbatim
-even when the surrounding sentence is Chinese — those are what a later prompt
-actually repeats.
+- Name the situation and the concrete objects in it (the server, the command,
+  the flag, the file), because those stay stable while the phrasing does not.
+- Fold in the variants of the complaint you can see evidence for — 「连不上」
+  「登不进去」「又问我要密码」「密码不是给过吗」 are one situation, and a
+  condition that carries all of them is reached by all of them.
+- Keep the user's own wording inside the summary. Do not replace it with a
+  tidier synonym: matching is literal, so a condition that says 连接 never
+  matches a request that says 登录.
+
+Write every `applies_when` condition once, in the language the user writes in.
+Never also write an English rendering, or a translation in any other language:
+the user works in one language, the second copy can never match anything they
+type, and it costs budget the real conditions need. Keep technical identifiers
+(tool names, flags, paths, command names) verbatim even inside a Chinese
+sentence — those are what a later prompt actually repeats.
+
+`method_changes` is what the next session must DO, so each entry is an
+instruction with an object, not a pointer to somewhere else. 「先检查项目规则、
+已有反思和记忆摘要，确认是否已有授权认证方式」 is not an instruction: it tells
+the reader to go looking, in a place the reader may never reach, and it is what
+a lesson actually delivered for months while the same mistake kept recurring.
+State the action and its concrete parameters — 「连 192.168.100.1 用密码认证，
+不加 BatchMode=yes」.
+
+Use vague pointer phrasing only when the specific action genuinely cannot be
+determined from the evidence, and then say what is missing. Do not use it as a
+default because it is safe to write.
 
 Ground `facts`, `user_complaint`, `root_cause`, and
 `repeated_pattern_evidence` only in the supplied source, direct referent, nearby
