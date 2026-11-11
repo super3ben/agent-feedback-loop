@@ -74,6 +74,17 @@ const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 const REVIEW_DECLINE_META_PREFIX = "review_decline:v1:";
 const REVIEW_DECLINE_MAX_STORED = 256;
 const REVIEW_DECLINE_MAX_TEXT = 600;
+// Why a review FAILED, not why it declined.
+//
+// A failure used to record only its code — provider_invalid — which says a
+// review broke but never what broke. Measured on a live project: 153 reviews
+// failed on provider_invalid over three weeks and the cause could not be
+// recovered from any stored record, so every diagnosis of it was a guess. The
+// message is the evidence, so it is kept even though it is diagnostic prose
+// rather than a fact about the user.
+const REVIEW_FAILURE_META_PREFIX = "review_failure:v1:";
+const REVIEW_FAILURE_MAX_STORED = 256;
+const REVIEW_FAILURE_MAX_TEXT = 500;
 // What rules block this session has already been sent, and when it was last
 // sent in full.
 //
@@ -1711,6 +1722,29 @@ function createStore(database, now) {
         WHERE project_id=? AND family_key IS NOT NULL AND state='reviewed_no_lesson'
         GROUP BY family_key`).all(safeProjectId).map((row) => ({ ...row }));
     },
+    // The complaints behind a family's reviews, newest first.
+    //
+    // A family that keeps being declined never publishes, so it has no lesson
+    // document to project from — and the decline prose that would describe it
+    // lives in a capped store_meta ring that has usually evicted it by the time
+    // anyone looks. The captured turn is the durable copy: it is written before
+    // the review exists and nothing prunes it. Returning the blob reference
+    // rather than the text keeps decryption with the caller that owns the key.
+    listFamilySourceEvents({ projectId, familyKey, limit = 6 }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const safeFamilyKey = assertString(familyKey, "familyKey", 128);
+      if (!FAMILY_KEY_PATTERN.test(safeFamilyKey)) throw new TypeError("familyKey is not a controlled key");
+      const safeLimit = assertLimit(limit, "limit", 6, 32);
+      if (safeLimit === 0) return [];
+      return database.prepare(`SELECT job.job_id, job.created_at, job.result_code,
+          event.role, event.encrypted_raw_ref
+        FROM reviewer_jobs AS job
+        JOIN session_events AS event ON event.event_uid = job.source_event_uid
+        WHERE job.project_id=? AND job.family_key=?
+        ORDER BY job.created_at DESC, job.job_id LIMIT ?`)
+        .all(safeProjectId, safeFamilyKey, safeLimit)
+        .map((row) => ({ ...row }));
+    },
     listRecentReviewJobs({ limit = 64 } = {}) {
       const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, 512) : 64;
       return database.prepare(`SELECT job_id, state, created_at, completed_at, published_path
@@ -1901,8 +1935,14 @@ function createStore(database, now) {
       const safeProjectId = assertString(projectId, "projectId", 4096);
       const safeLimit = assertLimit(limit, "limit", 128, 512);
       if (safeLimit === 0) return [];
+      // lastSeenAt travels with the count because a fact's age decides whether
+      // it is still true: the SSH credential fact was correct in November and
+      // wrong in October, when key auth still worked. A count alone cannot tell
+      // a live fact from a stale one.
       return database.prepare(`SELECT historic_job.family_key AS familyKey,
-          COUNT(DISTINCT source_event.content_hash) AS occurrences
+          COUNT(DISTINCT source_event.content_hash) AS occurrences,
+          MAX(historic_job.created_at) AS lastSeenAt,
+          MIN(historic_job.created_at) AS firstSeenAt
         FROM reviewer_jobs AS historic_job
         JOIN session_events AS source_event ON source_event.event_uid=historic_job.source_event_uid
         WHERE historic_job.project_id=? AND historic_job.family_key IS NOT NULL
@@ -1910,7 +1950,12 @@ function createStore(database, now) {
         ORDER BY occurrences DESC, historic_job.family_key
         LIMIT ?`)
         .all(safeProjectId, safeLimit)
-        .map((row) => ({ familyKey: row.familyKey, occurrences: Number(row.occurrences) }));
+        .map((row) => ({
+          familyKey: row.familyKey,
+          occurrences: Number(row.occurrences),
+          lastSeenAt: row.lastSeenAt ?? null,
+          firstSeenAt: row.firstSeenAt ?? null
+        }));
     },
     // How many times a family has been DECLINED, from the permanent job table.
     //
@@ -1936,6 +1981,40 @@ function createStore(database, now) {
         firstDeclinedAt: row?.firstDeclinedAt ?? null,
         lastDeclinedAt: row?.lastDeclinedAt ?? null
       };
+    },
+    // Total review jobs started in a window, including the ones that never
+    // reached a family. The ratio against listRecentUnclassifiedEvents is what
+    // says whether silence from a family means "stopped happening" or just
+    // "the review pipeline is down".
+    countRecentReviewJobs({ projectId, since }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const cutoff = timezoneTimestamp(since, "since");
+      const row = database.prepare(
+        "SELECT COUNT(*) AS total FROM reviewer_jobs WHERE project_id=? AND created_at>=?"
+      ).get(safeProjectId, cutoff);
+      return Number(row?.total ?? 0);
+    },
+    // Complaints captured recently that never reached a family.
+    //
+    // Activity used to be measured only from jobs that completed a review, so a
+    // family whose reviews kept failing looked dormant. Measured on a live
+    // project: 34 SSH complaints in three months, zero of them classified,
+    // because 82 review jobs died on provider_invalid before naming a family.
+    // The capture happens before the review exists, so this is the only signal
+    // that survives the review being broken — and the only thing standing
+    // between a live family and being faded out for looking dead.
+    listRecentUnclassifiedEvents({ projectId, since, limit = 200 }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      const cutoff = timezoneTimestamp(since, "since");
+      const safeLimit = assertLimit(limit, "limit", 200, 1000);
+      if (safeLimit === 0) return [];
+      return database.prepare(`SELECT job.job_id, job.created_at, event.role, event.encrypted_raw_ref
+        FROM reviewer_jobs AS job
+        JOIN session_events AS event ON event.event_uid = job.source_event_uid
+        WHERE job.project_id=? AND job.family_key IS NULL AND job.created_at>=?
+        ORDER BY job.created_at DESC LIMIT ?`)
+        .all(safeProjectId, cutoff, safeLimit)
+        .map((row) => ({ ...row }));
     },
     // How often each REASON has already been used to decline this family.
     //
@@ -2232,11 +2311,16 @@ function createStore(database, now) {
         return { ...completed };
       });
     },
-    failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode }) {
+    failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode, detail = null }) {
       const safeJobId = assertString(jobId, "jobId", 512);
       const safeOwnerId = assertString(ownerId, "ownerId", 512);
       const safeLeaseEpoch = assertOptionalEpoch(leaseEpoch, "leaseEpoch");
       const safeReasonCode = assertString(reasonCode, "reasonCode", 128);
+      // The message that explains the code. Optional, and never required for the
+      // failure to be recorded: losing the job matters more than losing the note.
+      const safeDetail = detail === null
+        ? null
+        : String(detail).replace(/\s+/gu, " ").trim().slice(0, REVIEW_FAILURE_MAX_TEXT) || null;
       if (!REVIEW_FAILURE_CODES.has(safeReasonCode)) {
         throw new TypeError("reasonCode is not a supported review failure reason");
       }
@@ -2266,6 +2350,25 @@ function createStore(database, now) {
           leaseEpoch: safeLeaseEpoch,
           timestamp
         });
+        if (safeDetail) {
+          database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+            .run(`${REVIEW_FAILURE_META_PREFIX}${safeJobId}`, JSON.stringify({
+              jobId: safeJobId,
+              reasonCode: safeReasonCode,
+              detail: safeDetail,
+              at: timestamp
+            }));
+          const retained = database.prepare(
+            "SELECT key FROM store_meta WHERE key LIKE ? ORDER BY rowid"
+          ).all(`${REVIEW_FAILURE_META_PREFIX}%`);
+          if (retained.length > REVIEW_FAILURE_MAX_STORED) {
+            const remove = database.prepare("DELETE FROM store_meta WHERE key=?");
+            for (const stale of retained.slice(0, retained.length - REVIEW_FAILURE_MAX_STORED)) {
+              remove.run(stale.key);
+            }
+          }
+        }
         return { ...failed };
       });
     },

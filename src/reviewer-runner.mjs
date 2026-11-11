@@ -226,13 +226,36 @@ function asFailure(error, fallback) {
   return new ReviewJobError(fallback, error);
 }
 
-function recordFailure(store, { jobId, ownerId, leaseEpoch, code }) {
+function recordFailure(store, { jobId, ownerId, leaseEpoch, code, detail = null }) {
   if (code === "lease_lost") return;
   try {
-    store.failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode: code });
+    store.failReviewJob({ jobId, ownerId, leaseEpoch, reasonCode: code, detail });
   } catch {
     // A concurrent owner or process failure owns subsequent recovery.
   }
+}
+
+/**
+ * The message behind a failure, bounded and without anything credential-shaped.
+ *
+ * A failure code alone cannot be diagnosed — 153 reviews failed on
+ * provider_invalid in three weeks and not one of them left a record of what the
+ * provider actually returned. The message is that record, so it is kept, but it
+ * travels through the same scrubber the rest of the pipeline uses because it
+ * quotes model output derived from untrusted transcripts.
+ */
+function failureDetail(error) {
+  if (!error) return null;
+  const parts = [];
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    const message = String(current.message ?? "").trim();
+    if (message) parts.push(message);
+    current = current.cause;
+  }
+  if (!parts.length) return null;
+  const text = redactText(parts.join(" | ")).text;
+  return text.slice(0, 400) || null;
 }
 
 export async function runReviewJob({
@@ -265,7 +288,7 @@ export async function runReviewJob({
     context = await buildReviewContext({ store, blobs, jobId, projectDir });
   } catch (error) {
     const failure = asFailure(error, "context_invalid");
-    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code, detail: failureDetail(error) });
     throw failure;
   }
 
@@ -274,11 +297,20 @@ export async function runReviewJob({
     rawResult = await provider(context, { resultKind: "lesson" });
   } catch (error) {
     const failure = new ReviewJobError(providerFailure(error), error);
-    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code, detail: failureDetail(error) });
     throw failure;
   }
 
-  const allowedFamilyIds = context.reflectionCatalog.map((item) => item.familyId);
+  // The catalog lists DOCUMENTS, and family projection keeps one document per
+  // family only at selection time — the reviewer is handed every raw document.
+  // So the same family id repeats, and `allowedFamilySet` rejects a duplicate
+  // outright. Measured on all four live projects, that killed EVERY lesson
+  // result: 77/31, 62/49, 12/11 and 16/15 documents per distinct family, so no
+  // review could publish directly. Only the escalation path — which validates
+  // through validateReflectionModel and never builds this set — still ran, which
+  // is why 75 of ai-movie's 78 published documents carry the same two template
+  // sentences. The set is a membership test; dedupe before it.
+  const allowedFamilyIds = [...new Set(context.reflectionCatalog.map((item) => item.familyId))];
   const recurrenceFamilyById = new Map(
     context.reflectionCatalog.map((item) => [item.reflectionId, item.familyId])
   );
@@ -287,7 +319,9 @@ export async function runReviewJob({
     result = validateReviewerResult(rawResult, { allowedFamilyIds, recurrenceFamilyById });
   } catch (error) {
     const failure = new ReviewJobError("provider_invalid", error);
-    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code });
+    // The validation message names the offending field, which is the only way to
+    // tell a schema regression from a model that simply answered badly.
+    recordFailure(store, { jobId, ownerId, leaseEpoch, code: failure.code, detail: failureDetail(error) });
     throw failure;
   }
 
@@ -388,7 +422,12 @@ export async function runReviewJob({
         // is the channel that reaches every later turn. Publishing without this
         // step leaves the lesson stored but never enforced.
         try {
-          await maybeUpdateRulesTier({ store, projectId: context.job.project_id, projectDir });
+          await maybeUpdateRulesTier({
+            store,
+            projectId: context.job.project_id,
+            projectDir,
+            readBlob: (ref) => blobs.read(ref)
+          });
         } catch {
           // The document is the durable record; a failed rules projection is
           // retried on the next publication.
@@ -517,7 +556,8 @@ export async function runReviewJob({
         // A job is rejected earlier unless its project_id equals projectDir, so
         // the directory is the project identity here.
         projectId: projectDir,
-        projectDir
+        projectDir,
+        readBlob: (ref) => blobs.read(ref)
       });
     } catch {}
     return { outcome: "published", documentPath: published.path };

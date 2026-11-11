@@ -76,6 +76,48 @@ const MAX_SECTION_BYTES = 1_200;
 const DEMOTED_CHANGE_MAX_CHARS = 110;
 
 /**
+ * How much of a family's first instruction the index line carries.
+ *
+ * The index is injected on every turn, so it is the only channel that reaches a
+ * session regardless of how the user phrases the request. That makes it the
+ * right place for the fact itself rather than a pointer to it — but it also
+ * makes its size the budget's real constraint, so each line stops at one clause.
+ */
+const INDEX_FACT_MAX_CHARS = 80;
+
+/**
+ * How long an index fact is trusted before the block marks it stale.
+ *
+ * A fact about the world is a claim with a window, not a permanent truth. The
+ * SSH credential fact was correct in November and wrong in October: key auth
+ * still worked then, so "do not use BatchMode" would have refused a working
+ * path. Nothing in the block distinguished those two states, so the same
+ * sentence was equally confident either way.
+ *
+ * Ninety days is not a claim about any particular fact — it is the point where
+ * "nobody has confirmed this recently" becomes worth saying out loud.
+ */
+const INDEX_FACT_TTL_DAYS = 90;
+
+/**
+ * How long a family may go without a recurrence before it is faded down.
+ *
+ * Distinct from staleness. Stale asks "is this fact still true"; dormant asks
+ * "is this family still worth the space". A class that happened for one week in
+ * July and never again is not wrong — it is just no longer earning a line of
+ * every-turn budget, while a class that recurs every few days is.
+ *
+ * Faded, never removed. Deleting would discard what the user taught; fading
+ * keeps the name and the count reachable while returning the fact's bytes to
+ * the families that are still live.
+ */
+const INDEX_DORMANT_AFTER_DAYS = 120;
+// Deliberately longer than INDEX_FACT_TTL_DAYS. Staleness is "verify this";
+// dormancy is "stop spending bytes on it". If dormancy came first, every stale
+// fact would already be faded and the two states would collapse into one — with
+// the milder, more useful state unreachable.
+
+/**
  * How many trigger conditions a section renders.
  *
  * They exist to be matched against a future prompt, and the injector scores on
@@ -172,7 +214,12 @@ function mergeFamilies(families) {
         // with nothing but the incident narrative to match on.
         appliesWhen: family.appliesWhen ?? [],
         familyKeys: [family.familyKey],
-        latestRecurrenceAt: family.latestRecurrenceAt ?? null
+        latestRecurrenceAt: family.latestRecurrenceAt ?? null,
+        // Carried for the same reason appliesWhen is: the index decides whether
+        // a fact is still current from this value, and dropping it during the
+        // merge marked every merged family as undatable — which renders as
+        // "may be stale" on facts that were confirmed this week.
+        lastSeenAt: family.lastSeenAt ?? null
       });
       continue;
     }
@@ -191,6 +238,14 @@ function mergeFamilies(families) {
       if (!key) continue;
       if (!existing.latestRecurrenceAt || Date.parse(key) > Date.parse(existing.latestRecurrenceAt)) {
         existing.latestRecurrenceAt = key;
+      }
+    }
+    // The merged family is as current as its most recent member, so take the
+    // latest of the two rather than whichever arrived first.
+    for (const key of [family.lastSeenAt, existing.lastSeenAt]) {
+      if (!key) continue;
+      if (!existing.lastSeenAt || Date.parse(key) > Date.parse(existing.lastSeenAt)) {
+        existing.lastSeenAt = key;
       }
     }
     // Severity rises to the worst member's: the group is only as safe as its
@@ -263,6 +318,38 @@ function trimToChars(value, max) {
  * the budget and demote several shorter ones; capping detail nobody reads buys
  * coverage everybody gets.
  */
+/**
+ * Whether a fact has gone unconfirmed long enough to stop being stated flatly.
+ *
+ * Undatable counts as stale. A fact whose last corroborating recurrence cannot
+ * be found has no evidence behind it today, and rendering it as current is the
+ * exact failure this guards against.
+ */
+function factIsStale(lastSeenAt, nowMs = Date.now()) {
+  const seen = Date.parse(lastSeenAt ?? "");
+  if (!Number.isFinite(seen)) return true;
+  return nowMs - seen > INDEX_FACT_TTL_DAYS * 24 * 60 * 60 * 1_000;
+}
+
+/**
+ * Whether a family has stopped earning its every-turn sentence.
+ *
+ * Fading requires more than silence. A family is only dormant when it has been
+ * quiet AND nothing suggests it is still live but unmeasured — a review pipeline
+ * that is failing produces exactly that silence while the problem continues, and
+ * fading on silence alone would withdraw the answer at the moment it is needed.
+ * The caller decides what counts as that counter-evidence; this only takes the
+ * verdict.
+ */
+function isDormant(lastSeenAt, stillLive, nowMs = Date.now()) {
+  if (stillLive) return false;
+  const seen = Date.parse(lastSeenAt ?? "");
+  // Undatable is stale, not dormant: staleness says "verify first", dormancy
+  // says "stop showing this", and an unknown date is not evidence of silence.
+  if (!Number.isFinite(seen)) return false;
+  return nowMs - seen > INDEX_DORMANT_AFTER_DAYS * 24 * 60 * 60 * 1_000;
+}
+
 function renderSection(family, demoted) {
   const label = family.familyKeys.join(", ");
   const lines = [`### ${label} (${family.occurrences}×, ${family.severity})`, ""];
@@ -413,6 +500,16 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
 
   const merged = rankFamilies(mergeFamilies(families));
 
+  // A family with no instructions of its own — one that never published — has
+  // nothing to expand into. It exists only as the fact on its index line, so
+  // rendering a section for it would restate that fact and spend budget the
+  // families with real detail need.
+  const factOnly = new Set(
+    merged
+      .filter((family) => !(family.methodChanges ?? []).length)
+      .map((family) => family.familyKeys[0])
+  );
+
   // Every family that fits the file budget gets a full section. Shedding the
   // tail here is a file-size concern only; it no longer decides what a turn
   // sees, because L0 below still lists what was shed.
@@ -420,6 +517,10 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
   const overflowed = [];
   let used = byteLength(AFL_RULES_START) + byteLength(AFL_RULES_END) + 8;
   for (const family of merged) {
+    if (factOnly.has(family.familyKeys[0])) {
+      overflowed.push(family);
+      continue;
+    }
     const section = renderSection(family, false);
     const cost = byteLength(section);
     if (used + cost > maxBytes) {
@@ -432,10 +533,37 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
 
   // L0 names every family, including any whose full section did not fit. This is
   // the guarantee the flat budget could not give: a family is never invisible.
-  const index = merged.map((family) => ({
-    familyKey: family.familyKeys[0],
-    occurrences: family.occurrences
-  }));
+  //
+  // Each line carries a fact, not just a name. A bare `- some-family (12×)` tells
+  // the reader that something happened twelve times and nothing about what to do;
+  // measured on a live project the index was 16 such lines and the answer to the
+  // recurring problem was not among them. The fact is the first instruction the
+  // family has, and for a family that never published it is the user's own words.
+  const index = merged.map((family) => {
+    const firstAction = (family.methodChanges ?? [])[0] ?? null;
+    return {
+      familyKey: family.familyKeys[0],
+      occurrences: family.occurrences,
+      // The index repeats a section only when the section was shed. When the
+      // full text is already above, the line stays a name — otherwise the same
+      // sentence appears twice in one block and the second copy buys nothing.
+      fact: overflowed.some((entry) => entry.familyKeys[0] === family.familyKeys[0])
+        ? (firstAction
+          ? trimToChars(firstAction, INDEX_FACT_MAX_CHARS)
+          : trimToChars(family.incidentSummary ?? "", INDEX_FACT_MAX_CHARS) || null)
+        : null,
+      unpublished: Boolean(family.unpublished),
+      // Set by the projection, which is the only place that can weigh dormancy
+      // against evidence that the family is still live but unclassified.
+      dormant: family.dormant === undefined
+        ? isDormant(family.lastSeenAt ?? null, false)
+        : Boolean(family.dormant),
+      // When the fact was last corroborated by an actual recurrence. Null means
+      // it cannot be dated, which renders as stale rather than fresh — an
+      // undatable claim is not a confirmed one.
+      lastSeenAt: family.lastSeenAt ?? null
+    };
+  });
 
   const compose = (bodySections) => {
     const lines = [
@@ -446,7 +574,21 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
     ];
     for (const section of bodySections) lines.push(section.text.trimEnd(), "");
     lines.push(INDEX_HEADING, "");
-    for (const entry of index) lines.push(`- ${entry.familyKey} (${entry.occurrences}×)`);
+    for (const entry of index) {
+      const tags = [];
+      if (entry.unpublished) tags.push("未发布·聚合");
+      // A stale fact keeps its line — deleting it would lose what was learned —
+      // but it loses the authority of a fact and becomes a question the reader
+      // must settle before acting on it.
+      if (entry.fact && factIsStale(entry.lastSeenAt)) tags.push("可能已过期·先验证");
+      if (entry.dormant) tags.push(`长期未复发·已降级`);
+      const tag = tags.length ? ` [${tags.join("·")}]` : "";
+      // A dormant family gives back the fact's bytes. The name and count stay so
+      // the family is still discoverable and returns in full on its next
+      // recurrence; only the always-on sentence is withdrawn.
+      const fact = entry.fact && !entry.dormant ? ` → ${entry.fact}` : "";
+      lines.push(`- ${entry.familyKey} (${entry.occurrences}×)${tag}${fact}`);
+    }
     lines.push("");
     lines.push(AFL_RULES_END);
     return lines;

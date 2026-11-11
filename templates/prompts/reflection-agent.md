@@ -126,6 +126,18 @@ listed in the catalog. Every `recurrence_of` id must be a listed reflection from
 that same family. Otherwise set `family_id` to null, provide a stable lowercase
 hyphenated `proposed_family_key`, and leave `recurrence_of` empty.
 
+Two identifiers, two different separators — the validators are strict and reject
+the whole result over either one:
+
+- `method_class` is UNDERSCORES: lowercase ASCII words joined by single `_`, no
+  spaces, hyphens, capitals or non-ASCII, at most 64 characters —
+  `verify_before_claiming`. It is a fixed-vocabulary key that groups recurrences,
+  not prose: a readable sentence there does not just look wrong, it makes the
+  family ungroupable and the review is thrown away. The readable description
+  belongs in `class_of_mistake`, which is free text.
+- `proposed_family_key` is HYPHENS: lowercase ASCII words joined by single `-`,
+  never `_`, at most 128 characters — `verify-before-claiming`.
+
 Each `applies_when` condition describes the situation a future session is
 **about to enter**, not the moment this failure was noticed. A future session is
 matched to this lesson by its opening request, so a condition phrased as the

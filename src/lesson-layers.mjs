@@ -88,7 +88,11 @@ function termsOf(values) {
   return terms;
 }
 
-const L0_LINE = /^-\s+(.+?)\s+\((\d+)×\)/u;
+// The index line carries an optional trailing fact: `- family (12×) [tag] → what
+// to do`. The fact is the only part that says what the family means, so the
+// parser keeps it and the composer puts it back — dropping it at either end
+// leaves a name that identifies nothing.
+const L0_LINE = /^-\s+(.+?)\s+\((\d+)×\)(.*)$/u;
 const L1_HEADING = /^###\s+(.+?)\s+\((\d+)×,\s*(\w+)\)/u;
 
 /**
@@ -136,7 +140,11 @@ export function parseLayeredBlock(text) {
     }
     const indexEntry = L0_LINE.exec(line.trim());
     if (indexEntry) {
-      l0.push({ familyKey: indexEntry[1].trim(), occurrences: Number(indexEntry[2]) });
+      l0.push({
+        familyKey: indexEntry[1].trim(),
+        occurrences: Number(indexEntry[2]),
+        detail: (indexEntry[3] ?? "").trim()
+      });
       continue;
     }
     if (current) {
@@ -371,7 +379,8 @@ export function selectL1Sections({
  */
 export function composeInjection({ preamble = "", l0 = [], selected = [], maxBytes, header = null }) {
   const headerLines = [header].filter(Boolean);
-  const indexLines = l0.map((entry) => `- ${entry.familyKey} (${entry.occurrences}×)`);
+  const indexLines = l0.map((entry) =>
+    `- ${entry.familyKey} (${entry.occurrences}×)${entry.detail ? ` ${entry.detail}` : ""}`);
 
   const assemble = (sections) => {
     const lines = [];

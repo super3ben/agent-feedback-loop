@@ -35,6 +35,49 @@ import {
  * English echo in place, which still scored against every prompt and kept the
  * family ranked on noise.
  */
+/**
+ * How often a never-published family must have recurred before it earns an
+ * index line.
+ *
+ * Three, matching the Major threshold the published path uses: a class hit
+ * three times has proven it recurs, and recurrence is the whole point of the
+ * tier. Requiring a publication as well is what hid these families entirely.
+ */
+const UNPUBLISHED_RECURRENCE_THRESHOLD = 3;
+
+/**
+ * How recently an unclassified complaint counts as evidence a family is alive.
+ *
+ * A family is only as dormant as the review pipeline is healthy. When reviews
+ * fail before classifying — 82 jobs died on provider_invalid in one month on a
+ * live project, none of them ever naming a family — a live family looks silent,
+ * and fading it would withdraw exactly the entry that was needed. This window is
+ * the guard against that: silence plus recent unclassified complaints is not
+ * silence.
+ */
+const UNCLASSIFIED_GRACE_DAYS = 21;
+
+/**
+ * Whether the review pipeline is healthy enough for silence to mean anything.
+ *
+ * Fading a family says "this stopped happening". That inference is only valid
+ * when reviews actually complete — a failing pipeline produces silence that is
+ * indistinguishable from a class that went away. Measured on a live project:
+ * 221 of 255 review jobs in three weeks died before naming a family, and the
+ * SSH family's last classified recurrence was 81 days old while the complaint
+ * was raised again that same week.
+ *
+ * Matching unclassified complaints back to a family by text was tried first and
+ * abandoned: with Chinese complaints the anchor overlap scored an unrelated
+ * group-permission complaint above the real SSH one, so the guard would have
+ * protected the wrong families. The pipeline's health is measurable without
+ * that guess, and it is the same judgement for every family.
+ */
+function pipelineTrustworthy({ total, unclassified, maxUnclassifiedRatio = 0.3 }) {
+  if (!total) return false;
+  return unclassified / total <= maxUnclassifiedRatio;
+}
+
 const LEGACY_CONDITION = /^当要处理「([\s\S]*)」同类问题/u;
 const LEGACY_CONDITION_EN = /^when handling the same class of problem as 「([\s\S]*)」,/u;
 
@@ -83,7 +126,7 @@ export function normalizeAppliesWhen(conditions) {
  * family it displaces. Demotion is a projection, not a deletion — the lesson
  * stays published, stays counted, and returns on its next recurrence.
  */
-export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
+export async function maybeUpdateRulesTier({ store, projectId, projectDir, readBlob = null }) {
   if (!store || !projectId || !projectDir) return { updated: false, reason: "missing_input" };
 
   let recurrence;
@@ -94,11 +137,63 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
   }
 
   const qualified = [];
-  for (const { familyKey, occurrences } of recurrence) {
+  // Families that qualify on recurrence but have never published.
+  //
+  // The tier used to require a published lesson, which deadlocked the families
+  // that needed it most: a class declined every time never publishes, so it
+  // never entered the rules block, so the next session had nothing telling it
+  // the class existed, so it was declined again. Measured on a live project:
+  // ten families, 54 declared occurrences, all invisible — including the SSH
+  // credential family that had been declined five times across four months.
+  //
+  // Recurrence is the signal that advice is not getting through, whether or not
+  // a reviewer ever agreed to write it down.
+  // Read the unclassified complaints once, then decide per family. This is the
+  // counter-evidence that keeps a live-but-unmeasured family from being faded:
+  // a failing review pipeline produces silence that looks exactly like a class
+  // that stopped happening.
+  let unclassified = [];
+  if (typeof store.listRecentUnclassifiedEvents === "function") {
+    try {
+      const since = new Date(Date.now() - UNCLASSIFIED_GRACE_DAYS * 24 * 60 * 60 * 1_000).toISOString();
+      unclassified = store.listRecentUnclassifiedEvents({ projectId, since });
+    } catch {
+      unclassified = [];
+    }
+  }
+  // How much of the recent pipeline actually completed a review. Dormancy is
+  // only inferred when this is healthy; otherwise every family looks quiet
+  // because nothing is being classified, and fading on that would withdraw the
+  // entries the failed reviews were supposed to update.
+  let recentTotal = unclassified.length;
+  if (typeof store.countRecentReviewJobs === "function") {
+    try {
+      const since = new Date(Date.now() - UNCLASSIFIED_GRACE_DAYS * 24 * 60 * 60 * 1_000).toISOString();
+      recentTotal = store.countRecentReviewJobs({ projectId, since });
+    } catch {
+      recentTotal = unclassified.length;
+    }
+  }
+  const allowDormancy = pipelineTrustworthy({
+    total: recentTotal,
+    unclassified: unclassified.length
+  });
+
+  const unpublished = [];
+  for (const { familyKey, occurrences, lastSeenAt } of recurrence) {
     let job;
     try {
       job = store.getLatestPublishedJobForFamily({ projectId, familyKey });
     } catch {
+      continue;
+    }
+    if (!job) {
+      // No published lesson. If the family recurred enough to be worth a rule,
+      // it still belongs in the index — the index is what makes it visible at
+      // all, and invisibility is the failure being fixed here.
+      if (occurrences >= UNPUBLISHED_RECURRENCE_THRESHOLD) {
+        unpublished.push({ familyKey, occurrences, lastSeenAt });
+      }
       continue;
     }
     // Severity is null for rows published before it was recorded. Those cannot
@@ -160,6 +255,10 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
       // five times this week. A lesson that stopped recurring may have been
       // learned; one that keeps recurring has not.
       latestRecurrenceAt: job.completed_at ?? null,
+      // When the family last actually recurred, which is when its statement was
+      // last corroborated. The index uses this to tell a live fact from one
+      // nobody has confirmed in months.
+      lastSeenAt: lastSeenAt ?? job.completed_at ?? null,
       // What the user actually complained about, not the reviewer's class label.
       //
       // class_of_mistake is what the section renders, and for escalated families
@@ -182,7 +281,51 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir }) {
       // Normalised on the way through, so documents published under the old
       // template stop poisoning the match without being rewritten on disk.
       appliesWhen: unionConditions.length ? unionConditions : normalizeAppliesWhen(document.appliesWhen),
+      // Dormant only when quiet AND nothing unclassified suggests it is live.
+      // The published path says whether the family recurred; the unclassified
+      // complaints say whether it might be recurring without being seen.
+      dormant: false,
       methodChanges: document.methodChanges
+    });
+  }
+
+  // A never-published family gets an index entry carrying the user's own words,
+  // pulled from the captured turn. It has no lesson document to project from —
+  // that is what "never published" means — but the complaint text is durable and
+  // is exactly what the next session needs to recognise the situation.
+  //
+  // Degrades to an index line without a fact when the blob cannot be read: an
+  // entry that names the family is still better than the invisibility this
+  // replaces, and the caller keeps its previous block on a hard failure.
+  for (const { familyKey, occurrences, lastSeenAt } of unpublished) {
+    let quote = null;
+    if (typeof store.listFamilySourceEvents === "function" && readBlob) {
+      try {
+        const events = store.listFamilySourceEvents({ projectId, familyKey, limit: 3 });
+        for (const event of events) {
+          if (!event.encrypted_raw_ref) continue;
+          const text = await readBlob(event.encrypted_raw_ref);
+          const cleaned = String(text ?? "").replace(/\s+/gu, " ").trim();
+          if (cleaned) { quote = cleaned; break; }
+        }
+      } catch {
+        quote = null;
+      }
+    }
+    qualified.push({
+      familyKey,
+      severity: null,
+      occurrences,
+      latestRecurrenceAt: null,
+      lastSeenAt: lastSeenAt ?? null,
+      incidentSummary: quote,
+      appliesWhen: quote ? [quote] : [],
+      // No lesson was ever written, so there is no method change to carry. The
+      // index entry states the fact and the reader decides; inventing an
+      // instruction here would be the escalation template problem again.
+      methodChanges: [],
+      unpublished: true,
+      dormant: allowDormancy,
     });
   }
 

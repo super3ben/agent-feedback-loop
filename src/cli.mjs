@@ -1388,7 +1388,19 @@ export async function main(args, {
         // better summary source) never reaches an existing project until its
         // next publication, which on a quiet project may be never. That is the
         // difference between "the fix is deployed" and "the fix is in effect".
-        const result = await maybeUpdateRulesTier({ store, projectId: projectDir, projectDir });
+        // The blob store is what lets a never-published family carry the user's
+        // own words into the index; without it those families still appear, just
+        // without the fact that makes the entry actionable.
+        const rulesBlobs = new EncryptedBlobStore({
+          root: paths.blobRoot,
+          keyProvider: new BlobKeyProvider({ keyRoot: paths.keyRoot })
+        });
+        const result = await maybeUpdateRulesTier({
+          store,
+          projectId: projectDir,
+          projectDir,
+          readBlob: (ref) => rulesBlobs.read(ref)
+        });
         console.log(JSON.stringify({
           projectDir,
           updated: result.updated,

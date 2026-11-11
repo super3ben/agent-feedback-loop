@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { readReflectionCatalog } from "./reflection-document.mjs";
+import { mergeReflectionDocuments } from "./reflection-merge.mjs";
 
 const HARD_LIMITS = Object.freeze({
   maxFileBytes: 131_072,
@@ -238,15 +239,25 @@ function completeDocument(document) {
 export async function loadReflectionDocuments({
   projectDir,
   publishedBefore,
-  maxFileBytes = HARD_LIMITS.maxFileBytes
+  maxFileBytes = HARD_LIMITS.maxFileBytes,
+  merge = true
 }) {
   const catalog = await readReflectionCatalog({
     projectDir,
     publishedBefore,
     maxFileBytes: boundedLimit(maxFileBytes, HARD_LIMITS.maxFileBytes)
   });
+  // One file per reviewed incident means a class the user keeps hitting arrives
+  // as N near-identical documents, each competing for the same injection budget
+  // as a genuinely different lesson. Collapsing them here — at read time, never
+  // on disk — keeps the delivery log's document hashes intact while freeing the
+  // budget for the lessons that differ.
+  const { documents, mergedGroups } = merge
+    ? mergeReflectionDocuments(catalog.documents)
+    : { documents: catalog.documents, mergedGroups: [] };
   return {
-    documents: catalog.documents,
+    documents,
+    mergedGroups,
     omissions: catalog.omissions.map((item) => ({
       opaqueId: sha256(`catalog\u0000${item.path}`),
       reason: CATALOG_REASON[item.omission] ?? "parse_error"
