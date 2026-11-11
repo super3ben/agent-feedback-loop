@@ -121,11 +121,27 @@ jobs:
 
       - name: Verify the registry serves this version
         if: steps.version.outputs.skip == 'false' && inputs.dry_run != true
+        # npm acknowledges a publish with "+ name@version" while the package is
+        # still being processed, and the registry keeps serving the PREVIOUS
+        # version for a while after that. A single read straight after the
+        # publish step therefore fails on a release that actually succeeded —
+        # observed on the first run of this workflow, where it reported 0.9.0
+        # seconds after 0.10.0 was accepted. Poll until propagation finishes
+        # instead of treating "not yet" as "failed".
         run: |
+          NAME=$(node -p 'require("./package.json").name')
           LOCAL=$(node -p 'require("./package.json").version')
-          LIVE=$(npm view "$(node -p 'require("./package.json").name')" version)
-          echo "registry reports $LIVE"
-          test "$LIVE" = "$LOCAL"
+          for attempt in $(seq 1 30); do
+            LIVE=$(npm view "$NAME" version 2>/dev/null || true)
+            echo "attempt $attempt: registry reports ${LIVE:-(nothing)}"
+            if [ "$LIVE" = "$LOCAL" ]; then
+              echo "::notice::$NAME@$LOCAL is live"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$NAME@$LOCAL was accepted but the registry never served it"
+          exit 1
 
       - name: Summary
         if: always()
