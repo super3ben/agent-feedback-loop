@@ -219,7 +219,22 @@ const OBJECTION = Object.freeze([
   /(?:本来|应该)[^。！？?\n]{0,14}(?:却|但|结果)/u,
   // The agent's own output called out directly.
   /(?:你|你们)(?:这个|那个|根本|又)[^。！？?\n]{0,18}(?:不|没|错|乱|简单|粗糙|搞)/u,
-  /(?:你|你们)[^。！？?\n]{0,10}(?:说错|做错|搞错|没改|没做|漏了)/u
+  /(?:你|你们)[^。！？?\n]{0,10}(?:说错|做错|搞错|没改|没做|漏了)/u,
+  // An explicit correction or standing instruction: 「别用密钥，用密码」
+  // 「不要用 BatchMode」「以后都用密码登录」. This is not a complaint about a
+  // finished failure — it is the user drawing a line the agent is about to cross
+  // or has crossed, which is exactly the moment the matching lesson should
+  // arrive. Measured on a live project: this shape carried the user's clearest
+  // requirement about credentials, and the gate held every lesson back because
+  // none of the patterns above describe an instruction.
+  //
+  // Each alternative names a real marker. An earlier draft wrote `禁?止?用?`,
+  // where every quantifier made its character optional, so the group matched the
+  // empty string and EVERY non-empty prompt passed the gate — the opposite bug,
+  // and a silent one.
+  /(?:别|不要|不准|禁止|不该)\s*[^。！？?\n]{1,20}/u,
+  /(?:以后|今后|下次|往后)[^。！？?\n]{0,12}(?:都|一律|统一|只|要|用)/u,
+  /(?:应该|必须|一定要)\s*(?:用|走|按|从)/u
 ]);
 
 /**

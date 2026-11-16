@@ -84,6 +84,60 @@ async function contextEvent(row, blobs) {
   };
 }
 
+/**
+ * Pick the earlier project messages that state a requirement, then fill with
+ * the most recent ones.
+ *
+ * The point of the wider window is that the decisive message is usually not the
+ * newest. Measured on a live project: the user stated "use the password, not the
+ * key" in four separate sessions over four months and complained ten times in
+ * six others. Taking the most recent six would have shown the reviewer six
+ * ordinary instructions and none of the rules.
+ *
+ * Requirement-shaped, not keyword-matched on one domain: the markers below are
+ * about the ACT of restating something already agreed ("I already told you",
+ * "didn't I give you", "we agreed"), which is what makes a repeat the agent's
+ * fault regardless of subject matter.
+ */
+const STATED_REQUIREMENT_MARKERS = [
+  /不是(说过|讲过|给过|告诉过)/u,
+  /(之前|以前|上次|早就)(都|不是)?(说|讲|给|告诉|提)过/u,
+  /(我跟|和你)(说|讲)过/u,
+  /(已经|早就)(给|告诉|说)(过|你)/u,
+  /(为什么|怎么)(又|还)(问|要)/u,
+  /(明明|不是)(有|能|可以)/u,
+  /i (already |had )?(told|gave|said)/iu,
+  /as i (said|mentioned)/iu
+];
+const PROJECT_PRIOR_SELECTED = 6;
+const PROJECT_PRIOR_REQUIREMENTS = 4;
+
+function looksLikeStatedRequirement(text) {
+  const value = String(text ?? "");
+  return STATED_REQUIREMENT_MARKERS.some((pattern) => pattern.test(value));
+}
+
+function selectStatedRequirements(events) {
+  const usable = (Array.isArray(events) ? events : []).filter(Boolean);
+  if (usable.length <= PROJECT_PRIOR_SELECTED) return usable;
+
+  const requirements = usable.filter((event) => looksLikeStatedRequirement(event.text));
+  const chosen = requirements.slice(-PROJECT_PRIOR_REQUIREMENTS);
+  const chosenIds = new Set(chosen.map((event) => event.eventUid));
+
+  // Fill the rest from the newest messages, which is what a plain window would
+  // have given. Newest first here because these are the ones recounting what
+  // just happened; the requirements above are the ones stating a rule.
+  const recent = [...usable].reverse().filter((event) => !chosenIds.has(event.eventUid));
+  for (const event of recent) {
+    if (chosen.length >= PROJECT_PRIOR_SELECTED) break;
+    chosen.push(event);
+    chosenIds.add(event.eventUid);
+  }
+  // Restore chronological order so the reviewer reads them as a timeline.
+  return chosen.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+}
+
 async function catalogSummaries(projectDir, publishedBefore) {
   const catalog = await readReflectionCatalog({ projectDir, publishedBefore });
   return catalog.documents.map((document) => ({
@@ -191,6 +245,19 @@ async function buildReviewContext({ store, blobs, jobId, projectDir }) {
     referent: await contextEvent(stored.referent, blobs),
     prior: await Promise.all(stored.prior.slice(-6).map((row) => contextEvent(row, blobs))),
     following: await Promise.all(stored.following.slice(0, 2).map((row) => contextEvent(row, blobs))),
+    // What this user already said about this project, in sessions this review
+    // would otherwise not see. A rule the user stated once, in another session,
+    // is exactly the evidence that decides whether a repeat is the agent's
+    // fault — and it was invisible for as long as the window was per-session.
+    //
+    // Ranked, not merely truncated. The window comes back newest-first, and the
+    // rule that decided the incident is often months old: the user stated it
+    // once in July and complained about it in November. Selecting the most recent
+    // six would hand the reviewer six ordinary instructions and no rule, which is
+    // the same blindness at a wider radius.
+    projectPrior: selectStatedRequirements(await Promise.all(
+      (stored.projectPrior ?? []).map((row) => contextEvent(row, blobs))
+    )),
     reflectionCatalog,
     recurrence
   };

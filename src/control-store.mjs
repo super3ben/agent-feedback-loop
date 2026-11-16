@@ -65,6 +65,11 @@ const MAX_CAPTURE_FAIL_OPEN_RECORDS = 50;
 const MAX_RECOVERABLE_REVIEW_JOBS = 8;
 const MAX_PRIOR_REVIEW_EVENTS = 6;
 const MAX_FOLLOWING_REVIEW_EVENTS = 2;
+// How many earlier project messages are scanned when looking for the rule this
+// incident broke. Wider than the window the reviewer receives: the requirement
+// may be months old, and it has to survive ranking against recent chatter before
+// it can be selected.
+const PROJECT_PRIOR_SCAN_LIMIT = 64;
 const FAMILY_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const EXECUTION_MONITOR_META_PREFIX = "execution_monitor:v1:";
 // Why a review declined to publish. Kept in store_meta rather than a new column
@@ -2401,6 +2406,50 @@ function createStore(database, now) {
         job.referent_event_uid,
         safePriorLimit
       ).reverse();
+      // The user corrects the same mistake across SEPARATE sessions, and the
+      // evidence they gave lives in whichever session they gave it in. A window
+      // scoped to one session sees the complaint and not the requirement, so the
+      // reviewer keeps concluding "not the agent's fault" about a mistake the
+      // user had already stated a rule for.
+      //
+      // Measured on one project: the user said "use the password, not the key"
+      // in four different sessions over four months, and complained ten times in
+      // six others. No single review ever saw both halves, which is why a lesson
+      // about it was never written.
+      //
+      // Scoped to the PROJECT, never wider: another repository's history is a
+      // different codebase with different constraints, and mixing them would let
+      // one project's rule fire on another's work.
+      // `session_uid` exists on both sides of the join, so the shared column
+      // list has to be qualified or SQLite rejects the query as ambiguous.
+      const projectEventColumns = eventContextColumns
+        .split(",")
+        .map((column) => `event.${column.trim()}`)
+        .join(", ");
+      // The project's earlier user messages. A plain "most recent N" window drops
+      // the one that matters: a rule stated four months ago is the evidence that
+      // decides today's complaint, and it loses its place to whatever was said
+      // yesterday. SQLite cannot classify text, so a wider window is fetched here
+      // and ranked below by `rankProjectPrior` — requirement-shaped messages
+      // first, then recency.
+      const projectPriorWindow = safePriorLimit === 0 || !job.project_id ? [] : database.prepare(`
+        SELECT ${projectEventColumns}
+        FROM session_events AS event
+        JOIN sessions AS session ON session.session_uid = event.session_uid
+        WHERE session.project_id=?
+          AND event.session_uid<>?
+          AND event.role='user'
+          AND (event.created_at<? OR (event.created_at=? AND event.event_uid<?))
+          AND event.event_uid<>?
+        ORDER BY event.created_at DESC, event.event_uid DESC LIMIT ?`).all(
+        job.project_id,
+        source.session_uid,
+        source.created_at,
+        source.created_at,
+        source.event_uid,
+        source.event_uid,
+        PROJECT_PRIOR_SCAN_LIMIT
+      ).reverse();
       const following = safeFollowingLimit === 0 ? [] : database.prepare(`SELECT ${eventContextColumns}
         FROM session_events
         WHERE session_uid=?
@@ -2421,7 +2470,12 @@ function createStore(database, now) {
         source: { ...source },
         referent: referent ? { ...referent } : null,
         prior: prior.map((row) => ({ ...row })),
-        following: following.map((row) => ({ ...row }))
+        following: following.map((row) => ({ ...row })),
+        // Earlier user messages from OTHER sessions of the same project, as a
+        // wider window than the reviewer ultimately sees. Ranking needs the text
+        // and the text is encrypted, so the caller decrypts and ranks; this layer
+        // only bounds how much is read.
+        projectPrior: projectPriorWindow.map((row) => ({ ...row }))
       };
     },
     assertCaptureAllowed(event) {

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "class_of_mistake": {
+      "type": "string",
+      "maxLength": 600
+    },
+    "method_changes": {
+      "type": "array",
+      "maxItems": 4,
+      "items": { "type": "string", "maxLength": 300 }
+    }
+  },
+  "required": ["class_of_mistake", "method_changes"]
+}

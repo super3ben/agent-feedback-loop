@@ -119,6 +119,25 @@ next occurrence will qualify is how a lesson the user has hit three times was
 never written; the user was asked for the same credential in three separate
 sessions because each review deferred to a next time that never counted.
 
+`projectPrior` holds earlier user messages from OTHER sessions of this same
+project. Read it before deciding `responsibility`, because it answers the one
+question a single session cannot: whether the user had already stated a rule
+this incident broke.
+
+A complaint that looks like a fresh misunderstanding is usually the second half
+of a pair. The user stated the requirement in one session and is complaining
+about it in another, and a window scoped to one session sees only the complaint.
+Measured on a live project: the user said "use the password, not the key" in
+four separate sessions across four months and complained ten times in six
+others; no single review ever saw both halves, so each one judged the complaint
+alone and concluded `not_agent_fault`. That is wrong when `projectPrior` shows
+the rule was already given — a user repeating a requirement they have already
+stated is the definition of the agent's fault, not an external limit.
+
+Use it as evidence, not as context to summarise. When `projectPrior` contains
+the requirement this incident broke, say so in `facts` (quoted, with its date)
+and let it drive `final_severity`; do not restate the whole history.
+
 For a proven lesson, identify a controlled reusable `method_class`, determine
 whether an existing family in `reflectionCatalog` applies, and return exactly the
 lesson object required by the schema. Use an existing `family_id` only when it is
