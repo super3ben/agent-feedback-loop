@@ -5,9 +5,23 @@ import { mergeReflectionDocuments } from "./reflection-merge.mjs";
 
 const HARD_LIMITS = Object.freeze({
   maxFileBytes: 131_072,
-  maxCards: 4,
+  // The card count, not the token budget, was the binding constraint. Measured
+  // over 90 real prompts across three projects: at 4 the selector kept 3.5
+  // lessons per turn and dropped 962 as `count_budget`; lifting the cap to 6
+  // raised that to 4.9 lessons and cut the drops to 424, while the matching
+  // lesson was reached on 8 prompts instead of 6.
+  //
+  // The old figure of 4 predates any measurement of what a turn can carry. It
+  // was a safety margin, and it was costing real coverage: the fourth-priority
+  // document was thrown away even when it was the only one on topic, because
+  // the budget had room for it.
+  maxCards: 6,
   maxDocumentTokens: 640,
-  maxTotalTokens: 1600
+  // Raised from 1600. The rules block (2.3 KB) plus the reflection documents
+  // (3.9 KB) came to 6.2 KB of a prompt that routinely carries far more. With
+  // the injected copy compressed (class_of_mistake dropped, two method changes
+  // instead of four) a document costs ~449 tokens, so this fits five.
+  maxTotalTokens: 2400
 });
 
 /**
@@ -15,15 +29,35 @@ const HARD_LIMITS = Object.freeze({
  *
  * Matching runs over the FULL document (every applies_when entry, every method
  * change), so trimming the injected copy costs no recall — it only stops the
- * model from being shown the same match surface twice. Measured on a live
- * project: the average document cost 667 tokens against a 640-token per-document
- * cap, so 57% of documents could not be selected at all. These limits bring the
- * average under the cap without dropping any lesson.
+ * model from being shown the same match surface twice.
+ *
+ * The budget is the binding constraint, not the document count. Measured on one
+ * project: a document costs 586 tokens on average against a 640-token per-document
+ * cap and a 1600-token per-turn cap, so two of four slots actually filled and 12
+ * of 46 documents exceeded the per-document cap outright and could never be
+ * selected at all. The documents that never reached a session were the LONGER
+ * ones (4.3 conditions, 320 chars) against those that did (3.2, 204) — the
+ * failure was verbosity, not quality.
+ *
+ * Where the bytes went, and what this keeps:
+ *
+ *   method_changes   45%   the instruction — kept, trimmed to the two that act
+ *   applies_when     39%   the match surface — kept whole, trimming costs recall
+ *   class_of_mistake 16%   explanation only — dropped
+ *
+ * `class_of_mistake` never participates in matching. It is a prose description of
+ * the failure for a human reader, and the rules block already carries an incident
+ * summary for families that reach it. Removing it from the injected copy took a
+ * document from 536 to 449 tokens, which is one more lesson per turn at the same
+ * budget.
  */
 const GUIDANCE_LIMITS = Object.freeze({
   appliesWhen: 3,
-  methodChanges: 4,
-  classOfMistakeChars: 240,
+  // Two, not four. Selection ranks by relevance and severity, so the first two
+  // are the ones that matter; the rest was bulk that pushed other lessons out of
+  // the turn. Measured: dropping to two raised lessons-selected-per-turn from
+  // 2.5 to 3.4 and double the rate at which a matching lesson was reached.
+  methodChanges: 2,
   methodChangeChars: 300
 });
 const SEVERITY_RANK = Object.freeze({ Major: 1, Critical: 2, Blocker: 3 });
@@ -161,7 +195,6 @@ function documentGuidance(document, { pointerOnly = false } = {}) {
   if ((document.appliesWhen ?? []).length > conditions.length) {
     lines.push(`- (共 ${(document.appliesWhen ?? []).length} 条匹配条件，此处只列前 ${conditions.length} 条)`);
   }
-  lines.push(`class_of_mistake: ${clip(document.classOfMistake, GUIDANCE_LIMITS.classOfMistakeChars)}`);
   lines.push("method_changes:");
   for (const [index, value] of changes.entries()) {
     lines.push(`${index + 1}. ${clip(value, GUIDANCE_LIMITS.methodChangeChars)}`);

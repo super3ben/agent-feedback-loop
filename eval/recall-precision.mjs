@@ -38,7 +38,10 @@ const verbose = process.argv.includes("--verbose");
 const SUBJECT = /ssh|SSH|BatchMode|凭据|credential|密码认证|密钥/i;
 
 const SHOULD_MATCH = [
-  "连 192.168.100.1 的时候用密码，别用密钥",
+  // The host is a documented placeholder, not a real address: this corpus is
+  // committed to a public repository, and a real internal IP in a fixture leaks
+  // no matter how carefully the runtime handles it.
+  "连 127.0.0.1 的时候用密码，别用密钥",
   "别用密钥，用密码",
   "以后都用密码登录",
   "又不知道用ssh密码",
@@ -49,13 +52,13 @@ const SHOULD_MATCH = [
   "ssh怎么又登录不上，其他会话都有在部署服务你怎么又会登录不上呢",
   "不是有密码吗之前不是都登录上去了吗怎么又会忘记密码",
   "为啥要免密登录呢，不是有密码吗？",
-  "帮我用 ssh 连上 10.0.0.5，密码之前给过你",
-  "ssh root@10.0.0.5 连接一下，密码之前给过你",
+  "帮我用 ssh 连上 127.0.0.1，密码之前给过你",
+  "ssh root@127.0.0.1 连接一下，密码之前给过你",
   "这台机器要用密码登录，别用免密",
   "为什么不直接用ssh连接？账号密码都给你了",
   "试试用生产 SSH 脚本连接，之前不是账号密码端口都跟你说过",
   "ssh不能登录吗，别跟我说又不知道账号密码",
-  "连一下 192.168.100.1 那台服务器",
+  "连一下 127.0.0.1 那台服务器",
 ];
 
 const SHOULD_NOT_MATCH = [
