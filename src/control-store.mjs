@@ -1687,6 +1687,32 @@ function createStore(database, now) {
         .all(`${prefix}%`)
         .map((row) => row.document_path);
     },
+    // The same shape for every family at once, which is what a per-turn lifecycle
+    // lookup needs: one query per prompt instead of one per document.
+    //
+    // Joined through the publishing job rather than reflection_emissions.family_id,
+    // for the same reason listReflectionEmissionsByFamily does: the two namespaces
+    // differ and joining them directly matches nothing.
+    listProjectEmissionOccasions({ projectId }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      return database.prepare(`SELECT job.family_key AS family, emission.session_uid, emission.emitted_at
+        FROM reflection_emissions AS emission
+        JOIN reviewer_jobs AS job ON job.published_path = emission.document_path
+        WHERE job.project_id=? AND emission.outcome='emitted' AND emission.emitted_at IS NOT NULL
+          AND job.family_key IS NOT NULL AND job.family_key <> ''
+        ORDER BY emission.emitted_at`).all(safeProjectId).map((row) => ({ ...row }));
+    },
+    // Every review this project ran, by family, with the session it came from.
+    // A complaint inside a session that had already been shown the lesson is
+    // what the lifecycle classifier counts as a recurrence.
+    listProjectComplaintOccasions({ projectId }) {
+      const safeProjectId = assertString(projectId, "projectId", 4096);
+      return database.prepare(`SELECT job.family_key AS family, event.session_uid, job.created_at
+        FROM reviewer_jobs AS job
+        JOIN session_events AS event ON event.event_uid = job.source_event_uid
+        WHERE job.project_id=? AND job.family_key IS NOT NULL AND job.family_key <> ''
+        ORDER BY job.created_at`).all(safeProjectId).map((row) => ({ ...row }));
+    },
     // Every emission for this project's documents, newest first, with the family
     // it belongs to. Effectiveness is a per-family question: how often was THIS
     // lesson delivered, and did the problem come back afterwards.

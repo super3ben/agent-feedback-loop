@@ -174,17 +174,18 @@
 
 <!-- afl:rules:start -->
 
-<!-- afl:rules:budget 6049/65536 demoted=2 -->
+<!-- afl:rules:budget 6097/65536 demoted=2 -->
 
-### reflection-context-ineffective (7×, Major)
+### reflection-context-ineffective (8×, Major)
 
 **何时适用：**
-- 用户说「你自己测试一下现在改动的效果」「自测一下」「会不会起作用」，要求验证反思注入链路的改动时
+- 刚改完反思注入或匹配链路（带上下文匹配、排序、distinctive 门槛、停用词、语义闸门），准备汇报「已完成并生效」「已装到运行时」之前
 
 **Do not repeat this mistake:**
-- 自测反思注入时，直接拿用户真实说过的话当输入：「ssh 某台机器 连接一下，密码之前给过你」「为什么又问我密码 ssh 连不上」「连一下某台机器」，并打印实际注入到上下文的那段反思原文，逐条确认命中。
-- 把语义闸门对「请求做某事」的判定改为放行：只要用户提到的对象与场景（ssh、某台机器、密码、凭据）与已有反思匹配就注入，不再要求提示必须写成「报告问题」。
-- 自测发现用户反复出现的真实说法仍命中不了时，直接当成缺陷修掉，并在交付里给出修复前后的命中结果，而不是用「闸门判定它不是该出现的时机」解释掉再问用户要不要修。
+- 改完反思注入或匹配逻辑后，在同一轮内跑一次真实模型的有注入/无注入对照：用用户原话各发一次，把两段模型输出原文贴进交付，不只贴注入文本。
+- 交付里把结论拆成两行：「注入文本正确」用 hook 输出证明；「模型判断改变」没有对照实验就写「未验证」，不写「已生效」。
+- 召回率、精确率、覆盖率单列为「链路指标」，不与「生效」并列，也不作为行为结论的依据。
+- 在让用户去测之前，自己起一个新会话，发一条用户最可能说的原话（例如「连一下那台服务器」或「为啥要免密登录呢，不是有密码吗？」），检查注入内容与模型首句反应后再汇报。
 
 ### platform-formula-syntax-support (7×, Major)
 
@@ -239,7 +240,7 @@
 
 **本项目已记录的全部教训家族**
 
-- reflection-context-ineffective (7×)
+- reflection-context-ineffective (8×)
 - platform-formula-syntax-support (7×)
 - backtest-calculation-metric-validity (7×)
 - design-phase-generation-counting (7×)

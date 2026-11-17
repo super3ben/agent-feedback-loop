@@ -389,7 +389,11 @@ function compareNewest(left, right) {
  */
 function rankKey(document) {
   return [
-    -document.relevanceScore,
+    // A family whose lesson was already in front of the agent when the same
+    // complaint happened again has been contradicted by evidence. It is not
+    // removed — its subject may still be right — but it loses the slot to a
+    // lesson that has never been disproven. See src/reflection-lifecycle.mjs.
+    -(document.relevanceScore * (document.lifecycleWeight ?? 1)),
     -(SEVERITY_RANK[document.finalSeverity] ?? 0),
     // Newest first. An undatable document sorts last rather than crashing.
     -(Date.parse(document.createdAt) || 0),
@@ -470,6 +474,12 @@ export function selectReflections({
   priorEmissions = [],
   publishedBefore,
   familyRecurrence = {},
+  // Per-family lifecycle state, from src/reflection-lifecycle.mjs. Only
+  // "recurred" changes anything: it demotes a family whose lesson was already in
+  // front of the agent when the same complaint happened again. Absent entries
+  // rank at full weight, so a caller that does not compute states behaves as it
+  // did before.
+  familyLifecycle = {},
   coveredFamilies = null,
   // The families the rules block rendered IN FULL this turn. Distinct from
   // coveredFamilies, which is what selection must skip; this is what selection
@@ -660,7 +670,8 @@ export function selectReflections({
       ...document,
       finalSeverity: document.severity,
       relevanceScore: entry.relevanceScore,
-      familyRecurrence: recurrence.get(document.familyId)
+      familyRecurrence: recurrence.get(document.familyId),
+      lifecycleWeight: familyLifecycle[document.familyId] === "recurred" ? 0.5 : 1
     });
   }
 

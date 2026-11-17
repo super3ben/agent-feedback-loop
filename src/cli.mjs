@@ -1,6 +1,6 @@
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,7 @@ import { handleExecutionHook, resetExecutionMonitorForPrompt } from "./execution
 import { resolveDesignPermit } from "./design-permit.mjs";
 import { archiveReflections, selectArchivableReflections, DEFAULT_ARCHIVE_AFTER_DAYS } from "./reflection-archive.mjs";
 import { summarizeReflectionEffectiveness } from "./reflection-effectiveness.mjs";
+import { classifyProject } from "./reflection-lifecycle.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
@@ -813,6 +814,26 @@ export async function handlePromptHook({
       maxFileBytes: result.selectionInput.maxFileBytes
     });
     let familyRecurrence = {};
+    // Which families have been contradicted by evidence, so selection can demote
+    // them. Computed once per prompt from two queries rather than per document.
+    //
+    // This is the read side of the lifecycle: a lesson that was already in front
+    // of the agent when the same complaint happened again has been tested and
+    // failed, and should yield its slot to a lesson nothing has disproven. The
+    // write side — retiring a family that has gone dormant long enough to be
+    // noise — is `reflections lifecycle --apply`, because retiring changes what
+    // the catalog contains and is not something a prompt hook should do silently.
+    let familyLifecycle = {};
+    try {
+      const lifecycle = classifyProject({
+        emissions: controlStore.listProjectEmissionOccasions({ projectId: result.selectionInput.projectDir }),
+        complaints: controlStore.listProjectComplaintOccasions({ projectId: result.selectionInput.projectDir })
+      });
+      familyLifecycle = lifecycle.states;
+    } catch {
+      // A lifecycle that cannot be computed costs a ranking nudge, not the turn.
+      familyLifecycle = {};
+    }
     // Which reviewer family a document belongs to, and how often that family has
     // recurred. Selection needs both to recognise a document whose family the
     // rules block already injects every turn.
@@ -885,6 +906,11 @@ export async function handlePromptHook({
     const selection = selectDocuments({
       documents: catalog.documents,
       familyRecurrence,
+      // Which families have already been contradicted by evidence: their lesson
+      // was in front of the agent when the same complaint happened again. Those
+      // are demoted so a lesson nobody has disproven wins the slot instead.
+      // Computed per prompt from one query — see classifyProject.
+      familyLifecycle,
       // Separate, not concatenated: the message decides the ranking and the
       // conversation is the fallback for a message with no subject of its own.
       // Merging them let the longer side win, so a turn that changed the subject
@@ -1437,6 +1463,83 @@ export async function main(args, {
           declines: store.listFamilyDeclineCounts({ projectId: projectDir })
         });
         console.log(JSON.stringify(summary, null, 2));
+        return;
+      }
+      if (subcommand === "lifecycle") {
+        // Which lessons earned their place, which were contradicted, and which
+        // have gone quiet for so long that they are about something that
+        // happened once rather than long-term experience.
+        //
+        // Retiring is the only destructive part and needs --apply. Demotion is
+        // not destructive at all: a recurred family keeps its file and simply
+        // ranks below lessons that have not been disproven, which the selection
+        // path already reads on every prompt.
+        const observationDaysRaw = optionValue(options.args, "--observation-days", "30");
+        const retireAfterRaw = optionValue(options.args, "--retire-after-days", "90");
+        const observationDays = Number(observationDaysRaw);
+        const retireAfterDays = Number(retireAfterRaw);
+        if (!Number.isSafeInteger(observationDays) || observationDays < 1) {
+          throw new Error("--observation-days must be a positive integer");
+        }
+        if (!Number.isSafeInteger(retireAfterDays) || retireAfterDays < observationDays) {
+          throw new Error("--retire-after-days must be an integer >= --observation-days");
+        }
+        const lifecycle = classifyProject({
+          emissions: store.listProjectEmissionOccasions({ projectId: projectDir }),
+          complaints: store.listProjectComplaintOccasions({ projectId: projectDir }),
+          observationDays,
+          retireAfterDays
+        });
+        const retireFamilies = new Set(
+          lifecycle.families.filter((entry) => entry.retire).map((entry) => entry.family)
+        );
+        const apply = options.args.includes("--apply");
+        let retired = [];
+        if (apply && retireFamilies.size) {
+          // Retirement moves the family's documents out of the scanned directory.
+          // A move, not a delete: the file keeps its bytes and its name, so the
+          // decision is reversible by moving it back. Only families the
+          // classifier called dormant qualify — see shouldRetire.
+          const published = store.listPublishedJobsWithFamily({ projectId: projectDir })
+            .filter((job) => retireFamilies.has(job.family_key) && job.published_path);
+          const candidates = [];
+          const seen = new Set();
+          for (const job of published) {
+            const documentPath = path.resolve(job.published_path);
+            if (seen.has(documentPath)) continue;
+            seen.add(documentPath);
+            try {
+              const info = await stat(documentPath);
+              candidates.push({
+                name: path.basename(documentPath),
+                path: documentPath,
+                bytes: info.size,
+                modifiedAt: new Date(info.mtimeMs).toISOString()
+              });
+            } catch {
+              // A document the store knows about but the disk does not is not a
+              // retirement candidate; it is a separate inconsistency.
+            }
+          }
+          const result = await archiveReflections({ reflectionsDir, candidates, dryRun: false });
+          retired = result.moved.map((entry) => entry.name);
+        }
+        const retiring = lifecycle.families.filter((entry) => entry.retire);
+        console.log(JSON.stringify({
+          status: apply ? "applied" : "dry_run",
+          projectDir,
+          observationDays,
+          retireAfterDays,
+          totals: lifecycle.totals,
+          demoted: lifecycle.families.filter((entry) => entry.weight < 1).map((entry) => entry.family),
+          retireCandidates: retiring.map((entry) => ({
+            family: entry.family,
+            state: entry.state,
+            lastDeliveredAt: entry.lastDeliveredAt,
+            dormantDays: entry.observedDays
+          })),
+          retired
+        }, null, 2));
         return;
       }
       if (subcommand === "rules") {

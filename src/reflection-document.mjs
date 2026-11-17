@@ -241,6 +241,36 @@ function sectionsFrom(markdown) {
     const end = index + 1 < listMarkers.length ? listMarkers[index + 1].index : markdown.length;
     sections.set(kind, listMarkers[index + 1] ? markdown.slice(start, end).trim() : markdown.slice(start).trim());
   }
+  // A third shape: the label sits at the left margin with no marker at all —
+  // `class of mistake:` on its own line, body underneath. Neither pattern above
+  // matches it, so those sections parsed as missing and the whole document fell
+  // out of the catalog. Measured across five live projects, 8 documents were in
+  // this state, including 20260707-161405-ssh-batchmode-auth.md — the lesson that
+  // says to drop `BatchMode=yes` so the password can be typed, which is the rule
+  // the user had to restate more than ten times.
+  //
+  // This runs even when the list pass already found something, because the
+  // shapes MIX: that SSH document has facts/complaint/root cause as list entries
+  // and class of mistake / method change as bare labels. Returning early after
+  // the list pass left exactly the two sections that make a lesson actionable
+  // missing, which reads as "the document has no method" rather than "the parser
+  // stopped too soon".
+  //
+  // Only a line that is EXACTLY `name:` counts, and only for names already in
+  // the alias table. Prose that happens to contain a colon mid-sentence is not a
+  // section boundary, and any other reading would split real documents apart.
+  const bareMarkers = [];
+  for (const match of markdown.matchAll(/^([A-Za-z][A-Za-z0-9 _/]*?)\s*:\s*$/gmu)) {
+    const kind = HEADING_ALIASES.get(normalizeHeading(match[1].replace(/_/gu, " ")));
+    if (kind) bareMarkers.push({ kind, index: match.index, length: match[0].length });
+  }
+  for (let index = 0; index < bareMarkers.length; index += 1) {
+    const marker = bareMarkers[index];
+    if (sections.has(marker.kind)) continue;
+    const start = marker.index + marker.length;
+    const end = index + 1 < bareMarkers.length ? bareMarkers[index + 1].index : markdown.length;
+    sections.set(marker.kind, markdown.slice(start, end).trim());
+  }
   return sections;
 }
 
