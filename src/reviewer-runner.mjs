@@ -7,7 +7,7 @@ import {
   readReflectionCatalog,
   validateReflectionModel
 } from "./reflection-document.mjs";
-import { validateReviewerResult } from "./reviewer-result.mjs";
+import { validateReviewerResult, deriveReviewerFamilyId } from "./reviewer-result.mjs";
 import { maybeUpdateRulesTier } from "./update-rules-tier.mjs";
 import { escalateDeclinedFamily } from "./reviewer-escalate.mjs";
 
@@ -136,6 +136,39 @@ function selectStatedRequirements(events) {
   }
   // Restore chronological order so the reviewer reads them as a timeline.
   return chosen.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+}
+
+/**
+ * The key an already-known family was filed under.
+ *
+ * A reviewer returning to an existing family sets `proposed_family_key: null` —
+ * it only mints a key for a NEW family — so the publication path used to record
+ * `family_key: null` for every recurrence. Those rows then had no key to count
+ * against: they could not enter the rules block, and no later prompt could match
+ * them. Measured: 17 such rows in one store, every one a lesson that became
+ * unreachable the moment it was published a second time.
+ *
+ * The family id is derived from (methodClass, familyKey), so the key cannot be
+ * read back from the id. It IS recoverable by trying the keys this project
+ * already knows: the one that derives this id is the one that was used.
+ */
+function familyKeyForExisting(store, jobId, methodClass, familyId) {
+  if (!familyId || !methodClass || typeof store.listReviewFamilyKeys !== "function") return null;
+  let known;
+  try {
+    known = store.listReviewFamilyKeys({ jobId, limit: 128 });
+  } catch {
+    return null;
+  }
+  for (const entry of known ?? []) {
+    if (typeof entry?.familyKey !== "string") continue;
+    try {
+      if (deriveReviewerFamilyId(methodClass, entry.familyKey) === familyId) return entry.familyKey;
+    } catch {
+      // A key that cannot derive anything is simply not this family's.
+    }
+  }
+  return null;
 }
 
 async function catalogSummaries(projectDir, publishedBefore) {
@@ -606,9 +639,19 @@ export async function runReviewJob({
       leaseEpoch,
       path: published.path,
       sha256: published.sha256,
-      // A new family proposes its key; an existing one already has recurrence
-      // recorded against the key its earlier reviews used.
-      familyKey: result.proposed_family_key ?? null,
+      // A new family proposes its key. An EXISTING family returns
+      // `proposed_family_key: null` — the reviewer only fills that field when it
+      // is minting a family — so this used to record null for every recurrence
+      // of an already-known family. Those rows then have no key to count
+      // against, never enter the rules block, and never match a later prompt:
+      // measured 17 such rows in one store, each a lesson that could not be
+      // reached again.
+      //
+      // The key they were filed under is the one the catalog already knows, so
+      // fall back to the family id's own key rather than null.
+      familyKey: result.proposed_family_key
+        ?? familyKeyForExisting(store, jobId, model.method_class, model.family_id)
+        ?? null,
       // Severity drives the rules-tier gate: Major + 3 → .agent/rules/,
       // Critical + 2, Blocker + 1.
       severity: result.final_severity ?? null

@@ -229,12 +229,31 @@ function compareNewest(left, right) {
   return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
 }
 
+/**
+ * Ranking order for equally relevant lessons.
+ *
+ * `familyRecurrence` used to outrank recency, which permanently buried a lesson
+ * the moment it was written: a family that recurred 99 times months ago kept the
+ * slot against the document written yesterday, which had recurred once. Measured
+ * adversarially — one new document against eight old ones, all at the same
+ * relevance — the new one was dropped every time.
+ *
+ * That inverts the point of the system. A lesson written today describes the
+ * problem the user is hitting now; one from three months ago describes what they
+ * were hitting then. The count says how often it mattered historically, not
+ * whether it is the one that matters today.
+ *
+ * So recency leads and the count breaks ties, which keeps the old behaviour
+ * where it was right: among documents of the same age, the one that keeps
+ * recurring still wins.
+ */
 function rankKey(document) {
   return [
     -document.relevanceScore,
     -(SEVERITY_RANK[document.finalSeverity] ?? 0),
+    // Newest first. An undatable document sorts last rather than crashing.
+    -(Date.parse(document.createdAt) || 0),
     -document.familyRecurrence,
-    -Date.parse(document.createdAt),
     document.reflectionId ?? ""
   ];
 }
