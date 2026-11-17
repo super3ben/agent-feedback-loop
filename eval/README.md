@@ -14,6 +14,7 @@ node eval/run-all.mjs
 | `session-recurrence.mjs` | After delivery, does the family recur less often? | The lesson arrives and nothing changes |
 | `project-drift.mjs` | Did the whole project go quiet anyway? | The drop is the project's trend, not the lesson |
 | `net-effect.mjs` | Family change minus project change | The only number attributable to the lesson |
+| `lifecycle-effect.mjs` | Does demoting a contradicted family change a turn — in the right direction, and only where it should? | Demotion never fires, or it reorders lessons it has no evidence about |
 
 ## Things that made earlier measurements wrong
 

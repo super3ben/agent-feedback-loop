@@ -51,6 +51,13 @@ sections.push(await run("复发变化（30 天）", "session-recurrence.mjs", ["
 sections.push(await run("项目整体漂移（对照）", "project-drift.mjs"));
 sections.push(await run("净效果（扣除项目趋势）", "net-effect.mjs"));
 
+// 5. Lifecycle: does demoting a contradicted family change a turn, in the right
+// direction, and only where it should? Separate from the four above because it
+// answers a narrower question — not "did recurrence fall" but "does the
+// mechanism reach the ranking at all". This one exits non-zero on a failed
+// assertion, so it is a regression guard rather than a report.
+sections.push(await run("生命周期降权效果", "lifecycle-effect.mjs"));
+
 let failed = 0;
 for (const section of sections) {
   console.log(`\n${"█".repeat(68)}`);
