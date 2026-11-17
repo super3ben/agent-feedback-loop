@@ -2552,6 +2552,33 @@ function createStore(database, now) {
         FROM session_events WHERE event_uid=?`).get(assertString(eventUid, "event_uid", 512));
       return row ? { ...row } : null;
     },
+    /**
+     * The last few user messages of a session, oldest first.
+     *
+     * Selection used to match a lesson against the CURRENT prompt alone, which
+     * cannot work for short turns: 「部署上去」 shares one term with anything.
+     * Measured on a real session, that message hit 1 lesson term on its own and
+     * 19 when the four preceding messages were included — the topic was in the
+     * conversation, not in the four characters.
+     *
+     * Only user messages: the assistant's own text is what the lesson may be
+     * about, and matching against it would find every lesson that describes an
+     * agent mistake.
+     */
+    listRecentUserMessages({ sessionUid, before = null, limit = 4 }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      const safeLimit = assertLimit(limit, "limit", 4, 16);
+      if (safeLimit === 0) return [];
+      const safeBefore = before === null ? null : assertString(before, "before", 64);
+      const rows = safeBefore === null
+        ? database.prepare(`SELECT event_uid, encrypted_raw_ref, created_at FROM session_events
+            WHERE session_uid=? AND role='user'
+            ORDER BY created_at DESC, event_uid DESC LIMIT ?`).all(safeSessionUid, safeLimit)
+        : database.prepare(`SELECT event_uid, encrypted_raw_ref, created_at FROM session_events
+            WHERE session_uid=? AND role='user' AND created_at<?
+            ORDER BY created_at DESC, event_uid DESC LIMIT ?`).all(safeSessionUid, safeBefore, safeLimit);
+      return rows.reverse().map((row) => ({ ...row }));
+    },
     getExecutionMonitor({ monitorId }) {
       const safeMonitorId = executionMonitorId(monitorId);
       const row = database.prepare("SELECT value FROM store_meta WHERE key=?")

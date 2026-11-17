@@ -711,6 +711,53 @@ export async function handlePromptHook({
   } catch {
     promptLog("reflection_parse_omitted", { reason: "selection_record_failed" });
   }
+  // What this turn is ABOUT, not just this sentence.
+  //
+  // Selection used to match against the current prompt alone, and a gate
+  // required that prompt to read as a complaint. Both were wrong for the same
+  // reason: the user's topic is usually in the conversation, not in the message.
+  // 「部署上去」 shares one lesson term on its own; with the four preceding
+  // messages it shares nineteen. Meanwhile 「今天天气怎么样」 shares enough
+  // two-character bigrams with everything to score like a real match, which is
+  // why no score threshold could separate related from unrelated — measured
+  // across 12 thresholds, the best split still missed half.
+  //
+  // Computed once, before either channel reads it, so the rules block and the
+  // selector agree about what the turn is about.
+  //
+  // Kept as two texts rather than one concatenation. Truncation is lossless here
+  // for the rules block, which only asks "does any of this text touch the
+  // section", but not for selection: there, merging let the longer side decide
+  // the ranking, so a message that changed the subject still lost to the topic
+  // from twenty turns ago. The selector receives them separately and decides
+  // which one governs. See the ranking block in src/selector.mjs.
+  const currentPrompt = result.selectionInput.prompt;
+  let conversationContext = "";
+  try {
+    const sessionUid = result.selectionInput.session.sessionUid;
+    if (sessionUid && controlStore && typeof controlStore.listRecentUserMessages === "function" && blobs) {
+      const recent = controlStore.listRecentUserMessages({ sessionUid, limit: 4 });
+      const parts = [];
+      for (const row of recent) {
+        if (!row.encrypted_raw_ref) continue;
+        try {
+          const text = await blobs.read(row.encrypted_raw_ref);
+          if (text) parts.push(String(text).slice(0, 400));
+        } catch {
+          // An unreadable message costs one context line, not the turn.
+        }
+      }
+      if (parts.length) conversationContext = parts.join(" ");
+    }
+  } catch {
+    conversationContext = "";
+  }
+  // What the rules block matches against: topic from either source, since it
+  // only decides whether a section is on subject at all.
+  const selectionText = conversationContext
+    ? `${conversationContext} ${currentPrompt} ${currentPrompt}`
+    : currentPrompt;
+
   // Read the every-turn rules block BEFORE selecting, because selection has to
   // know which families it already covers. A family that reached the rules tier
   // is injected on every prompt; selecting its document again injects the same
@@ -720,8 +767,13 @@ export async function handlePromptHook({
     // The prompt is passed so the layered block can expand the sections this
     // turn actually touches. Reading the block without it would inject the
     // index alone and lose every instruction.
+    //
+    // The recent conversation is included for the same reason selection needs it:
+    // a short instruction carries its topic in the conversation, not in itself.
+    // Without this the block and the selector would disagree about what the turn
+    // is about, and a lesson expanded by one would be suppressed by the other.
     rulesBlock = await readProjectRulesBlock(result.selectionInput.projectDir, {
-      prompt: userText
+      prompt: selectionText ?? userText
     });
   } catch (error) {
     promptLog("rules_block_injected", { reason: "read_failed" });
@@ -827,11 +879,18 @@ export async function handlePromptHook({
     // an ordinary instruction from burning an emission record, which would make
     // that lesson look "delivered" in the effectiveness report for a turn that
     // could not have used it.
-    const selectionApplies = readsAsProblemOrObjection(result.selectionInput.prompt);
+    //
+    // The match text was computed above, before the rules block read it, so both
+    // channels answer "what is this turn about" the same way.
     const selection = selectDocuments({
-      documents: selectionApplies ? catalog.documents : [],
+      documents: catalog.documents,
       familyRecurrence,
-      prompt: result.selectionInput.prompt,
+      // Separate, not concatenated: the message decides the ranking and the
+      // conversation is the fallback for a message with no subject of its own.
+      // Merging them let the longer side win, so a turn that changed the subject
+      // still received the lesson from the previous one.
+      prompt: currentPrompt,
+      context: conversationContext,
       session: result.selectionInput.session,
       task: result.selectionInput.task,
       budget: {

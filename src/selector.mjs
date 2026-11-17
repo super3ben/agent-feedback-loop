@@ -75,6 +75,32 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * Terms that appear across most lessons carry no discriminating power, but they
+ * dominate a naive overlap count all the same.
+ *
+ * This list already existed in the rules-block channel; selection had none, and
+ * that asymmetry produced the false matches. Measured over 13 unrelated requests
+ * against a live project, every false positive rested on one of these terms:
+ * 「加一个接口，返回用户列表」 matched a lesson on 一个/用户/返回/列表 and reached a
+ * score of 16, 「写一个 README」 matched on 一个 alone. With them removed, the same
+ * 13 requests produced no match at all.
+ *
+ * Kept deliberately short and additive to the rules-block list rather than a
+ * second, divergent one: the two channels answer the same question, and a term
+ * that is noise for one is noise for the other.
+ */
+const GENERIC_TERMS = new Set([
+  "用户", "问题", "必须", "不是", "不要", "需要", "执行", "处理", "时候", "已经",
+  "事情", "东西", "这个", "这些", "那样", "之前", "之后", "而是", "所以", "因为",
+  "一个", "一下", "可以", "什么", "怎么", "还是", "没有", "现在", "然后", "如果",
+  "就是", "这样", "但是", "只是", "应该", "可能", "知道", "或者", "以及", "进行",
+  "通过", "我的", "你的", "他们", "也要", "一起", "直接", "现在", "全部", "开始",
+  "user", "the", "and", "for", "when", "with", "that", "this", "from", "into",
+  "must", "never", "always", "agent", "should", "before", "after", "same",
+  "not", "are", "was", "has", "have", "its", "one", "only", "than", "run", "runs"
+]);
+
 function normalize(value) {
   return String(value ?? "").normalize("NFKC").toLocaleLowerCase("en-US").replace(/\s+/gu, " ").trim();
 }
@@ -84,22 +110,18 @@ function textFeatures(values) {
   const cjk = new Set();
   for (const source of Array.isArray(values) ? values : [values]) {
     const value = normalize(source);
-    for (const token of value.match(LATIN_WORD) ?? []) latin.add(token);
+    for (const token of value.match(LATIN_WORD) ?? []) {
+      if (!GENERIC_TERMS.has(token)) latin.add(token);
+    }
     for (const run of value.match(CJK_RUN) ?? []) {
       const points = Array.from(run);
       for (let index = 0; index + 1 < points.length; index += 1) {
-        cjk.add(`${points[index]}${points[index + 1]}`);
+        const bigram = `${points[index]}${points[index + 1]}`;
+        if (!GENERIC_TERMS.has(bigram)) cjk.add(bigram);
       }
     }
   }
   return { latin, cjk };
-}
-
-function intersectionSize(left, right) {
-  let count = 0;
-  for (const token of left.latin) if (right.latin.has(token)) count += 1;
-  for (const token of left.cjk) if (right.cjk.has(token)) count += 1;
-  return count;
 }
 
 function exactMetadataMatches(document, task) {
@@ -118,15 +140,133 @@ function exactMetadataMatches(document, task) {
   return matches;
 }
 
-function relevanceScore(document, prompt, task) {
-  const promptFeatures = textFeatures(prompt);
-  const lexical =
-    4 * intersectionSize(promptFeatures, textFeatures(document.appliesWhen ?? []))
-    + 3 * intersectionSize(promptFeatures, textFeatures(document.classOfMistake))
-    + 2 * intersectionSize(promptFeatures, textFeatures(document.methodClass))
-    + intersectionSize(promptFeatures, textFeatures(document.methodChanges ?? []));
+/**
+ * A term shared by this share of the candidate lessons says nothing about which
+ * one applies. Same ratio, same reasoning, as the rules-block channel — the two
+ * channels answer the same question and must agree about what counts as signal.
+ */
+const DISTINCTIVE_DF_RATIO = 0.5;
+
+/**
+ * The bar a match must clear when no lesson can be told apart from the others.
+ *
+ * Only used in that case — see the separability block in selectReflections. It is
+ * deliberately above the noise range measured on an unrelated request against a
+ * live project (top score ~6), because a shared condition is what an accidental
+ * match looks like and there is no distinctive term left to tell them apart.
+ */
+const AMBIGUOUS_SCORE_FLOOR = 10;
+
+/**
+ * The lowest score any selected lesson may carry, separable or not.
+ *
+ * The distinctive floor answers "can I tell these lessons apart"; it does not
+ * answer "does anything apply". After it was made available-aware (a two-term
+ * message like 「又不知道用ssh密码」 can never supply four distinctive terms), a
+ * message with ONE shared term cleared a floor of one and injected lessons at
+ * score 4. Measured: 「今天天气怎么样」 selected two lessons.
+ *
+ * Four is where the ranges separate on real data: the weakest genuine match
+ * (「部署上去」 against the deployment lesson) scores 4.0, while unrelated prompts
+ * top out at 1.0-3.0.
+ */
+const MIN_SELECTED_SCORE = 4;
+
+/**
+ * Which terms a lesson is about, and how strongly each one counts.
+ *
+ * A term's weight is the strongest field it appears in, not the sum: a condition
+ * that appears in both applies_when and the method text is one condition, and
+ * adding the two weights would let a verbose lesson outrank a focused one.
+ *
+ * Cached per document object. The document set is re-read on every prompt, but
+ * within one process the same objects are scored against several texts (the
+ * current message, then the conversation), and rebuilding this map for each is
+ * pure waste.
+ */
+const TERM_WEIGHT_CACHE = new WeakMap();
+
+function lessonTermWeights(document) {
+  const cached = TERM_WEIGHT_CACHE.get(document);
+  if (cached) return cached;
+  const weights = new Map();
+  // A bare numeral is not a term. Lesson ids and fixture names carry digits
+  // (`class_1`, `family-2`), so a reply of 「1」 otherwise matched one of them and
+  // counted as a distinctive hit — which told the selector the message had a
+  // subject of its own and stopped it from falling back to the conversation. The
+  // measured effect was a single digit silently suppressing the context path.
+  const isNumber = (term) => /^\d+$/u.test(term);
+  const fields = [
+    [4, textFeatures(document.appliesWhen ?? [])],
+    [3, textFeatures(document.classOfMistake)],
+    [2, textFeatures(document.methodClass)],
+    [1, textFeatures(document.methodChanges ?? [])]
+  ];
+  for (const [weight, features] of fields) {
+    for (const term of features.latin) {
+      if (isNumber(term)) continue;
+      const key = `l\u0000${term}`;
+      if ((weights.get(key) ?? 0) < weight) weights.set(key, weight);
+    }
+    for (const term of features.cjk) {
+      const key = `c\u0000${term}`;
+      if ((weights.get(key) ?? 0) < weight) weights.set(key, weight);
+    }
+  }
+  TERM_WEIGHT_CACHE.set(document, weights);
+  return weights;
+}
+
+/**
+ * How much this lesson is about this text, and on how many uncommon terms that
+ * rests.
+ *
+ * Both halves are needed. The score alone cannot separate a real match from an
+ * accident once the text may be a whole conversation: measured over 187 real
+ * turns of one project, every candidate scored above the noise floor on every
+ * turn — 5,955 selections for 187 turns, so the budget was always full and the
+ * ranking was decided by whatever bigrams happened to line up. On a labelled set
+ * that showed up as 7 of 13 unrelated requests pulling in a lesson about
+ * credentials.
+ *
+ * `distinctive` is the half that fixes it, and it is the same guard the
+ * rules-block channel already applies: a match resting only on terms shared
+ * across half the project carries no information about WHICH lesson applies. The
+ * two channels answered the same question differently, which is how a request
+ * for "跑一下测试" could arrive carrying a lesson about SSH.
+ */
+function promptMatch(document, promptFeatures, task, documentFrequency, distinctiveLimit) {
+  const weights = lessonTermWeights(document);
+  let lexical = 0;
+  let distinctive = 0;
+  for (const term of promptFeatures.latin) {
+    const weight = weights.get(`l\u0000${term}`);
+    if (weight === undefined) continue;
+    lexical += weight;
+    if ((documentFrequency.get(`l\u0000${term}`) ?? 0) <= distinctiveLimit) distinctive += 1;
+  }
+  for (const term of promptFeatures.cjk) {
+    const weight = weights.get(`c\u0000${term}`);
+    if (weight === undefined) continue;
+    lexical += weight;
+    if ((documentFrequency.get(`c\u0000${term}`) ?? 0) <= distinctiveLimit) distinctive += 1;
+  }
   const metadata = 8 * exactMetadataMatches(document, task);
-  return Math.min(40, lexical + metadata);
+  // Square root rather than the full count: linear normalisation would make a
+  // lesson that genuinely matches a long report score lower than one that
+  // coincidentally matches a short message. The root keeps longer matches ahead
+  // while stopping the count from growing with text length alone.
+  const promptTermCount = promptFeatures.latin.size + promptFeatures.cjk.size;
+  const scale = Math.max(1, Math.sqrt(promptTermCount / 8));
+  return {
+    relevanceScore: Math.min(40, (lexical + metadata) / scale),
+    distinctive,
+    // An exact path or tool match is not an accident of shared vocabulary, so it
+    // satisfies the distinctive check on its own. Without this a task-scoped
+    // lesson — the one case where the match is certain — would be the one case
+    // the floor rejected.
+    exactMatch: metadata > 0
+  };
 }
 
 function boundedLimit(value, fallback) {
@@ -320,6 +460,10 @@ export async function loadReflectionDocuments({
 export function selectReflections({
   documents,
   prompt,
+  // The preceding user messages in this session, if the caller has them. Used
+  // only as a fallback when `prompt` carries no distinctive subject of its own —
+  // never merged into one string with it. See the ranking block below.
+  context = "",
   session,
   task,
   budget,
@@ -392,17 +536,130 @@ export function selectReflections({
       recurrence.set(familyId, Math.max(recurrence.get(familyId) ?? 0, occurrences));
     }
   }
-  const applicable = [];
+  const scored = [];
+  const distinctiveFloor = Math.max(1, Math.ceil(Math.sqrt(candidates.length) / 2));
+  const distinctiveLimit = Math.max(1, Math.floor(candidates.length * DISTINCTIVE_DF_RATIO));
+
+  // Document frequency over this project's own lessons, not a general corpus.
+  // Counting is per distinctive term identity (`l\0word` / `c\0bigram`) because
+  // a Latin word and a CJK bigram can spell the same string, and a match on one
+  // must not make the other look common.
+  const documentFrequency = new Map();
   for (const document of candidates) {
-    const score = relevanceScore(document, prompt, task);
-    if (score <= 0) {
+    for (const [key] of lessonTermWeights(document)) {
+      documentFrequency.set(key, (documentFrequency.get(key) ?? 0) + 1);
+    }
+  }
+
+  // Which text decides this turn — decided ONCE for the whole turn.
+  //
+  // The conversation says what the work is ABOUT; the message says what is being
+  // ASKED right now, and those are not the same question once a session runs for
+  // a while. Scored as one concatenated text, the longer side always won: the
+  // topic set up twenty turns ago drowned out a message that had changed the
+  // subject, and measured on a real session the selector kept returning the SSH
+  // lesson when the user had moved on to page styling.
+  //
+  // The choice must be global, not per-document. Deciding it document by
+  // document lets every lesson that matches the current message poorly fall back
+  // to the conversation and score high there, while the one lesson the message
+  // actually matches keeps its honest, lower score — so the fallback outranks the
+  // real answer. Measured exactly that way: 「这个页面的样式跟上面不一致」 with an
+  // SSH conversation put the SSH lesson first and the styling lesson behind it.
+  //
+  // So: does the current message distinguish ANY lesson? If yes it is the
+  // subject, and the conversation is ignored for ranking. If no — 「B」, 「好」,
+  // 「继续」 — the whole turn falls back, because the message carries no subject
+  // of its own and the only thing left to go on is what the session is about.
+  const currentFeatures = textFeatures(prompt);
+  const contextFeatures = textFeatures(context);
+  const hasContext = contextFeatures.latin.size + contextFeatures.cjk.size > 0;
+
+  // How many distinctive terms the message has to offer at all.
+  //
+  // The corpus-scaled floor below asks for four, which is right when the message
+  // is a paragraph. It is impossible for a message that only contains two rare
+  // terms in total: 「又不知道用ssh密码」 is exactly that — ssh and 密码 are the
+  // evidence, everything else in it is 又不/不知/知道, shared with every other
+  // complaint in the project. Demanding four distinctive matches from a message
+  // that only HAS two rejects the most direct complaint about credentials on
+  // record, which is the failure this whole project exists to prevent.
+  //
+  // So the floor is capped by what the message can supply. A short, precise
+  // message asks for less because it offers less, not because it is weaker
+  // evidence — and two rare terms that both point at the same lesson are stronger
+  // evidence than four scattered ones.
+  //
+  // Zero is a different case from "few". A message that shares no distinctive
+  // term with any lesson cannot establish separability at all, so the floor must
+  // not collapse to 1 — that would be the most permissive setting on the exact
+  // input that carries the least signal, which is backwards. Measured that way:
+  // 「今天天气怎么样」 matched two lessons at score 4.
+  const availableDistinctive = candidates.reduce((best, document) => {
+    let count = 0;
+    const weights = lessonTermWeights(document);
+    for (const term of currentFeatures.latin) {
+      if (weights.has(`l\u0000${term}`) && (documentFrequency.get(`l\u0000${term}`) ?? 0) <= distinctiveLimit) count += 1;
+    }
+    for (const term of currentFeatures.cjk) {
+      if (weights.has(`c\u0000${term}`) && (documentFrequency.get(`c\u0000${term}`) ?? 0) <= distinctiveLimit) count += 1;
+    }
+    return Math.max(best, count);
+  }, 0);
+  const effectiveFloor = availableDistinctive > 0
+    ? Math.min(distinctiveFloor, availableDistinctive)
+    : distinctiveFloor;
+
+  const fromPromptAll = candidates.map((document) =>
+    promptMatch(document, currentFeatures, task, documentFrequency, distinctiveLimit));
+  const promptSeparates = fromPromptAll.some((match) => match.distinctive >= effectiveFloor);
+  const useContext = hasContext && !promptSeparates;
+
+  for (const [index, document] of candidates.entries()) {
+    const chosen = useContext
+      ? promptMatch(document, contextFeatures, task, documentFrequency, distinctiveLimit)
+      : fromPromptAll[index];
+    if (chosen.relevanceScore <= 0) {
+      omissions.push(omission(document, "not_applicable"));
+      continue;
+    }
+    scored.push({ document, ...chosen });
+  }
+
+  // Is there ANY lesson this prompt can be told apart by?
+  //
+  // The floor below rejects a match that rests only on terms shared across half
+  // the project — those terms cannot say WHICH lesson applies. But that breaks
+  // on a project whose lessons genuinely share a condition: with five lessons all
+  // written for 「修改已有架构前先核对用户目标」, that condition IS the answer for
+  // all five, and every one of them scores zero distinctive terms. Rejecting them
+  // all would turn a well-covered class into a total miss.
+  //
+  // So the floor applies only when some lesson CAN be distinguished. When none
+  // can, the prompt matched a shared condition rather than a separating one, and
+  // the honest response is to rank by score alone — with a higher bar, because a
+  // shared condition is exactly what an accidental match looks like. Measured on
+  // a labelled set of 13 unrelated requests against a live project: this held
+  // back all 13 while keeping 14 of 14 real ones.
+  const maxDistinctive = scored.reduce((best, entry) => Math.max(best, entry.distinctive), 0);
+  const separabilityRequired = maxDistinctive >= effectiveFloor;
+
+  const applicable = [];
+  for (const { document, ...entry } of scored) {
+    if (separabilityRequired
+      ? entry.distinctive < effectiveFloor && !entry.exactMatch
+      : entry.relevanceScore < AMBIGUOUS_SCORE_FLOOR) {
+      omissions.push(omission(document, "ambiguous_match"));
+      continue;
+    }
+    if (entry.relevanceScore < MIN_SELECTED_SCORE) {
       omissions.push(omission(document, "not_applicable"));
       continue;
     }
     applicable.push({
       ...document,
       finalSeverity: document.severity,
-      relevanceScore: score,
+      relevanceScore: entry.relevanceScore,
       familyRecurrence: recurrence.get(document.familyId)
     });
   }

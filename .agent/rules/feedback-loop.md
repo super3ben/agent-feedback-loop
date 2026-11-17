@@ -174,7 +174,17 @@
 
 <!-- afl:rules:start -->
 
-<!-- afl:rules:budget 6052/65536 demoted=2 -->
+<!-- afl:rules:budget 6049/65536 demoted=2 -->
+
+### reflection-context-ineffective (7×, Major)
+
+**何时适用：**
+- 用户说「你自己测试一下现在改动的效果」「自测一下」「会不会起作用」，要求验证反思注入链路的改动时
+
+**Do not repeat this mistake:**
+- 自测反思注入时，直接拿用户真实说过的话当输入：「ssh 某台机器 连接一下，密码之前给过你」「为什么又问我密码 ssh 连不上」「连一下某台机器」，并打印实际注入到上下文的那段反思原文，逐条确认命中。
+- 把语义闸门对「请求做某事」的判定改为放行：只要用户提到的对象与场景（ssh、某台机器、密码、凭据）与已有反思匹配就注入，不再要求提示必须写成「报告问题」。
+- 自测发现用户反复出现的真实说法仍命中不了时，直接当成缺陷修掉，并在交付里给出修复前后的命中结果，而不是用「闸门判定它不是该出现的时机」解释掉再问用户要不要修。
 
 ### platform-formula-syntax-support (7×, Major)
 
@@ -214,17 +224,6 @@
 - 若豁免依赖外部阶段信号文件，检查这些文件在用户环境中是否存在并会被写入；验证缺失时的默认行为，并说明豁免如何启用。
 - 交付时分别说明已验证解决的部分和未覆盖部分；把实现过程中仍出现的 guard 或 grant 阻塞视为验收未通过，先核对触发路径。
 
-### reflection-context-ineffective (5×, Major)
-
-**何时适用：**
-- 准备宣称批量改写、迁移或修复「全部完成、0 跳过、0 失败」之前,尤其是反思文档、catalog 或注入管线的改动。
-
-**Do not repeat this mistake:**
-- 宣称批量改写/迁移完成前,先打印「处理数、跳过数、跳过原因、跳过清单」,把跳过清单与目标全集(含 legacy 与缺章节文档)逐条比对,数量对不上就不算完成。
-- 处理反思文档时,先确认每篇都能解析出 `## class of mistake` 和 `## method change`、且 `canonical !== false`,再统计真正进入 catalog 的篇数。
-- 验证生效时,用用户反复出现的词(ssh、密码、BatchMode、凭据)在注入文本里直接检索到那句可执行指令,不要只看注入字节数或 catalog 篇数。
-- 发现关键教训落在 legacy 或被跳过的文档时,先补章节或加适配层让它进入 catalog,再处理其他能注入的文档,不要把精力先花在 canonical 上。
-
 ### backtest-conclusion-inconsistency (5×, Major)
 
 **何时适用：**
@@ -240,10 +239,10 @@
 
 **本项目已记录的全部教训家族**
 
+- reflection-context-ineffective (7×)
 - platform-formula-syntax-support (7×)
 - backtest-calculation-metric-validity (7×)
 - design-phase-generation-counting (7×)
-- reflection-context-ineffective (5×)
 - backtest-conclusion-inconsistency (5×)
 - reviewer-shared-ambiguity-threshold (4×) → 更新到服务里
 - strategy-backtest-deferral (3×) → 效果不太好，我现在还是想象不出来S3的这个通用模型的图像，你能通过15个月甚至扩大到20个月的数据看下S3的选股图形是怎么样的…

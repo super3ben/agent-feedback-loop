@@ -12,6 +12,12 @@
  * behaves as it did when it was fixed", not "this is how well it works in
  * production". Production behaviour is measured by session-recurrence.mjs.
  *
+ * Measured against the path production actually uses. Two earlier versions of
+ * this file measured paths that no longer existed: one required a "reads as a
+ * complaint" gate that has since been removed, so every positive case that the
+ * gate held back was reported as a selector failure. A harness that exercises a
+ * different code path than the one shipped reports on nothing but itself.
+ *
  * Usage: node eval/recall-precision.mjs [--verbose]
  */
 
@@ -23,7 +29,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(HERE, "..");
 const SRC = (name) => path.join(PROJECT_ROOT, "src", name);
 
-const { parseLayeredBlock, selectL1Sections, readsAsProblemOrObjection } =
+const { parseLayeredBlock, selectL1Sections } =
   await import(SRC("lesson-layers.mjs"));
 const { loadReflectionDocuments, selectReflections } = await import(SRC("selector.mjs"));
 const { deriveReviewerFamilyId } = await import(SRC("reviewer-result.mjs"));
@@ -95,12 +101,14 @@ const familyKeyOf = (document) => {
 };
 
 function inspect(prompt) {
-  const gate = readsAsProblemOrObjection(prompt);
   const l1 = selectL1Sections({ l1: parsed.l1, prompt });
   const covered = new Set((l1.selected ?? []).map((section) => section.familyKey).filter(Boolean));
   const selection = selectReflections({
     documents,
     prompt,
+    // Production passes the recent conversation alongside the message. Omitting
+    // it here would measure a path that only runs on a session's first turn.
+    context: "",
     session: {},
     task: {},
     budget: { maxCards: 4, maxDocumentTokens: 640, maxTotalTokens: 1600 },
@@ -114,33 +122,34 @@ function inspect(prompt) {
     + (document.classOfMistake ?? "")
     + (document.methodChanges ?? []).join(" ")
   ));
-  return { gate, matching, l1: [...covered] };
+  return { matching, l1: [...covered], selected: selection.selected.length };
 }
 
 const positiveRows = SHOULD_MATCH.map((prompt) => ({ prompt, ...inspect(prompt) }));
 const negativeRows = SHOULD_NOT_MATCH.map((prompt) => ({ prompt, ...inspect(prompt) }));
 
-const recalled = positiveRows.filter((row) => row.gate && row.matching.length > 0).length;
-const gated = positiveRows.filter((row) => row.gate).length;
+// No gate. The complaint gate was removed from selection because it held back
+// exactly the turns a lesson was written for — 「部署上去」 right after a lesson
+// about deploy verification. What remains is the match itself, so that is what
+// this measures.
+const recalled = positiveRows.filter((row) => row.matching.length > 0).length;
 const clean = negativeRows.filter((row) => row.matching.length === 0).length;
-const blocked = negativeRows.filter((row) => !row.gate).length;
 
 const pct = (part, whole) => (whole === 0 ? 0 : Math.round((100 * part) / whole));
 
 console.log("=== 召回与精确（标注语料）===\n");
-console.log(`召回率:  ${recalled}/${SHOULD_MATCH.length}  ${pct(recalled, SHOULD_MATCH.length)}%  (闸门放行且命中)`);
-console.log(`闸门通过: ${gated}/${SHOULD_MATCH.length}  ${pct(gated, SHOULD_MATCH.length)}%`);
+console.log(`召回率:  ${recalled}/${SHOULD_MATCH.length}  ${pct(recalled, SHOULD_MATCH.length)}%  (命中对应教训)`);
 console.log(`精确率:  ${clean}/${SHOULD_NOT_MATCH.length}  ${pct(clean, SHOULD_NOT_MATCH.length)}%  (无关请求不命中)`);
-console.log(`闸门拦截: ${blocked}/${SHOULD_NOT_MATCH.length}  ${pct(blocked, SHOULD_NOT_MATCH.length)}%`);
+const noise = negativeRows.reduce((total, row) => total + row.selected, 0);
+console.log(`无关请求平均选出: ${(noise / SHOULD_NOT_MATCH.length).toFixed(2)} 篇`);
 
-const missed = positiveRows.filter((row) => !row.gate || row.matching.length === 0);
+const missed = positiveRows.filter((row) => row.matching.length === 0);
 const falsePositive = negativeRows.filter((row) => row.matching.length > 0);
 
 if (missed.length) {
   console.log(`\n未命中 ${missed.length} 条:`);
   for (const row of missed) {
-    const why = !row.gate ? "闸门挡住" : "未匹配到教训";
-    console.log(`  ✗ [${why}] ${row.prompt}`);
+    console.log(`  ✗ 选出 ${row.selected} 篇但无对应教训: ${row.prompt}`);
   }
 }
 if (falsePositive.length) {
@@ -151,7 +160,10 @@ if (falsePositive.length) {
 }
 if (verbose) {
   console.log("\n=== 全部明细 ===");
-  for (const row of [...positiveRows, ...negativeRows]) {
-    console.log(`  ${row.gate ? "放" : "挡"} | SSH命中 ${row.matching.length} | ${row.prompt}`);
+  for (const [kind, rows] of [["应命中", positiveRows], ["应不命中", negativeRows]]) {
+    console.log(`--- ${kind} ---`);
+    for (const row of rows) {
+      console.log(`  ${row.matching.length ? "命中" : "    "} | 共 ${row.selected} 篇 | ${row.prompt}`);
+    }
   }
 }

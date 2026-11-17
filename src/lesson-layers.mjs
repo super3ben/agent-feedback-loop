@@ -350,26 +350,37 @@ export function selectL1Sections({
 
   const top = ranked[0] ?? null;
 
-  // The gate comes first, before the match result is worth reporting. A lesson
-  // is a record of a problem the user reported before, so it is worth showing
-  // when they are reporting one now — not when they are giving the next ordinary
-  // instruction, however much the words happen to overlap.
+  // No complaint gate. A lesson should arrive when its SUBJECT comes up, not
+  // only when the user complains about it again — that is the whole point of
+  // recording the lesson in the first place. The gate used to require the prompt
+  // to read as a problem report, which held back exactly the turns the lesson was
+  // written for: 「部署上去」 right after a lesson about deploy verification is
+  // the moment to show it, and it was being skipped.
   //
-  // Ordering it this way also makes the reason honest: when an instruction
-  // happens to share no words with any lesson, saying "nothing matched" would
-  // point at the wrong problem. Nothing SHOULD have matched, because an
-  // instruction is not a moment for lessons at all.
-  //
-  // Skipping is cheap and safe: L0 still lists every family, so nothing is
-  // hidden. What is saved is the 2 KB of instructions that do not apply.
-  if (!readsAsProblemOrObjection(prompt)) return { selected: [], scores: ranked, gated: "not_a_problem" };
-
+  // What replaces the gate is the match itself, made honest by the caller: the
+  // prompt it passes is the recent conversation plus this message, so a short
+  // instruction still carries its topic, and a genuinely unrelated request
+  // carries none. An instruction that shares no distinctive term with any
+  // section still selects nothing — see the distinctive check below.
   if (!top || top.rawScore <= 0) return { selected: [], scores: ranked, gated: "no_match" };
 
-  // At least one matched term must be distinctive to this section. Scale-free on
-  // purpose: an absolute score floor is calibrated to one corpus size, since IDF
-  // for a unique term is 0.69 with two sections and 2.43 with sixteen.
-  if (top.distinctive < 1) return { selected: [], scores: ranked, gated: "no_distinctive_term" };
+  // How many distinctive terms the match must rest on.
+  //
+  // Not a constant. A fixed floor is calibrated to one corpus size: three is
+  // right for an eighteen-section project and impossible for a three-section one,
+  // where no term can be distinctive enough to count three times. That is the
+  // same trap the score floor above documents, so the number scales with the
+  // corpus: ceil(sqrt(n) / 2), which is 1 at three sections, 3 at eighteen, 4 at
+  // forty-seven.
+  //
+  // With the complaint gate gone this check is the only thing standing between a
+  // lesson and every ordinary instruction. Measured over a labelled set at
+  // eighteen sections, a floor of one let 6 of 8 unrelated instructions through;
+  // this floor lets 0 of 8 through while still passing 5 of 6 related ones.
+  const distinctiveFloor = Math.max(1, Math.ceil(Math.sqrt(total) / 2));
+  if (top.distinctive < distinctiveFloor) {
+    return { selected: [], scores: ranked, gated: "no_distinctive_term" };
+  }
 
   const cutoff = top.score * RELATIVE_THRESHOLD;
   const selected = ranked
