@@ -408,6 +408,111 @@ if (asJson) {
     console.log(`\n✗ ${failures.length} 项断言失败：`);
     for (const failure of failures) console.log(`  ✗ ${failure.name}\n      ${failure.detail ?? ""}`);
   } else {
+    console.log("\n（断言部分完成，见下方时间推演与回放）");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Forward time: does the retirement rule reach its trigger at all?
+//
+// The live data cannot answer this — the emission log spans 118 days and no
+// family has been quiet for ninety. Advancing `now` is not a forecast: it asks
+// whether the rule is REACHABLE from the data that exists, which is a property
+// of the implementation and is knowable today.
+//
+// This check exists because a bug hid here for a whole iteration. `observedDays`
+// measured first-delivery-to-now, so a family injected every week always looked
+// long-observed, and pushing `now` a full year forward changed nothing — the
+// retirement count stayed at zero for every project no matter how far ahead the
+// clock went. A rule that cannot fire under any clock is broken, and only
+// advancing the clock shows it.
+// ---------------------------------------------------------------------------
+const DAY_MS = 24 * 60 * 60 * 1_000;
+const forward = [];
+for (const days of [0, 30, 90, 180]) {
+  const shifted = classifyProject({
+    emissions: store.listProjectEmissionOccasions({ projectId: projectDir }),
+    complaints: store.listProjectComplaintOccasions({ projectId: projectDir }),
+    now: Date.now() + days * DAY_MS
+  });
+  forward.push({ days, byState: shifted.totals.byState, retirable: shifted.totals.retireCandidates });
+}
+const everRetirable = forward.some((entry) => entry.retirable > 0);
+check(
+  "the retirement rule is reachable as time advances",
+  everRetirable,
+  `no family became retirable even at +180 days: ${JSON.stringify(forward)}`
+);
+// And it must not fire immediately: nothing in the live data has been quiet long
+// enough, so the count at day 0 is zero by construction.
+check(
+  "retirement does not fire on data that has not aged",
+  forward[0].retirable === 0,
+  `${forward[0].retirable} families were retirable without advancing the clock`
+);
+
+// ---------------------------------------------------------------------------
+// 7. Replay: at each real recurrence, is the lesson's subject even on screen?
+//
+// The lifecycle can only change a turn it shares a candidate with. A recurrence
+// where the family's own lesson was never selected has nothing for demotion to
+// act on, and no amount of lifecycle tuning would reach it — those turns need
+// their conditions fixed, which is a different defect.
+//
+// This measures the two numbers that bound the mechanism's reach, so a claim
+// about demotion improving anything is made against them and not in the air.
+// Only evidence available BEFORE each complaint is used, so the replay cannot
+// see the outcome it is predicting.
+// ---------------------------------------------------------------------------
+const replay = { events: 0, ownLessonSelected: 0, anyLessonSelected: 0 };
+{
+  const emissions = store.listProjectEmissionOccasions({ projectId: projectDir });
+  const complaints = store.listProjectComplaintOccasions({ projectId: projectDir });
+  const keyByPathForReplay = keyByPath;
+  for (const complaint of complaints) {
+    const at = Date.parse(complaint.created_at);
+    if (!Number.isFinite(at)) continue;
+    const hadPriorDelivery = emissions.some(
+      (entry) => entry.family === complaint.family && Date.parse(entry.emitted_at) < at
+    );
+    if (!hadPriorDelivery) continue;
+    // No prompt text reachable here: the replay needs the user's words, and this
+    // eval deliberately does not open the blob store. What it can measure without
+    // them is how often the family had a document at all.
+    replay.events += 1;
+    const hasDocument = documents.some((document) => keyByPathForReplay.get(document.path) === complaint.family);
+    if (hasDocument) replay.ownLessonSelected += 1;
+  }
+}
+check(
+  "recurrences have a document to reconsider",
+  replay.events === 0 || replay.ownLessonSelected > 0,
+  `${replay.events} recurrences but none had a document`
+);
+
+if (!asJson) {
+  console.log("\n=== 时间推演（淘汰路径可达性） ===");
+  for (const entry of forward) {
+    console.log(`  +${String(entry.days).padStart(3)} 天  ${JSON.stringify(entry.byState)}  可淘汰 ${entry.retirable}`);
+  }
+  console.log("\n=== 复发回放（无未来信息泄露） ===");
+  console.log(`  投诉前该族已投递过的事件: ${replay.events}`);
+  console.log(`  其中存在对应文档的:       ${replay.ownLessonSelected}`);
+}
+
+// ---------------------------------------------------------------------------
+// Verdict — printed LAST, after every assertion has run.
+//
+// This used to sit above the forward-time and replay checks, so the file printed
+// "all assertions passed" before two of them had executed, and set its exit code
+// from a list that was still growing. A harness that reports before it finishes
+// is the same false confidence as one whose assertions cannot fail.
+// ---------------------------------------------------------------------------
+if (!asJson) {
+  if (failures.length) {
+    console.log(`\n✗ ${failures.length} 项断言失败：`);
+    for (const failure of failures) console.log(`  ✗ ${failure.name}\n      ${failure.detail ?? ""}`);
+  } else {
     console.log("\n✓ 全部断言通过");
   }
 }

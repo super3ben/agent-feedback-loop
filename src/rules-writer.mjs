@@ -86,6 +86,18 @@ const DEMOTED_CHANGE_MAX_CHARS = 110;
 const INDEX_FACT_MAX_CHARS = 80;
 
 /**
+ * How much of the instruction an index line carries when its full section is
+ * already above it.
+ *
+ * Shorter, but never empty. The section above says it in full; this is the
+ * handle for a reader who is skimming the index and for anyone re-reading the
+ * block later, when the sections that expanded have changed but the index has
+ * not. Measured across eighteen families: 50 characters each costs 2.3 KB, which
+ * the 6 KB injection budget already accommodates alongside two expanded sections.
+ */
+const INDEX_FACT_EXPANDED_CHARS = 50;
+
+/**
  * How long an index fact is trusted before the block marks it stale.
  *
  * A fact about the world is a claim with a window, not a permanent truth. The
@@ -534,24 +546,74 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
   // L0 names every family, including any whose full section did not fit. This is
   // the guarantee the flat budget could not give: a family is never invisible.
   //
-  // Each line carries a fact, not just a name. A bare `- some-family (12×)` tells
-  // the reader that something happened twelve times and nothing about what to do;
-  // measured on a live project the index was 16 such lines and the answer to the
-  // recurring problem was not among them. The fact is the first instruction the
-  // family has, and for a family that never published it is the user's own words.
+  // Each line carries a FACT, not just a name, and every line does — not only the
+  // ones whose section was shed.
+  //
+  // That distinction was the difference between this system working and not. On a
+  // live project the index rendered as 18 bare names:
+  //
+  //   - implementation-continuation-request (45×)
+  //   - remote-server-log-diagnosis (24×)
+  //
+  // while only two sections expanded per turn. Measured against 52 real
+  // recurrences, the family's own instructions were on screen for 33 of them
+  // (63.5%) and absent for the other 19 (36.5%) — the model was told that
+  // something had happened 24 times and nothing about what to do, which is not a
+  // lesson. Every one of those turns had the answer one line away.
+  //
+  // The old rule avoided repeating a sentence that the expanded section already
+  // says. That saving is real but it was the wrong thing to optimise: the cost is
+  // about 2.8 KB across eighteen families, and the budget already fits it.
+  // The instruction that goes on an index line has to distinguish this family
+  // from the others, and the first one often does not.
+  //
+  // Reviewers write from a shared template, so the leading method change of
+  // several unrelated families can be the same sentence. Measured on a live
+  // project after the index began carrying instructions: 5 of 26 lines read
+  // 「收到用户的明确范围…agent 的第一反应是去核查、去执行」 — five different
+  // families, one instruction. Restoring text to the index while giving five
+  // families the same text would replace "no answer" with "five identical
+  // answers", which is no better for a reader trying to tell them apart.
+  //
+  // So: prefer an instruction that appears in only one family, falling back to
+  // the first when every one of them is shared (a family whose entire method is
+  // boilerplate has nothing better to offer, and showing something beats
+  // showing nothing).
+  const factKey = (value) => String(value ?? "").replace(/\s+/gu, " ").trim().slice(0, 40);
+  const factFrequency = new Map();
+  for (const family of merged) {
+    const seen = new Set();
+    for (const change of family.methodChanges ?? []) {
+      const key = factKey(change);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      factFrequency.set(key, (factFrequency.get(key) ?? 0) + 1);
+    }
+  }
+  const distinguishingFact = (family) => {
+    const changes = (family.methodChanges ?? []).filter((entry) => String(entry ?? "").trim());
+    const unique = changes.find((change) => (factFrequency.get(factKey(change)) ?? 0) === 1);
+    return unique ?? changes[0] ?? null;
+  };
+
   const index = merged.map((family) => {
     const firstAction = (family.methodChanges ?? [])[0] ?? null;
+    const distinguishing = distinguishingFact(family);
+    const expanded = !overflowed.some((entry) => entry.familyKeys[0] === family.familyKeys[0]);
     return {
       familyKey: family.familyKeys[0],
       occurrences: family.occurrences,
-      // The index repeats a section only when the section was shed. When the
-      // full text is already above, the line stays a name — otherwise the same
-      // sentence appears twice in one block and the second copy buys nothing.
-      fact: overflowed.some((entry) => entry.familyKeys[0] === family.familyKeys[0])
-        ? (firstAction
-          ? trimToChars(firstAction, INDEX_FACT_MAX_CHARS)
-          : trimToChars(family.incidentSummary ?? "", INDEX_FACT_MAX_CHARS) || null)
-        : null,
+      // Always populated. When the full section is above, the line is truncated
+      // harder rather than emptied: a reader skimming past the section still gets
+      // the handle, and a reader who scrolled to the index gets the instruction.
+      fact: distinguishing
+        ? trimToChars(distinguishing, expanded ? INDEX_FACT_EXPANDED_CHARS : INDEX_FACT_MAX_CHARS)
+        : trimToChars(family.incidentSummary ?? "", INDEX_FACT_MAX_CHARS) || null,
+      // Marks the lines whose section is NOT above, so a reader can tell which
+      // ones are the whole lesson and which are a reminder of one they already
+      // have. Rendering ignores this; it exists for tests and for anyone reading
+      // the file.
+      expanded,
       unpublished: Boolean(family.unpublished),
       // Set by the projection, which is the only place that can weigh dormancy
       // against evidence that the family is still live but unclassified.

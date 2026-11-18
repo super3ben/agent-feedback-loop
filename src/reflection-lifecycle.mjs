@@ -133,14 +133,30 @@ export function classifyFamily({
   // track record.
   const sessions = new Set(delivered.map((entry) => entry.sessionUid).filter(Boolean));
   const opportunityCount = sessions.size;
-  const observedDays = Math.max(0, Math.round(((now < lastAt ? now : lastAt) - firstAt) / DAY_MS));
+  // Two different spans, and conflating them hid the whole retirement rule:
+  //
+  //   observedDays  first delivery -> now. How long this family has been under
+  //                 observation at all, which decides whether a verdict is
+  //                 possible yet.
+  //   silentDays    LAST delivery -> now. How long nothing has needed this
+  //                 lesson, which is what retirement is about.
+  //
+  // Measured with a single span taken from the first delivery: one project's
+  // delivered families all read as observed for 60-87 days, so every one of them
+  // looked like a long-running success, while several had not been injected for
+  // weeks. Pushing `now` a full year forward changed nothing — the number was
+  // computed from the data, not from now, so the retirement path stayed at zero
+  // forever.
+  const observedDays = Math.max(0, Math.round((now - firstAt) / DAY_MS));
+  const silentDays = Math.max(0, Math.round((now - lastAt) / DAY_MS));
 
   const base = {
     firstDeliveredAt: new Date(firstAt).toISOString(),
     lastDeliveredAt: new Date(lastAt).toISOString(),
     opportunityCount,
     recurrences,
-    observedDays
+    observedDays,
+    silentDays
   };
 
   if (recurrences > 0) {
@@ -224,12 +240,21 @@ export function classifyFamily({
  * The clock runs from the last time the subject came up, not from publication:
  * what matters is how long nothing has needed this lesson, and a family that was
  * used last week has not been idle for long however old the file is.
+ *
+ * `silentDays` is carried on the classification so this and the report agree on
+ * the number. Recomputing it here from `lastDeliveredAt` looks equivalent but is
+ * not: the report printed `observedDays`, which measured a different span
+ * entirely, so the two disagreed about how long a family had been quiet.
  */
 export function shouldRetire(family, {
   retireAfterDays = DEFAULT_RETIRE_AFTER_DAYS,
   now = Date.now()
 } = {}) {
   if (family?.state !== "dormant") return false;
+  const silentDays = Number(family.silentDays);
+  if (Number.isFinite(silentDays)) return silentDays >= retireAfterDays;
+  // Older callers pass a classification without the field; fall back to the
+  // timestamp so a stale shape cannot silently disable retirement.
   const lastAt = Date.parse(family.lastDeliveredAt ?? "");
   if (!Number.isFinite(lastAt)) return false;
   return (now - lastAt) >= retireAfterDays * DAY_MS;

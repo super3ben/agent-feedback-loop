@@ -174,18 +174,17 @@
 
 <!-- afl:rules:start -->
 
-<!-- afl:rules:budget 6097/65536 demoted=2 -->
+<!-- afl:rules:budget 6063/65536 demoted=2 -->
 
-### reflection-context-ineffective (8×, Major)
+### reflection-context-ineffective (9×, Major)
 
 **何时适用：**
-- 刚改完反思注入或匹配链路（带上下文匹配、排序、distinctive 门槛、停用词、语义闸门），准备汇报「已完成并生效」「已装到运行时」之前
+- 刚改完反思生命周期（dormant/recurred 状态、90 天静默淘汰、降权权重），准备说评测做完、改动有效时
 
 **Do not repeat this mistake:**
-- 改完反思注入或匹配逻辑后，在同一轮内跑一次真实模型的有注入/无注入对照：用用户原话各发一次，把两段模型输出原文贴进交付，不只贴注入文本。
-- 交付里把结论拆成两行：「注入文本正确」用 hook 输出证明；「模型判断改变」没有对照实验就写「未验证」，不写「已生效」。
-- 召回率、精确率、覆盖率单列为「链路指标」，不与「生效」并列，也不作为行为结论的依据。
-- 在让用户去测之前，自己起一个新会话，发一条用户最可能说的原话（例如「连一下那台服务器」或「为啥要免密登录呢，不是有密码吗？」），检查注入内容与模型首句反应后再汇报。
+- 对「降权是否真的让复发下降」这类需要时间流逝的问题，构造「投递→降权→90 天静默窗口」的合成家族，一组降权后同族复发、一组不复发，断言两组的复发计数差并打印样本数，用合成场景给出结论而不是等真实样本。
+- 写下「按定义需要等待」「要等 90 天后才有第一个真实样本」之前，先列出可合成的时间与流量维度并各跑一遍；确实跑不出来的，写明缺的是哪个维度，不用「按定义」封口。
+- 生命周期改动的效果结论只用降权前后同族复发率对比支撑；「排序是否改变」「6 个查询里 2 个改变选择」「选中条数/token 变化」只能作为机制连通性证据，两类结论分栏写。
 
 ### platform-formula-syntax-support (7×, Major)
 
@@ -240,7 +239,7 @@
 
 **本项目已记录的全部教训家族**
 
-- reflection-context-ineffective (8×)
+- reflection-context-ineffective (9×)
 - platform-formula-syntax-support (7×)
 - backtest-calculation-metric-validity (7×)
 - design-phase-generation-counting (7×)
