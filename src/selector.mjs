@@ -103,6 +103,12 @@ const GENERIC_TERMS = new Set([
   // to decide which lesson applies.
   "帮我", "给你", "我看", "看看", "看下", "一下", "这个", "那个", "这些", "那些",
   "上面", "下面", "看看这", "麻烦", "谢谢", "请问", "能否", "是否", "有没有",
+  // Nouns so general they name no subject at all. 「帮我看看这个文件」 matched a
+  // PDF-font lesson on 文件 alone and scored exactly the floor of 4, so a request
+  // about nothing in particular injected a lesson about printing. Measured across
+  // one live project: 文件 appears in 55 of 129 documents, which is the definition
+  // of a term that cannot say WHICH lesson applies.
+  "文件", "内容", "东西", "情况", "问题", "方式", "方法", "地方", "部分", "方面",
   "user", "the", "and", "for", "when", "with", "that", "this", "from", "into",
   "must", "never", "always", "agent", "should", "before", "after", "same",
   "not", "are", "was", "has", "have", "its", "one", "only", "than", "run", "runs"
