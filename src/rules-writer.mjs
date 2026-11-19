@@ -19,7 +19,27 @@ import path from "node:path";
 const AFL_RULES_START = "<!-- afl:rules:start -->";
 const AFL_RULES_END = "<!-- afl:rules:end -->";
 const SEVERITY_ORDER = { Blocker: 0, Critical: 1, Major: 2 };
-const SEVERITY_THRESHOLDS = { Major: 3, Critical: 2, Blocker: 1 };
+// How many recurrences a family needs before it earns an always-on index line.
+//
+// These used to be 3 / 2 / 1, on the reasoning that a class hit three times has
+// proven it recurs. Measured against a live project: 22 published families, only
+// 4 qualified — so 18 written lessons never appeared in the channel that runs on
+// every turn, and the only way they could reach a model was a literal word
+// overlap with the request in progress. That overlap measured 33% for the way
+// people actually ask ("这张表加几个字段" against a condition that says
+// 「准备执行数据库迁移脚本」).
+//
+// The threshold also inverts its own purpose. A lesson's job is to stop the
+// second occurrence; requiring three means the problem has to hurt three times
+// before anything is written down, and by then the lesson describes a failure
+// that has already been normalised.
+//
+// Every published lesson now earns a line. What keeps that affordable is not a
+// rarity filter but the budget: the index sheds facts before it sheds names (see
+// the shrink loop in buildRulesBlock), and the lifecycle eventually retires
+// families that stopped recurring (reflection-lifecycle.mjs). A lesson nobody
+// needs costs a name and a count, not a paragraph.
+const SEVERITY_THRESHOLDS = { Major: 1, Critical: 1, Blocker: 1 };
 
 /**
  * The injection budget the reader enforces (`RULES_BLOCK_MAX_BYTES` in
@@ -627,7 +647,7 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
     };
   });
 
-  const compose = (bodySections) => {
+  const compose = (bodySections, indexEntries = index) => {
     const lines = [
       AFL_RULES_START,
       "",
@@ -636,7 +656,7 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
     ];
     for (const section of bodySections) lines.push(section.text.trimEnd(), "");
     lines.push(INDEX_HEADING, "");
-    for (const entry of index) {
+    for (const entry of indexEntries) {
       const tags = [];
       if (entry.unpublished) tags.push("未发布·聚合");
       // A stale fact keeps its line — deleting it would lose what was learned —
@@ -644,6 +664,10 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
       // must settle before acting on it.
       if (entry.fact && factIsStale(entry.lastSeenAt)) tags.push("可能已过期·先验证");
       if (entry.dormant) tags.push(`长期未复发·已降级`);
+      // Budget pressure is reported on the line rather than hidden: a family
+      // whose instruction was given up is still discoverable by name, and the
+      // reader can tell it was cut rather than never written.
+      if (entry.factShed) tags.push("指令已省略·预算");
       const tag = tags.length ? ` [${tags.join("·")}]` : "";
       // A dormant family gives back the fact's bytes. The name and count stay so
       // the family is still discoverable and returns in full on its next
@@ -656,22 +680,48 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
     return lines;
   };
 
-  // Shrink until the file fits. The index goes last because it is the cheap
-  // layer: dropping a full section costs detail a reader can still reach through
-  // the index, while dropping an index line costs the visibility entirely.
+  // Shrink until the file fits.
+  //
+  // The order matters and used to be wrong for the channel that actually
+  // matters. This loop trimmed BODY sections only; the index was never
+  // shortened. That was safe while the index held 20-30 families. It stops being
+  // safe the moment the qualification threshold drops and every published lesson
+  // earns a line — measured projection: 32 -> 40+ families on a live project,
+  // with each line now carrying an instruction (4.8 KB -> 7 KB), against a 6 KB
+  // injection cap. A block that cannot fit returns null, the caller keeps its
+  // previous block, and the new lessons never appear — the gate would look
+  // lowered while the block silently froze.
+  //
+  // So the index shrinks too, and it shrinks LAST and least: a body section
+  // costs detail a reader can still reach through the index, an index line costs
+  // visibility of the family entirely. When even the index is too big, the
+  // least valuable lines lose their FACT first (the name and count stay, so the
+  // family remains discoverable) before any line is dropped.
   let body = [...sections];
+  let indexEntries = [...index];
+  let factsGivenUp = 0;
   for (;;) {
-    const lines = compose(body);
+    const lines = compose(body, indexEntries);
     const measured = byteLength(lines.join("\n"));
     lines[2] = budgetLine(measured, merged.length - body.length, maxBytes);
     const final = lines.join("\n");
     if (byteLength(final) <= maxBytes) return final;
-    if (!body.length) {
-      // Even the index alone does not fit. Returning null beats throwing: the
-      // caller keeps its previous block instead of freezing on an exception.
-      return null;
+    if (body.length) {
+      body = body.slice(0, -1);
+      continue;
     }
-    body = body.slice(0, -1);
+    // No body left. Shed facts from the tail of the index — the ranking already
+    // put the most severe and most recurring families first.
+    const shed = indexEntries.findLastIndex((entry) => entry.fact);
+    if (shed >= 0) {
+      indexEntries = indexEntries.map((entry, position) =>
+        (position === shed ? { ...entry, fact: null, factShed: true } : entry));
+      factsGivenUp += 1;
+      continue;
+    }
+    // Even names and counts alone do not fit. Returning null beats throwing: the
+    // caller keeps its previous block instead of freezing on an exception.
+    return null;
   }
 }
 

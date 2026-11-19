@@ -405,34 +405,99 @@ export function selectL1Sections({
  */
 export function composeInjection({ preamble = "", l0 = [], selected = [], maxBytes, header = null }) {
   const headerLines = [header].filter(Boolean);
-  const indexLines = l0.map((entry) =>
-    `- ${entry.familyKey} (${entry.occurrences}×)${entry.detail ? ` ${entry.detail}` : ""}`);
 
-  const assemble = (sections) => {
+  // What each layer is worth, and therefore what goes first when the budget is
+  // tight. This ordering is the whole function.
+  //
+  // The previous loop shed `selected` — the sections this turn actually matched —
+  // and never touched the index. That was survivable while the index was 20-30
+  // bare names. Once every published family earned a line AND each line carried
+  // an instruction, the index alone measured 4.4 KB against a 6 KB cap, so the
+  // loop dropped every section and returned an index with no lessons in it: the
+  // model was told thirty things had happened and nothing about what to do, on
+  // the exact turn a lesson had matched. The budget made the matching work
+  // invisible.
+  //
+  // Order, cheapest loss first:
+  //   1. A fact whose section is already expanded — pure duplication.
+  //   2. Facts on unexpanded lines, worst-ranked first — the name and count stay,
+  //      so the family remains discoverable and the reader can open the document.
+  //   3. Sections beyond the first — the best match is kept to the last.
+  //   4. Index lines, worst-ranked first, only if nothing else is left.
+  const expandedKeys = new Set(selected.map((section) => section.familyKey).filter(Boolean));
+  const entries = l0.map((entry) => ({
+    familyKey: entry.familyKey,
+    occurrences: entry.occurrences,
+    // `detail` is the rendered " → instruction" tail, if any.
+    detail: entry.detail ?? "",
+    expanded: expandedKeys.has(entry.familyKey)
+  }));
+
+  const render = (sections, indexEntries) => {
     const lines = [];
     if (headerLines.length) {
       lines.push(...headerLines, "");
     }
     for (const section of sections) lines.push(section.text, "");
-    if (indexLines.length) {
+    if (indexEntries.length) {
       lines.push("**本项目已记录的全部教训家族**（命中相关时上面对应条目会展开；需要完整经过时读 `.agent/reflections/`）", "");
-      lines.push(...indexLines);
+      for (const entry of indexEntries) {
+        lines.push(`- ${entry.familyKey} (${entry.occurrences}×)${entry.detail ? ` ${entry.detail}` : ""}`);
+      }
     }
     return lines.join("\n").trim();
   };
 
   let sections = [...selected];
+
+  // 1 + 2. Give back index facts, cheapest first, until the block fits.
+  let facts = entries.map((entry) => ({ ...entry }));
   for (;;) {
-    const text = assemble(sections);
+    const text = render(sections, facts);
     if (Buffer.byteLength(text, "utf8") <= maxBytes) {
-      return { text, expandedCount: sections.length, indexCount: indexLines.length };
+      return {
+        text,
+        expandedCount: sections.length,
+        indexCount: facts.length,
+        factsShed: facts.filter((entry) => entry.detail === "").length - entries.filter((entry) => entry.detail === "").length
+      };
     }
-    if (!sections.length) {
-      // Only the index and header remain. The index alone is the smallest
-      // useful output; if even that overflows, it is still better than nothing
-      // and the caller logs the overshoot.
-      return { text, expandedCount: 0, indexCount: indexLines.length, overBudget: true };
+    // Prefer a fact that duplicates an expanded section; otherwise the last one
+    // in rank order, which is the least severe and least recurring.
+    const duplicate = facts.findLastIndex((entry) => entry.detail && entry.expanded);
+    const shedAt = duplicate >= 0 ? duplicate : facts.findLastIndex((entry) => entry.detail);
+    if (shedAt < 0) break;
+    facts = facts.map((entry, position) =>
+      (position === shedAt ? { ...entry, detail: "" } : entry));
+  }
+
+  // 3. Sections, worst-ranked first.
+  for (;;) {
+    const text = render(sections, facts);
+    if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+      return { text, expandedCount: sections.length, indexCount: facts.length, factsShed: true };
     }
-    sections = sections.slice(0, -1);
+    if (sections.length > 1) {
+      sections = sections.slice(0, -1);
+      continue;
+    }
+    break;
+  }
+
+  // 4. Names and counts, worst-ranked first. Only reached when even a bare index
+  // plus one section does not fit, which means the project has outgrown its
+  // budget and something has to be lost; dropping the least severe family is
+  // better than dropping the lesson that just matched.
+  let names = [...facts];
+  for (;;) {
+    const text = render(sections, names);
+    if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+      return { text, expandedCount: sections.length, indexCount: names.length, truncated: true };
+    }
+    if (!names.length) {
+      // Even the header and one section do not fit.
+      return { text, expandedCount: sections.length, indexCount: 0, overBudget: true };
+    }
+    names = names.slice(0, -1);
   }
 }

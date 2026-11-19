@@ -150,6 +150,50 @@ export function normalizeAppliesWhen(conditions) {
 }
 
 /**
+ * Conditions a future prompt can actually match, given how the reviewer wrote them.
+ *
+ * The failure this corrects, measured on two live projects: 16 of 56 documents in
+ * one and 48 of 110 in the other had EVERY applies_when condition describing the
+ * reviewer's own decision —
+ *
+ *   评审用户明确反馈的同类问题，准备判断是否值得沉淀，尤其是问题在同一窗口内再次出现时
+ *
+ * — instead of the situation a user will be in. No matcher can reach a lesson
+ * through that sentence, because no user types it; the reviewer was describing
+ * what it was about to do, not what the user was about to do. Those lessons were
+ * present in the catalog, had conditions, and were unreachable on every turn.
+ *
+ * user_complaint is written per incident and says what actually happened, in the
+ * user's own vocabulary. When every condition is reviewer-shaped, it goes in
+ * first: it is the only text in the document phrased the way a prompt will be.
+ *
+ * Reviewer-shaped conditions are kept rather than deleted — they still describe
+ * when the lesson applies, and a reviewer reading the block benefits from them.
+ * They simply stop being the only thing there is.
+ *
+ * @param {{conditions: string[], userComplaint?: string|null}} params
+ * @returns {string[]}
+ */
+export function conditionsForMatching({ conditions, userComplaint }) {
+  const list = Array.isArray(conditions) ? conditions.filter((c) => String(c ?? "").trim()) : [];
+  const complaint = String(userComplaint ?? "").trim();
+  if (!complaint) return list;
+
+  const REVIEW_SELF = /评审|沉淀为反思|沉淀为规则|would_qualify_if|insufficient_evidence|拒绝记录|判定是否|是否值得|准备判断/;
+  const everyConditionIsReviewer = list.length > 0 && list.every((condition) => REVIEW_SELF.test(condition));
+  if (!everyConditionIsReviewer) return list;
+
+  // Trim to a clause: a complaint runs to a paragraph, and a 400-character
+  // condition both blows the schema bound and matches nothing extra.
+  const clause = complaint
+    .split(/[。；\n]/u)
+    .map((part) => part.trim())
+    .find((part) => part.length >= 8) ?? complaint;
+  const condition = clause.length > 120 ? `${clause.slice(0, 120)}…` : clause;
+  return [`用户说类似「${condition}」时`, ...list].slice(0, 8);
+}
+
+/**
  * Rebuilds the whole managed block from current state rather than appending to
  * it. Selection happens under a fixed byte budget inside buildRulesBlock, so
  * the block cannot grow without bound and nobody has to prune it by hand: a
@@ -311,7 +355,22 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
       //
       // Normalised on the way through, so documents published under the old
       // template stop poisoning the match without being rewritten on disk.
-      appliesWhen: unionConditions.length ? unionConditions : normalizeAppliesWhen(document.appliesWhen),
+      //
+      // And de-contaminated: a condition that describes the REVIEWER'S decision
+      // ("评审用户明确反馈的同类问题，准备判断是否值得沉淀") matches nothing a user
+      // ever types. Measured across two live projects: 16 of 56 documents in one
+      // and 48 of 110 in the other had every condition written that way. Those
+      // lessons were invisible in the channel that runs every turn, and no
+      // matcher can fix a condition about a decision the user never makes.
+      //
+      // The user's own words are right there in user_complaint, which is written
+      // per-incident precisely so it says something specific. When every
+      // condition is reviewer-shaped, the complaint goes in FIRST — it is the
+      // only text in the document written in the vocabulary a prompt will use.
+      appliesWhen: conditionsForMatching({
+        conditions: unionConditions.length ? unionConditions : normalizeAppliesWhen(document.appliesWhen),
+        userComplaint: document.userComplaint
+      }),
       // Dormant only when quiet AND nothing unclassified suggests it is live.
       // The published path says whether the family recurred; the unclassified
       // complaints say whether it might be recurring without being seen.

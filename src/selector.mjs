@@ -96,6 +96,13 @@ const GENERIC_TERMS = new Set([
   "一个", "一下", "可以", "什么", "怎么", "还是", "没有", "现在", "然后", "如果",
   "就是", "这样", "但是", "只是", "应该", "可能", "知道", "或者", "以及", "进行",
   "通过", "我的", "你的", "他们", "也要", "一起", "直接", "现在", "全部", "开始",
+  // Politeness and deictic filler. These were missing and became visible the
+  // moment user_complaint started participating in matching: 「帮我看看这个文件」,
+  // a request about nothing in particular, overlapped a chart lesson on 帮我 and
+  // 看看 alone and injected it. They carry no subject, so they cannot be allowed
+  // to decide which lesson applies.
+  "帮我", "给你", "我看", "看看", "看下", "一下", "这个", "那个", "这些", "那些",
+  "上面", "下面", "看看这", "麻烦", "谢谢", "请问", "能否", "是否", "有没有",
   "user", "the", "and", "for", "when", "with", "that", "this", "from", "into",
   "must", "never", "always", "agent", "should", "before", "after", "same",
   "not", "are", "was", "has", "have", "its", "one", "only", "than", "run", "runs"
@@ -200,7 +207,26 @@ function lessonTermWeights(document) {
     [4, textFeatures(document.appliesWhen ?? [])],
     [3, textFeatures(document.classOfMistake)],
     [2, textFeatures(document.methodClass)],
-    [1, textFeatures(document.methodChanges ?? [])]
+    [1, textFeatures(document.methodChanges ?? [])],
+    // The complaint, in the user's own words.
+    //
+    // This field has been stored since the format existed and was never matched
+    // against — the selector read four fields and skipped it. It is the only
+    // place a lesson records what the user actually SAID, and matching is
+    // literal word overlap, so its absence is measured: an indirect request
+    // ("这张表加几个字段") reached its lesson 1 time in 3 with conditions alone,
+    // and 3 in 3 once the user's own phrasing was available to match.
+    //
+    // Weighted 3, level with class_of_mistake: it is evidence of the real
+    // situation, but it is a record of one utterance, and a lesson must not be
+    // reachable only by someone who phrases it the same way. The condition field
+    // keeps its 4 so a well-written condition still outranks a quoted sentence.
+    [3, textFeatures(document.userComplaint ?? "")],
+    // root_cause is the reviewer's diagnosis, not the user's words, and it is
+    // weighted separately and lower for that reason. Folding it in with
+    // user_complaint made the two indistinguishable: a request that touched only
+    // a phrase from the diagnosis scored exactly as if the user had said it.
+    [2, textFeatures(document.rootCause ?? "")]
   ];
   for (const [weight, features] of fields) {
     for (const term of features.latin) {
