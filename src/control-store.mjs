@@ -102,6 +102,15 @@ const REVIEW_FAILURE_MAX_TEXT = 500;
 // losing the whole ledger would restore the repeated-injection problem this
 // exists to fix.
 const INJECTION_LEDGER_META_PREFIX = "rules_injection:v1:";
+// Which families a PreToolUse injection has already shown in this session.
+//
+// A tool loop runs dozens of commands. Without this, the same lesson arrives on
+// every `ssh`, `git`, `npm` call in a row — the repeated-injection problem this
+// project already spent a round fixing on the prompt channel, where a 6 KB block
+// went out 36 times in one session. Keyed by session, storing the family keys
+// only: the text is in the block, and the ledger exists to prevent a repeat, not
+// to reconstruct what was sent.
+const TOOL_INJECTION_META_PREFIX = "tool_injection:v1:";
 const INJECTION_LEDGER_MAX_STORED = 2_048;
 // What each prompt actually received from the rules block.
 //
@@ -2146,6 +2155,55 @@ function createStore(database, now) {
         // a delivery detail.
         return null;
       }
+    },
+    // Which lesson families a PreToolUse injection has already shown in this
+    // session, so one lesson cannot repeat on every command of a tool loop.
+    getToolInjectionLedger({ sessionUid }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      let row;
+      try {
+        row = database.prepare("SELECT value FROM store_meta WHERE key=?")
+          .get(`${TOOL_INJECTION_META_PREFIX}${safeSessionUid}`);
+      } catch {
+        return [];
+      }
+      if (!row) return [];
+      try {
+        const parsed = JSON.parse(row.value);
+        return Array.isArray(parsed?.families)
+          ? parsed.families.filter((family) => typeof family === "string")
+          : [];
+      } catch {
+        // A ledger that no longer parses is treated as empty, which costs one
+        // repeat. Throwing here would fail a command over a delivery detail.
+        return [];
+      }
+    },
+    recordToolInjection({ sessionUid, families }) {
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      if (!Array.isArray(families)) throw new TypeError("families must be an array");
+      const incoming = families
+        .map((family) => assertString(family, "family", 128))
+        .filter(Boolean);
+      if (!incoming.length) return [];
+      return transaction(() => {
+        const key = `${TOOL_INJECTION_META_PREFIX}${safeSessionUid}`;
+        let prior = [];
+        try {
+          const row = database.prepare("SELECT value FROM store_meta WHERE key=?").get(key);
+          if (row) {
+            const parsed = JSON.parse(row.value);
+            if (Array.isArray(parsed?.families)) prior = parsed.families.filter((f) => typeof f === "string");
+          }
+        } catch {
+          prior = [];
+        }
+        const merged = [...new Set([...prior, ...incoming])].slice(-64);
+        database.prepare(`INSERT INTO store_meta(key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+          .run(key, JSON.stringify({ families: merged }));
+        return merged;
+      });
     },
     recordRulesInjection({ sessionUid, digest, turn, mode, lastFullTurn = null }) {
       const safeSessionUid = assertString(sessionUid, "sessionUid", 512);

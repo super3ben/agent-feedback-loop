@@ -430,6 +430,128 @@ async function readProjectRulesBlock(projectDir, { prompt = null } = {}) {
   };
 }
 
+/**
+ * A lesson to show the model at the moment it runs a tool call, or null.
+ *
+ * Why this exists, in the failure that made it necessary: a live session was
+ * asked to check what a server reported. The agent worked for seven minutes,
+ * ran into `Permission denied (publickey)`, said "SSH isn't working, I'll skip
+ * the server and change the docs instead", and never tried the password. The
+ * lesson describing exactly that mistake — 「免密私钥失败不等于 SSH 不可用；先用
+ * 密码认证登录一次」— had been injected in full at the start of that same
+ * session. It arrived twenty minutes before the decision it was about.
+ *
+ * A lesson at the START of a turn competes with everything else the model is
+ * holding by the time it reaches the step the lesson is about. The same lesson
+ * at the moment of the step has nothing to compete with.
+ *
+ * Four properties matter more than the matching:
+ *
+ * 1. It never blocks. The response is always `{"continue":true}`; this only
+ *    ever adds a sentence to the context. The execution guard that used to run
+ *    on this event decided whether to BLOCK, and its false blocks cost more
+ *    than the circling it caught — this deliberately shares none of that.
+ *
+ * 2. It is silent when unsure. No project, no rules block, no match, any
+ *    error: return null and let the tool call proceed. A hook on the critical
+ *    path of every command must fail to "nothing", never to "something wrong".
+ *
+ * 3. It fires once per family per session. A tool loop runs dozens of commands;
+ *    the same lesson on each of them is the repeated-injection problem this
+ *    project already spent a round fixing on the prompt channel. The ledger is
+ *    the same one that channel uses, keyed separately.
+ *
+ * 4. It matches the COMMAND, not the user's request. `ssh root@host` is the
+ *    thing the lesson is about, and the command text is available here in full.
+ */
+async function injectLessonForToolCall({ payload, projectDir, controlStore }) {
+  try {
+    if (typeof projectDir !== "string" || !path.isAbsolute(projectDir)) return null;
+    const toolInput = payload?.tool_input ?? payload?.toolInput;
+    if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return null;
+
+    // Only the fields that carry what the tool is about to DO. A Read call's
+    // path is a weak signal and matching lessons on file paths injects on
+    // nearly every call; a Bash command is the exact thing a lesson warns
+    // about. Deliberately narrow.
+    const command = typeof toolInput.command === "string" ? toolInput.command.trim() : "";
+    if (!command) return null;
+    // Very short commands ("ls", "pwd") carry no subject to match on, and the
+    // short-command case is where a wrong match costs the most: it would fire
+    // on every single call in a loop.
+    if (command.length < 12) return null;
+
+    const rulesBlock = await readProjectRulesBlock(projectDir, { prompt: command });
+    if (!rulesBlock || !rulesBlock.text) return null;
+
+    const sessionUid = payload?.session_id ?? payload?.sessionId ?? null;
+    const ledgerKey = typeof sessionUid === "string" && sessionUid
+      ? `tool_injection:v1:${sessionUid}`
+      : null;
+    // The families already shown this session, so one lesson cannot repeat on
+    // every command of a loop. Read once, written once.
+    let alreadyShown = new Set();
+    if (ledgerKey && controlStore?.getToolInjectionLedger) {
+      try {
+        alreadyShown = new Set(controlStore.getToolInjectionLedger({ sessionUid }) ?? []);
+      } catch {
+        alreadyShown = new Set();
+      }
+    }
+
+    // Which families the block actually expanded for THIS command. The block
+    // already decided relevance; re-deriving it here would be a second,
+    // divergent answer to the same question.
+    const expanded = [...(rulesBlock.expandedFamilies ?? rulesBlock.coveredFamilies ?? [])]
+      .filter((family) => !alreadyShown.has(family));
+    if (!expanded.length) return null;
+
+    // Send only the expanded sections, not the index: the index is already in
+    // the prompt channel's block, and repeating 26 lines here would cost more
+    // than the instruction it points at.
+    //
+    // The section ends at the next heading OR at the index — whoever comes
+    // first. The first version anchored the end on `$` under the `m` flag,
+    // where `$` matches end-of-LINE: the lazy quantifier stopped at the first
+    // newline, so every "injected lesson" was a bare heading with no body. It
+    // read as working — the context arrived, the family was named — and it
+    // carried none of the instructions, which is the failure this whole session
+    // has been about. A non-greedy body with a lookahead on the NEXT heading is
+    // the correct shape, and `(?=...)` has to name both terminators because the
+    // last expanded section is followed by the index, not a heading.
+    const sections = [];
+    for (const family of expanded) {
+      const escaped = family.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const pattern = new RegExp(
+        `^### ${escaped} \\([^\\n]*\\n[\\s\\S]*?(?=^### |^\\*\\*本项目已记录|(?![\\s\\S]))`,
+        "mu"
+      );
+      const match = pattern.exec(rulesBlock.text);
+      if (match) sections.push(match[0].trim());
+    }
+    if (!sections.length) return null;
+
+    if (ledgerKey && controlStore?.recordToolInjection) {
+      try {
+        controlStore.recordToolInjection({ sessionUid, families: expanded });
+      } catch {
+        // Failing to record costs a possible repeat, not the tool call.
+      }
+    }
+
+    return [
+      "【与本步操作相关的教训】",
+      "以下条目对应你正要执行的这个操作，按它执行，不要跳过：",
+      "",
+      ...sections
+    ].join("\n");
+  } catch {
+    // A hook on the path of every tool call must never turn a matching bug
+    // into a blocked command.
+    return null;
+  }
+}
+
 export async function handlePromptHook({
   payload,
   cli,
@@ -1748,50 +1870,40 @@ export async function main(args, {
     try {
       controlStore = openControlStore({ paths, busyTimeoutMs: 250 });
       if (EXECUTION_HOOK_EVENTS.has(nativeHookEventName)) {
-        // The execution guard is retired (2026-08-31). It was built for
-        // GPT-era overthinking — Codex review-then-improve loops that never
-        // failed a single call — and current Claude runs do not circle that
-        // way: measured on live sessions the guard's false blocks cost more
-        // than the circling it caught. The PreToolUse hooks are uninstalled
-        // from both hosts (backups: ~/.claude/settings.json.bak-guard-off,
-        // ~/.codex/config.toml.bak-guard-off), and this dispatch is commented
-        // out so a hook that gets reinstalled fails open instead of silently
-        // reviving the guard. To revive: restore the block below and
-        // reinstall the hooks. The store, hook logic and their tests are
-        // kept intact.
+        // PreToolUse injects a lesson when the command being run is one a
+        // lesson is about — and does nothing else.
         //
-        // let designPermit = null;
-        // try {
-        //   const toolInput = payload?.tool_input ?? payload?.toolInput;
-        //   if (toolInput && typeof toolInput === "object" && !Array.isArray(toolInput)) {
-        //     for (const field of ["file_path", "filePath", "path", "notebook_path"]) {
-        //       const value = toolInput[field];
-        //       if (typeof value === "string" && value.trim()) {
-        //         designPermit = await resolveDesignPermit(value.trim(), null, controlStore.designPermitCache);
-        //         break;
-        //       }
-        //     }
-        //   }
-        // } catch {}
-        // await handleExecutionHook({
-        //   payload,
-        //   cli,
-        //   controlStore,
-        //   designPermit,
-        //   writeResponse,
-        //   nativeResponse: { continue: true },
-        //   launchDirectionReview({ monitorId, transcriptPath }) {
-        //     return launchDetachedDirectionReview({
-        //       platform: process.platform,
-        //       nodeExecutable: process.execPath,
-        //       cliFile: CLI_FILE,
-        //       home: paths.home,
-        //       monitorId,
-        //       cli,
-        //       transcriptPath
-        //     });
-        //   }
-        // });
+        // The execution GUARD that used to live here is still retired (see
+        // below); this is a different mechanism with a different contract. The
+        // guard decided whether to BLOCK a tool call, and its false blocks cost
+        // more than the circling it caught. This never blocks: the response is
+        // always `{"continue":true}` plus, at most, a note in the model's
+        // context. A hook that only ever adds a sentence cannot repeat the
+        // failure that retired the guard.
+        //
+        // It exists because a lesson can only reach the model at the moment the
+        // model is deciding, and that is not always when the user speaks. A live
+        // session showed the gap: the user asked to check a server, the agent
+        // spent seven minutes working, hit `Permission denied (publickey)`,
+        // concluded "SSH is down, I'll skip the server", and changed the docs
+        // instead. The lesson that says exactly how to get in had been injected
+        // in full at the start of that same session. It arrived twenty minutes
+        // before the decision it was about.
+        const injected = await injectLessonForToolCall({
+          payload,
+          projectDir: payload?.cwd ?? null,
+          controlStore
+        });
+        if (injected) {
+          await writeResponse({
+            continue: true,
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              additionalContext: injected
+            }
+          });
+          return;
+        }
         await writeResponse();
         return;
       }
