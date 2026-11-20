@@ -43,6 +43,10 @@ function say(message) {
   process.stdout.write(`  ${message}\n`);
 }
 
+function warn(message) {
+  process.stdout.write(`  ! ${message}\n`);
+}
+
 function fail(message, hint) {
   process.stderr.write(`\n✗ ${message}\n`);
   if (hint) process.stderr.write(`  ${hint}\n`);
