@@ -9,6 +9,7 @@
  * recurred four times. Repetition is the signal that advice is not enough.
  */
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import { parseReflectionMarkdown } from "./reflection-document.mjs";
 import { distinctTerms } from "./reviewer-escalate.mjs";
@@ -194,6 +195,36 @@ export function conditionsForMatching({ conditions, userComplaint }) {
 }
 
 /**
+ * The families a behavioural check showed do not earn their always-on line.
+ *
+ * ONLY `redundant` demotes. `missed` deliberately does not, and the review of
+ * this wiring is why: "missed" is produced in two very different situations —
+ * the lesson genuinely does not land, and the measurement never ran. A prompt
+ * beginning with "- " made `claude -p` exit 1 for 10 of 58 families, giving an
+ * empty answer in both arms and a "missed" verdict for a call that failed.
+ * Demoting on that would delete lessons for the verifier's bug, which is worse
+ * than having no verifier at all. "redundant" is the safe direction: it says
+ * the model answered correctly WITHOUT the lesson, which a failed measurement
+ * cannot produce by accident — a failed call scores zero on both sides and
+ * lands in "missed", not here.
+ *
+ * Reads `entry.verdict` and nothing else. `reflections verify` also attaches a
+ * `reviewFlag` to families its marker scorer cannot measure; that is a note for
+ * a person, never a verdict, and reading one field by name is what keeps a new
+ * field in the report from silently becoming lifecycle state.
+ *
+ * @param {object} report - parsed `.agent/verify-report.json`
+ * @returns {Set<string>}
+ */
+export function demotedFamiliesFromVerifyReport(report) {
+  const demoted = new Set();
+  for (const [family, entry] of Object.entries(report?.verdicts ?? {})) {
+    if (entry?.verdict === "redundant") demoted.add(family);
+  }
+  return demoted;
+}
+
+/**
  * Rebuilds the whole managed block from current state rather than appending to
  * it. Selection happens under a fixed byte budget inside buildRulesBlock, so
  * the block cannot grow without bound and nobody has to prune it by hand: a
@@ -256,28 +287,15 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
 
   // Families a behavioural check showed do not earn their always-on line.
   //
-  // Read from `.agent/verify-report.json`, written by `reflections verify`.
-  //
-  // ONLY `redundant` demotes. `missed` deliberately does not, and the review of
-  // this wiring is why: "missed" is produced in two very different situations —
-  // the lesson genuinely does not land, and the measurement never ran. A prompt
-  // beginning with "- " made `claude -p` exit 1 for 10 of 58 families, giving an
-  // empty answer in both arms and a "missed" verdict for a call that failed.
-  // Demoting on that would delete lessons for the verifier's bug, which is worse
-  // than having no verifier at all. "redundant" is the safe direction: it says
-  // the model answered correctly WITHOUT the lesson, which a failed measurement
-  // cannot produce by accident — a failed call scores zero on both sides and
-  // lands in "missed", not here.
+  // Read from `.agent/verify-report.json`, written by `reflections verify`. The
+  // rule for which verdicts demote is in `demotedFamiliesFromVerifyReport`.
   //
   // A report that cannot be read is treated as empty. A maintenance artifact
   // must never be able to silently withdraw every lesson in the project.
-  const demotedFamilies = new Set();
+  let demotedFamilies = new Set();
   try {
     const raw = await readFile(path.join(projectDir, ".agent", "verify-report.json"), "utf8");
-    const parsed = JSON.parse(raw);
-    for (const [family, entry] of Object.entries(parsed?.verdicts ?? {})) {
-      if (entry?.verdict === "redundant") demotedFamilies.add(family);
-    }
+    demotedFamilies = demotedFamiliesFromVerifyReport(JSON.parse(raw));
   } catch {
     // No report, or an unreadable one: nothing is demoted.
   }
