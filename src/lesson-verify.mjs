@@ -84,10 +84,23 @@ function isReproducibleToken(token) {
 /**
  * Terms that belong to one family and no other.
  *
- * @param {{family: object, others: object[], max?: number}} params
+ * `prompt` is excluded, and that exclusion is not optional. The prompt sent to
+ * both arms is built from this family's own `applies_when`, so a marker drawn
+ * from that field is present in BOTH answers no matter what the lesson says.
+ * Measured: 31 of 202 markers were already in the prompt, and 7 of 58 families
+ * had enough of them to reach the threshold on the control alone — the verdict
+ * was forced to "redundant" before either model call ran. A marker that the
+ * question already contains cannot show that the lesson changed the answer.
+ *
+ * `minCount` guards the other end: when a family has fewer markers than this,
+ * the caller should treat the result as unmeasurable rather than score it. A
+ * family with two markers needs the model to reproduce 100% of its vocabulary
+ * verbatim, so a single paraphrase flips the verdict.
+ *
+ * @param {{family: object, others: object[], prompt?: string, max?: number}} params
  * @returns {string[]}
  */
-export function distinctiveMarkers({ family, others = [], max = 12 }) {
+export function distinctiveMarkers({ family, others = [], prompt = "", max = 12 }) {
   const gather = (entry) => [
     ...(entry.appliesWhen ?? []),
     entry.incidentSummary ?? "",
@@ -100,6 +113,8 @@ export function distinctiveMarkers({ family, others = [], max = 12 }) {
   for (const other of others) {
     for (const token of tokenize(gather(other))) shared.add(token);
   }
+  // The question itself is common ground, not evidence.
+  for (const token of tokenize(prompt)) shared.add(token);
 
   const unique = own.filter((token) => !shared.has(token));
   unique.sort((left, right) => right.length - left.length || left.localeCompare(right, "en-US"));
@@ -145,7 +160,7 @@ export async function verifyFamily({
   prepareControl,
   prepareTreatment
 }) {
-  const markers = distinctiveMarkers({ family, others });
+  const markers = distinctiveMarkers({ family, others, prompt });
   const familyKey = family.familyKey ?? family.familyKeys?.[0] ?? "(unnamed)";
 
   // A family with no vocabulary of its own cannot be measured this way. Saying

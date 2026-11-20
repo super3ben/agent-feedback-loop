@@ -256,13 +256,18 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
 
   // Families a behavioural check showed do not earn their always-on line.
   //
-  // Read from `.agent/verify-report.json`, written by `reflections verify`. Only
-  // two verdicts demote: `redundant` (the model answers correctly without the
-  // lesson, so the line says what it already knows) and `missed` (the lesson is
-  // present and the answer does not reflect it). `earned` keeps its line —
-  // that is the only category that demonstrated a difference — and
-  // `unmeasurable` keeps its line too, because failing to measure is not
-  // evidence of anything.
+  // Read from `.agent/verify-report.json`, written by `reflections verify`.
+  //
+  // ONLY `redundant` demotes. `missed` deliberately does not, and the review of
+  // this wiring is why: "missed" is produced in two very different situations —
+  // the lesson genuinely does not land, and the measurement never ran. A prompt
+  // beginning with "- " made `claude -p` exit 1 for 10 of 58 families, giving an
+  // empty answer in both arms and a "missed" verdict for a call that failed.
+  // Demoting on that would delete lessons for the verifier's bug, which is worse
+  // than having no verifier at all. "redundant" is the safe direction: it says
+  // the model answered correctly WITHOUT the lesson, which a failed measurement
+  // cannot produce by accident — a failed call scores zero on both sides and
+  // lands in "missed", not here.
   //
   // A report that cannot be read is treated as empty. A maintenance artifact
   // must never be able to silently withdraw every lesson in the project.
@@ -271,7 +276,7 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
     const raw = await readFile(path.join(projectDir, ".agent", "verify-report.json"), "utf8");
     const parsed = JSON.parse(raw);
     for (const [family, entry] of Object.entries(parsed?.verdicts ?? {})) {
-      if (entry?.verdict === "redundant" || entry?.verdict === "missed") demotedFamilies.add(family);
+      if (entry?.verdict === "redundant") demotedFamilies.add(family);
     }
   } catch {
     // No report, or an unreadable one: nothing is demoted.

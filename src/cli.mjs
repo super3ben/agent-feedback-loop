@@ -1703,7 +1703,15 @@ export async function main(args, {
 
           // The request comes from the family's own trigger condition, which is
           // the wording the lesson was written to catch.
-          const prompt = String(family.appliesWhen?.[0] ?? family.incidentSummary ?? key);
+          // Strip list markers before handing this to the CLI. `applies_when`
+          // entries are rendered as markdown list items, so 10 of 58 families
+          // start with "- " — and `claude -p "- agent 把密码…"` parses that as
+          // an unknown option, exits 1, and returns an empty answer. Both arms
+          // then score zero and the family was demoted for a call that never
+          // ran. A measurement that fails must not look like a lesson that
+          // fails.
+          const rawPrompt = String(family.appliesWhen?.[0] ?? family.incidentSummary ?? key);
+          const prompt = rawPrompt.replace(/^\s*[-*+]\s+/u, "").trim() || key;
 
           results.push(await verifyFamily({
             family,
