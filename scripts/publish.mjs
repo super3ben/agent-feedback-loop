@@ -75,15 +75,21 @@ async function run(command, commandArgs, { allowFailure = false, capture = true 
  * the push there is simply nothing to watch, and treating that as failure would
  * report a broken release that is in fact about to start.
  */
-async function waitForWorkflowStart({ name, version, attempts = 40, intervalMs = 3_000 }) {
+async function waitForWorkflowStart({ name, version, sha, attempts = 40, intervalMs = 3_000 }) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const raw = await run("gh", [
-      "run", "list", "--workflow=publish.yml", "--limit=1", "--json=databaseId,headBranch,headSha,event,status"
+      "run", "list", "--workflow=publish.yml", "--limit=10", "--json=databaseId,headBranch,headSha,event,status"
     ], { allowFailure: true });
     if (raw) {
       try {
-        const [latest] = JSON.parse(raw);
-        if (latest?.databaseId) return latest.databaseId;
+        // The list is never empty, so "the newest run" is not "the run we just
+        // triggered": on the 0.11.0 release this returned a nine-day-old
+        // failure while the tag's own run had not been created yet, and the
+        // script reported the release as failed after pushing and tagging it.
+        // Match the commit being released instead.
+        const runs = JSON.parse(raw);
+        const match = runs.find((entry) => entry?.databaseId && entry.headSha === sha);
+        if (match) return match.databaseId;
       } catch {
         // A transient read error is not a verdict; retry.
       }
@@ -216,7 +222,8 @@ async function main() {
 
   step("Waiting for the publish workflow");
   say("the workflow runs the suite, publishes over OIDC, then verifies the registry");
-  const runId = await waitForWorkflowStart({ name, version });
+  const headSha = await run("git", ["rev-parse", "HEAD"]);
+  const runId = await waitForWorkflowStart({ name, version, sha: headSha });
   const conclusion = await watchWorkflow(runId, { name, version });
   if (conclusion !== "success") {
     fail(`the publish workflow finished as "${conclusion}"`,
