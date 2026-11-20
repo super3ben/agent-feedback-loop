@@ -22,6 +22,25 @@ const ESCALATION_THRESHOLD = 3;
 // month a year ago does not escalate forever.
 const ESCALATION_WINDOW_MS = 14 * 24 * 60 * 60 * 1_000;
 
+/**
+ * The two sentences every escalated lesson is given, verbatim.
+ *
+ * Exported because the rules-block writer has to recognise them. Measured on a
+ * live project: five unrelated families — implementation continuation, card
+ * surface regression, execution-channel mismatch, bot-console parity, ops-stats
+ * coverage — all carried the identical first sentence into the always-on index,
+ * so five consecutive lines said the same thing and none of them said what to do
+ * about its own subject.
+ *
+ * The writer could not tell they were boilerplate; it only knew the sentence was
+ * shared, and its fallback was to print it anyway. Naming the template here lets
+ * the writer refuse it and fall through to the incident instead.
+ */
+export const ESCALATION_METHOD_CHANGES = Object.freeze([
+  "收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。",
+  "当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。"
+]);
+
 // How many times the SAME stated reason may be used on one family before it
 // stops counting as a judgement. Two is the honest limit: the first decline
 // states a condition, the second must be tested against it, and a second
@@ -252,10 +271,7 @@ export function escalateDeclinedFamily({
     )
   ].filter(Boolean);
 
-  const methodChanges = [
-    "收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。",
-    "当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。"
-  ].slice(0, 8);
+  const methodChanges = ESCALATION_METHOD_CHANGES.slice(0, 8);
 
   // Selection matches a future session's OPENING request by literal word
   // overlap, so the condition has to be phrased in the vocabulary the user will

@@ -16,6 +16,8 @@
 import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { ESCALATION_METHOD_CHANGES } from "./reviewer-escalate.mjs";
+
 const AFL_RULES_START = "<!-- afl:rules:start -->";
 const AFL_RULES_END = "<!-- afl:rules:end -->";
 const SEVERITY_ORDER = { Blocker: 0, Critical: 1, Major: 2 };
@@ -116,6 +118,19 @@ const INDEX_FACT_MAX_CHARS = 80;
  * the 6 KB injection budget already accommodates alongside two expanded sections.
  */
 const INDEX_FACT_EXPANDED_CHARS = 50;
+
+/**
+ * How much of an incident quote an index line carries.
+ *
+ * Separate from the instruction cap because a quote needs a different cut.
+ * `trimToChars` cuts at the LAST clause boundary, which is right for an
+ * instruction — the end of a sentence is where the action is — and wrong for a
+ * quote, where it keeps the reviewer narrating and drops the user's words:
+ * 「用户问「改完了吗啊？」。被评审的 agent 回合只是进行中的状态…」 trimmed at 80
+ * characters keeps the narration. A quote needs its FIRST sentence, so the cap is
+ * applied after that cut rather than instead of it.
+ */
+const INDEX_FACT_QUOTE_CHARS = 60;
 
 /**
  * How long an index fact is trusted before the block marks it stale.
@@ -251,7 +266,14 @@ function mergeFamilies(families) {
         // a fact is still current from this value, and dropping it during the
         // merge marked every merged family as undatable — which renders as
         // "may be stale" on facts that were confirmed this week.
-        lastSeenAt: family.lastSeenAt ?? null
+        lastSeenAt: family.lastSeenAt ?? null,
+        // Carried for the same reason again, and it was dropped here too: the
+        // `[未发布·聚合]` tag read `Boolean(family.unpublished)` on a field the
+        // merge never copied, so it was false for all eight never-published
+        // families and the tag never rendered once. A reader could not tell a
+        // family that has no lesson from one whose lesson was merely short.
+        unpublished: Boolean(family.unpublished),
+        dormant: family.dormant
       });
       continue;
     }
@@ -585,20 +607,33 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
   // says. That saving is real but it was the wrong thing to optimise: the cost is
   // about 2.8 KB across eighteen families, and the budget already fits it.
   // The instruction that goes on an index line has to distinguish this family
-  // from the others, and the first one often does not.
+  // from the others, and being unique is not the same as being about this family.
   //
-  // Reviewers write from a shared template, so the leading method change of
-  // several unrelated families can be the same sentence. Measured on a live
-  // project after the index began carrying instructions: 5 of 26 lines read
-  // 「收到用户的明确范围…agent 的第一反应是去核查、去执行」 — five different
-  // families, one instruction. Restoring text to the index while giving five
-  // families the same text would replace "no answer" with "five identical
-  // answers", which is no better for a reader trying to tell them apart.
+  // Two families of sentence are refused outright, whatever their frequency:
   //
-  // So: prefer an instruction that appears in only one family, falling back to
-  // the first when every one of them is shared (a family whose entire method is
-  // boilerplate has nothing better to offer, and showing something beats
-  // showing nothing).
+  // 1. THE ESCALATION TEMPLATE. `escalateDeclinedFamily` gives every family it
+  //    rescues the same two sentences, so five unrelated families in one live
+  //    project rendered the identical line. The old rule preferred a sentence
+  //    that appeared in only one family and fell back to `changes[0]` otherwise —
+  //    which, for a family whose entire method IS the template, prints the
+  //    template. Measured: that fallback fired for five lines and produced no
+  //    distinguishing text at all.
+  //
+  // 2. REVIEW-PROCESS PROSE. 「在再次使用 minor_issue 前，核对同类问题此前的拒绝
+  //    次数」 is about the reviewer deciding, not about the project. It is unique
+  //    in the corpus, so the old rule accepted it and never reached the family's
+  //    real instruction two entries later. Uniqueness cannot tell "specific to
+  //    this family" from "specific to this reviewer's habit".
+  //
+  // When nothing survives, the line falls back to the INCIDENT — the user's own
+  // words — rather than to a generic sentence. A generic instruction is true of
+  // every family and therefore about none; the incident at least names the
+  // situation, and the generic instruction is still in the L1 section above.
+  const REVIEW_PROCESS = /评审|沉淀为反思|沉淀为规则|沉淀|would_qualify_if|insufficient_evidence|拒绝记录|判定是否|判断是否|是否值得|准备判断|判定|minor_issue|shared_ambiguity|首次交付|首次理解/iu;
+  const templateKeys = new Set(
+    ESCALATION_METHOD_CHANGES.map((value) => String(value).replace(/\s+/gu, " ").trim().slice(0, 40))
+  );
+
   const factKey = (value) => String(value ?? "").replace(/\s+/gu, " ").trim().slice(0, 40);
   const factFrequency = new Map();
   for (const family of merged) {
@@ -610,25 +645,49 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
       factFrequency.set(key, (factFrequency.get(key) ?? 0) + 1);
     }
   }
-  const distinguishingFact = (family) => {
-    const changes = (family.methodChanges ?? []).filter((entry) => String(entry ?? "").trim());
+  const usableInstruction = (change) => {
+    const text = String(change ?? "").trim();
+    if (!text) return false;
+    if (templateKeys.has(factKey(text))) return false;
+    if (REVIEW_PROCESS.test(text)) return false;
+    return true;
+  };
+  /**
+   * The sentence a line carries, and what kind it is.
+   *
+   * Three kinds, and the renderer gives each its own shape rather than a tag:
+   * an instruction behind `→`, an incident in `「」`, and nothing at all.
+   *
+   * The shapes are not decoration. Before this, a never-published family's line
+   * read `- destructive-cleanup-before-review (9×) → 看着都没什用都删了吧`. Behind
+   * an arrow that is an instruction to delete whatever looks unused — and that
+   * sentence is the user reporting the mistake it caused. The arrow inverted it.
+   */
+  const factFor = (family) => {
+    const changes = (family.methodChanges ?? []).filter(usableInstruction);
     const unique = changes.find((change) => (factFrequency.get(factKey(change)) ?? 0) === 1);
-    return unique ?? changes[0] ?? null;
+    const instruction = unique ?? changes[0] ?? null;
+    if (instruction) return { text: instruction, kind: "instruction" };
+    const incident = String(family.incidentSummary ?? "").trim();
+    if (incident) return { text: incident, kind: "quote" };
+    return { text: null, kind: "none" };
   };
 
   const index = merged.map((family) => {
-    const firstAction = (family.methodChanges ?? [])[0] ?? null;
-    const distinguishing = distinguishingFact(family);
+    const picked = factFor(family);
     const expanded = !overflowed.some((entry) => entry.familyKeys[0] === family.familyKeys[0]);
     return {
       familyKey: family.familyKeys[0],
       occurrences: family.occurrences,
-      // Always populated. When the full section is above, the line is truncated
-      // harder rather than emptied: a reader skimming past the section still gets
-      // the handle, and a reader who scrolled to the index gets the instruction.
-      fact: distinguishing
-        ? trimToChars(distinguishing, expanded ? INDEX_FACT_EXPANDED_CHARS : INDEX_FACT_MAX_CHARS)
-        : trimToChars(family.incidentSummary ?? "", INDEX_FACT_MAX_CHARS) || null,
+      // What the line carries, and which kind it is. `kind` decides the SHAPE at
+      // render time — `→` for an instruction, `「」` for an incident quote — which
+      // is what keeps a user's complaint from reading like an order.
+      fact: picked.text
+        ? trimToChars(picked.text, picked.kind === "quote"
+          ? INDEX_FACT_QUOTE_CHARS
+          : (expanded ? INDEX_FACT_EXPANDED_CHARS : INDEX_FACT_MAX_CHARS))
+        : null,
+      factKind: picked.kind,
       // Marks the lines whose section is NOT above, so a reader can tell which
       // ones are the whole lesson and which are a reminder of one they already
       // have. Rendering ignores this; it exists for tests and for anyone reading
@@ -669,10 +728,23 @@ export function buildRulesBlock(families, { maxBytes = RULES_FILE_BUDGET_BYTES }
       // reader can tell it was cut rather than never written.
       if (entry.factShed) tags.push("指令已省略·预算");
       const tag = tags.length ? ` [${tags.join("·")}]` : "";
+      // The tail's SHAPE carries its kind, and the shape is not decoration.
+      //
+      // Before this, a never-published family rendered as
+      //   - destructive-cleanup-before-review (9×) → 看着都没什用都删了吧
+      // Behind an arrow that reads as an instruction to delete whatever looks
+      // unused — and the sentence is the user reporting the mistake that
+      // instruction caused. A quote in 「」 cannot be mistaken for an order.
+      //
       // A dormant family gives back the fact's bytes. The name and count stay so
       // the family is still discoverable and returns in full on its next
       // recurrence; only the always-on sentence is withdrawn.
-      const fact = entry.fact && !entry.dormant ? ` → ${entry.fact}` : "";
+      let fact = "";
+      if (entry.fact && !entry.dormant) {
+        if (entry.factKind === "quote") fact = ` 「${entry.fact}」`;
+        else if (entry.factKind === "none") fact = "";
+        else fact = ` → ${entry.fact}`;
+      }
       lines.push(`- ${entry.familyKey} (${entry.occurrences}×)${tag}${fact}`);
     }
     lines.push("");
