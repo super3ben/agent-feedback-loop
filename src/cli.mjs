@@ -1,4 +1,5 @@
 import os from "node:os";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -36,6 +37,8 @@ import { summarizeReflectionEffectiveness } from "./reflection-effectiveness.mjs
 import { classifyProject } from "./reflection-lifecycle.mjs";
 import { dreamOverReflections } from "./reflection-dream.mjs";
 import { readReflectionCatalog } from "./reflection-document.mjs";
+import { selectFamiliesToVerify, verifyFamily, weightForVerdict } from "./lesson-verify.mjs";
+import { buildRulesBlock } from "./rules-writer.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
@@ -1587,6 +1590,159 @@ export async function main(args, {
           declines: store.listFamilyDeclineCounts({ projectId: projectDir })
         });
         console.log(JSON.stringify(summary, null, 2));
+        return;
+      }
+      if (subcommand === "verify") {
+        // Does each lesson actually change what a model answers?
+        //
+        // Every other check here measures the text — readable, concrete, cites a
+        // file that exists. None of them answer the only question that matters:
+        // give a model this lesson, bring up the situation it describes, does the
+        // model do anything differently?
+        //
+        // Answered the only way it can be from outside the model: run the same
+        // request twice, once with nothing at all and once with only this
+        // family's line, and see whether the answer moves in the lesson's
+        // direction. Run by hand across eight families before this command
+        // existed, it separated them cleanly — 3 earned, 4 redundant, 1 missed.
+        // The redundant ones were general best practice the model states
+        // unprompted; the earned ones were project facts no reasoning produces.
+        //
+        // Expensive by construction: two model calls per family. Bounded by
+        // --limit, ordered by the bytes each line costs, so a run buys the most
+        // budget back per call.
+        const limitRaw = optionValue(options.args, "--limit", "4");
+        const limit = Number(limitRaw);
+        if (!Number.isSafeInteger(limit) || limit < 1) {
+          throw new Error("--limit must be a positive integer");
+        }
+        const apply = options.args.includes("--apply");
+        const verdictPath = path.join(projectDir, ".agent", "verify-report.json");
+
+        let prior = { verdicts: {} };
+        try {
+          prior = JSON.parse(await readFile(verdictPath, "utf8"));
+        } catch {
+          prior = { verdicts: {} };
+        }
+
+        const verifyCutoff = new Date(Date.now() + 1_000).toISOString();
+        const { documents: verifiable } = await loadReflectionDocuments({
+          projectDir,
+          publishedBefore: verifyCutoff
+        });
+
+        // Built from the documents rather than from the rendered block: the
+        // block has already dropped the methods it decided not to render, and
+        // the marker has to come from everything the family actually says.
+        const families = verifiable.map((document) => ({
+          familyKey: document.familyId,
+          severity: document.severity,
+          occurrences: 3,
+          latestRecurrenceAt: document.createdAt,
+          lastSeenAt: document.createdAt,
+          incidentSummary: document.classOfMistake,
+          appliesWhen: document.appliesWhen,
+          methodChanges: document.methodChanges,
+          dormant: false
+        }));
+
+        const lineBytesOf = (family) => Buffer.byteLength([
+          family.familyKey,
+          ...(family.methodChanges ?? [])
+        ].join(" "), "utf8");
+
+        const selected = selectFamiliesToVerify({
+          families,
+          verdicts: prior.verdicts ?? {},
+          limit,
+          lineBytesOf
+        });
+
+        if (!selected.length) {
+          console.log(JSON.stringify({
+            status: "nothing_to_verify",
+            projectDir,
+            note: "所有家族的判定都在有效期内；用 --limit 提高单次预算，或等 maxAgeDays 过期。"
+          }, null, 2));
+          return;
+        }
+
+        const claudeBin = await resolveReviewerExecutable({ cli: "claude" });
+        if (!claudeBin) {
+          throw new Error("找不到 claude 可执行文件；设置 AGENT_FEEDBACK_LOOP_CLAUDE_COMMAND 或把 claude 放进 PATH");
+        }
+
+        // Two throwaway workspaces per family. The control has NO .agent at all:
+        // a project whose rules block was merely removed still injects documents
+        // through the selector, so "no block" is not "no lesson". That mistake
+        // produced a false negative the first time this was measured by hand.
+        const workRoot = await mkdtemp(path.join(tmpdir(), "afl-verify-"));
+        const runOne = async ({ workspace, prompt }) => new Promise((resolve) => {
+          const child = spawn(claudeBin, [
+            "-p", prompt,
+            // No tools: the question is answered from context alone, so neither
+            // condition can use the repository as a second source of truth.
+            "--disallowedTools", "Read", "Grep", "Glob", "Bash"
+          ], { cwd: workspace, stdio: ["ignore", "pipe", "ignore"] });
+          let out = "";
+          child.stdout.on("data", (chunk) => { out += String(chunk); });
+          child.on("error", () => resolve(""));
+          child.on("close", () => resolve(out));
+        });
+
+        const results = [];
+        for (const family of selected) {
+          const key = family.familyKey;
+          const controlDir = path.join(workRoot, `${key}-control`);
+          const treatmentDir = path.join(workRoot, `${key}-treatment`);
+          await mkdir(controlDir, { recursive: true });
+          await mkdir(path.join(treatmentDir, ".agent", "rules"), { recursive: true });
+          const singleBlock = buildRulesBlock([family]);
+          await writeFile(path.join(treatmentDir, ".agent", "rules", "feedback-loop.md"), singleBlock, "utf8");
+
+          // The request comes from the family's own trigger condition, which is
+          // the wording the lesson was written to catch.
+          const prompt = String(family.appliesWhen?.[0] ?? family.incidentSummary ?? key);
+
+          results.push(await verifyFamily({
+            family,
+            others: families.filter((entry) => entry.familyKey !== key),
+            prompt,
+            run: runOne,
+            prepareControl: async () => controlDir,
+            prepareTreatment: async () => treatmentDir
+          }));
+        }
+
+        try { await rm(workRoot, { recursive: true, force: true }); } catch {}
+
+        const stamped = results.map((entry) => ({ ...entry, checkedAt: new Date().toISOString() }));
+        const merged = { ...(prior.verdicts ?? {}) };
+        for (const entry of stamped) merged[entry.family] = entry;
+        const report = {
+          checkedAt: new Date().toISOString(),
+          projectDir,
+          verdicts: merged
+        };
+        if (apply) {
+          await mkdir(path.dirname(verdictPath), { recursive: true, mode: 0o700 });
+          await writeFile(verdictPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+        }
+
+        console.log(JSON.stringify({
+          status: apply ? "applied" : "dry_run",
+          projectDir,
+          verdictPath: apply ? verdictPath : null,
+          results: stamped.map((entry) => ({
+            family: entry.family,
+            verdict: entry.verdict,
+            markers: entry.markers?.slice(0, 4) ?? [],
+            rank: weightForVerdict(entry.verdict),
+            control: entry.control ? `${entry.control.count}/${entry.markers.length}` : null,
+            treatment: entry.treatment ? `${entry.treatment.count}/${entry.markers.length}` : null
+          }))
+        }, null, 2));
         return;
       }
       if (subcommand === "dream") {

@@ -254,6 +254,29 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
     unclassified: unclassified.length
   });
 
+  // Families a behavioural check showed do not earn their always-on line.
+  //
+  // Read from `.agent/verify-report.json`, written by `reflections verify`. Only
+  // two verdicts demote: `redundant` (the model answers correctly without the
+  // lesson, so the line says what it already knows) and `missed` (the lesson is
+  // present and the answer does not reflect it). `earned` keeps its line —
+  // that is the only category that demonstrated a difference — and
+  // `unmeasurable` keeps its line too, because failing to measure is not
+  // evidence of anything.
+  //
+  // A report that cannot be read is treated as empty. A maintenance artifact
+  // must never be able to silently withdraw every lesson in the project.
+  const demotedFamilies = new Set();
+  try {
+    const raw = await readFile(path.join(projectDir, ".agent", "verify-report.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    for (const [family, entry] of Object.entries(parsed?.verdicts ?? {})) {
+      if (entry?.verdict === "redundant" || entry?.verdict === "missed") demotedFamilies.add(family);
+    }
+  } catch {
+    // No report, or an unreadable one: nothing is demoted.
+  }
+
   const unpublished = [];
   for (const { familyKey, occurrences, lastSeenAt } of recurrence) {
     let job;
@@ -374,7 +397,21 @@ export async function maybeUpdateRulesTier({ store, projectId, projectDir, readB
       // Dormant only when quiet AND nothing unclassified suggests it is live.
       // The published path says whether the family recurred; the unclassified
       // complaints say whether it might be recurring without being seen.
-      dormant: false,
+      //
+      // And now also when a behavioural check showed the lesson does not move
+      // the model: `reflections verify` records, per family, whether the answer
+      // changes when the lesson is present. A family whose lesson the model
+      // reaches anyway — general best practice, already known — was spending a
+      // line in the channel that runs on every turn to say what the model would
+      // have said unprompted. `dormant` is the existing plumbing for "keep the
+      // name and the count, withdraw the always-on sentence", which is exactly
+      // the demotion this earns: the document, its history and its index line
+      // all survive, and the family returns in full if it recurs.
+      //
+      // Measured before it was wired: 4 of 8 families were redundant in that
+      // sense, and 3 of 8 were earned. Without this read, the verdict was
+      // printed and thrown away — the report existed and nothing consumed it.
+      dormant: demotedFamilies.has(familyKey),
       methodChanges: document.methodChanges
     });
   }
