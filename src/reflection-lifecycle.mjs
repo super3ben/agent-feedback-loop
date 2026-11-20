@@ -216,7 +216,27 @@ export function classifyFamily({
     return {
       ...base,
       state: "preempted",
-      reason: "repeated_opportunity_without_recurrence"
+      reason: "repeated_opportunity_without_recurrence",
+      // What this timestamp licenses, stated where it is produced so no caller
+      // has to guess: this family's lesson was written into a session, the same
+      // kind of work came up again LATER, and no complaint attributable to this
+      // family was recorded about it.
+      //
+      // It is survival of a repeat exposure. It is not proof that the lesson
+      // caused anything, that the user was spared anything, or that the
+      // instruction was read. A field called "verified" is one keystroke from
+      // claiming causation, and this project has already had to undo that once
+      // ("quiet since delivery" read as "fixed"). The causal claim lives in
+      // eval/net-effect.mjs, computed against never-delivered families — nothing
+      // derived per family may promote itself to that.
+      //
+      // Coverage limit, also deliberate: only the SELECTION channel writes a
+      // durable per-session row (reflection_emissions). The always-on index and
+      // the PreToolUse channel leave no per-family timestamp, so a family
+      // delivered only through those is never counted here. This field therefore
+      // under-reports, and never over-reports — which is the direction an error
+      // in a "verified" field must point.
+      verifiedAt: new Date(lastAt).toISOString()
     };
   }
 

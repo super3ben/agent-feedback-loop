@@ -196,6 +196,24 @@ a lesson actually delivered for months while the same mistake kept recurring.
 State the action and its concrete parameters — 「连 192.168.100.1 用密码认证，
 不加 BatchMode=yes」.
 
+Apply this test to every entry before writing it: **could a session that starts
+fresh with only the repository work this out for itself?** If yes, do not write
+it down. 「用密码登录」 fails the test — the agent can read the server's auth
+config and reach the same conclusion, so the sentence buys nothing and spends a
+line in the channel that runs on every turn. 「ssh -o PubkeyAuthentication=no -o
+PreferredAuthentications=password，不要加 BatchMode=yes」 passes: it names the
+flags, and no amount of reading the repo tells you that BatchMode kills the
+password prompt until you have lost an afternoon to it.
+
+Measured: 78% of the lessons in one live project failed that test. They recorded
+the diagnosis — which the agent would have reached anyway — and not the
+parameter — which only experience supplies. A lesson is worth keeping only for
+the part that could not be re-derived.
+
+Write the anchor, not the advice. Every entry should contain at least one of: a
+command or flag, a path, an identifier, a quoted literal, or a quantity with its
+unit. If none of those belongs in the sentence, the sentence is advice.
+
 Use vague pointer phrasing only when the specific action genuinely cannot be
 determined from the evidence, and then say what is missing. Do not use it as a
 default because it is safe to write.

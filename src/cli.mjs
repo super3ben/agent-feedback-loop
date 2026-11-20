@@ -1,6 +1,6 @@
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +34,8 @@ import { resolveDesignPermit } from "./design-permit.mjs";
 import { archiveReflections, selectArchivableReflections, DEFAULT_ARCHIVE_AFTER_DAYS } from "./reflection-archive.mjs";
 import { summarizeReflectionEffectiveness } from "./reflection-effectiveness.mjs";
 import { classifyProject } from "./reflection-lifecycle.mjs";
+import { dreamOverReflections } from "./reflection-dream.mjs";
+import { readReflectionCatalog } from "./reflection-document.mjs";
 
 const CLI_FILE = fileURLToPath(new URL("../bin/agent-feedback-loop.mjs", import.meta.url));
 const EXECUTION_HOOK_EVENTS = new Set(["PreToolUse"]);
@@ -1585,6 +1587,60 @@ export async function main(args, {
           declines: store.listFamilyDeclineCounts({ projectId: projectDir })
         });
         console.log(JSON.stringify(summary, null, 2));
+        return;
+      }
+      if (subcommand === "dream") {
+        // An offline re-read of published lessons: what no longer holds.
+        //
+        // The lesson is written once, at the moment of the complaint, by a
+        // reviewer that saw part of a conversation. Nothing looks at it again.
+        // Measured on a live project: a memory index said "key auth works since
+        // 2026-09-11" two months after the body had been corrected to say it was
+        // dead, and an agent followed the index into a twelve-minute dead end.
+        //
+        // Read-only by default. `--apply` writes a report file beside the
+        // reflections; it never edits a document, because a document's bytes are
+        // the key to its own delivery history (documentHash = sha256(bytes),
+        // which keys reflection_emissions). Rewriting one in place would detach
+        // it from the record of what was delivered.
+        const dreamCutoff = new Date(Date.now() + 1_000).toISOString();
+        // The catalog's omissions carry the PATH, which is what makes an
+        // "unreadable document" finding actionable. loadReflectionDocuments maps
+        // them to an opaque id instead, deliberately, because it feeds the
+        // prompt hook; a maintenance report needs the file name.
+        const dreamCatalog = await readReflectionCatalog({
+          projectDir,
+          publishedBefore: dreamCutoff
+        });
+        const { documents: dreamable } = await loadReflectionDocuments({
+          projectDir,
+          publishedBefore: dreamCutoff
+        });
+        const dream = await dreamOverReflections({
+          projectDir,
+          documents: dreamable,
+          omissions: (dreamCatalog.omissions ?? []).map((entry) => ({
+            path: entry.path ?? null,
+            reason: entry.omission ?? "parse_error"
+          })),
+          checkPaths: !options.args.includes("--no-paths")
+        });
+        const apply = options.args.includes("--apply");
+        let reportPath = null;
+        if (apply) {
+          reportPath = path.join(projectDir, ".agent", "dream-report.json");
+          await mkdir(path.dirname(reportPath), { recursive: true, mode: 0o700 });
+          await writeFile(reportPath, `${JSON.stringify(dream, null, 2)}\n`, "utf8");
+        }
+        console.log(JSON.stringify({
+          status: apply ? "applied" : "dry_run",
+          projectDir,
+          documents: dream.documents,
+          totals: dream.totals,
+          reportPath,
+          findings: dream.findings,
+          coverage: dream.coverage
+        }, null, 2));
         return;
       }
       if (subcommand === "lifecycle") {
