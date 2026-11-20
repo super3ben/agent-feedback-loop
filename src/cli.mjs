@@ -1608,9 +1608,15 @@ export async function main(args, {
         // The redundant ones were general best practice the model states
         // unprompted; the earned ones were project facts no reasoning produces.
         //
-        // Expensive by construction: two model calls per family. Bounded by
-        // --limit, ordered by the bytes each line costs, so a run buys the most
-        // budget back per call.
+        // Expensive by construction: two model calls per family for one the
+        // markers can measure. A family that yields no DISTINCTIVE marker takes
+        // four, because it gets the structure fallback instead — two runs per
+        // arm are the minimum that can tell a lesson's effect from the variance
+        // of the same question. (Zero markers does not mean no Latin text: on
+        // the live corpus those families carry identifiers, but none of them is
+        // unique to the family.) A family whose structure terms come out empty
+        // costs no call at all. Bounded by --limit, ordered by the bytes each
+        // line costs, so a run buys the most budget back per call.
         const limitRaw = optionValue(options.args, "--limit", "4");
         const limit = Number(limitRaw);
         if (!Number.isSafeInteger(limit) || limit < 1) {
@@ -1748,7 +1754,12 @@ export async function main(args, {
             markers: entry.markers?.slice(0, 4) ?? [],
             rank: weightForVerdict(entry.verdict),
             control: entry.control ? `${entry.control.count}/${entry.markers.length}` : null,
-            treatment: entry.treatment ? `${entry.treatment.count}/${entry.markers.length}` : null
+            treatment: entry.treatment ? `${entry.treatment.count}/${entry.markers.length}` : null,
+            // Present only for a family the marker scorer could not see. It is
+            // printed, never ranked: `rank` above is computed from `verdict`,
+            // and this field is not consulted by anything that changes a
+            // lesson's weight, dormancy or index line.
+            reviewFlag: entry.reviewFlag ?? null
           }))
         }, null, 2));
         return;
