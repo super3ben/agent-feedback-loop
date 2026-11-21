@@ -174,7 +174,7 @@
 
 <!-- afl:rules:start -->
 
-<!-- afl:rules:budget 9095/65536 demoted=2 -->
+<!-- afl:rules:budget 10411/65536 demoted=2 -->
 
 ### reflection-context-ineffective (10×, Major)
 
@@ -249,6 +249,18 @@
 - 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
 - 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
 
+### workflow-notification-not-user-feedback (2×, Major)
+
+**何时适用：**
+- 当任务涉及「现在这个不好、不要把本地测试的实际用例暴露出去、agent 07:56 回复称已派出三步后台 workf、并承诺跑完亲手抽帧检查、删除 assets/tests.、本条证据是 08」时，或用户以相近说法指出同类问题时
+- when the task involves 现在这个不好、不要把本地测试的实际用例暴露出去、agent 07:56 回复称已派出三步后台 workf、并承诺跑完亲手抽帧检查、删除 assets/tests.、本条证据是 08, or the user raises the same class of problem
+
+用户 07:42 要求按 comet 版式重做 README（「现在这个不好」），并明确「不要把本地测试的实际用例暴露出去」…
+
+**Do not repeat this mistake:**
+- 收到用户的明确范围、能力声明或否定性反馈时，agent 的第一反应是去核查、去执行，而不是先反驳或把活推回用户；事后承认不能替代第一时间做对。
+- 当同类问题第二次出现时，把它当作已承诺的 would_qualify_if 已被命中，必须沉淀为反思或规则，而不是再次以相同理由拒绝。
+
 ### one-off-plan-vs-recurring-automation (2×, Major)
 
 **何时适用：**
@@ -268,6 +280,7 @@
 - design-phase-generation-counting (7×) [可能已过期·先验证] → 复现用户报告的被拦操作，并确认原阻塞不再触发后再验收；单元测试通过只作为辅助证据。
 - backtest-conclusion-inconsistency (5×) → 核对用户明确反馈与 agent 的首次行动，判断首次行动是否偏离用户问题；将两者及偏离之处记入反思。
 - self-verification-marker-quality (3×) 「用户这条消息是后台 workflow 的完成通知，不是用户反馈…」
+- workflow-notification-not-user-feedback (2×) 「用户 07:42 要求按 comet 版式重做 README（「现在这个不好」）…」
 - one-off-plan-vs-recurring-automation (2×) 「用户说「可以继续修复吧」，并追问 agent 是否已经总结出一套自测工作流：现在每次有点问题都要用户主动要求…」
 - reviewer-shared-ambiguity-threshold (4×) [未发布·聚合] 「更新到服务里」
 - strategy-backtest-deferral (3×) [未发布·聚合] 「效果不太好，我现在还是想象不出来S3的这个通用模型的图像，你能通过15个月甚至扩大到20个月的数据看下S3的选股图形是…」
