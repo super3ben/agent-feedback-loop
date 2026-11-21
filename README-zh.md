@@ -4,6 +4,78 @@
 
 **运行时版本：`0.11.0`**
 
+## 闭环演示
+
+![反馈闭环：0.11.0 下六条链路已闭四条](assets/loop.gif)
+
+绿色链路在代码里自动闭合；两条橙色虚线不闭合。验证只在有人手动跑
+`reflections verify` 时才发生；经注入区块的复发从不被记账。光点是一条教训走完
+六步。每条链路的颜色都是照着 0.11.0 的 `src/` 核对出来的，不是按设计意图画的。
+
+![一次不满走完整条链路，全程实录](assets/demo.gif)
+
+四幕都是真跑，`HOME` 指向临时目录：`node bin/agent-feedback-loop.mjs install --home $HOME`；
+然后 `afl-hook hook --event UserPromptSubmit --cli codex --continue < ~/payload-1.json`
+输入一句中文抱怨；然后 `ls .agent/reflections && head -n 11 .agent/reflections/*.md`
+看 reviewer 写下的文档；最后对第二条 prompt 再跑一次 hook，用
+`jq -r .hookSpecificOutput.additionalContext` 把注入区块从返回的 JSON 里取出来。
+`reflections verify` 故意没有入镜——它每个家族要两次真实模型调用，把它脚本化等于
+伪造被测量的东西。
+
+![撑住整个闭环的测试](assets/tests.gif)
+
+`node --test test/lesson-verify.test.mjs test/lesson-structure.test.mjs
+test/update-rules-tier.test.mjs`——39/39 全过。全量 `node --test` 是 871 个用例，
+870 过、1 挂；挂的是 `test/platform-smoke.test.mjs` 里既有的那条（断言在 :522，
+用例在 :404），实录里原样保留，没有剪掉。
+
+![结构评分的 A/B：对照组、实验组与同臂噪声](assets/verify-ab.png)
+
+三个家族各跑两组：一组完全没有 `.agent`，一组只有该家族的规则区块。纵轴数的是
+答案重现了多少该教训的特征词和项目对象，不是 agent 的行为有没有变——换个说法答对
+也可能得 0 分，所以差距只能当下界看。横轴止于 8，是因为 `extractObjects` 的对象
+上限就是 8（`src/lesson-structure.mjs:194`）；每组至少两次，因为 `repeats` 低于
+2 会被抬到 2（`src/lesson-verify.mjs:260`），而 SSH 家族同臂三次抽取是 6、2、1，
+一组一次分不开教训和噪声。
+
+### 闭环闭合了吗？
+
+0.11.0 下六条链路有四条不需要人介入。两条没有，而且已闭合的链路里有一条比看上去窄。
+
+**已闭合**
+
+- **捕获 → 评审。** prompt hook 记录 `feedback_signal_evaluated`，reason 为
+  `candidate` 或 `not_candidate`（`src/cli.mjs:614`），分离的 reviewer 把作业变成
+  反思文档。端到端用例：`test/platform-smoke.test.mjs:404`。
+- **评审 → 编译。** 已发布文档带 `family_id`、`applies_when`、`method_changes`
+  （`src/reflection-document.mjs:9-11`）；tier 构建合并同族，并给每个已发布家族
+  一行索引（`SEVERITY_THRESHOLDS = { Major: 1, Critical: 1, Blocker: 1 }`，
+  `src/rules-writer.mjs:44`）。"复发 3 次才升级"只剩给从未发布过的家族
+  （`UNPUBLISHED_RECURRENCE_THRESHOLD`，`src/update-rules-tier.mjs:47`）。
+- **编译 → 注入。** `buildRulesBlock` 渲染分层区块（`src/rules-writer.mjs`），
+  prompt 路径每轮都读（`src/cli.mjs:889-907`）。按会话记的 `rules_injection`
+  台账防止同一家族在每次工具调用里重复出现（`src/control-store.mjs:104`）。
+- **验证 → 生命周期。** 只有 `redundant` 判定会降级
+  （`demotedFamiliesFromVerifyReport`，`src/update-rules-tier.mjs`）：文档保留，
+  失去常驻指令行，索引上打 `长期未复发·已降级` 标签（`src/rules-writer.mjs:725`）。
+  这件事到 0.11.0 才成立：读 verify-report 时调用 `path.join` 却没 import
+  `node:path`，裸 `catch` 把 `ReferenceError` 吞了，此前没有任何判定降级过任何
+  东西（`8e3e469` 修复）。
+
+**未闭合**
+
+- **注入 → 验证。** `verifyFamily` 只有一处调用者，就是 `reflections verify`
+  命令（`src/cli.mjs:1722`）。没有任何东西自动触发它；不跑就没有判定，也就永远
+  不会降级。
+- **注入 → 捕获（复发）。** 区块通道的投递不写进 `reflection_emissions`：
+  `findPriorFamilyEmission` 只读 `outcome='emitted'` 的行
+  （`src/control-store.mjs:1274`），而 selector 对区块已覆盖的家族直接以
+  `covered_by_rules` 跳过（`src/selector.mjs:563`）。于是
+  `recurrence_after_emission` 对区块覆盖的家族永远不会触发——而这些正是复发
+  频率高到能进索引的那些。
+- **测量本身只是下界。** 验证评的是答案有没有重现教训的特征词和项目对象，不是
+  agent 的行为有没有变（`src/lesson-verify.mjs`）；答对但换了措辞可能得 0 分。
+
 ## 反馈学习
 
 1. prompt hook 捕获合格的用户不满后立即返回宿主。

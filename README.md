@@ -5,6 +5,93 @@ Codex, Claude Code, and Gemini CLI. [中文说明](README-zh.md)
 
 **Runtime version: `0.11.0`**
 
+## See the loop
+
+![The feedback loop: 4 of 6 links closed as of 0.11.0](assets/loop.gif)
+
+Green links close inside the code. The two amber dashed links do not: verify runs
+only when someone types `reflections verify`, and recurrence through the injected
+block is never recorded. The dot is one lesson walking the six steps. Every
+colour was read from `src/` at 0.11.0, not drawn from intent.
+
+![One incident through the loop, recorded end to end](assets/demo.gif)
+
+Four scenes, all real runs against a throwaway `HOME`:
+`node bin/agent-feedback-loop.mjs install --home $HOME`; then
+`afl-hook hook --event UserPromptSubmit --cli codex --continue < ~/payload-1.json`
+on a Chinese complaint; then `ls .agent/reflections && head -n 11
+.agent/reflections/*.md` for the document the reviewer published; then the same
+hook on a second prompt, with `jq -r .hookSpecificOutput.additionalContext`
+pulling the injected block back out of the returned JSON. `reflections verify`
+is deliberately absent — it needs two real model calls per family, and scripting
+those answers would fake the very thing being measured.
+
+![The tests that hold the loop together](assets/tests.gif)
+
+`node --test test/lesson-verify.test.mjs test/lesson-structure.test.mjs
+test/update-rules-tier.test.mjs` — 39 of 39 pass. The full suite is 871 tests:
+870 pass, 1 fails, and that failure is pre-existing in
+`test/platform-smoke.test.mjs` (assertion at :522, test at :404). It is shown in
+the capture rather than trimmed out.
+
+![Structure-scored A/B: control vs treatment, plus same-arm spread](assets/verify-ab.png)
+
+Three families replayed with no `.agent` at all and with only that family's rules
+block. The chart counts the lesson's distinctive terms and project objects that
+reappear in the answer — not whether the agent behaves differently, so a
+paraphrasing answer can score zero and the gaps are a lower bound. The x axis
+stops at 8 because `extractObjects` caps objects there
+(`src/lesson-structure.mjs:194`); two runs per arm is the floor because `repeats`
+below 2 is raised to 2 (`src/lesson-verify.mjs:260`), and the SSH family's
+same-arm draws were 6, 2 and 1 — one run per arm cannot separate a lesson from
+noise.
+
+### Is the loop closed?
+
+Four of the six links run without a human as of 0.11.0. Two do not, and one of
+the closed ones is narrower than it looks.
+
+**Closed**
+
+- **capture → review.** The prompt hook logs `feedback_signal_evaluated` with
+  reason `candidate` or `not_candidate` (`src/cli.mjs:614`), and a detached
+  reviewer turns the job into a reflection. End-to-end coverage:
+  `test/platform-smoke.test.mjs:404`.
+- **review → compile.** A published document carries `family_id`, `applies_when`
+  and `method_changes` (`src/reflection-document.mjs:9-11`); the tier builder
+  merges the family and gives every published family an index line
+  (`SEVERITY_THRESHOLDS = { Major: 1, Critical: 1, Blocker: 1 }`,
+  `src/rules-writer.mjs:44`). "Promote at 3 recurrences" survives only for
+  families that never published (`UNPUBLISHED_RECURRENCE_THRESHOLD`,
+  `src/update-rules-tier.mjs:47`).
+- **compile → inject.** `buildRulesBlock` renders the layered block
+  (`src/rules-writer.mjs`), and the prompt path reads it on every turn
+  (`src/cli.mjs:889-907`). A per-session `rules_injection` ledger keeps the same
+  family from arriving again on every tool call (`src/control-store.mjs:104`).
+- **verify → lifecycle.** Only a `redundant` verdict demotes
+  (`demotedFamiliesFromVerifyReport`, `src/update-rules-tier.mjs`); the family
+  keeps its document, loses the always-on line, and gains the
+  `长期未复发·已降级` tag (`src/rules-writer.mjs:725`). This only became true in
+  0.11.0: the verify-report read called `path.join` without importing
+  `node:path`, and a bare `catch` swallowed the `ReferenceError`, so no verdict
+  had ever demoted anything (fixed in `8e3e469`).
+
+**Open**
+
+- **inject → verify.** `verifyFamily` has exactly one caller, the
+  `reflections verify` command (`src/cli.mjs:1722`). Nothing schedules it, so a
+  project that never runs it never gets verdicts — and therefore never demotes.
+- **inject → capture (recurrence).** Block-channel deliveries are not written to
+  `reflection_emissions`: `findPriorFamilyEmission` reads only rows with
+  `outcome='emitted'` (`src/control-store.mjs:1274`), and the selector skips a
+  family the block already covers with reason `covered_by_rules`
+  (`src/selector.mjs:563`). So `recurrence_after_emission` never fires for the
+  families the block covers — the ones recurring often enough to earn a line.
+- **The measurement is a lower bound.** Verification scores whether the answer
+  reproduces the lesson's distinctive terms and project objects, not whether the
+  agent's behaviour changed (`src/lesson-verify.mjs`). A correct answer that
+  paraphrases can score zero.
+
 ## Feedback learning
 
 1. A prompt hook captures eligible user dissatisfaction and immediately returns to
