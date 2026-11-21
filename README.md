@@ -1,96 +1,109 @@
 # Agent Feedback Loop
 
-Local prompt-time feedback learning for
-Codex, Claude Code, and Gemini CLI. [中文说明](README-zh.md)
+<p align="center">
+  <img src="assets/banner.png" alt="Agent Feedback Loop" width="100%">
+</p>
 
-**Runtime version: `0.11.0`**
+<p align="center">
+  <a href="https://www.npmjs.com/package/agent-feedback-loop"><img alt="npm version" src="https://img.shields.io/npm/v/agent-feedback-loop?style=flat-square"></a>
+  <a href="https://www.npmjs.com/package/agent-feedback-loop"><img alt="npm monthly downloads" src="https://img.shields.io/npm/dm/agent-feedback-loop?style=flat-square&label=downloads%2Fmo"></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/super3ben/agent-feedback-loop?style=flat-square"></a>
+  <a href="https://nodejs.org/"><img alt="node >=24.15" src="https://img.shields.io/badge/node-%3E%3D24.15-339933?style=flat-square"></a>
+  <a href="https://github.com/super3ben/agent-feedback-loop/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/super3ben/agent-feedback-loop?style=flat-square"></a>
+</p>
+
+<p align="center"><sub><b>Runtime version: 0.11.0</b></sub></p>
+
+<p align="center"><sub><a href="README-zh.md">中文说明</a></sub></p>
+
+**Agent Feedback Loop turns a user's dissatisfaction into a local, severity-aware
+rule that returns on the next matching prompt.**
+
+> [!IMPORTANT]
+> **0.11.0**
+>
+> - **Verification now acts on what it measures.** A `redundant` verdict
+>   withdraws the always-on line; before this release the verify report was
+>   never read, so nothing had ever demoted.
+> - **Unmeasurable lessons get a review flag.** Families the marker scorer
+>   cannot see are scored by the project objects they name and flagged for
+>   review, instead of reported as a bare `unmeasurable`.
+> - **The quoted-words marker is gone.** It rewarded restating the injected
+>   block, so verification scores project objects instead.
+
+## Why Agent Feedback Loop
+
+- **Local, not remote.** Lessons are Markdown under `.agent/reflections/`; the
+  control database holds lifecycle state, never lesson bodies.
+- **The prompt never waits.** The hook records and returns at once, and the
+  reviewer runs detached: a document published during a prompt can affect only
+  a later matching one.
+- **Complaints, not keyword lists.** Wordlist routes, a reason-first classifier
+  for referent-backed prompts, and deterministic escalation when a reviewer
+  keeps declining the same family.
+- **Same-class lessons merge.** A recurrence strengthens one family line instead
+  of duplicating documents (`src/reflection-document.mjs`,
+  `src/rules-writer.mjs`).
+- **Severity sets the bar.** A Major, Critical or Blocker publication earns its
+  index line on the first occurrence (`SEVERITY_THRESHOLDS`,
+  `src/rules-writer.mjs`); a family that never published waits for three
+  recurrences (`src/update-rules-tier.mjs`).
+- **Measured, not assumed.** `reflections verify` replays a trigger with and
+  without the family's block; only a `redundant` verdict withdraws the line.
 
 ## See the loop
 
-![The feedback loop: 4 of 6 links closed as of 0.11.0](assets/loop.gif)
+![One lesson, six steps](assets/loop.gif)
 
-Green links close inside the code. The two amber dashed links do not: verify runs
-only when someone types `reflections verify`, and recurrence through the injected
-block is never recorded. The dot is one lesson walking the six steps. Every
+Green links close inside the code; the two amber dashed links do not. Every
 colour was read from `src/` at 0.11.0, not drawn from intent.
 
-![One incident through the loop, recorded end to end](assets/demo.gif)
+![Three scenes from one recorded run](assets/demo.gif)
 
-Four scenes, all real runs against a throwaway `HOME`:
-`node bin/agent-feedback-loop.mjs install --home $HOME`; then
-`afl-hook hook --event UserPromptSubmit --cli codex --continue < ~/payload-1.json`
-on a Chinese complaint; then `ls .agent/reflections && head -n 11
-.agent/reflections/*.md` for the document the reviewer published; then the same
-hook on a second prompt, with `jq -r .hookSpecificOutput.additionalContext`
-pulling the injected block back out of the returned JSON. `reflections verify`
-is deliberately absent — it needs two real model calls per family, and scripting
-those answers would fake the very thing being measured.
-
-![The tests that hold the loop together](assets/tests.gif)
-
-`node --test test/lesson-verify.test.mjs test/lesson-structure.test.mjs
-test/update-rules-tier.test.mjs` — 39 of 39 pass. The full suite is 871 tests:
-870 pass, 1 fails, and that failure is pre-existing in
-`test/platform-smoke.test.mjs` (assertion at :522, test at :404). It is shown in
-the capture rather than trimmed out.
-
-![Structure-scored A/B: control vs treatment, plus same-arm spread](assets/verify-ab.png)
-
-Three families replayed with no `.agent` at all and with only that family's rules
-block. The chart counts the lesson's distinctive terms and project objects that
-reappear in the answer — not whether the agent behaves differently, so a
-paraphrasing answer can score zero and the gaps are a lower bound. The x axis
-stops at 8 because `extractObjects` caps objects there
-(`src/lesson-structure.mjs:194`); two runs per arm is the floor because `repeats`
-below 2 is raised to 2 (`src/lesson-verify.mjs:260`), and the SSH family's
-same-arm draws were 6, 2 and 1 — one run per arm cannot separate a lesson from
-noise.
+Three scenes from one run. **Capture:** the hook takes a frustrated prompt and
+returns while the reviewer keeps working. **Review and compile:** a document
+lands in `.agent/reflections/`; **inject:** the next matching prompt gets it.
 
 ### Is the loop closed?
 
-Four of the six links run without a human as of 0.11.0. Two do not, and one of
-the closed ones is narrower than it looks.
+Four of the six links run without a human. Two do not, and one of the closed
+links is narrower than it looks.
 
 **Closed**
 
-- **capture → review.** The prompt hook logs `feedback_signal_evaluated` with
-  reason `candidate` or `not_candidate` (`src/cli.mjs:614`), and a detached
-  reviewer turns the job into a reflection. End-to-end coverage:
-  `test/platform-smoke.test.mjs:404`.
-- **review → compile.** A published document carries `family_id`, `applies_when`
-  and `method_changes` (`src/reflection-document.mjs:9-11`); the tier builder
-  merges the family and gives every published family an index line
-  (`SEVERITY_THRESHOLDS = { Major: 1, Critical: 1, Blocker: 1 }`,
-  `src/rules-writer.mjs:44`). "Promote at 3 recurrences" survives only for
-  families that never published (`UNPUBLISHED_RECURRENCE_THRESHOLD`,
-  `src/update-rules-tier.mjs:47`).
-- **compile → inject.** `buildRulesBlock` renders the layered block
-  (`src/rules-writer.mjs`), and the prompt path reads it on every turn
-  (`src/cli.mjs:889-907`). A per-session `rules_injection` ledger keeps the same
-  family from arriving again on every tool call (`src/control-store.mjs:104`).
+- **capture → review → compile → inject.** The demo above is that path end to
+  end: the hook logs and returns (`src/cli.mjs`), the reviewer publishes, the
+  writer merges the family into a block (`src/rules-writer.mjs`), and the prompt
+  path reads it (`src/selector.mjs`).
 - **verify → lifecycle.** Only a `redundant` verdict demotes
-  (`demotedFamiliesFromVerifyReport`, `src/update-rules-tier.mjs`); the family
-  keeps its document, loses the always-on line, and gains the
-  `长期未复发·已降级` tag (`src/rules-writer.mjs:725`). This only became true in
-  0.11.0: the verify-report read called `path.join` without importing
-  `node:path`, and a bare `catch` swallowed the `ReferenceError`, so no verdict
-  had ever demoted anything (fixed in `8e3e469`).
+  (`demotedFamiliesFromVerifyReport`, `src/update-rules-tier.mjs`). This is live
+  since 0.11.0: before it, the verify-report read threw and nothing ever
+  demoted (fixed in `8e3e469`).
 
 **Open**
 
-- **inject → verify.** `verifyFamily` has exactly one caller, the
-  `reflections verify` command (`src/cli.mjs:1722`). Nothing schedules it, so a
-  project that never runs it never gets verdicts — and therefore never demotes.
-- **inject → capture (recurrence).** Block-channel deliveries are not written to
-  `reflection_emissions`: `findPriorFamilyEmission` reads only rows with
-  `outcome='emitted'` (`src/control-store.mjs:1274`), and the selector skips a
-  family the block already covers with reason `covered_by_rules`
-  (`src/selector.mjs:563`). So `recurrence_after_emission` never fires for the
-  families the block covers — the ones recurring often enough to earn a line.
-- **The measurement is a lower bound.** Verification scores whether the answer
-  reproduces the lesson's distinctive terms and project objects, not whether the
-  agent's behaviour changed (`src/lesson-verify.mjs`). A correct answer that
-  paraphrases can score zero.
+- **inject → verify.** `verifyFamily` has one caller, the `reflections verify`
+  command (`src/cli.mjs`). Nothing schedules it, so a project that never runs it
+  never gets verdicts.
+- **inject → recurrence.** Block-channel deliveries are not written to
+  `reflection_emissions` (`src/control-store.mjs`), and the selector skips
+  families the block already covers (`src/selector.mjs`), so recurrence is never
+  recorded for the families that recur most.
+- **The measurement is a lower bound.** Verification scores whether an answer
+  reproduces the lesson's terms and project objects, not whether behaviour
+  changed (`src/lesson-verify.mjs`). A correct paraphrase can score zero.
+
+## Quick start
+
+```sh
+npm install -g agent-feedback-loop
+agent-feedback-loop install
+```
+
+The next prompt in Codex, Claude Code, or Gemini CLI goes through the hook: an
+eligible complaint is captured in the background, and a later matching prompt
+reads the lesson it produced. Wiring, uninstall, and diagnostics are under
+[Install and diagnose](#install-and-diagnose).
 
 ## Feedback learning
 

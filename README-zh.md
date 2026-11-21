@@ -1,80 +1,96 @@
 # Agent Feedback Loop 中文说明
 
-面向 Codex、Claude Code、Gemini CLI 的本地提示时反馈学习。
+<p align="center">
+  <img src="assets/banner.png" alt="Agent Feedback Loop" width="100%">
+</p>
 
-**运行时版本：`0.11.0`**
+<p align="center">
+  <a href="https://www.npmjs.com/package/agent-feedback-loop"><img alt="npm version" src="https://img.shields.io/npm/v/agent-feedback-loop?style=flat-square"></a>
+  <a href="https://www.npmjs.com/package/agent-feedback-loop"><img alt="npm monthly downloads" src="https://img.shields.io/npm/dm/agent-feedback-loop?style=flat-square&label=downloads%2Fmo"></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/super3ben/agent-feedback-loop?style=flat-square"></a>
+  <a href="https://nodejs.org/"><img alt="node >=24.15" src="https://img.shields.io/badge/node-%3E%3D24.15-339933?style=flat-square"></a>
+  <a href="https://github.com/super3ben/agent-feedback-loop/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/super3ben/agent-feedback-loop?style=flat-square"></a>
+</p>
+
+<p align="center"><sub><b>运行时版本：0.11.0</b></sub></p>
+
+<p align="center"><sub><a href="README.md">English</a></sub></p>
+
+**Agent Feedback Loop 把用户的不满沉淀成本地、带严重度的一条规则，在下一次匹配的
+提示里回到上下文。**
+
+> [!IMPORTANT]
+> **0.11.0**
+>
+> - **验证结果真正生效了。** `redundant` 判定会撤掉常驻指令行；此前 verify 报告
+>   从未被读取，没有任何判定真正降级过。
+> - **测不了的教训有了复核标记。** 缺少家族特征词的教训改按它点名的项目对象打分，
+>   以 `reviewFlag` 附在报告上，而不是只报一句 `unmeasurable`。
+> - **引号词标记已移除。** 它奖励的是复述注入区块，现在改为核对项目对象。
+
+## 为什么是 Agent Feedback Loop
+
+- **本地，不上传。** 教训是 `.agent/reflections/` 下的 Markdown；控制库只存
+  生命周期状态，从不存正文。
+- **prompt 从不等待。** hook 记录后立刻返回，reviewer 分离运行；处理期间发布的
+  文档只影响后续匹配的提示。
+- **认抱怨，不认关键词表。** 词表路由、对带指代 prompt 的 reason-first 分类器，
+  以及 reviewer 反复拒收同族时的确定性升级。
+- **同族合并。** 复发让同一条家族线更强，而不是复制出多份文档
+  （`src/reflection-document.mjs`、`src/rules-writer.mjs`）。
+- **严重度决定门槛。** Major、Critical、Blocker 的发布第一次出现即进索引
+  （`SEVERITY_THRESHOLDS`，`src/rules-writer.mjs`）；从未发布过的家族要复发三次
+  （`src/update-rules-tier.mjs`）。
+- **靠测量，不靠假设。** `reflections verify` 用有/无该家族区块两种条件重放触发；
+  只有 `redundant` 判定才撤掉指令行。
 
 ## 闭环演示
 
-![反馈闭环：0.11.0 下六条链路已闭四条](assets/loop.gif)
+![一条教训，六个步骤](assets/loop.gif)
 
-绿色链路在代码里自动闭合；两条橙色虚线不闭合。验证只在有人手动跑
-`reflections verify` 时才发生；经注入区块的复发从不被记账。光点是一条教训走完
-六步。每条链路的颜色都是照着 0.11.0 的 `src/` 核对出来的，不是按设计意图画的。
+绿色链路在代码里自动闭合；两条橙色虚线不闭合。每条链路的颜色都是照着 0.11.0 的
+`src/` 核对出来的，不是按设计意图画的。
 
-![一次不满走完整条链路，全程实录](assets/demo.gif)
+![一次实录里的三幕](assets/demo.gif)
 
-四幕都是真跑，`HOME` 指向临时目录：`node bin/agent-feedback-loop.mjs install --home $HOME`；
-然后 `afl-hook hook --event UserPromptSubmit --cli codex --continue < ~/payload-1.json`
-输入一句中文抱怨；然后 `ls .agent/reflections && head -n 11 .agent/reflections/*.md`
-看 reviewer 写下的文档；最后对第二条 prompt 再跑一次 hook，用
-`jq -r .hookSpecificOutput.additionalContext` 把注入区块从返回的 JSON 里取出来。
-`reflections verify` 故意没有入镜——它每个家族要两次真实模型调用，把它脚本化等于
-伪造被测量的东西。
-
-![撑住整个闭环的测试](assets/tests.gif)
-
-`node --test test/lesson-verify.test.mjs test/lesson-structure.test.mjs
-test/update-rules-tier.test.mjs`——39/39 全过。全量 `node --test` 是 871 个用例，
-870 过、1 挂；挂的是 `test/platform-smoke.test.mjs` 里既有的那条（断言在 :522，
-用例在 :404），实录里原样保留，没有剪掉。
-
-![结构评分的 A/B：对照组、实验组与同臂噪声](assets/verify-ab.png)
-
-三个家族各跑两组：一组完全没有 `.agent`，一组只有该家族的规则区块。纵轴数的是
-答案重现了多少该教训的特征词和项目对象，不是 agent 的行为有没有变——换个说法答对
-也可能得 0 分，所以差距只能当下界看。横轴止于 8，是因为 `extractObjects` 的对象
-上限就是 8（`src/lesson-structure.mjs:194`）；每组至少两次，因为 `repeats` 低于
-2 会被抬到 2（`src/lesson-verify.mjs:260`），而 SSH 家族同臂三次抽取是 6、2、1，
-一组一次分不开教训和噪声。
+三幕都来自同一次实录。**捕获：** hook 接下不满的 prompt 后立刻返回，reviewer
+继续在后台工作。**评审与编译：** 一份文档落到 `.agent/reflections/`。
+**注入：** 下一次匹配的提示已经带着编译好的区块。
 
 ### 闭环闭合了吗？
 
-0.11.0 下六条链路有四条不需要人介入。两条没有，而且已闭合的链路里有一条比看上去窄。
+六条链路里有四条不需要人介入。两条没有，而且已闭合的链路里有一条比看上去窄。
 
 **已闭合**
 
-- **捕获 → 评审。** prompt hook 记录 `feedback_signal_evaluated`，reason 为
-  `candidate` 或 `not_candidate`（`src/cli.mjs:614`），分离的 reviewer 把作业变成
-  反思文档。端到端用例：`test/platform-smoke.test.mjs:404`。
-- **评审 → 编译。** 已发布文档带 `family_id`、`applies_when`、`method_changes`
-  （`src/reflection-document.mjs:9-11`）；tier 构建合并同族，并给每个已发布家族
-  一行索引（`SEVERITY_THRESHOLDS = { Major: 1, Critical: 1, Blocker: 1 }`，
-  `src/rules-writer.mjs:44`）。"复发 3 次才升级"只剩给从未发布过的家族
-  （`UNPUBLISHED_RECURRENCE_THRESHOLD`，`src/update-rules-tier.mjs:47`）。
-- **编译 → 注入。** `buildRulesBlock` 渲染分层区块（`src/rules-writer.mjs`），
-  prompt 路径每轮都读（`src/cli.mjs:889-907`）。按会话记的 `rules_injection`
-  台账防止同一家族在每次工具调用里重复出现（`src/control-store.mjs:104`）。
+- **捕获 → 评审 → 编译 → 注入。** 上面的演示就是这条路的全程：hook 记录并返回
+  （`src/cli.mjs`），reviewer 发布文档，写入层把同族并进区块
+  （`src/rules-writer.mjs`），prompt 路径每轮读取（`src/selector.mjs`）。
 - **验证 → 生命周期。** 只有 `redundant` 判定会降级
-  （`demotedFamiliesFromVerifyReport`，`src/update-rules-tier.mjs`）：文档保留，
-  失去常驻指令行，索引上打 `长期未复发·已降级` 标签（`src/rules-writer.mjs:725`）。
-  这件事到 0.11.0 才成立：读 verify-report 时调用 `path.join` 却没 import
-  `node:path`，裸 `catch` 把 `ReferenceError` 吞了，此前没有任何判定降级过任何
-  东西（`8e3e469` 修复）。
+  （`demotedFamiliesFromVerifyReport`，`src/update-rules-tier.mjs`）。这件事到
+  0.11.0 才成立：此前读 verify 报告会抛异常，没有任何东西降级过（`8e3e469`
+  修复）。
 
 **未闭合**
 
 - **注入 → 验证。** `verifyFamily` 只有一处调用者，就是 `reflections verify`
-  命令（`src/cli.mjs:1722`）。没有任何东西自动触发它；不跑就没有判定，也就永远
-  不会降级。
-- **注入 → 捕获（复发）。** 区块通道的投递不写进 `reflection_emissions`：
-  `findPriorFamilyEmission` 只读 `outcome='emitted'` 的行
-  （`src/control-store.mjs:1274`），而 selector 对区块已覆盖的家族直接以
-  `covered_by_rules` 跳过（`src/selector.mjs:563`）。于是
-  `recurrence_after_emission` 对区块覆盖的家族永远不会触发——而这些正是复发
-  频率高到能进索引的那些。
+  命令（`src/cli.mjs`）。没有任何东西自动触发它；不跑就没有判定。
+- **注入 → 复发。** 区块通道的投递不写进 `reflection_emissions`
+  （`src/control-store.mjs`），selector 对区块已覆盖的家族直接跳过
+  （`src/selector.mjs`），于是复发频率最高的那些家族反而不被记账。
 - **测量本身只是下界。** 验证评的是答案有没有重现教训的特征词和项目对象，不是
   agent 的行为有没有变（`src/lesson-verify.mjs`）；答对但换了措辞可能得 0 分。
+
+## 快速开始
+
+```sh
+npm install -g agent-feedback-loop
+agent-feedback-loop install
+```
+
+下一次在 Codex、Claude Code 或 Gemini CLI 里发提示时就会经过 hook：合格的不满在
+后台被捕获，后续匹配的提示读到它沉淀出的教训。接线、卸载与诊断见
+[安装与诊断](#安装与诊断)。
 
 ## 反馈学习
 
