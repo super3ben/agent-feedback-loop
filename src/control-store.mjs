@@ -112,6 +112,14 @@ const INJECTION_LEDGER_META_PREFIX = "rules_injection:v1:";
 // to reconstruct what was sent.
 const TOOL_INJECTION_META_PREFIX = "tool_injection:v1:";
 const INJECTION_LEDGER_MAX_STORED = 2_048;
+// The task fingerprint a rules-block delivery row carries.
+//
+// It is a sentinel, not a fingerprint: the block delivers the same lesson to
+// every turn of a session, and a per-turn key would write one row per turn. A
+// value no host can supply collapses the row to (document, session, epoch) under
+// the table's existing unique key, so the ledger stays bounded without a new
+// column or a migration. It is also readable in the ledger as what it is.
+const RULES_BLOCK_TASK_FINGERPRINT = "rules-block";
 // What each prompt actually received from the rules block.
 //
 // This is the record that makes "did the matching work" answerable after the
@@ -1256,6 +1264,69 @@ function createStore(database, now) {
           WHERE id=? RETURNING *`).get(nowIso(now), safeEmissionId);
         if (!row) throw new TypeError("emissionId was not found");
         return { ...row };
+      });
+    },
+    // Records that the every-turn rules block put this family's lesson in front
+    // of the model in this session.
+    //
+    // Only the selection channel wrote a delivery row before this. The block
+    // channel — which is where the families that recurred >= 3 times live, the
+    // ones that matter most — wrote nothing at all, so `findPriorFamilyEmission`
+    // could never see a block delivery, lifecycle classified those families
+    // `never_delivered` forever, and demotion never fired for them. The block
+    // still delivered the text; only the accounting was missing.
+    //
+    // Identity: the published document the block rendered, plus this session and
+    // context epoch, plus the sentinel task fingerprint 'rules-block'. The
+    // sentinel cannot collide with a real per-turn fingerprint (those are the
+    // host's, `project:session` by default), so the row collapses to one per
+    // (document, session, epoch) no matter how many turns carry it: later turns
+    // only advance emitted_at. Growth is therefore bounded by the number of
+    // families the block delivers in a session, not by the number of turns.
+    recordRulesBlockDelivery({ document, familyId, sessionUid, contextEpoch }) {
+      if (!document || typeof document !== "object" || Array.isArray(document)) {
+        throw new TypeError("document must be a delivered catalog document");
+      }
+      const documentPath = assertString(document.path, "document.path", 4096);
+      if (!path.isAbsolute(documentPath) || documentPath.includes("\0")) {
+        throw new TypeError("document.path must be an absolute path");
+      }
+      const documentSha256 = assertString(document.documentHash, "document.documentHash", 64);
+      if (!SHA256_PATTERN.test(documentSha256)) {
+        throw new TypeError("document.documentHash must be an exact lowercase sha256");
+      }
+      const documentFamilyId = assertString(document.familyId, "document.familyId", 128);
+      const safeFamilyId = assertString(familyId, "familyId", 128);
+      if (!FAMILY_ID_PATTERN.test(documentFamilyId) || !FAMILY_ID_PATTERN.test(safeFamilyId)
+          || documentFamilyId !== safeFamilyId) {
+        throw new TypeError("familyId must match document.familyId");
+      }
+      const safeSessionUid = assertString(sessionUid, "sessionUid", 512);
+      const safeContextEpoch = requiredEpoch(contextEpoch, "contextEpoch");
+      const timestamp = nowIso(now);
+      return transaction(() => {
+        database.prepare(`INSERT INTO reflection_emissions
+          (document_path, document_sha256, family_id, session_uid, context_epoch,
+           task_fingerprint, selected_at, emitted_at, outcome, reason_code)
+          VALUES (?, ?, ?, ?, ?, '${RULES_BLOCK_TASK_FINGERPRINT}', ?, ?, 'emitted', NULL)
+          ON CONFLICT(document_sha256, session_uid, context_epoch, task_fingerprint)
+          DO UPDATE SET emitted_at=MAX(emitted_at, excluded.emitted_at)`).run(
+          documentPath,
+          documentSha256,
+          safeFamilyId,
+          safeSessionUid,
+          safeContextEpoch,
+          timestamp,
+          timestamp
+        );
+        const row = database.prepare(`SELECT * FROM reflection_emissions
+          WHERE document_sha256=? AND session_uid=? AND context_epoch=? AND task_fingerprint=?`).get(
+          documentSha256,
+          safeSessionUid,
+          safeContextEpoch,
+          RULES_BLOCK_TASK_FINGERPRINT
+        );
+        return row ? { ...row } : null;
       });
     },
     listPriorReflectionEmissions({ sessionUid, contextEpoch, taskFingerprint }) {

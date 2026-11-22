@@ -230,12 +230,15 @@ export function classifyFamily({
       // eval/net-effect.mjs, computed against never-delivered families — nothing
       // derived per family may promote itself to that.
       //
-      // Coverage limit, also deliberate: only the SELECTION channel writes a
-      // durable per-session row (reflection_emissions). The always-on index and
-      // the PreToolUse channel leave no per-family timestamp, so a family
-      // delivered only through those is never counted here. This field therefore
-      // under-reports, and never over-reports — which is the direction an error
-      // in a "verified" field must point.
+      // Coverage limit, also deliberate: a durable per-family row
+      // (reflection_emissions) is written by both the selection channel and the
+      // every-turn rules block, each only when lesson text actually goes out. A
+      // turn that sends the index alone names the family without showing its
+      // instruction, so it is not a delivery and leaves no timestamp. The
+      // PreToolUse channel still leaves no per-family timestamp, so a family
+      // delivered only through it is never counted here. This field therefore
+      // remains a lower bound — under-reports, and never over-reports — which is
+      // the direction an error in a "verified" field must point.
       verifiedAt: new Date(lastAt).toISOString()
     };
   }

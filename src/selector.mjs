@@ -527,6 +527,22 @@ export function selectReflections({
   const limits = limitsFrom(budget);
   const cutoffMs = Date.parse(publishedBefore);
   if (!Number.isFinite(cutoffMs)) throw new TypeError("publishedBefore must be a valid timestamp");
+  // Which key the caller's lifecycle map uses for this document. The store's
+  // states are keyed by reviewer family_key; the document carries a derived
+  // `family-<sha20>` id. They are different namespaces, so the lookup has to go
+  // through the same resolver selection already uses to recognise a covered
+  // family — otherwise the demotion is looked up under a key that never exists.
+  const lifecycleKeyOf = (document) => {
+    if (typeof familyKeyOf === "function") {
+      try {
+        const key = familyKeyOf(document);
+        if (key) return key;
+      } catch {
+        // Fall through to the document id.
+      }
+    }
+    return document.familyId;
+  };
   const ordered = [...(Array.isArray(documents) ? documents : [])]
     .sort((left, right) => stableIdentity(left).localeCompare(stableIdentity(right), "en-US"));
   const omissions = [];
@@ -703,7 +719,12 @@ export function selectReflections({
       finalSeverity: document.severity,
       relevanceScore: entry.relevanceScore,
       familyRecurrence: recurrence.get(document.familyId),
-      lifecycleWeight: familyLifecycle[document.familyId] === "recurred" ? 0.5 : 1
+      // The lifecycle is keyed by reviewer family_key, not by the document's
+      // derived familyId: `family-<sha20>` is a hash of (method_class, key), and
+      // looking it up against the store's keys matched nothing — demotion was
+      // computed and then never applied. Fall back to familyId so a caller that
+      // supplies states keyed by document (the lifecycle eval does) still works.
+      lifecycleWeight: familyLifecycle[lifecycleKeyOf(document)] === "recurred" ? 0.5 : 1
     });
   }
 

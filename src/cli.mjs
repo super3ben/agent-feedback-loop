@@ -374,6 +374,15 @@ async function readProjectRulesBlock(projectDir, { prompt = null } = {}) {
     if (composed.overBudget) {
       promptLog("rules_block_injected", { reason: "index_over_budget", count: composed.indexCount });
     }
+    // composeInjection sheds the lowest-ranked sections when the composed text
+    // overflows maxBytes, and reports how many survived. `selected` is what
+    // ranking chose; `included` is what the model was actually shown. Every
+    // downstream use below — which documents selection must skip, which are
+    // allowed to collapse to a pointer, and what the delivery ledger records —
+    // has to describe the sent text. Recording a shed section as delivered would
+    // turn a later complaint into a "recurrence" of text nobody saw, the
+    // over-report direction this module is explicitly designed to avoid.
+    const included = selected.slice(0, composed.expandedCount ?? selected.length);
     return {
       text: composed.text,
       dropped: 0,
@@ -383,7 +392,7 @@ async function readProjectRulesBlock(projectDir, { prompt = null } = {}) {
       // index — using the index would suppress every document whose family
       // appears there, which after this change is every family.
       coveredFamilies: new Set(
-        selected.map((section) => section.familyKey).filter(Boolean)
+        included.map((section) => section.familyKey).filter(Boolean)
       ),
       // The same set, published under the name the selector reads when deciding
       // whether a document may be reduced to a pointer. It is separate because
@@ -397,13 +406,13 @@ async function readProjectRulesBlock(projectDir, { prompt = null } = {}) {
       // work, which is why documents that clearly duplicated the block were
       // still shipped in full.
       expandedFamilies: new Set(
-        selected.map((section) => section.familyKey).filter(Boolean)
+        included.map((section) => section.familyKey).filter(Boolean)
       ),
       layer: {
         mode: "layered",
         indexCount: layered.l0.length,
         sectionCount: layered.l1.length,
-        expanded: selected.length,
+        expanded: included.length,
         topScores: scores.slice(0, 3).map((entry) => ({ family: entry.familyKey, score: Number(entry.score.toFixed(2)) }))
       }
     };
@@ -829,6 +838,36 @@ export async function handlePromptHook({
     maxFileBytes: lowerOnlyLimit(selectionLimits.maxFileBytes, PROMPT_SELECTION_LIMITS.maxFileBytes)
   };
   const selectedEmissionIds = [];
+  // The families the selection channel delivered this turn. Used to keep the
+  // block channel from recording the same family twice in one turn.
+  const selectedFamilyIds = new Set();
+  // Families the every-turn block actually put in front of the model this turn,
+  // resolved to their published documents. Collected here and written only after
+  // the host write succeeds, for the same reason selection's rows are: text that
+  // never reached the model is not a delivery.
+  const blockDeliveries = [];
+  // Which published document carries each family key. Built alongside the
+  // family-key lookup selection already needs, so the block channel costs no
+  // extra I/O — the job table and the catalog are both already read.
+  //
+  // One known gap, in the safe direction: the catalog is the merged view, and
+  // two DIFFERENT families that share a class_of_mistake collapse to the newest
+  // member's document. The family whose document was merged away has no identity
+  // here, so its block delivery goes unrecorded rather than being recorded
+  // against another family's document. Same family, newer document is not
+  // affected: both paths map to the same key and the newer one wins.
+  const documentByFamilyKey = new Map();
+  const rememberFamilyDocument = (familyKey, document) => {
+    const current = documentByFamilyKey.get(familyKey);
+    if (!current) {
+      documentByFamilyKey.set(familyKey, document);
+      return;
+    }
+    const currentAt = Date.parse(current.publishedAt ?? current.createdAt ?? "") || 0;
+    const nextAt = Date.parse(document.publishedAt ?? document.createdAt ?? "") || 0;
+    if (nextAt > currentAt) documentByFamilyKey.set(familyKey, document);
+  };
+
   let priorEmissions = [];
   try {
     priorEmissions = controlStore.listPriorReflectionEmissions({
@@ -992,6 +1031,7 @@ export async function handlePromptHook({
         if (direct && byKey.has(direct)) {
           familyRecurrence[document.familyId] = byKey.get(direct);
           familyKeyByFamilyId.set(document.familyId, direct);
+          rememberFamilyDocument(direct, document);
           continue;
         }
         // A legacy document has nothing to derive from: its method_class is not
@@ -1005,6 +1045,7 @@ export async function handlePromptHook({
             if (deriveReviewerFamilyId(document.methodClass, key) === document.familyId) {
               familyRecurrence[document.familyId] = occurrences;
               familyKeyByFamilyId.set(document.familyId, key);
+              rememberFamilyDocument(key, document);
               break;
             }
           } catch {}
@@ -1089,6 +1130,7 @@ export async function handlePromptHook({
           contextEpoch: result.selectionInput.session.contextEpoch,
           taskFingerprint: result.selectionInput.task.fingerprint
         }));
+        selectedFamilyIds.add(document.familyId);
         promptLog("reflection_selected", { document: document.documentHash, family: document.familyId, result: "selected" });
       } catch {
         promptLog("reflection_parse_omitted", { reason: "selection_record_failed", document: document.documentHash });
@@ -1159,6 +1201,31 @@ export async function handlePromptHook({
       result.guidance = [memoryNotice, injected, result.guidance]
         .filter(Boolean)
         .join("\n\n");
+      // Which families this turn actually put in front of the model, for the
+      // delivery ledger. The test is what the model received, not what the block
+      // covers: a flat block reduced to its index names the families but carries
+      // no lesson text, and a layered block that expanded nothing is an index
+      // too. Neither is a delivery, and recording it would make a family look
+      // like it had been shown a lesson it never saw.
+      //
+      // The flat branch is legacy shape only. Any `### heading (N×, Severity)`
+      // makes parseLayeredBlock recognise the block as layered, so a flat block
+      // currently carries no covered families at all; the branch is kept so a
+      // future flat format cannot record an index turn as a delivery.
+      const carriedLessonText = rulesBlock.layer?.mode === "layered"
+        ? rulesBlock.coveredFamilies.size > 0
+        : plan.mode === "full";
+      if (carriedLessonText) {
+        for (const familyKey of rulesBlock.coveredFamilies) {
+          const document = documentByFamilyKey.get(familyKey);
+          if (!document) continue;
+          // Selection skips families the block covers, so this should be empty;
+          // the check is here so a future change to that rule cannot silently
+          // record one family twice in one turn.
+          if (selectedFamilyIds.has(document.familyId)) continue;
+          blockDeliveries.push({ document, familyId: document.familyId });
+        }
+      }
       promptLog("rules_block_injected", {
         bytes: Buffer.byteLength(injected, "utf8"),
         fullBytes: Buffer.byteLength(rulesBlock.text, "utf8"),
@@ -1238,6 +1305,30 @@ export async function handlePromptHook({
         promptLog("reflection_emitted", { result: "emitted" });
       } catch {
         promptLog("reflection_emitted", { reason: "emission_record_failed" });
+      }
+    }
+    // The same rule as selection: a row is written only after the text has been
+    // handed to the host. The rules block is its own channel, so it records into
+    // the same ledger — that is what lets a later complaint ask "was this lesson
+    // already on screen", which the selection-only ledger could never answer for
+    // the families that recur most.
+    const blockSession = result.selectionInput.session ?? {};
+    if (blockDeliveries.length
+        && typeof blockSession.sessionUid === "string" && blockSession.sessionUid
+        && Number.isSafeInteger(blockSession.contextEpoch)) {
+      for (const delivery of blockDeliveries) {
+        try {
+          controlStore.recordRulesBlockDelivery({
+            document: delivery.document,
+            familyId: delivery.familyId,
+            sessionUid: blockSession.sessionUid,
+            contextEpoch: blockSession.contextEpoch
+          });
+          promptLog("reflection_emitted", { document: delivery.document.documentHash, result: "emitted" });
+        } catch {
+          // One missing accounting row never costs the user their turn.
+          promptLog("reflection_emitted", { reason: "emission_record_failed" });
+        }
       }
     }
   }

@@ -53,10 +53,11 @@ rule that returns on the next matching prompt.**
 
 ## See the loop
 
-![One lesson, six steps](assets/loop.gif)
+![One lesson, six steps, one loop](assets/loop.gif)
 
-Green links close inside the code; the two amber dashed links do not. Every
-colour was read from `src/` at 0.11.0, not drawn from intent.
+Green links close inside the code; the one amber dashed link does not. The
+recurrence edge on the left is drawn thick, because it is the edge that closes
+the loop. Every colour was read from `src/` at 0.11.0, not drawn from intent.
 
 ![Three scenes from one recorded run](assets/demo.gif)
 
@@ -66,8 +67,18 @@ lands in `.agent/reflections/`; **inject:** the next matching prompt gets it.
 
 ### Is the loop closed?
 
-Four of the six links run without a human. Two do not, and one of the closed
-links is narrower than it looks.
+Yes — through the recurrence edge. A lesson that was actually delivered is
+recorded, so when the same complaint comes back the system can see that it
+recurred after the lesson was shown: the family is counted again, the recurrence
+is attached to the next publication, and a family that never recurs fades and is
+eventually retired. Six of the seven edges close in code. The exception is
+inject → verify, which still runs by hand — and the two maintenance edges behind
+it only fire once that verdict exists. The measurement is still a lower bound.
+
+What changed: the every-turn rules block now records the families whose lesson
+text it actually sent, after the host write succeeds
+(`recordRulesBlockDelivery`, `src/control-store.mjs`), so recurrence is
+measurable on both prompt channels.
 
 **Closed**
 
@@ -75,20 +86,28 @@ links is narrower than it looks.
   end: the hook logs and returns (`src/cli.mjs`), the reviewer publishes, the
   writer merges the family into a block (`src/rules-writer.mjs`), and the prompt
   path reads it (`src/selector.mjs`).
+- **inject → recurrence → capture.** A delivered lesson is recorded on both
+  channels that reach a prompt: the selector writes its emission row, and the
+  rules block records the families whose text it sent. So the next complaint of
+  the same family meets a prior delivery, is classified as a recurrence
+  (`src/reflection-lifecycle.mjs`), and the reviewer's next result carries
+  `effectiveness: recurrence_after_emission` (`src/reviewer-runner.mjs`). Before
+  this, block deliveries were invisible, and the families that recur most — the
+  ones the block exists for — were never counted as having recurred.
 - **verify → lifecycle.** Only a `redundant` verdict demotes
   (`demotedFamiliesFromVerifyReport`, `src/update-rules-tier.mjs`). This is live
   since 0.11.0: before it, the verify-report read threw and nothing ever
   demoted (fixed in `8e3e469`).
+- **lifecycle → compile.** A demoted or dormant family loses its always-on line
+  the next time the block is rebuilt, which changes what the block contains; a
+  family that has gone quiet long enough to be noise can be retired with
+  `reflections lifecycle --apply`.
 
 **Open**
 
 - **inject → verify.** `verifyFamily` has one caller, the `reflections verify`
   command (`src/cli.mjs`). Nothing schedules it, so a project that never runs it
   never gets verdicts.
-- **inject → recurrence.** Block-channel deliveries are not written to
-  `reflection_emissions` (`src/control-store.mjs`), and the selector skips
-  families the block already covers (`src/selector.mjs`), so recurrence is never
-  recorded for the families that recur most.
 - **The measurement is a lower bound.** Verification scores whether an answer
   reproduces the lesson's terms and project objects, not whether behaviour
   changed (`src/lesson-verify.mjs`). A correct paraphrase can score zero.
