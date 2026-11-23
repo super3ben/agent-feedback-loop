@@ -378,6 +378,15 @@ Trusted Publisher → GitHub Actions, workflow `publish.yml`. Until that binding
 exists the publish step fails 404/401, which is the expected symptom of a
 missing binding rather than a broken workflow.
 
+The same release also publishes the dsh plugin, `agent-feedback-loop-dsh`, from
+`templates/dsh-plugin`, under its own tag `dsh-v<version>` and its own workflow,
+`publish-dsh.yml`. Before anything is pushed the script asserts that the
+plugin's version equals this package's, because the two must move together — a
+plugin left on an old version keeps serving old behaviour from the marketplace.
+That package needs its own trusted publisher binding on npmjs.com (workflow
+`publish-dsh.yml`) before its first OIDC publish, exactly the one-time setup
+`publish.yml` needed.
+
 `node scripts/marketplace.mjs` refreshes the dsh marketplace entry separately.
 It opens a pull request from this account's fork of the marketplace repository
 and never writes to its `main`; it runs on ordinary `gh` credentials, so it is

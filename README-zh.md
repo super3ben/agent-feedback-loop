@@ -313,6 +313,13 @@ registry 存在的版本、带 `--provenance` 发布，然后轮询直到 regist
 Publisher → GitHub Actions，workflow 填 `publish.yml`。绑定存在之前发布步骤会以
 404/401 失败，这是缺绑定的预期症状，不是 workflow 坏了。
 
+同一次发布还会从 `templates/dsh-plugin` 发出另一个 npm 包
+`agent-feedback-loop-dsh`，用独立 tag `dsh-v<version>` 触发独立 workflow
+`publish-dsh.yml`。推送之前脚本会断言插件版本与本包版本相同——两者必须一起动，插件
+留在旧版本就会继续从市场里提供旧行为。这个包在第一次走 OIDC 发布之前，也要在
+npmjs.com 上单独绑定 trusted publisher（workflow 填 `publish-dsh.yml`），和当初
+`publish.yml` 需要的一次性设置一样。
+
 `node scripts/marketplace.mjs` 单独更新 dsh 市场条目。它从本账号的市场仓库 fork 开
 PR，绝不写入对方 `main`；用的是普通 `gh` 凭据，因此不在发布 workflow 里。
 

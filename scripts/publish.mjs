@@ -134,6 +134,24 @@ async function main() {
   }
   say("clean");
 
+  // The dsh plugin is a separate npm package that embeds this runtime's
+  // behaviour, and it has drifted before: it sat at 0.9.0 while the runtime
+  // moved to 0.11.0, and the marketplace showed the stale number. Nothing in
+  // the suite would notice, because both versions are internally consistent.
+  // The only reliable rule is that they move together, so a mismatch stops the
+  // release before anything is pushed.
+  step("Checking the dsh plugin version matches");
+  const pluginPkg = JSON.parse(
+    await readFile(path.join(ROOT, "templates", "dsh-plugin", "package.json"), "utf8")
+  );
+  if (pluginPkg.version !== version) {
+    fail(
+      `templates/dsh-plugin/package.json is ${pluginPkg.version}, package.json is ${version}`,
+      "the two must move together — bump templates/dsh-plugin/package.json in the same commit"
+    );
+  }
+  say(`agent-feedback-loop-dsh@${pluginPkg.version}`);
+
   step("Checking npm authentication");
   // Only a READ is needed locally now: publication happens in CI. `whoami` is
   // still checked because an expired token makes `npm view` below fail in a way
@@ -217,6 +235,10 @@ async function main() {
   if (skipWait) {
     step("Skipping the wait (--skip-wait)");
     say(`CI publishes on the tag; watch it with: gh run list --workflow=publish.yml`);
+    // The dsh tag is only pushed once the main workflow has succeeded, so this
+    // path deliberately does not tag it: nothing here knows whether the release
+    // actually landed.
+    say(`the dsh plugin tag (dsh-v${pluginPkg.version}) is pushed after the main workflow succeeds`);
     return;
   }
 
@@ -236,6 +258,35 @@ async function main() {
   // reached npm. It opens a pull request; it never writes to their main.
   const marketplace = await syncMarketplace({ dryRun: false });
 
+  // The plugin has its own version, so it needs its own tag: `v*` already means
+  // "the runtime", and a second package cannot share it. Pushing the tag is all
+  // that happens here — publish-dsh.yml publishes on its own, and waiting for a
+  // second workflow would make one release depend on two registry round trips
+  // for no extra confidence.
+  const dshTag = `dsh-v${pluginPkg.version}`;
+  step(`Tagging the dsh plugin as ${dshTag}`);
+  const existingDshTag = await run("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${dshTag}`], {
+    allowFailure: true
+  });
+  const remoteDshTag = existingDshTag
+    ? null
+    : await run("git", ["ls-remote", "--tags", "origin", `refs/tags/${dshTag}`], { allowFailure: true });
+  let dshTagState;
+  if (existingDshTag || remoteDshTag) {
+    // Re-publishing the same plugin version is not an error: the workflow skips
+    // a version the registry already serves, so an existing tag means the work
+    // is already done.
+    dshTagState = "already present";
+    say(`${dshTag} already exists — publish-dsh.yml has this version`);
+  } else {
+    await run("git", ["tag", "-a", dshTag, "-m", `agent-feedback-loop-dsh@${pluginPkg.version}`], {
+      capture: false
+    });
+    await run("git", ["push", "origin", `refs/tags/${dshTag}`], { capture: false });
+    dshTagState = "pushed";
+    say(`tagged ${dshTag}`);
+  }
+
   const summary = [
     `✓ ${name}@${version}`,
     "  GitHub   pushed",
@@ -248,6 +299,7 @@ async function main() {
         ? "  dsh      entry already current"
         : "  dsh      not updated — see the warning above"
   );
+  summary.push(`  dsh tag  ${dshTag} ${dshTagState}`);
   process.stdout.write(`\n${summary.join("\n")}\n`);
 }
 
